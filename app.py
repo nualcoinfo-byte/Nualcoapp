@@ -653,41 +653,80 @@ elif PAGE == "Material Recovery & Yield":
 elif PAGE == "Customers":
     st.title("Customer Master")
     with st.form("cust_form", clear_on_submit=True):
-        c1, c2 = st.columns(2)
+        c1, c2, c3 = st.columns(3)
         with c1:
-            name = st.text_input("Customer name (PK) *")
+            code = st.text_input("Cust code (PK) *")
+            name = st.text_input("Customer name *")
             gst = st.text_input("GST")
             pan = st.text_input("PAN")
-            code = st.text_input("Cust code")
             status = st.selectbox("Status", db.ACTIVE_STATUS)
-        with c2:
             address = st.text_input("Address")
             city = st.text_input("City")
+        with c2:
             state = st.text_input("State")
             pincode = st.text_input("Pincode")
             country = st.text_input("Country", value="India")
+            contact1 = st.text_input("Contact1 name")
+            phone1 = st.text_input("Phone1")
+            contact2 = st.text_input("Contact name2")
+            phone2 = st.text_input("Phone2")
+        with c3:
+            email = st.text_input("Email")
+            website = st.text_input("Website")
+            bank_account = st.text_input("Bank account")
+            ifsc = st.text_input("IFSC code")
+            bank_name = st.text_input("Bank name")
+            branch_category = st.text_input("Branch Category")
+            created_date = st.text_input(
+                "Created date",
+                value=date.today().isoformat(),
+                help="Defaults to today; leave as-is for new customers.",
+            )
         if st.form_submit_button("Save customer", type="primary"):
-            if not name.strip():
+            if not code.strip():
+                st.error("Cust code is required (primary key).")
+            elif not name.strip():
                 st.error("Customer name is required.")
             else:
                 db.upsert_customer(
                     {
+                        "Cust_code": code.strip(),
                         "Custome_Name": name.strip(),
                         "GST": gst,
                         "PAN": pan,
-                        "Cust_code": code,
                         "Address": address,
                         "City": city,
                         "State": state,
                         "Pincode": pincode,
                         "Country": country,
+                        "Contact1_name": contact1,
+                        "Phone1": phone1,
+                        "Contact_name2": contact2,
+                        "phone2": phone2,
+                        "email": email,
+                        "website": website,
+                        "Bank_account": bank_account,
+                        "IFSC_CODE": ifsc,
+                        "Bank_name": bank_name,
+                        "Branch_Category": branch_category,
+                        "created_date": created_date.strip() or None,
                         "Status": status,
                     }
                 )
-                st.success(f"Saved customer **{name.strip()}**.")
+                st.success(f"Saved customer **{code.strip()}** — {name.strip()}.")
 
     st.dataframe(
-        df_from_rows(db.fetch_all("SELECT * FROM Customer_Master ORDER BY Custome_Name")),
+        df_from_rows(
+            db.fetch_all(
+                """
+                SELECT Cust_code, Custome_Name, GST, PAN, Address, City, State, Pincode, Country,
+                       Contact1_name, Phone1, Contact_name2, phone2, email, website,
+                       Bank_account, IFSC_CODE, Bank_name, Branch_Category, created_date, Status
+                FROM Customer_Master
+                ORDER BY Cust_code
+                """
+            )
+        ),
         use_container_width=True,
         hide_index=True,
     )

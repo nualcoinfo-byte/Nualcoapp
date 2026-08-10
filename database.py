@@ -94,15 +94,26 @@ def init_db() -> None:
         cur.execute(
             """
             CREATE TABLE IF NOT EXISTS Customer_Master (
-                Custome_Name TEXT PRIMARY KEY,
+                Cust_code TEXT PRIMARY KEY,
+                Custome_Name TEXT NOT NULL UNIQUE,
                 GST TEXT,
                 PAN TEXT,
-                Cust_code TEXT,
                 Address TEXT,
                 City TEXT,
                 State TEXT,
                 Pincode TEXT,
                 Country TEXT,
+                Contact1_name TEXT,
+                Phone1 TEXT,
+                Contact_name2 TEXT,
+                phone2 TEXT,
+                email TEXT,
+                website TEXT,
+                Bank_account TEXT,
+                IFSC_CODE TEXT,
+                Bank_name TEXT,
+                Branch_Category TEXT,
+                created_date TEXT DEFAULT CURRENT_TIMESTAMP,
                 Status TEXT CHECK(Status IN ('Active', 'Inactive')) DEFAULT 'Active'
             )
             """
@@ -315,6 +326,9 @@ def init_db() -> None:
                 (str(n),),
             )
 
+        # Migrate older DBs: Customer_Master PK + columns
+        _migrate_customer_master(cur)
+
         # Migrate older DBs: add columns if missing
         _ensure_columns(
             cur,
@@ -326,8 +340,7 @@ def init_db() -> None:
             "Production_batch",
             [
                 ("Workflow_stage", "TEXT DEFAULT 'Raw Material'"),
-                ("Output_Weight", "REAL"),
-            ],
+                ("Output_Weight", "REAL"),            ],
         )
 
 
@@ -336,6 +349,120 @@ def _ensure_columns(cur: sqlite3.Cursor, table: str, columns: list[tuple[str, st
     for name, typedef in columns:
         if name not in existing:
             cur.execute(f"ALTER TABLE {table} ADD COLUMN {name} {typedef}")
+
+
+def _customer_master_pk(cur: sqlite3.Cursor) -> Optional[str]:
+    for row in cur.execute("PRAGMA table_info(Customer_Master)").fetchall():
+        # PRAGMA table_info: cid, name, type, notnull, dflt_value, pk
+        if row[5] == 1:
+            return row[1]
+    return None
+
+
+def _migrate_customer_master(cur: sqlite3.Cursor) -> None:
+    """Ensure Cust_code is PK and contact/bank columns exist (rebuild when needed)."""
+    info = cur.execute("PRAGMA table_info(Customer_Master)").fetchall()
+    if not info:
+        return
+
+    existing = {row[1] for row in info}
+    pk = _customer_master_pk(cur)
+    needed = {
+        "Cust_code",
+        "Custome_Name",
+        "Contact1_name",
+        "Phone1",
+        "Contact_name2",
+        "phone2",
+        "email",
+        "website",
+        "Bank_account",
+        "IFSC_CODE",
+        "Bank_name",
+        "Branch_Category",
+        "created_date",
+    }
+    if pk == "Cust_code" and needed.issubset(existing):
+        return
+
+    cur.execute("PRAGMA foreign_keys = OFF")
+    cur.execute(
+        """
+        CREATE TABLE Customer_Master__new (
+            Cust_code TEXT PRIMARY KEY,
+            Custome_Name TEXT NOT NULL UNIQUE,
+            GST TEXT,
+            PAN TEXT,
+            Address TEXT,
+            City TEXT,
+            State TEXT,
+            Pincode TEXT,
+            Country TEXT,
+            Contact1_name TEXT,
+            Phone1 TEXT,
+            Contact_name2 TEXT,
+            phone2 TEXT,
+            email TEXT,
+            website TEXT,
+            Bank_account TEXT,
+            IFSC_CODE TEXT,
+            Bank_name TEXT,
+            Branch_Category TEXT,
+            created_date TEXT DEFAULT CURRENT_TIMESTAMP,
+            Status TEXT CHECK(Status IN ('Active', 'Inactive')) DEFAULT 'Active'
+        )
+        """
+    )
+
+    cols = [
+        "Cust_code",
+        "Custome_Name",
+        "GST",
+        "PAN",
+        "Address",
+        "City",
+        "State",
+        "Pincode",
+        "Country",
+        "Contact1_name",
+        "Phone1",
+        "Contact_name2",
+        "phone2",
+        "email",
+        "website",
+        "Bank_account",
+        "IFSC_CODE",
+        "Bank_name",
+        "Branch_Category",
+        "created_date",
+        "Status",
+    ]
+    select_exprs = []
+    for col in cols:
+        if col == "Cust_code" and "Cust_code" in existing:
+            select_exprs.append(
+                "CASE WHEN Cust_code IS NULL OR TRIM(Cust_code) = '' "
+                "THEN 'CUST-' || Custome_Name ELSE Cust_code END AS Cust_code"
+            )
+        elif col == "Cust_code":
+            select_exprs.append("'CUST-' || Custome_Name AS Cust_code")
+        elif col == "created_date" and "created_date" not in existing:
+            select_exprs.append("CURRENT_TIMESTAMP AS created_date")
+        elif col in existing:
+            select_exprs.append(col)
+        else:
+            select_exprs.append(f"NULL AS {col}")
+
+    cur.execute(
+        f"""
+        INSERT INTO Customer_Master__new ({", ".join(cols)})
+        SELECT {", ".join(select_exprs)}
+        FROM Customer_Master
+        """
+    )
+    cur.execute("DROP TABLE Customer_Master")
+    cur.execute("ALTER TABLE Customer_Master__new RENAME TO Customer_Master")
+    cur.execute("PRAGMA foreign_keys = ON")
 
 
 def fetch_all(sql: str, params: Iterable[Any] = ()) -> list[sqlite3.Row]:
@@ -432,26 +559,47 @@ def list_inventory_lots(
 # ---------- Customers / Suppliers ----------
 
 def upsert_customer(data: dict[str, Any]) -> None:
+    created = data.get("created_date") or datetime.now().isoformat(timespec="seconds")
     execute(
         """
         INSERT INTO Customer_Master
-            (Custome_Name, GST, PAN, Cust_code, Address, City, State, Pincode, Country, Status)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(Custome_Name) DO UPDATE SET
-            GST=excluded.GST, PAN=excluded.PAN, Cust_code=excluded.Cust_code,
+            (Cust_code, Custome_Name, GST, PAN, Address, City, State, Pincode, Country,
+             Contact1_name, Phone1, Contact_name2, phone2, email, website,
+             Bank_account, IFSC_CODE, Bank_name, Branch_Category, created_date, Status)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(Cust_code) DO UPDATE SET
+            Custome_Name=excluded.Custome_Name,
+            GST=excluded.GST, PAN=excluded.PAN,
             Address=excluded.Address, City=excluded.City, State=excluded.State,
-            Pincode=excluded.Pincode, Country=excluded.Country, Status=excluded.Status
+            Pincode=excluded.Pincode, Country=excluded.Country,
+            Contact1_name=excluded.Contact1_name, Phone1=excluded.Phone1,
+            Contact_name2=excluded.Contact_name2, phone2=excluded.phone2,
+            email=excluded.email, website=excluded.website,
+            Bank_account=excluded.Bank_account, IFSC_CODE=excluded.IFSC_CODE,
+            Bank_name=excluded.Bank_name, Branch_Category=excluded.Branch_Category,
+            Status=excluded.Status
         """,
         (
+            data["Cust_code"],
             data["Custome_Name"],
             data.get("GST"),
             data.get("PAN"),
-            data.get("Cust_code"),
             data.get("Address"),
             data.get("City"),
             data.get("State"),
             data.get("Pincode"),
             data.get("Country"),
+            data.get("Contact1_name"),
+            data.get("Phone1"),
+            data.get("Contact_name2"),
+            data.get("phone2"),
+            data.get("email"),
+            data.get("website"),
+            data.get("Bank_account"),
+            data.get("IFSC_CODE"),
+            data.get("Bank_name"),
+            data.get("Branch_Category"),
+            created,
             data.get("Status", "Active"),
         ),
     )
