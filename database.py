@@ -95,7 +95,7 @@ def init_db() -> None:
             """
             CREATE TABLE IF NOT EXISTS Customer_Master (
                 Cust_code TEXT PRIMARY KEY,
-                Custome_Name TEXT NOT NULL UNIQUE,
+                Customer_name TEXT NOT NULL UNIQUE,
                 GST TEXT,
                 PAN TEXT,
                 Address TEXT,
@@ -203,12 +203,12 @@ def init_db() -> None:
             """
             CREATE TABLE IF NOT EXISTS Alloy_Master (
                 Alloy_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                Customer_name TEXT,
+                Cust_code TEXT,
                 Alloy_name TEXT NOT NULL,
                 Alloy_Family TEXT,
                 Created_by TEXT,
                 Created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY (Customer_name) REFERENCES Customer_Master(Custome_Name)
+                FOREIGN KEY (Cust_code) REFERENCES Customer_Master(Cust_code)
             )
             """
         )
@@ -298,14 +298,14 @@ def init_db() -> None:
             CREATE TABLE IF NOT EXISTS Build_of_Material (
                 BOMID REAL NOT NULL,
                 Effective_date TEXT NOT NULL,
-                Customer_Name TEXT,
+                Cust_code TEXT,
                 Alloy_Name TEXT,
                 Raw_Material_Name TEXT,
                 Quantity REAL,
                 Sequence_Order REAL,
                 notes TEXT,
                 PRIMARY KEY (BOMID, Effective_date),
-                FOREIGN KEY (Customer_Name) REFERENCES Customer_Master(Custome_Name)
+                FOREIGN KEY (Cust_code) REFERENCES Customer_Master(Cust_code)
             )
             """
         )
@@ -326,8 +326,9 @@ def init_db() -> None:
                 (str(n),),
             )
 
-        # Migrate older DBs: Customer_Master PK + columns
+        # Migrate older DBs: Customer_Master PK/columns + Cust_code FKs
         _migrate_customer_master(cur)
+        _migrate_customer_code_fks(cur)
 
         # Migrate older DBs: add columns if missing
         _ensure_columns(
@@ -340,7 +341,8 @@ def init_db() -> None:
             "Production_batch",
             [
                 ("Workflow_stage", "TEXT DEFAULT 'Raw Material'"),
-                ("Output_Weight", "REAL"),            ],
+                ("Output_Weight", "REAL"),
+            ],
         )
 
 
@@ -359,8 +361,20 @@ def _customer_master_pk(cur: sqlite3.Cursor) -> Optional[str]:
     return None
 
 
+def _table_columns(cur: sqlite3.Cursor, table: str) -> set[str]:
+    return {row[1] for row in cur.execute(f"PRAGMA table_info({table})").fetchall()}
+
+
+def _table_sql(cur: sqlite3.Cursor, table: str) -> str:
+    row = cur.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name = ?",
+        (table,),
+    ).fetchone()
+    return row[0] if row and row[0] else ""
+
+
 def _migrate_customer_master(cur: sqlite3.Cursor) -> None:
-    """Ensure Cust_code is PK and contact/bank columns exist (rebuild when needed)."""
+    """Ensure Cust_code is PK, Customer_name renamed, and contact/bank columns exist."""
     info = cur.execute("PRAGMA table_info(Customer_Master)").fetchall()
     if not info:
         return
@@ -369,7 +383,7 @@ def _migrate_customer_master(cur: sqlite3.Cursor) -> None:
     pk = _customer_master_pk(cur)
     needed = {
         "Cust_code",
-        "Custome_Name",
+        "Customer_name",
         "Contact1_name",
         "Phone1",
         "Contact_name2",
@@ -382,15 +396,25 @@ def _migrate_customer_master(cur: sqlite3.Cursor) -> None:
         "Branch_Category",
         "created_date",
     }
-    if pk == "Cust_code" and needed.issubset(existing):
+    if pk == "Cust_code" and needed.issubset(existing) and "Custome_Name" not in existing:
         return
+
+    name_source = (
+        "Customer_name"
+        if "Customer_name" in existing
+        else "Custome_Name"
+        if "Custome_Name" in existing
+        else None
+    )
+    if name_source is None:
+        raise RuntimeError("Customer_Master is missing Customer_name / Custome_Name")
 
     cur.execute("PRAGMA foreign_keys = OFF")
     cur.execute(
         """
         CREATE TABLE Customer_Master__new (
             Cust_code TEXT PRIMARY KEY,
-            Custome_Name TEXT NOT NULL UNIQUE,
+            Customer_name TEXT NOT NULL UNIQUE,
             GST TEXT,
             PAN TEXT,
             Address TEXT,
@@ -416,7 +440,7 @@ def _migrate_customer_master(cur: sqlite3.Cursor) -> None:
 
     cols = [
         "Cust_code",
-        "Custome_Name",
+        "Customer_name",
         "GST",
         "PAN",
         "Address",
@@ -442,10 +466,12 @@ def _migrate_customer_master(cur: sqlite3.Cursor) -> None:
         if col == "Cust_code" and "Cust_code" in existing:
             select_exprs.append(
                 "CASE WHEN Cust_code IS NULL OR TRIM(Cust_code) = '' "
-                "THEN 'CUST-' || Custome_Name ELSE Cust_code END AS Cust_code"
+                f"THEN 'CUST-' || {name_source} ELSE Cust_code END AS Cust_code"
             )
         elif col == "Cust_code":
-            select_exprs.append("'CUST-' || Custome_Name AS Cust_code")
+            select_exprs.append(f"'CUST-' || {name_source} AS Cust_code")
+        elif col == "Customer_name":
+            select_exprs.append(f"{name_source} AS Customer_name")
         elif col == "created_date" and "created_date" not in existing:
             select_exprs.append("CURRENT_TIMESTAMP AS created_date")
         elif col in existing:
@@ -462,6 +488,140 @@ def _migrate_customer_master(cur: sqlite3.Cursor) -> None:
     )
     cur.execute("DROP TABLE Customer_Master")
     cur.execute("ALTER TABLE Customer_Master__new RENAME TO Customer_Master")
+    cur.execute("PRAGMA foreign_keys = ON")
+
+
+def _resolve_cust_code_expr(legacy_col: str) -> str:
+    """Map a legacy customer-name column value to Cust_code when possible."""
+    return (
+        "COALESCE("
+        f"(SELECT c.Cust_code FROM Customer_Master c WHERE c.Customer_name = old.{legacy_col}), "
+        f"(SELECT c.Cust_code FROM Customer_Master c WHERE c.Cust_code = old.{legacy_col}), "
+        f"old.{legacy_col}"
+        ")"
+    )
+
+
+def _migrate_customer_code_fks(cur: sqlite3.Cursor) -> None:
+    """Point Alloy_Master / Build_of_Material customer FKs at Cust_code."""
+    cur.execute("PRAGMA foreign_keys = OFF")
+
+    alloy_cols = _table_columns(cur, "Alloy_Master")
+    alloy_sql = _table_sql(cur, "Alloy_Master")
+    needs_alloy = (
+        "Customer_name" in alloy_cols
+        or "Customer_Name" in alloy_cols
+        or "Custome_Name" in alloy_cols
+        or ("Cust_code" not in alloy_cols)
+        or "REFERENCES Customer_Master(Custome_Name)" in alloy_sql
+        or "REFERENCES Customer_Master(Customer_name)" in alloy_sql
+    )
+    if needs_alloy and alloy_cols:
+        legacy = (
+            "Customer_name"
+            if "Customer_name" in alloy_cols
+            else "Customer_Name"
+            if "Customer_Name" in alloy_cols
+            else "Custome_Name"
+            if "Custome_Name" in alloy_cols
+            else "Cust_code"
+        )
+        code_expr = (
+            "old.Cust_code"
+            if legacy == "Cust_code"
+            else _resolve_cust_code_expr(legacy)
+        )
+        cur.execute(
+            """
+            CREATE TABLE Alloy_Master__new (
+                Alloy_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                Cust_code TEXT,
+                Alloy_name TEXT NOT NULL,
+                Alloy_Family TEXT,
+                Created_by TEXT,
+                Created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (Cust_code) REFERENCES Customer_Master(Cust_code)
+            )
+            """
+        )
+        cur.execute(
+            f"""
+            INSERT INTO Alloy_Master__new
+                (Alloy_id, Cust_code, Alloy_name, Alloy_Family, Created_by, Created_at)
+            SELECT
+                old.Alloy_id,
+                {code_expr},
+                old.Alloy_name,
+                old.Alloy_Family,
+                old.Created_by,
+                old.Created_at
+            FROM Alloy_Master AS old
+            """
+        )
+        cur.execute("DROP TABLE Alloy_Master")
+        cur.execute("ALTER TABLE Alloy_Master__new RENAME TO Alloy_Master")
+
+    bom_cols = _table_columns(cur, "Build_of_Material")
+    bom_sql = _table_sql(cur, "Build_of_Material")
+    needs_bom = (
+        "Customer_Name" in bom_cols
+        or "Customer_name" in bom_cols
+        or "Custome_Name" in bom_cols
+        or ("Cust_code" not in bom_cols)
+        or "REFERENCES Customer_Master(Custome_Name)" in bom_sql
+        or "REFERENCES Customer_Master(Customer_name)" in bom_sql
+    )
+    if needs_bom and bom_cols:
+        legacy = (
+            "Customer_Name"
+            if "Customer_Name" in bom_cols
+            else "Customer_name"
+            if "Customer_name" in bom_cols
+            else "Custome_Name"
+            if "Custome_Name" in bom_cols
+            else "Cust_code"
+        )
+        code_expr = (
+            "old.Cust_code"
+            if legacy == "Cust_code"
+            else _resolve_cust_code_expr(legacy)
+        )
+        cur.execute(
+            """
+            CREATE TABLE Build_of_Material__new (
+                BOMID REAL NOT NULL,
+                Effective_date TEXT NOT NULL,
+                Cust_code TEXT,
+                Alloy_Name TEXT,
+                Raw_Material_Name TEXT,
+                Quantity REAL,
+                Sequence_Order REAL,
+                notes TEXT,
+                PRIMARY KEY (BOMID, Effective_date),
+                FOREIGN KEY (Cust_code) REFERENCES Customer_Master(Cust_code)
+            )
+            """
+        )
+        cur.execute(
+            f"""
+            INSERT INTO Build_of_Material__new
+                (BOMID, Effective_date, Cust_code, Alloy_Name,
+                 Raw_Material_Name, Quantity, Sequence_Order, notes)
+            SELECT
+                old.BOMID,
+                old.Effective_date,
+                {code_expr},
+                old.Alloy_Name,
+                old.Raw_Material_Name,
+                old.Quantity,
+                old.Sequence_Order,
+                old.notes
+            FROM Build_of_Material AS old
+            """
+        )
+        cur.execute("DROP TABLE Build_of_Material")
+        cur.execute("ALTER TABLE Build_of_Material__new RENAME TO Build_of_Material")
+
     cur.execute("PRAGMA foreign_keys = ON")
 
 
@@ -488,12 +648,12 @@ def execute_many(sql: str, seq: list[tuple[Any, ...]]) -> None:
 
 # ---------- Lookups ----------
 
-def list_customers(active_only: bool = True) -> list[str]:
-    sql = "SELECT Custome_Name FROM Customer_Master"
+def list_customers(active_only: bool = True) -> list[sqlite3.Row]:
+    sql = "SELECT Cust_code, Customer_name FROM Customer_Master"
     if active_only:
         sql += " WHERE Status = 'Active'"
-    sql += " ORDER BY Custome_Name"
-    return [r["Custome_Name"] for r in fetch_all(sql)]
+    sql += " ORDER BY Cust_code"
+    return fetch_all(sql)
 
 
 def list_suppliers(active_only: bool = True) -> list[str]:
@@ -531,9 +691,10 @@ def list_raw_materials(active_only: bool = True) -> list[str]:
 def list_alloys() -> list[sqlite3.Row]:
     return fetch_all(
         """
-        SELECT Alloy_id, Alloy_name, Customer_name, Alloy_Family
-        FROM Alloy_Master
-        ORDER BY Alloy_name
+        SELECT a.Alloy_id, a.Alloy_name, a.Cust_code, c.Customer_name, a.Alloy_Family
+        FROM Alloy_Master a
+        LEFT JOIN Customer_Master c ON c.Cust_code = a.Cust_code
+        ORDER BY a.Alloy_name
         """
     )
 
@@ -563,12 +724,12 @@ def upsert_customer(data: dict[str, Any]) -> None:
     execute(
         """
         INSERT INTO Customer_Master
-            (Cust_code, Custome_Name, GST, PAN, Address, City, State, Pincode, Country,
+            (Cust_code, Customer_name, GST, PAN, Address, City, State, Pincode, Country,
              Contact1_name, Phone1, Contact_name2, phone2, email, website,
              Bank_account, IFSC_CODE, Bank_name, Branch_Category, created_date, Status)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(Cust_code) DO UPDATE SET
-            Custome_Name=excluded.Custome_Name,
+            Customer_name=excluded.Customer_name,
             GST=excluded.GST, PAN=excluded.PAN,
             Address=excluded.Address, City=excluded.City, State=excluded.State,
             Pincode=excluded.Pincode, Country=excluded.Country,
@@ -581,7 +742,7 @@ def upsert_customer(data: dict[str, Any]) -> None:
         """,
         (
             data["Cust_code"],
-            data["Custome_Name"],
+            data["Customer_name"],
             data.get("GST"),
             data.get("PAN"),
             data.get("Address"),
@@ -713,7 +874,7 @@ def get_lot_chemistry(lot_id: int) -> dict[str, float]:
 # ---------- Alloys ----------
 
 def add_alloy(
-    customer: Optional[str],
+    cust_code: Optional[str],
     alloy_name: str,
     family: str,
     created_by: str,
@@ -723,10 +884,10 @@ def add_alloy(
         cur = conn.execute(
             """
             INSERT INTO Alloy_Master
-                (Customer_name, Alloy_name, Alloy_Family, Created_by, Created_at)
+                (Cust_code, Alloy_name, Alloy_Family, Created_by, Created_at)
             VALUES (?, ?, ?, ?, ?)
             """,
-            (customer, alloy_name, family, created_by, datetime.now().isoformat(timespec="seconds")),
+            (cust_code, alloy_name, family, created_by, datetime.now().isoformat(timespec="seconds")),
         )
         alloy_id = cur.lastrowid
         for sym, (mn, mx) in specs.items():
@@ -929,7 +1090,7 @@ def calc_yield(input_weight: float, output_weight: float) -> dict[str, float]:
 def add_bom_line(
     bom_id: float,
     effective_date: str,
-    customer: Optional[str],
+    cust_code: Optional[str],
     alloy_name: Optional[str],
     raw_material: Optional[str],
     quantity: float,
@@ -939,11 +1100,11 @@ def add_bom_line(
     execute(
         """
         INSERT OR REPLACE INTO Build_of_Material
-            (BOMID, Effective_date, Customer_Name, Alloy_Name,
+            (BOMID, Effective_date, Cust_code, Alloy_Name,
              Raw_Material_Name, Quantity, Sequence_Order, notes)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         """,
-        (bom_id, effective_date, customer, alloy_name, raw_material, quantity, sequence, notes),
+        (bom_id, effective_date, cust_code, alloy_name, raw_material, quantity, sequence, notes),
     )
 
 

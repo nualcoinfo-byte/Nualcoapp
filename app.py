@@ -277,7 +277,7 @@ elif PAGE == "Production Batch & Chemistry":
     alloys = db.list_alloys()
     alloy_labels = {
         f"{a['Alloy_id']} — {a['Alloy_name']}"
-        + (f" ({a['Customer_name']})" if a["Customer_name"] else ""): a["Alloy_id"]
+        + (f" ({a['Cust_code']})" if a["Cust_code"] else ""): a["Alloy_id"]
         for a in alloys
     }
     materials = db.list_raw_materials()
@@ -691,7 +691,7 @@ elif PAGE == "Customers":
                 db.upsert_customer(
                     {
                         "Cust_code": code.strip(),
-                        "Custome_Name": name.strip(),
+                        "Customer_name": name.strip(),
                         "GST": gst,
                         "PAN": pan,
                         "Address": address,
@@ -719,7 +719,7 @@ elif PAGE == "Customers":
         df_from_rows(
             db.fetch_all(
                 """
-                SELECT Cust_code, Custome_Name, GST, PAN, Address, City, State, Pincode, Country,
+                SELECT Cust_code, Customer_name, GST, PAN, Address, City, State, Pincode, Country,
                        Contact1_name, Phone1, Contact_name2, phone2, email, website,
                        Bank_account, IFSC_CODE, Bank_name, Branch_Category, created_date, Status
                 FROM Customer_Master
@@ -784,6 +784,9 @@ elif PAGE == "Suppliers":
 elif PAGE == "Alloys":
     st.title("Alloy Master & Spec")
     customers = db.list_customers()
+    customer_labels = {
+        f"{c['Cust_code']} — {c['Customer_name']}": c["Cust_code"] for c in customers
+    }
 
     with st.form("alloy_form", clear_on_submit=True):
         a1, a2 = st.columns(2)
@@ -792,7 +795,10 @@ elif PAGE == "Alloys":
             family = st.text_input("Alloy family", placeholder="e.g. Al-Si-Cu")
             created_by = st.text_input("Created by", value="operator")
         with a2:
-            customer = st.selectbox("Customer", [""] + customers)
+            customer_label = st.selectbox(
+                "Customer (Cust code)",
+                ["— none —"] + list(customer_labels.keys()),
+            )
             st.caption("Spec range (%) for key elements")
 
         specs: dict[str, tuple[float | None, float | None]] = {}
@@ -807,8 +813,13 @@ elif PAGE == "Alloys":
             if not aname.strip():
                 st.error("Alloy name is required.")
             else:
+                cust_code = (
+                    None
+                    if customer_label == "— none —"
+                    else customer_labels[customer_label]
+                )
                 aid = db.add_alloy(
-                    customer=customer or None,
+                    cust_code=cust_code,
                     alloy_name=aname.strip(),
                     family=family.strip(),
                     created_by=created_by.strip(),
@@ -858,6 +869,9 @@ elif PAGE == "Furnaces":
 elif PAGE == "Bill of Materials":
     st.title("Build of Material (BOM)")
     customers = db.list_customers()
+    customer_labels = {
+        f"{c['Cust_code']} — {c['Customer_name']}": c["Cust_code"] for c in customers
+    }
     materials = db.list_raw_materials()
     alloys = [a["Alloy_name"] for a in db.list_alloys()]
 
@@ -866,7 +880,10 @@ elif PAGE == "Bill of Materials":
         with b1:
             bom_id = st.number_input("BOM ID *", min_value=1.0, value=1.0, step=1.0)
             eff = st.date_input("Effective date", value=date.today())
-            customer = st.selectbox("Customer", [""] + customers)
+            customer_label = st.selectbox(
+                "Customer (Cust code)",
+                ["— none —"] + list(customer_labels.keys()),
+            )
             alloy_name = st.selectbox("Alloy name", [""] + alloys)
         with b2:
             rm = st.selectbox("Raw material", [""] + materials)
@@ -874,10 +891,15 @@ elif PAGE == "Bill of Materials":
             seq = st.number_input("Sequence order", min_value=0.0, value=1.0, step=1.0)
             notes = st.text_input("Notes")
         if st.form_submit_button("Save BOM line", type="primary"):
+            cust_code = (
+                None
+                if customer_label == "— none —"
+                else customer_labels[customer_label]
+            )
             db.add_bom_line(
                 bom_id=bom_id,
                 effective_date=eff.isoformat(),
-                customer=customer or None,
+                cust_code=cust_code,
                 alloy_name=alloy_name or None,
                 raw_material=rm or None,
                 quantity=qty,
@@ -890,10 +912,11 @@ elif PAGE == "Bill of Materials":
         df_from_rows(
             db.fetch_all(
                 """
-                SELECT BOMID, Effective_date, Customer_Name, Alloy_Name,
-                       Raw_Material_Name, Quantity, Sequence_Order, notes
-                FROM Build_of_Material
-                ORDER BY BOMID, Sequence_Order
+                SELECT b.BOMID, b.Effective_date, b.Cust_code, c.Customer_name,
+                       b.Alloy_Name, b.Raw_Material_Name, b.Quantity, b.Sequence_Order, b.notes
+                FROM Build_of_Material b
+                LEFT JOIN Customer_Master c ON c.Cust_code = b.Cust_code
+                ORDER BY b.BOMID, b.Sequence_Order
                 """
             )
         ),
