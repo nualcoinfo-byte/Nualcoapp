@@ -1,6 +1,7 @@
 """
 Nualco — Secondary Aluminum Alloy Production Tracker
-Streamlit + SQLite application for batch, chemistry, and yield tracking.
+Streamlit application for batch, chemistry, and yield tracking.
+Runs on Neon Postgres (DATABASE_URL) with local SQLite as fallback.
 """
 
 from __future__ import annotations
@@ -70,7 +71,7 @@ PAGE = st.sidebar.radio(
         "Production Workflow Tracker",
         "Material Recovery & Yield",
         "Customers",
-        "Suppliers",
+        "Vendors",
         "Alloys",
         "Furnaces",
         "Bill of Materials",
@@ -81,7 +82,7 @@ PAGE = st.sidebar.radio(
 st.sidebar.divider()
 st.sidebar.markdown(
     f"**Yield target:** {db.YIELD_TARGET_PCT:.0f}%  \n"
-    f"**DB:** `{db.DB_PATH.name}`"
+    f"**DB:** `{db.DB_LABEL}`"
 )
 
 
@@ -134,9 +135,10 @@ elif PAGE == "Raw Material Logging":
         "and capture chemistry (Si, Fe, Cu, Mn, Mg, …)."
     )
 
-    suppliers = db.list_suppliers()
-    if not suppliers:
-        st.warning("Add at least one supplier under **Suppliers** before logging material.")
+    vendors = db.list_vendors()
+    vendor_opts = {f"{v['Vendor_name']} (#{v['Vendor_code']})": v["Vendor_code"] for v in vendors}
+    if not vendors:
+        st.warning("Add at least one vendor under **Vendors** before logging material.")
 
     with st.form("rm_log_form", clear_on_submit=True):
         st.markdown("#### Material & receipt")
@@ -146,7 +148,15 @@ elif PAGE == "Raw Material Logging":
                 "Raw material name *",
                 placeholder="e.g. Tense, Taint/Tabor, UBC, Pure Al",
             )
+            isri_opts = {
+                f"{c['ISRI_CODE']} — {c['Description']}": c["ISRI_CODE"]
+                for c in db.list_isri_codes()
+            }
+            isri_label = st.selectbox("ISRI code", options=[""] + list(isri_opts.keys()))
             alloy_family = st.text_input("Alloy family", placeholder="e.g. Al-Si")
+            fe_level = st.selectbox("Fe", [""] + db.ELEMENT_LEVEL)
+            cu_level = st.selectbox("Cu", [""] + db.ELEMENT_LEVEL)
+            mg_level = st.selectbox("Mg", [""] + db.ELEMENT_LEVEL)
             availability = st.selectbox(
                 "Availability class",
                 ["Standard", "Spot", "Contract", "Internal"],
@@ -154,10 +164,11 @@ elif PAGE == "Raw Material Logging":
             recovery = st.number_input("Expected recovery %", 0.0, 100.0, 95.0, 0.1)
             cost = st.number_input("Cost per kg", min_value=0.0, value=0.0, step=0.01)
         with col_b:
-            supplier = st.selectbox("Supplier", options=[""] + suppliers)
+            vendor_label = st.selectbox("Vendor", options=[""] + list(vendor_opts.keys()))
             effective = st.date_input("Effective date", value=date.today())
             received = st.date_input("Received date", value=date.today())
-            invoice = st.text_input("Supplier invoice")
+            invoice = st.text_input("Vendor invoice")
+            invoice_date = st.date_input("Supplier invoice date", value=date.today())
             weight = st.number_input("Total weight (kg) *", min_value=0.0, value=1000.0, step=1.0)
             storage = st.text_input("Storage bay", placeholder="e.g. Bay-A1")
             inv_status = st.selectbox("Inventory status", db.INVENTORY_STATUS, index=1)
@@ -196,30 +207,37 @@ elif PAGE == "Raw Material Logging":
             st.error("Raw material name is required.")
         elif weight <= 0:
             st.error("Total weight must be greater than zero.")
-        elif not suppliers:
-            st.error("Create a supplier first.")
+        elif not vendors:
+            st.error("Create a vendor first.")
         else:
             try:
+                vendor_code = vendor_opts[vendor_label] if vendor_label else None
                 db.add_raw_material_master(
                     name=rm_name.strip(),
                     effective_date=effective.isoformat(),
-                    supplier=supplier or None,
+                    vendor_code=vendor_code,
                     alloy_family=alloy_family.strip(),
                     availability_class=availability,
                     recovery=recovery,
                     status=rm_status,
                     cost_per_kg=cost,
                     photo=photo_bytes(photo),
+                    isri_code=isri_opts[isri_label] if isri_label else None,
+                    fe=fe_level or None,
+                    cu=cu_level or None,
+                    mg=mg_level or None,
                 )
                 lot_id = db.add_inventory_lot(
                     material=rm_name.strip(),
-                    supplier=supplier or None,
+                    vendor_code=vendor_code,
                     invoice=invoice.strip(),
                     received_date=received.isoformat(),
                     weight=weight,
                     storage_bay=storage.strip(),
                     status=inv_status,
                     photo=photo_bytes(photo),
+                    supplier_invoice_date=invoice_date.isoformat(),
+                    cost_per_kg=cost,
                 )
                 cleaned = {k: v for k, v in composition.items() if v and v > 0}
                 if cleaned:
@@ -237,10 +255,18 @@ elif PAGE == "Raw Material Logging":
     recent = df_from_rows(
         db.fetch_all(
             """
-            SELECT Lot_id, Raw_Material_Name, Supplier, Received_date,
-                   Received_weight, Remaining_Weight, Storage_bay, Status
-            FROM Raw_Material_Inventory
-            ORDER BY Lot_id DESC
+            SELECT i.Lot_id AS "Lot_id", i.Raw_Material_Name AS "Raw_Material_Name",
+                   v.Vendor_name AS "Vendor_name",
+                   i.Supplier_Invoice AS "Supplier_Invoice",
+                   i.Supplier_invoice_date AS "Supplier_invoice_date",
+                   i.Received_date AS "Received_date",
+                   i.Received_weight AS "Received_weight",
+                   i.Remaining_Weight AS "Remaining_Weight",
+                   i.Cost_per_kg AS "Cost_per_kg",
+                   i.Storage_bay AS "Storage_bay", i.Status AS "Status"
+            FROM Raw_Material_Inventory i
+            LEFT JOIN Vendor_Master v ON v.Vendor_code = i.Vendor_code
+            ORDER BY i.Lot_id DESC
             LIMIT 50
             """
         )
@@ -655,10 +681,16 @@ elif PAGE == "Customers":
     with st.form("cust_form", clear_on_submit=True):
         c1, c2 = st.columns(2)
         with c1:
-            name = st.text_input("Customer name (PK) *")
+            code = st.text_input("Customer code (PK) *", placeholder="e.g. CUST_0026")
+            name = st.text_input("Customer name *")
             gst = st.text_input("GST")
             pan = st.text_input("PAN")
-            code = st.text_input("Cust code")
+            contact1 = st.text_input("Contact 1 name")
+            phone1 = st.text_input("Phone 1")
+            contact2 = st.text_input("Contact 2 name")
+            phone2 = st.text_input("Phone 2")
+            email = st.text_input("Email")
+            website = st.text_input("Website")
             status = st.selectbox("Status", db.ACTIVE_STATUS)
         with c2:
             address = st.text_input("Address")
@@ -666,45 +698,59 @@ elif PAGE == "Customers":
             state = st.text_input("State")
             pincode = st.text_input("Pincode")
             country = st.text_input("Country", value="India")
+            bank_account = st.text_input("Bank account")
+            ifsc_code = st.text_input("IFSC code")
+            bank_name = st.text_input("Bank name")
+            branch_category = st.text_input("Branch")
         if st.form_submit_button("Save customer", type="primary"):
-            if not name.strip():
-                st.error("Customer name is required.")
+            if not code.strip() or not name.strip():
+                st.error("Customer code and name are required.")
             else:
                 db.upsert_customer(
                     {
-                        "Custome_Name": name.strip(),
+                        "Cust_code": code.strip(),
+                        "Customer_name": name.strip(),
                         "GST": gst,
                         "PAN": pan,
-                        "Cust_code": code,
                         "Address": address,
                         "City": city,
                         "State": state,
                         "Pincode": pincode,
                         "Country": country,
+                        "Contact1_name": contact1,
+                        "Phone1": phone1,
+                        "Contact_name2": contact2,
+                        "Phone2": phone2,
+                        "Email": email,
+                        "Website": website,
+                        "Bank_account": bank_account,
+                        "IFSC_code": ifsc_code,
+                        "Bank_name": bank_name,
+                        "Branch_category": branch_category,
                         "Status": status,
                     }
                 )
                 st.success(f"Saved customer **{name.strip()}**.")
 
     st.dataframe(
-        df_from_rows(db.fetch_all("SELECT * FROM Customer_Master ORDER BY Custome_Name")),
+        df_from_rows(db.get_all_records("Customer_Master", order_by="Cust_code")),
         use_container_width=True,
         hide_index=True,
     )
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# Suppliers
+# Vendors
 # ═══════════════════════════════════════════════════════════════════════════════
-elif PAGE == "Suppliers":
-    st.title("Supplier Master")
+elif PAGE == "Vendors":
+    st.title("Vendor Master")
+    st.caption("Vendor code is auto-generated serially when a new vendor is created.")
     with st.form("sup_form", clear_on_submit=True):
         c1, c2 = st.columns(2)
         with c1:
-            name = st.text_input("Supplier (PK) *")
+            name = st.text_input("Vendor name *")
             gst = st.text_input("GST")
             pan = st.text_input("PAN")
-            code = st.text_input("Vendor code")
             status = st.selectbox("Status", db.ACTIVE_STATUS)
         with c2:
             address = st.text_input("Address")
@@ -712,28 +758,60 @@ elif PAGE == "Suppliers":
             state = st.text_input("State")
             pincode = st.text_input("Pincode")
             country = st.text_input("Country", value="India")
-        if st.form_submit_button("Save supplier", type="primary"):
+
+        st.markdown("#### Contacts")
+        k1, k2 = st.columns(2)
+        with k1:
+            contact1 = st.text_input("Contact person 1")
+            phone1 = st.text_input("Phone 1")
+            email = st.text_input("Email")
+        with k2:
+            contact2 = st.text_input("Contact person 2")
+            phone2 = st.text_input("Phone 2")
+            website = st.text_input("Website")
+
+        st.markdown("#### Commercial & bank details")
+        b1, b2 = st.columns(2)
+        with b1:
+            credit_period = st.number_input("Credit period (days)", min_value=0, value=0, step=1)
+            bank_account = st.text_input("Bank account no.")
+            bank_name = st.text_input("Bank name")
+        with b2:
+            branch = st.text_input("Branch")
+            ifsc = st.text_input("IFSC code")
+
+        if st.form_submit_button("Save vendor", type="primary"):
             if not name.strip():
-                st.error("Supplier name is required.")
+                st.error("Vendor name is required.")
             else:
                 db.upsert_supplier(
                     {
-                        "Supplier": name.strip(),
+                        "Vendor_name": name.strip(),
                         "GST": gst,
                         "PAN": pan,
-                        "Vendor_code": code,
                         "Address": address,
                         "City": city,
                         "State": state,
                         "Pincode": pincode,
                         "Country": country,
+                        "Contact1": contact1.strip(),
+                        "Phone1": phone1.strip(),
+                        "Contact2": contact2.strip(),
+                        "Phone2": phone2.strip(),
+                        "Email": email.strip(),
+                        "Website": website.strip(),
+                        "Credit_period": int(credit_period),
+                        "Bank_account": bank_account.strip(),
+                        "Branch": branch.strip(),
+                        "IFSC_code": ifsc.strip().upper(),
+                        "Bank_name": bank_name.strip(),
                         "Status": status,
                     }
                 )
-                st.success(f"Saved supplier **{name.strip()}**.")
+                st.success(f"Saved vendor **{name.strip()}**.")
 
     st.dataframe(
-        df_from_rows(db.fetch_all("SELECT * FROM Supplier_Master ORDER BY Supplier")),
+        df_from_rows(db.get_all_records("Vendor_Master", order_by="Vendor_code")),
         use_container_width=True,
         hide_index=True,
     )
@@ -744,7 +822,10 @@ elif PAGE == "Suppliers":
 # ═══════════════════════════════════════════════════════════════════════════════
 elif PAGE == "Alloys":
     st.title("Alloy Master & Spec")
-    customers = db.list_customers()
+    cust_opts = {
+        f"{c['Cust_code']} — {c['Customer_name']}": c["Cust_code"]
+        for c in db.list_customer_codes()
+    }
 
     with st.form("alloy_form", clear_on_submit=True):
         a1, a2 = st.columns(2)
@@ -753,7 +834,22 @@ elif PAGE == "Alloys":
             family = st.text_input("Alloy family", placeholder="e.g. Al-Si-Cu")
             created_by = st.text_input("Created by", value="operator")
         with a2:
-            customer = st.selectbox("Customer", [""] + customers)
+            customer = st.selectbox("Customer", [""] + list(cust_opts.keys()))
+            colour = st.text_input("Colour code", placeholder="e.g. Red, #FF0000")
+            bis_desig = st.text_input("BIS designation", placeholder="e.g. IS 617")
+            sludge = st.number_input("Sludge factor", min_value=0.0, value=0.0, step=0.01)
+            other_each = st.number_input(
+                "Other elements each %", min_value=0.0, value=0.0, step=0.01
+            )
+            other_total = st.number_input(
+                "Other elements total %", min_value=0.0, value=0.0, step=0.01
+            )
+            rev_dt = st.text_input(
+                "Revision datetime",
+                value=datetime.now().isoformat(timespec="seconds"),
+            )
+            remarks = st.text_area("Remarks")
+            alloy_status = st.selectbox("Status", db.ACTIVE_STATUS)
             st.caption("Spec range (%) for key elements")
 
         specs: dict[str, tuple[float | None, float | None]] = {}
@@ -769,11 +865,19 @@ elif PAGE == "Alloys":
                 st.error("Alloy name is required.")
             else:
                 aid = db.add_alloy(
-                    customer=customer or None,
+                    cust_code=cust_opts[customer] if customer else None,
                     alloy_name=aname.strip(),
                     family=family.strip(),
                     created_by=created_by.strip(),
                     specs=specs,
+                    colour_code=colour.strip() or None,
+                    bis_designation=bis_desig.strip() or None,
+                    sludge_factor=sludge if sludge > 0 else None,
+                    revision_datetime=rev_dt.strip() or None,
+                    remarks=remarks.strip() or None,
+                    status=alloy_status,
+                    other_elements_each=other_each if other_each > 0 else None,
+                    other_elements_total=other_total if other_total > 0 else None,
                 )
                 st.success(f"Created alloy **{aname}** (ID {aid}).")
 
@@ -784,7 +888,8 @@ elif PAGE == "Alloys":
     if aid_view > 0:
         specs_df = df_from_rows(
             db.fetch_all(
-                "SELECT Element_symbol, Min_percent, Max_percent FROM Alloy_Master_spec WHERE Alloy_id = ?",
+                'SELECT Element_symbol AS "Element_symbol", Min_percent AS "Min_percent", '
+                'Max_percent AS "Max_percent" FROM Alloy_Master_spec WHERE Alloy_id = ?',
                 (int(aid_view),),
             )
         )
@@ -807,7 +912,7 @@ elif PAGE == "Furnaces":
                 st.success(f"Saved furnace **{fname.strip()}**.")
 
     st.dataframe(
-        df_from_rows(db.fetch_all("SELECT * FROM Furnace_Master ORDER BY Furnace")),
+        df_from_rows(db.get_all_records("Furnace_Master", order_by="Furnace")),
         use_container_width=True,
         hide_index=True,
     )
@@ -818,7 +923,10 @@ elif PAGE == "Furnaces":
 # ═══════════════════════════════════════════════════════════════════════════════
 elif PAGE == "Bill of Materials":
     st.title("Build of Material (BOM)")
-    customers = db.list_customers()
+    cust_opts = {
+        f"{c['Cust_code']} — {c['Customer_name']}": c["Cust_code"]
+        for c in db.list_customer_codes()
+    }
     materials = db.list_raw_materials()
     alloys = [a["Alloy_name"] for a in db.list_alloys()]
 
@@ -827,7 +935,7 @@ elif PAGE == "Bill of Materials":
         with b1:
             bom_id = st.number_input("BOM ID *", min_value=1.0, value=1.0, step=1.0)
             eff = st.date_input("Effective date", value=date.today())
-            customer = st.selectbox("Customer", [""] + customers)
+            customer = st.selectbox("Customer", [""] + list(cust_opts.keys()))
             alloy_name = st.selectbox("Alloy name", [""] + alloys)
         with b2:
             rm = st.selectbox("Raw material", [""] + materials)
@@ -838,7 +946,7 @@ elif PAGE == "Bill of Materials":
             db.add_bom_line(
                 bom_id=bom_id,
                 effective_date=eff.isoformat(),
-                customer=customer or None,
+                cust_code=cust_opts[customer] if customer else None,
                 alloy_name=alloy_name or None,
                 raw_material=rm or None,
                 quantity=qty,
@@ -851,10 +959,14 @@ elif PAGE == "Bill of Materials":
         df_from_rows(
             db.fetch_all(
                 """
-                SELECT BOMID, Effective_date, Customer_Name, Alloy_Name,
-                       Raw_Material_Name, Quantity, Sequence_Order, notes
-                FROM Build_of_Material
-                ORDER BY BOMID, Sequence_Order
+                SELECT b.BOMID AS "BOMID", b.Effective_date AS "Effective_date",
+                       b.Cust_code AS "Cust_code", c.Customer_name AS "Customer_name",
+                       b.Alloy_Name AS "Alloy_Name",
+                       b.Raw_Material_Name AS "Raw_Material_Name", b.Quantity AS "Quantity",
+                       b.Sequence_Order AS "Sequence_Order", b.notes AS "notes"
+                FROM Build_of_Material b
+                LEFT JOIN Customer_Master c ON c.Cust_code = b.Cust_code
+                ORDER BY b.BOMID, b.Sequence_Order
                 """
             )
         ),
@@ -878,10 +990,18 @@ elif PAGE == "Masters Overview":
             df_from_rows(
                 db.fetch_all(
                     """
-                    SELECT Raw_Material_Name, Effective_date, Supplier, Alloy_family,
-                           Availability_class, Recovery, Cost_per_kg, Status
-                    FROM Raw_Material_Master
-                    ORDER BY Raw_Material_Name, Effective_date DESC
+                    SELECT m.Raw_Material_Name AS "Raw_Material_Name",
+                           m.Effective_date AS "Effective_date",
+                           v.Vendor_name AS "Vendor_name",
+                           m.ISRI_CODE AS "ISRI_CODE",
+                           m.Alloy_family AS "Alloy_family",
+                           m.Fe AS "Fe", m.Cu AS "Cu", m.Mg AS "Mg",
+                           m.Availability_class AS "Availability_class",
+                           m.Recovery AS "Recovery", m.Cost_per_kg AS "Cost_per_kg",
+                           m.Status AS "Status"
+                    FROM Raw_Material_Master m
+                    LEFT JOIN Vendor_Master v ON v.Vendor_code = m.Vendor_code
+                    ORDER BY m.Raw_Material_Name, m.Effective_date DESC
                     """
                 )
             ),
@@ -893,7 +1013,8 @@ elif PAGE == "Masters Overview":
             df_from_rows(
                 db.fetch_all(
                     """
-                    SELECT Raw_Material_Name, Lot_id, Element_symbol, Percentage
+                    SELECT Raw_Material_Name AS "Raw_Material_Name", Lot_id AS "Lot_id",
+                           Element_symbol AS "Element_symbol", Percentage AS "Percentage"
                     FROM Raw_Material_Spec
                     ORDER BY Lot_id DESC, Element_symbol
                     LIMIT 200
@@ -911,7 +1032,7 @@ elif PAGE == "Masters Overview":
             | # | Table | Purpose |
             |---|-------|---------|
             | 1 | Customer_Master | Customers |
-            | 2 | Supplier_Master | Suppliers |
+            | 2 | Vendor_Master | Vendors (auto-serial Vendor_code PK) |
             | 3 | Element_Master | 36 chemistry elements (seeded) |
             | 4 | Raw_Material_Master | Material grades |
             | 5 | Raw_Material_Spec | Lot chemistry |
@@ -923,6 +1044,8 @@ elif PAGE == "Masters Overview":
             | 11 | batch_input | Charge sheets |
             | 12 | Batch_Chemical_Composition | Ladle chemistry |
             | 13 | Build_of_Material | BOM |
+            | 14 | Purchase_Order | Customer purchase orders |
+            | 15 | ISRI_CODE_TABLE | ISRI scrap specification codes |
 
             Extra production columns: `Workflow_stage`, `Output_Weight`, `Cost_per_kg`.
             """

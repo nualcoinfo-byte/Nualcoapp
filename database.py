@@ -1,17 +1,84 @@
 """
-SQLite database layer for Nualco Aluminum Alloy Manufacturing Tracker.
-Creates all master and transactional tables if they do not exist.
+Database layer for Nualco Aluminum Alloy Manufacturing Tracker.
+
+Runs on Neon Postgres when DATABASE_URL is available (from the environment or
+.env.local), otherwise falls back to the local SQLite file. All SQL goes
+through a single SQLAlchemy engine; queries are written in the portable
+subset both dialects support:
+
+- placeholders use `?` and are translated to `%s` for Postgres
+- upserts use `ON CONFLICT` (supported by both Postgres and SQLite 3.24+)
+- generated ids are read with `RETURNING` (Postgres and SQLite 3.35+)
+- selected columns carry quoted aliases so result keys keep their exact
+  case on Postgres, which folds unquoted identifiers to lowercase
 """
 
 from __future__ import annotations
 
-import sqlite3
+import os
 from contextlib import contextmanager
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Generator, Iterable, Optional
 
+from sqlalchemy import Connection, CursorResult, MetaData, Table, create_engine, select
+
 DB_PATH = Path(__file__).resolve().parent / "nualco.db"
+ENV_FILE = Path(__file__).resolve().parent / ".env.local"
+
+
+def _database_url() -> str | None:
+    url = os.environ.get("DATABASE_URL")
+    if url:
+        return url
+    # Streamlit Cloud / local secrets.toml (never commit real secrets).
+    try:
+        import streamlit as st  # type: ignore
+
+        secret = st.secrets.get("DATABASE_URL")
+        if secret:
+            return str(secret)
+    except Exception:
+        pass
+    if ENV_FILE.exists():
+        for line in ENV_FILE.read_text().splitlines():
+            line = line.strip()
+            if line.startswith("DATABASE_URL="):
+                return line.partition("=")[2].strip().strip('"').strip("'")
+    return None
+
+
+_URL = _database_url()
+if _URL:
+    ENGINE = create_engine(_URL, pool_pre_ping=True)
+    DB_LABEL = "Neon Postgres"
+else:
+    # check_same_thread=False because Streamlit reruns scripts on worker
+    # threads, so connections cross thread boundaries.
+    ENGINE = create_engine(
+        f"sqlite:///{DB_PATH}",
+        connect_args={"check_same_thread": False},
+    )
+    DB_LABEL = DB_PATH.name
+
+IS_POSTGRES = ENGINE.dialect.name == "postgresql"
+
+
+def _q(sql: str) -> str:
+    """Translate `?` placeholders to the driver's paramstyle."""
+    return sql.replace("?", "%s") if IS_POSTGRES else sql
+
+
+def _exec(conn: Connection, sql: str, params: Any = None) -> CursorResult:
+    return conn.exec_driver_sql(_q(sql), params)
+
+
+@contextmanager
+def get_connection() -> Generator[Connection, None, None]:
+    """Open a connection wrapped in a transaction (commit/rollback on exit)."""
+    with ENGINE.begin() as conn:
+        yield conn
+
 
 ELEMENTS: list[tuple[int, str, str]] = [
     (1, "Silicon", "Si"),
@@ -65,419 +132,524 @@ WORKFLOW_STAGES = [
 BATCH_QA_STATUS = ["Pending QA", "Approved", "Rejected"]
 INVENTORY_STATUS = ["Awaiting Assay", "Ready For Melt", "Not Ready for Melt"]
 ACTIVE_STATUS = ["Active", "Inactive"]
+ELEMENT_LEVEL = ["Low", "Medium", "High"]
 SHIFTS = ["A", "B"]
 MELT_NOS = [1, 2, 3, 4, 5, 6, 7, 9]
 HEAT_NOS = list(range(1, 13))
 YIELD_TARGET_PCT = 70.0
 
 
-@contextmanager
-def get_connection() -> Generator[sqlite3.Connection, None, None]:
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys = ON")
-    try:
-        yield conn
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
-        conn.close()
+# ---------- Schema ----------
+
+_SCHEMA_SHARED = """
+CREATE TABLE IF NOT EXISTS Customer_Master (
+    Cust_code TEXT PRIMARY KEY,
+    Customer_name TEXT NOT NULL UNIQUE,
+    GST TEXT, PAN TEXT, Address TEXT, City TEXT,
+    State TEXT, Pincode TEXT, Country TEXT,
+    Contact1_name TEXT, Phone1 TEXT, Contact_name2 TEXT, Phone2 TEXT,
+    Email TEXT, Website TEXT,
+    Bank_account TEXT, IFSC_code TEXT, Bank_name TEXT, Branch_category TEXT,
+    Created_date TEXT DEFAULT {now},
+    Status TEXT CHECK(Status IN ('Active', 'Inactive')) DEFAULT 'Active'
+);
+CREATE TABLE IF NOT EXISTS Vendor_Master (
+    Vendor_code {autopk},
+    Vendor_name TEXT NOT NULL UNIQUE,
+    GST TEXT, PAN TEXT, Address TEXT, City TEXT,
+    State TEXT, Pincode TEXT, Country TEXT,
+    Contact1 TEXT, Phone1 TEXT, Contact2 TEXT, Phone2 TEXT,
+    Email TEXT, Website TEXT,
+    Credit_period INTEGER,
+    Bank_account TEXT, Branch TEXT, IFSC_code TEXT, Bank_name TEXT,
+    Creation_date TEXT DEFAULT {now},
+    Status TEXT CHECK(Status IN ('Active', 'Inactive')) DEFAULT 'Active'
+);
+CREATE TABLE IF NOT EXISTS Element_Master (
+    Serial_no INTEGER PRIMARY KEY,
+    Element_Name TEXT NOT NULL,
+    Element_Symbol TEXT NOT NULL UNIQUE
+);
+CREATE TABLE IF NOT EXISTS ISRI_CODE_TABLE (
+    ISRI_CODE TEXT PRIMARY KEY,
+    Description TEXT,
+    Comments TEXT
+);
+CREATE TABLE IF NOT EXISTS Raw_Material_Master (
+    Raw_Material_Name TEXT NOT NULL,
+    Effective_date TEXT NOT NULL,
+    Vendor_code INTEGER REFERENCES Vendor_Master(Vendor_code),
+    ISRI_CODE TEXT REFERENCES ISRI_CODE_TABLE(ISRI_CODE),
+    Alloy_family TEXT,
+    Availability_class TEXT,
+    Recovery {float},
+    Photo {blob},
+    Status TEXT CHECK(Status IN ('Active', 'Inactive')) DEFAULT 'Active',
+    Cost_per_kg {float} DEFAULT 0,
+    Fe TEXT CHECK(Fe IS NULL OR Fe IN ('Low', 'Medium', 'High')),
+    Cu TEXT CHECK(Cu IS NULL OR Cu IN ('Low', 'Medium', 'High')),
+    Mg TEXT CHECK(Mg IS NULL OR Mg IN ('Low', 'Medium', 'High')),
+    PRIMARY KEY (Raw_Material_Name, Effective_date)
+);
+CREATE TABLE IF NOT EXISTS Raw_Material_Inventory (
+    Lot_id {autopk},
+    Raw_Material_Name TEXT NOT NULL,
+    Vendor_code INTEGER REFERENCES Vendor_Master(Vendor_code),
+    Supplier_Invoice TEXT,
+    Supplier_invoice_date TEXT,
+    Received_date TEXT,
+    Received_weight {float},
+    Remaining_Weight {float},
+    Storage_bay TEXT,
+    Status TEXT DEFAULT 'Awaiting Assay',
+    Photo {blob},
+    Cost_per_kg {float}
+);
+CREATE TABLE IF NOT EXISTS Raw_Material_Spec (
+    Raw_Material_Name TEXT NOT NULL,
+    Lot_id INTEGER NOT NULL REFERENCES Raw_Material_Inventory(Lot_id),
+    Element_symbol TEXT NOT NULL REFERENCES Element_Master(Element_Symbol),
+    Percentage {float},
+    PRIMARY KEY (Raw_Material_Name, Lot_id, Element_symbol)
+);
+CREATE TABLE IF NOT EXISTS Alloy_Master (
+    Alloy_id {autopk},
+    Cust_code TEXT REFERENCES Customer_Master(Cust_code),
+    Alloy_name TEXT NOT NULL,
+    Alloy_Family TEXT,
+    Created_by TEXT,
+    Created_at TEXT DEFAULT {now},
+    Colour_code TEXT,
+    Bis_Designation TEXT,
+    Sludge_factor {float},
+    Revision_datetime TEXT,
+    Remarks TEXT,
+    Status TEXT CHECK(Status IN ('Active', 'Inactive')) DEFAULT 'Active',
+    Other_elements_Each {float},
+    Other_elements_Total {float}
+);
+CREATE TABLE IF NOT EXISTS Alloy_Master_spec (
+    Alloy_id INTEGER NOT NULL REFERENCES Alloy_Master(Alloy_id),
+    Element_symbol TEXT NOT NULL REFERENCES Element_Master(Element_Symbol),
+    Min_percent {float},
+    Max_percent {float},
+    PRIMARY KEY (Alloy_id, Element_symbol)
+);
+CREATE TABLE IF NOT EXISTS Furnace_Master (
+    Furnace TEXT PRIMARY KEY,
+    Status TEXT CHECK(Status IN ('Active', 'Inactive')) DEFAULT 'Active'
+);
+CREATE TABLE IF NOT EXISTS Production_batch (
+    Batch_ID TEXT PRIMARY KEY,
+    Alloy_id INTEGER REFERENCES Alloy_Master(Alloy_id),
+    Production_Date TEXT,
+    Shift TEXT CHECK(Shift IN ('A', 'B')),
+    Furnace TEXT REFERENCES Furnace_Master(Furnace),
+    Melt_No INTEGER,
+    Heat_no TEXT,
+    Melting_team TEXT,
+    Weight {float} DEFAULT 0,
+    pieces {float} DEFAULT 0,
+    Notes TEXT,
+    Photo1 {blob}, Photo2 {blob}, Photo3 {blob},
+    Status TEXT DEFAULT 'Pending QA',
+    Workflow_stage TEXT DEFAULT 'Raw Material',
+    Output_Weight {float}
+);
+CREATE TABLE IF NOT EXISTS batch_input (
+    Batch_ID TEXT NOT NULL REFERENCES Production_batch(Batch_ID),
+    Raw_Material_Name TEXT NOT NULL,
+    Lot_id INTEGER NOT NULL REFERENCES Raw_Material_Inventory(Lot_id),
+    Weight {float} NOT NULL,
+    Charge_time TEXT DEFAULT {now},
+    Notes TEXT,
+    Photo1 {blob}, Photo2 {blob},
+    PRIMARY KEY (Batch_ID, Raw_Material_Name, Lot_id, Charge_time)
+);
+CREATE TABLE IF NOT EXISTS Batch_Chemical_Composition (
+    Batch_ID TEXT NOT NULL REFERENCES Production_batch(Batch_ID),
+    Element_symbol TEXT NOT NULL REFERENCES Element_Master(Element_Symbol),
+    Percentage {float},
+    PRIMARY KEY (Batch_ID, Element_symbol)
+);
+CREATE TABLE IF NOT EXISTS Build_of_Material (
+    BOMID {float} NOT NULL,
+    Effective_date TEXT NOT NULL,
+    Cust_code TEXT REFERENCES Customer_Master(Cust_code),
+    Alloy_Name TEXT,
+    Raw_Material_Name TEXT,
+    Quantity {float},
+    Sequence_Order {float},
+    notes TEXT,
+    PRIMARY KEY (BOMID, Effective_date)
+);
+CREATE TABLE IF NOT EXISTS Purchase_Order (
+    Customer_PO_No TEXT PRIMARY KEY,
+    Cust_code TEXT REFERENCES Customer_Master(Cust_code),
+    Customer_name TEXT REFERENCES Customer_Master(Customer_name),
+    Alloy_Id INTEGER REFERENCES Alloy_Master(Alloy_id),
+    Order_Date TEXT,
+    Delivery_Date TEXT,
+    Order_Qty {float},
+    Rate {float},
+    Billing_Address TEXT,
+    Billing_City TEXT,
+    Billing_state TEXT,
+    Billing_Pincode TEXT,
+    Billing_country TEXT,
+    Shipping_address TEXT,
+    Shipping_City TEXT,
+    Shipping_state TEXT,
+    Shipping_Pincode TEXT,
+    Shipping_country TEXT
+);
+"""
+
+_DIALECT_TYPES = {
+    True: {  # Postgres
+        "float": "DOUBLE PRECISION",
+        "blob": "BYTEA",
+        "autopk": "INTEGER PRIMARY KEY GENERATED BY DEFAULT AS IDENTITY",
+        "now": "(CURRENT_TIMESTAMP::text)",
+    },
+    False: {  # SQLite
+        "float": "REAL",
+        "blob": "BLOB",
+        "autopk": "INTEGER PRIMARY KEY AUTOINCREMENT",
+        "now": "CURRENT_TIMESTAMP",
+    },
+}
 
 
 def init_db() -> None:
     """Create all tables and seed Element_Master / default furnaces."""
+    schema = _SCHEMA_SHARED
+    for key, value in _DIALECT_TYPES[IS_POSTGRES].items():
+        schema = schema.replace("{" + key + "}", value)
+
     with get_connection() as conn:
-        cur = conn.cursor()
+        for stmt in schema.split(";"):
+            if stmt.strip():
+                _exec(conn, stmt)
 
-        cur.execute(
+        _exec(
+            conn,
             """
-            CREATE TABLE IF NOT EXISTS Customer_Master (
-                Custome_Name TEXT PRIMARY KEY,
-                GST TEXT,
-                PAN TEXT,
-                Cust_code TEXT,
-                Address TEXT,
-                City TEXT,
-                State TEXT,
-                Pincode TEXT,
-                Country TEXT,
-                Status TEXT CHECK(Status IN ('Active', 'Inactive')) DEFAULT 'Active'
-            )
-            """
-        )
-
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS Supplier_Master (
-                Supplier TEXT PRIMARY KEY,
-                GST TEXT,
-                PAN TEXT,
-                Vendor_code TEXT,
-                Address TEXT,
-                City TEXT,
-                State TEXT,
-                Pincode TEXT,
-                Country TEXT,
-                Status TEXT CHECK(Status IN ('Active', 'Inactive')) DEFAULT 'Active'
-            )
-            """
-        )
-
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS Element_Master (
-                Serial_no INTEGER PRIMARY KEY,
-                Element_Name TEXT NOT NULL,
-                Element_Symbol TEXT NOT NULL UNIQUE
-            )
-            """
-        )
-
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS Raw_Material_Master (
-                Raw_Material_Name TEXT NOT NULL,
-                Effective_date TEXT NOT NULL,
-                Supplier TEXT,
-                Alloy_family TEXT,
-                Availability_class TEXT,
-                Recovery REAL,
-                Photo BLOB,
-                Status TEXT CHECK(Status IN ('Active', 'Inactive')) DEFAULT 'Active',
-                Cost_per_kg REAL DEFAULT 0,
-                PRIMARY KEY (Raw_Material_Name, Effective_date),
-                FOREIGN KEY (Supplier) REFERENCES Supplier_Master(Supplier)
-            )
-            """
-        )
-
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS Raw_Material_Inventory (
-                Lot_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                Raw_Material_Name TEXT NOT NULL,
-                Supplier TEXT,
-                Supplier_Invoice TEXT,
-                Received_date TEXT,
-                Received_weight REAL,
-                Remaining_Weight REAL,
-                Storage_bay TEXT,
-                Status TEXT DEFAULT 'Awaiting Assay',
-                Photo BLOB,
-                FOREIGN KEY (Supplier) REFERENCES Supplier_Master(Supplier)
-            )
-            """
-        )
-
-        # Specs keyed by material + lot + element.
-        # Note: Raw_Material_Name is not alone a candidate key on Raw_Material_Master
-        # (composite PK with Effective_date), so name FKs are enforced in app logic.
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS Raw_Material_Spec (
-                Raw_Material_Name TEXT NOT NULL,
-                Lot_id INTEGER NOT NULL,
-                Element_symbol TEXT NOT NULL,
-                Percentage REAL,
-                PRIMARY KEY (Raw_Material_Name, Lot_id, Element_symbol),
-                FOREIGN KEY (Lot_id) REFERENCES Raw_Material_Inventory(Lot_id),
-                FOREIGN KEY (Element_symbol) REFERENCES Element_Master(Element_Symbol)
-            )
-            """
-        )
-
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS Alloy_Master (
-                Alloy_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                Customer_name TEXT,
-                Alloy_name TEXT NOT NULL,
-                Alloy_Family TEXT,
-                Created_by TEXT,
-                Created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY (Customer_name) REFERENCES Customer_Master(Custome_Name)
-            )
-            """
-        )
-
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS Alloy_Master_spec (
-                Alloy_id INTEGER NOT NULL,
-                Element_symbol TEXT NOT NULL,
-                Min_percent REAL,
-                Max_percent REAL,
-                PRIMARY KEY (Alloy_id, Element_symbol),
-                FOREIGN KEY (Alloy_id) REFERENCES Alloy_Master(Alloy_id),
-                FOREIGN KEY (Element_symbol) REFERENCES Element_Master(Element_Symbol)
-            )
-            """
-        )
-
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS Furnace_Master (
-                Furnace TEXT PRIMARY KEY,
-                Status TEXT CHECK(Status IN ('Active', 'Inactive')) DEFAULT 'Active'
-            )
-            """
-        )
-
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS Production_batch (
-                Batch_ID TEXT PRIMARY KEY,
-                Alloy_id INTEGER,
-                Production_Date TEXT,
-                Shift TEXT CHECK(Shift IN ('A', 'B')),
-                Furnace TEXT,
-                Melt_No INTEGER,
-                Heat_no TEXT,
-                Melting_team TEXT,
-                Weight REAL DEFAULT 0,
-                pieces REAL DEFAULT 0,
-                Notes TEXT,
-                Photo1 BLOB,
-                Photo2 BLOB,
-                Photo3 BLOB,
-                Status TEXT DEFAULT 'Pending QA',
-                Workflow_stage TEXT DEFAULT 'Raw Material',
-                Output_Weight REAL,
-                FOREIGN KEY (Alloy_id) REFERENCES Alloy_Master(Alloy_id),
-                FOREIGN KEY (Furnace) REFERENCES Furnace_Master(Furnace)
-            )
-            """
-        )
-
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS batch_input (
-                Batch_ID TEXT NOT NULL,
-                Raw_Material_Name TEXT NOT NULL,
-                Lot_id INTEGER NOT NULL,
-                Weight REAL NOT NULL,
-                Charge_time TEXT DEFAULT CURRENT_TIMESTAMP,
-                Notes TEXT,
-                Photo1 BLOB,
-                Photo2 BLOB,
-                PRIMARY KEY (Batch_ID, Raw_Material_Name, Lot_id, Charge_time),
-                FOREIGN KEY (Batch_ID) REFERENCES Production_batch(Batch_ID),
-                FOREIGN KEY (Lot_id) REFERENCES Raw_Material_Inventory(Lot_id)
-            )
-            """
-        )
-
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS Batch_Chemical_Composition (
-                Batch_ID TEXT NOT NULL,
-                Element_symbol TEXT NOT NULL,
-                Percentage REAL,
-                PRIMARY KEY (Batch_ID, Element_symbol),
-                FOREIGN KEY (Batch_ID) REFERENCES Production_batch(Batch_ID),
-                FOREIGN KEY (Element_symbol) REFERENCES Element_Master(Element_Symbol)
-            )
-            """
-        )
-
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS Build_of_Material (
-                BOMID REAL NOT NULL,
-                Effective_date TEXT NOT NULL,
-                Customer_Name TEXT,
-                Alloy_Name TEXT,
-                Raw_Material_Name TEXT,
-                Quantity REAL,
-                Sequence_Order REAL,
-                notes TEXT,
-                PRIMARY KEY (BOMID, Effective_date),
-                FOREIGN KEY (Customer_Name) REFERENCES Customer_Master(Custome_Name)
-            )
-            """
-        )
-
-        # Seed elements
-        cur.executemany(
-            """
-            INSERT OR IGNORE INTO Element_Master (Serial_no, Element_Name, Element_Symbol)
+            INSERT INTO Element_Master (Serial_no, Element_Name, Element_Symbol)
             VALUES (?, ?, ?)
+            ON CONFLICT DO NOTHING
             """,
             ELEMENTS,
         )
 
-        # Default furnaces
         for n in range(1, 5):
-            cur.execute(
-                "INSERT OR IGNORE INTO Furnace_Master (Furnace, Status) VALUES (?, 'Active')",
+            _exec(
+                conn,
+                "INSERT INTO Furnace_Master (Furnace, Status) VALUES (?, 'Active') "
+                "ON CONFLICT DO NOTHING",
                 (str(n),),
             )
 
-        # Migrate older DBs: add columns if missing
-        _ensure_columns(
-            cur,
-            "Raw_Material_Master",
-            [("Cost_per_kg", "REAL DEFAULT 0")],
-        )
-        _ensure_columns(
-            cur,
-            "Production_batch",
-            [
-                ("Workflow_stage", "TEXT DEFAULT 'Raw Material'"),
-                ("Output_Weight", "REAL"),
-            ],
-        )
+        # Migrate older SQLite DBs: add columns if missing (Postgres schema
+        # is always created complete, so this only applies to SQLite files).
+        if not IS_POSTGRES:
+            _ensure_columns(
+                conn,
+                "Raw_Material_Master",
+                [
+                    ("Cost_per_kg", "REAL DEFAULT 0"),
+                    ("ISRI_CODE", "TEXT REFERENCES ISRI_CODE_TABLE(ISRI_CODE)"),
+                    ("Fe", "TEXT"),
+                    ("Cu", "TEXT"),
+                    ("Mg", "TEXT"),
+                ],
+            )
+            _ensure_columns(
+                conn,
+                "Raw_Material_Inventory",
+                [
+                    ("Supplier_invoice_date", "TEXT"),
+                    ("Cost_per_kg", "REAL"),
+                ],
+            )
+            _ensure_columns(
+                conn,
+                "Production_batch",
+                [
+                    ("Workflow_stage", "TEXT DEFAULT 'Raw Material'"),
+                    ("Output_Weight", "REAL"),
+                ],
+            )
+            _ensure_columns(
+                conn,
+                "Alloy_Master",
+                [
+                    ("Cust_code", "TEXT REFERENCES Customer_Master(Cust_code)"),
+                    ("Colour_code", "TEXT"),
+                    ("Bis_Designation", "TEXT"),
+                    ("Sludge_factor", "REAL"),
+                    ("Revision_datetime", "TEXT"),
+                    ("Remarks", "TEXT"),
+                    ("Status", "TEXT DEFAULT 'Active'"),
+                    ("Other_elements_Each", "REAL"),
+                    ("Other_elements_Total", "REAL"),
+                ],
+            )
+            _ensure_columns(
+                conn,
+                "Build_of_Material",
+                [("Cust_code", "TEXT REFERENCES Customer_Master(Cust_code)")],
+            )
 
 
-def _ensure_columns(cur: sqlite3.Cursor, table: str, columns: list[tuple[str, str]]) -> None:
-    existing = {row[1] for row in cur.execute(f"PRAGMA table_info({table})").fetchall()}
+def _ensure_columns(conn: Connection, table: str, columns: list[tuple[str, str]]) -> None:
+    existing = {
+        row["name"] for row in _exec(conn, f"PRAGMA table_info({table})").mappings()
+    }
     for name, typedef in columns:
         if name not in existing:
-            cur.execute(f"ALTER TABLE {table} ADD COLUMN {name} {typedef}")
+            _exec(conn, f"ALTER TABLE {table} ADD COLUMN {name} {typedef}")
 
 
-def fetch_all(sql: str, params: Iterable[Any] = ()) -> list[sqlite3.Row]:
-    with get_connection() as conn:
-        return conn.execute(sql, tuple(params)).fetchall()
+# ---------- Generic helpers ----------
+
+def fetch_all(sql: str, params: Iterable[Any] = ()) -> list[dict[str, Any]]:
+    with ENGINE.connect() as conn:
+        return [dict(r) for r in _exec(conn, sql, tuple(params)).mappings()]
 
 
-def fetch_one(sql: str, params: Iterable[Any] = ()) -> Optional[sqlite3.Row]:
-    with get_connection() as conn:
-        return conn.execute(sql, tuple(params)).fetchone()
+def fetch_one(sql: str, params: Iterable[Any] = ()) -> Optional[dict[str, Any]]:
+    with ENGINE.connect() as conn:
+        row = _exec(conn, sql, tuple(params)).mappings().first()
+        return dict(row) if row is not None else None
 
 
 def execute(sql: str, params: Iterable[Any] = ()) -> int:
     with get_connection() as conn:
-        cur = conn.execute(sql, tuple(params))
-        return cur.lastrowid or 0
+        return _exec(conn, sql, tuple(params)).rowcount
 
 
 def execute_many(sql: str, seq: list[tuple[Any, ...]]) -> None:
     with get_connection() as conn:
-        conn.executemany(sql, seq)
+        _exec(conn, sql, seq)
+
+
+def get_all_records(table_name: str, order_by: str | None = None) -> list[dict[str, Any]]:
+    """Return all records from the given table as a list of dicts.
+
+    Uses SQLAlchemy table reflection, so it works for any table in the
+    database without needing model classes. Optionally sorts by a column.
+    """
+    if IS_POSTGRES:
+        # Postgres stores unquoted identifiers in lowercase
+        table_name = table_name.lower()
+        order_by = order_by.lower() if order_by else None
+    table = Table(table_name, MetaData(), autoload_with=ENGINE)
+    stmt = select(table)
+    if order_by is not None:
+        stmt = stmt.order_by(table.c[order_by])
+    with ENGINE.connect() as conn:
+        return [dict(row) for row in conn.execute(stmt).mappings()]
 
 
 # ---------- Lookups ----------
 
 def list_customers(active_only: bool = True) -> list[str]:
-    sql = "SELECT Custome_Name FROM Customer_Master"
+    sql = 'SELECT Customer_name AS "Customer_name" FROM Customer_Master'
     if active_only:
         sql += " WHERE Status = 'Active'"
-    sql += " ORDER BY Custome_Name"
-    return [r["Custome_Name"] for r in fetch_all(sql)]
+    sql += " ORDER BY Customer_name"
+    return [r["Customer_name"] for r in fetch_all(sql)]
+
+
+def list_customer_codes(active_only: bool = True) -> list[dict[str, Any]]:
+    """Customers with their codes, for code-based FK lookups."""
+    sql = 'SELECT Cust_code AS "Cust_code", Customer_name AS "Customer_name" FROM Customer_Master'
+    if active_only:
+        sql += " WHERE Status = 'Active'"
+    sql += " ORDER BY Cust_code"
+    return fetch_all(sql)
+
+
+def list_vendors(active_only: bool = True) -> list[dict[str, Any]]:
+    """Vendors with their auto-generated codes, for code-based FK lookups."""
+    sql = 'SELECT Vendor_code AS "Vendor_code", Vendor_name AS "Vendor_name" FROM Vendor_Master'
+    if active_only:
+        sql += " WHERE Status = 'Active'"
+    sql += " ORDER BY Vendor_name"
+    return fetch_all(sql)
 
 
 def list_suppliers(active_only: bool = True) -> list[str]:
-    sql = "SELECT Supplier FROM Supplier_Master"
-    if active_only:
-        sql += " WHERE Status = 'Active'"
-    sql += " ORDER BY Supplier"
-    return [r["Supplier"] for r in fetch_all(sql)]
+    """Vendor names only; kept for display lookups."""
+    return [v["Vendor_name"] for v in list_vendors(active_only)]
 
 
-def list_elements() -> list[sqlite3.Row]:
+def list_elements() -> list[dict[str, Any]]:
     return fetch_all(
-        "SELECT Serial_no, Element_Name, Element_Symbol FROM Element_Master ORDER BY Serial_no"
+        """
+        SELECT Serial_no AS "Serial_no", Element_Name AS "Element_Name",
+               Element_Symbol AS "Element_Symbol"
+        FROM Element_Master ORDER BY Serial_no
+        """
     )
 
 
 def list_furnaces(active_only: bool = True) -> list[str]:
-    sql = "SELECT Furnace FROM Furnace_Master"
+    sql = 'SELECT Furnace AS "Furnace" FROM Furnace_Master'
     if active_only:
         sql += " WHERE Status = 'Active'"
     sql += " ORDER BY CAST(Furnace AS INTEGER), Furnace"
     return [r["Furnace"] for r in fetch_all(sql)]
 
 
+def list_isri_codes() -> list[dict[str, Any]]:
+    return fetch_all(
+        """
+        SELECT ISRI_CODE AS "ISRI_CODE", Description AS "Description"
+        FROM ISRI_CODE_TABLE ORDER BY ISRI_CODE
+        """
+    )
+
+
 def list_raw_materials(active_only: bool = True) -> list[str]:
-    sql = """
-        SELECT DISTINCT Raw_Material_Name FROM Raw_Material_Master
-    """
+    sql = 'SELECT DISTINCT Raw_Material_Name AS "Raw_Material_Name" FROM Raw_Material_Master'
     if active_only:
         sql += " WHERE Status = 'Active'"
     sql += " ORDER BY Raw_Material_Name"
     return [r["Raw_Material_Name"] for r in fetch_all(sql)]
 
 
-def list_alloys() -> list[sqlite3.Row]:
+def list_alloys() -> list[dict[str, Any]]:
     return fetch_all(
         """
-        SELECT Alloy_id, Alloy_name, Customer_name, Alloy_Family
-        FROM Alloy_Master
-        ORDER BY Alloy_name
+        SELECT a.Alloy_id AS "Alloy_id", a.Alloy_name AS "Alloy_name",
+               a.Cust_code AS "Cust_code", c.Customer_name AS "Customer_name",
+               a.Alloy_Family AS "Alloy_Family", a.Colour_code AS "Colour_code",
+               a.Bis_Designation AS "Bis_Designation",
+               a.Sludge_factor AS "Sludge_factor",
+               a.Revision_datetime AS "Revision_datetime",
+               a.Remarks AS "Remarks", a.Status AS "Status",
+               a.Other_elements_Each AS "Other_elements_Each",
+               a.Other_elements_Total AS "Other_elements_Total"
+        FROM Alloy_Master a
+        LEFT JOIN Customer_Master c ON c.Cust_code = a.Cust_code
+        ORDER BY a.Alloy_name
         """
     )
 
 
 def list_inventory_lots(
     material: Optional[str] = None, ready_only: bool = False
-) -> list[sqlite3.Row]:
+) -> list[dict[str, Any]]:
     sql = """
-        SELECT Lot_id, Raw_Material_Name, Supplier, Remaining_Weight, Status, Received_date
-        FROM Raw_Material_Inventory
-        WHERE Remaining_Weight > 0
+        SELECT i.Lot_id AS "Lot_id", i.Raw_Material_Name AS "Raw_Material_Name",
+               i.Vendor_code AS "Vendor_code", v.Vendor_name AS "Vendor_name",
+               i.Remaining_Weight AS "Remaining_Weight",
+               i.Status AS "Status", i.Received_date AS "Received_date"
+        FROM Raw_Material_Inventory i
+        LEFT JOIN Vendor_Master v ON v.Vendor_code = i.Vendor_code
+        WHERE i.Remaining_Weight > 0
     """
     params: list[Any] = []
     if material:
-        sql += " AND Raw_Material_Name = ?"
+        sql += " AND i.Raw_Material_Name = ?"
         params.append(material)
     if ready_only:
-        sql += " AND Status = 'Ready For Melt'"
-    sql += " ORDER BY Lot_id DESC"
+        sql += " AND i.Status = 'Ready For Melt'"
+    sql += " ORDER BY i.Lot_id DESC"
     return fetch_all(sql, params)
 
 
 # ---------- Customers / Suppliers ----------
 
 def upsert_customer(data: dict[str, Any]) -> None:
+    """Insert or update a customer keyed on Cust_code."""
     execute(
         """
         INSERT INTO Customer_Master
-            (Custome_Name, GST, PAN, Cust_code, Address, City, State, Pincode, Country, Status)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(Custome_Name) DO UPDATE SET
-            GST=excluded.GST, PAN=excluded.PAN, Cust_code=excluded.Cust_code,
+            (Cust_code, Customer_name, GST, PAN, Address, City, State, Pincode, Country,
+             Contact1_name, Phone1, Contact_name2, Phone2, Email, Website,
+             Bank_account, IFSC_code, Bank_name, Branch_category, Status)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(Cust_code) DO UPDATE SET
+            Customer_name=excluded.Customer_name, GST=excluded.GST, PAN=excluded.PAN,
             Address=excluded.Address, City=excluded.City, State=excluded.State,
-            Pincode=excluded.Pincode, Country=excluded.Country, Status=excluded.Status
+            Pincode=excluded.Pincode, Country=excluded.Country,
+            Contact1_name=excluded.Contact1_name, Phone1=excluded.Phone1,
+            Contact_name2=excluded.Contact_name2, Phone2=excluded.Phone2,
+            Email=excluded.Email, Website=excluded.Website,
+            Bank_account=excluded.Bank_account, IFSC_code=excluded.IFSC_code,
+            Bank_name=excluded.Bank_name, Branch_category=excluded.Branch_category,
+            Status=excluded.Status
         """,
         (
-            data["Custome_Name"],
+            data["Cust_code"],
+            data["Customer_name"],
             data.get("GST"),
             data.get("PAN"),
-            data.get("Cust_code"),
             data.get("Address"),
             data.get("City"),
             data.get("State"),
             data.get("Pincode"),
             data.get("Country"),
+            data.get("Contact1_name"),
+            data.get("Phone1"),
+            data.get("Contact_name2"),
+            data.get("Phone2"),
+            data.get("Email"),
+            data.get("Website"),
+            data.get("Bank_account"),
+            data.get("IFSC_code"),
+            data.get("Bank_name"),
+            data.get("Branch_category"),
             data.get("Status", "Active"),
         ),
     )
 
 
 def upsert_supplier(data: dict[str, Any]) -> None:
+    """Insert or update a vendor by name; Vendor_code and Creation_date are
+    auto-generated on insert (Creation_date is preserved on update)."""
     execute(
         """
-        INSERT INTO Supplier_Master
-            (Supplier, GST, PAN, Vendor_code, Address, City, State, Pincode, Country, Status)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(Supplier) DO UPDATE SET
-            GST=excluded.GST, PAN=excluded.PAN, Vendor_code=excluded.Vendor_code,
+        INSERT INTO Vendor_Master
+            (Vendor_name, GST, PAN, Address, City, State, Pincode, Country,
+             Contact1, Phone1, Contact2, Phone2, Email, Website,
+             Credit_period, Bank_account, Branch, IFSC_code, Bank_name, Status)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(Vendor_name) DO UPDATE SET
+            GST=excluded.GST, PAN=excluded.PAN,
             Address=excluded.Address, City=excluded.City, State=excluded.State,
-            Pincode=excluded.Pincode, Country=excluded.Country, Status=excluded.Status
+            Pincode=excluded.Pincode, Country=excluded.Country,
+            Contact1=excluded.Contact1, Phone1=excluded.Phone1,
+            Contact2=excluded.Contact2, Phone2=excluded.Phone2,
+            Email=excluded.Email, Website=excluded.Website,
+            Credit_period=excluded.Credit_period,
+            Bank_account=excluded.Bank_account, Branch=excluded.Branch,
+            IFSC_code=excluded.IFSC_code, Bank_name=excluded.Bank_name,
+            Status=excluded.Status
         """,
         (
-            data["Supplier"],
+            data["Vendor_name"],
             data.get("GST"),
             data.get("PAN"),
-            data.get("Vendor_code"),
             data.get("Address"),
             data.get("City"),
             data.get("State"),
             data.get("Pincode"),
             data.get("Country"),
+            data.get("Contact1"),
+            data.get("Phone1"),
+            data.get("Contact2"),
+            data.get("Phone2"),
+            data.get("Email"),
+            data.get("Website"),
+            data.get("Credit_period"),
+            data.get("Bank_account"),
+            data.get("Branch"),
+            data.get("IFSC_code"),
+            data.get("Bank_name"),
             data.get("Status", "Active"),
         ),
     )
@@ -488,75 +660,115 @@ def upsert_supplier(data: dict[str, Any]) -> None:
 def add_raw_material_master(
     name: str,
     effective_date: str,
-    supplier: Optional[str],
+    vendor_code: Optional[int],
     alloy_family: str,
     availability_class: str,
     recovery: Optional[float],
     status: str,
     cost_per_kg: float,
     photo: Optional[bytes] = None,
+    isri_code: Optional[str] = None,
+    fe: Optional[str] = None,
+    cu: Optional[str] = None,
+    mg: Optional[str] = None,
 ) -> None:
     execute(
         """
-        INSERT OR REPLACE INTO Raw_Material_Master
-            (Raw_Material_Name, Effective_date, Supplier, Alloy_family,
-             Availability_class, Recovery, Photo, Status, Cost_per_kg)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO Raw_Material_Master
+            (Raw_Material_Name, Effective_date, Vendor_code, ISRI_CODE, Alloy_family,
+             Availability_class, Recovery, Photo, Status, Cost_per_kg, Fe, Cu, Mg)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(Raw_Material_Name, Effective_date) DO UPDATE SET
+            Vendor_code=excluded.Vendor_code, ISRI_CODE=excluded.ISRI_CODE,
+            Alloy_family=excluded.Alloy_family,
+            Availability_class=excluded.Availability_class, Recovery=excluded.Recovery,
+            Photo=excluded.Photo, Status=excluded.Status, Cost_per_kg=excluded.Cost_per_kg,
+            Fe=excluded.Fe, Cu=excluded.Cu, Mg=excluded.Mg
         """,
         (
             name,
             effective_date,
-            supplier,
+            vendor_code,
+            isri_code,
             alloy_family,
             availability_class,
             recovery,
             photo,
             status,
             cost_per_kg,
+            fe,
+            cu,
+            mg,
         ),
     )
 
 
 def add_inventory_lot(
     material: str,
-    supplier: Optional[str],
+    vendor_code: Optional[int],
     invoice: str,
     received_date: str,
     weight: float,
     storage_bay: str,
     status: str,
     photo: Optional[bytes] = None,
+    supplier_invoice_date: Optional[str] = None,
+    cost_per_kg: Optional[float] = None,
 ) -> int:
-    return execute(
-        """
-        INSERT INTO Raw_Material_Inventory
-            (Raw_Material_Name, Supplier, Supplier_Invoice, Received_date,
-             Received_weight, Remaining_Weight, Storage_bay, Status, Photo)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (material, supplier, invoice, received_date, weight, weight, storage_bay, status, photo),
-    )
+    with get_connection() as conn:
+        result = _exec(
+            conn,
+            """
+            INSERT INTO Raw_Material_Inventory
+                (Raw_Material_Name, Vendor_code, Supplier_Invoice, Supplier_invoice_date,
+                 Received_date, Received_weight, Remaining_Weight, Storage_bay, Status,
+                 Photo, Cost_per_kg)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            RETURNING Lot_id
+            """,
+            (
+                material,
+                vendor_code,
+                invoice,
+                supplier_invoice_date,
+                received_date,
+                weight,
+                weight,
+                storage_bay,
+                status,
+                photo,
+                cost_per_kg,
+            ),
+        )
+        return int(result.scalar_one())
 
 
 def set_lot_chemistry(material: str, lot_id: int, composition: dict[str, float]) -> None:
     with get_connection() as conn:
-        conn.execute(
+        _exec(
+            conn,
             "DELETE FROM Raw_Material_Spec WHERE Raw_Material_Name = ? AND Lot_id = ?",
             (material, lot_id),
         )
-        conn.executemany(
-            """
-            INSERT INTO Raw_Material_Spec
-                (Raw_Material_Name, Lot_id, Element_symbol, Percentage)
-            VALUES (?, ?, ?, ?)
-            """,
-            [(material, lot_id, sym, pct) for sym, pct in composition.items() if pct is not None],
-        )
+        rows = [(material, lot_id, sym, pct) for sym, pct in composition.items() if pct is not None]
+        if rows:
+            _exec(
+                conn,
+                """
+                INSERT INTO Raw_Material_Spec
+                    (Raw_Material_Name, Lot_id, Element_symbol, Percentage)
+                VALUES (?, ?, ?, ?)
+                """,
+                rows,
+            )
 
 
 def get_lot_chemistry(lot_id: int) -> dict[str, float]:
     rows = fetch_all(
-        "SELECT Element_symbol, Percentage FROM Raw_Material_Spec WHERE Lot_id = ?",
+        """
+        SELECT Element_symbol AS "Element_symbol", Percentage AS "Percentage"
+        FROM Raw_Material_Spec WHERE Lot_id = ?
+        """,
         (lot_id,),
     )
     return {r["Element_symbol"]: r["Percentage"] for r in rows}
@@ -565,33 +777,61 @@ def get_lot_chemistry(lot_id: int) -> dict[str, float]:
 # ---------- Alloys ----------
 
 def add_alloy(
-    customer: Optional[str],
+    cust_code: Optional[str],
     alloy_name: str,
     family: str,
     created_by: str,
     specs: dict[str, tuple[Optional[float], Optional[float]]],
+    colour_code: Optional[str] = None,
+    bis_designation: Optional[str] = None,
+    sludge_factor: Optional[float] = None,
+    revision_datetime: Optional[str] = None,
+    remarks: Optional[str] = None,
+    status: str = "Active",
+    other_elements_each: Optional[float] = None,
+    other_elements_total: Optional[float] = None,
 ) -> int:
     with get_connection() as conn:
-        cur = conn.execute(
+        result = _exec(
+            conn,
             """
             INSERT INTO Alloy_Master
-                (Customer_name, Alloy_name, Alloy_Family, Created_by, Created_at)
-            VALUES (?, ?, ?, ?, ?)
+                (Cust_code, Alloy_name, Alloy_Family, Created_by, Created_at,
+                 Colour_code, Bis_Designation, Sludge_factor,
+                 Revision_datetime, Remarks, Status,
+                 Other_elements_Each, Other_elements_Total)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            RETURNING Alloy_id
             """,
-            (customer, alloy_name, family, created_by, datetime.now().isoformat(timespec="seconds")),
+            (
+                cust_code,
+                alloy_name,
+                family,
+                created_by,
+                datetime.now().isoformat(timespec="seconds"),
+                colour_code,
+                bis_designation,
+                sludge_factor,
+                revision_datetime,
+                remarks,
+                status,
+                other_elements_each,
+                other_elements_total,
+            ),
         )
-        alloy_id = cur.lastrowid
+        alloy_id = int(result.scalar_one())
         for sym, (mn, mx) in specs.items():
             if mn is None and mx is None:
                 continue
-            conn.execute(
+            _exec(
+                conn,
                 """
                 INSERT INTO Alloy_Master_spec (Alloy_id, Element_symbol, Min_percent, Max_percent)
                 VALUES (?, ?, ?, ?)
                 """,
                 (alloy_id, sym, mn, mx),
             )
-        return int(alloy_id)
+        return alloy_id
 
 
 # ---------- Furnace ----------
@@ -626,14 +866,18 @@ def create_batch(
     composition: dict[str, float],
 ) -> str:
     batch_id = make_batch_id(furnace, heat_no)
-    existing = fetch_one("SELECT Batch_ID FROM Production_batch WHERE Batch_ID = ?", (batch_id,))
+    existing = fetch_one(
+        'SELECT Batch_ID AS "Batch_ID" FROM Production_batch WHERE Batch_ID = ?',
+        (batch_id,),
+    )
     if existing:
         raise ValueError(f"Batch ID {batch_id} already exists. Choose another Heat No.")
 
     total_weight = sum(float(i["Weight"]) for i in inputs)
 
     with get_connection() as conn:
-        conn.execute(
+        _exec(
+            conn,
             """
             INSERT INTO Production_batch
                 (Batch_ID, Alloy_id, Production_Date, Shift, Furnace, Melt_No,
@@ -656,10 +900,12 @@ def create_batch(
 
         for item in inputs:
             # Deduct inventory
-            lot = conn.execute(
-                "SELECT Remaining_Weight FROM Raw_Material_Inventory WHERE Lot_id = ?",
+            lot = _exec(
+                conn,
+                'SELECT Remaining_Weight AS "Remaining_Weight" '
+                "FROM Raw_Material_Inventory WHERE Lot_id = ?",
                 (item["Lot_id"],),
-            ).fetchone()
+            ).mappings().first()
             if not lot:
                 raise ValueError(f"Lot {item['Lot_id']} not found.")
             remaining = float(lot["Remaining_Weight"] or 0)
@@ -668,7 +914,8 @@ def create_batch(
                 raise ValueError(
                     f"Insufficient stock on Lot {item['Lot_id']}: need {w}, have {remaining}."
                 )
-            conn.execute(
+            _exec(
+                conn,
                 """
                 UPDATE Raw_Material_Inventory
                 SET Remaining_Weight = Remaining_Weight - ?
@@ -676,7 +923,8 @@ def create_batch(
                 """,
                 (w, item["Lot_id"]),
             )
-            conn.execute(
+            _exec(
+                conn,
                 """
                 INSERT INTO batch_input
                     (Batch_ID, Raw_Material_Name, Lot_id, Weight, Charge_time, Notes)
@@ -695,7 +943,8 @@ def create_batch(
         for sym, pct in composition.items():
             if pct is None:
                 continue
-            conn.execute(
+            _exec(
+                conn,
                 """
                 INSERT INTO Batch_Chemical_Composition (Batch_ID, Element_symbol, Percentage)
                 VALUES (?, ?, ?)
@@ -727,14 +976,28 @@ def update_batch_workflow(
     )
 
 
-def get_batch(batch_id: str) -> Optional[sqlite3.Row]:
-    return fetch_one("SELECT * FROM Production_batch WHERE Batch_ID = ?", (batch_id,))
+_BATCH_COLUMNS = """
+    Batch_ID AS "Batch_ID", Alloy_id AS "Alloy_id",
+    Production_Date AS "Production_Date", Shift AS "Shift",
+    Furnace AS "Furnace", Melt_No AS "Melt_No", Heat_no AS "Heat_no",
+    Melting_team AS "Melting_team", Weight AS "Weight", pieces AS "pieces",
+    Notes AS "Notes", Status AS "Status", Workflow_stage AS "Workflow_stage",
+    Output_Weight AS "Output_Weight"
+"""
 
 
-def get_batch_inputs(batch_id: str) -> list[sqlite3.Row]:
+def get_batch(batch_id: str) -> Optional[dict[str, Any]]:
+    return fetch_one(
+        f"SELECT {_BATCH_COLUMNS} FROM Production_batch WHERE Batch_ID = ?",
+        (batch_id,),
+    )
+
+
+def get_batch_inputs(batch_id: str) -> list[dict[str, Any]]:
     return fetch_all(
         """
-        SELECT Raw_Material_Name, Lot_id, Weight, Charge_time, Notes
+        SELECT Raw_Material_Name AS "Raw_Material_Name", Lot_id AS "Lot_id",
+               Weight AS "Weight", Charge_time AS "Charge_time", Notes AS "Notes"
         FROM batch_input WHERE Batch_ID = ?
         ORDER BY Charge_time
         """,
@@ -742,10 +1005,10 @@ def get_batch_inputs(batch_id: str) -> list[sqlite3.Row]:
     )
 
 
-def get_batch_chemistry(batch_id: str) -> list[sqlite3.Row]:
+def get_batch_chemistry(batch_id: str) -> list[dict[str, Any]]:
     return fetch_all(
         """
-        SELECT Element_symbol, Percentage
+        SELECT Element_symbol AS "Element_symbol", Percentage AS "Percentage"
         FROM Batch_Chemical_Composition WHERE Batch_ID = ?
         ORDER BY Element_symbol
         """,
@@ -753,12 +1016,14 @@ def get_batch_chemistry(batch_id: str) -> list[sqlite3.Row]:
     )
 
 
-def list_batches() -> list[sqlite3.Row]:
+def list_batches() -> list[dict[str, Any]]:
     return fetch_all(
         """
-        SELECT b.Batch_ID, b.Production_Date, b.Furnace, b.Heat_no, b.Melt_No,
-               b.Shift, b.Weight, b.Output_Weight, b.Status, b.Workflow_stage,
-               a.Alloy_name
+        SELECT b.Batch_ID AS "Batch_ID", b.Production_Date AS "Production_Date",
+               b.Furnace AS "Furnace", b.Heat_no AS "Heat_no", b.Melt_No AS "Melt_No",
+               b.Shift AS "Shift", b.Weight AS "Weight",
+               b.Output_Weight AS "Output_Weight", b.Status AS "Status",
+               b.Workflow_stage AS "Workflow_stage", a.Alloy_name AS "Alloy_name"
         FROM Production_batch b
         LEFT JOIN Alloy_Master a ON a.Alloy_id = b.Alloy_id
         ORDER BY b.Production_Date DESC, b.Batch_ID DESC
@@ -781,7 +1046,7 @@ def calc_yield(input_weight: float, output_weight: float) -> dict[str, float]:
 def add_bom_line(
     bom_id: float,
     effective_date: str,
-    customer: Optional[str],
+    cust_code: Optional[str],
     alloy_name: Optional[str],
     raw_material: Optional[str],
     quantity: float,
@@ -790,12 +1055,16 @@ def add_bom_line(
 ) -> None:
     execute(
         """
-        INSERT OR REPLACE INTO Build_of_Material
-            (BOMID, Effective_date, Customer_Name, Alloy_Name,
+        INSERT INTO Build_of_Material
+            (BOMID, Effective_date, Cust_code, Alloy_Name,
              Raw_Material_Name, Quantity, Sequence_Order, notes)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(BOMID, Effective_date) DO UPDATE SET
+            Cust_code=excluded.Cust_code, Alloy_Name=excluded.Alloy_Name,
+            Raw_Material_Name=excluded.Raw_Material_Name, Quantity=excluded.Quantity,
+            Sequence_Order=excluded.Sequence_Order, notes=excluded.notes
         """,
-        (bom_id, effective_date, customer, alloy_name, raw_material, quantity, sequence, notes),
+        (bom_id, effective_date, cust_code, alloy_name, raw_material, quantity, sequence, notes),
     )
 
 
