@@ -474,6 +474,211 @@ def get_all_records(table_name: str, order_by: str | None = None) -> list[dict[s
         return [dict(row) for row in conn.execute(stmt).mappings()]
 
 
+# ---------- Data browser / editor ----------
+
+# Tables users can inspect and correct from the Data Browser page.
+# `pk` / `order_by` / `identity` use the physical (Postgres-lowercase) names.
+EDITABLE_TABLES: list[dict[str, Any]] = [
+    {
+        "key": "customer_master",
+        "label": "Customers",
+        "pk": ["cust_code"],
+        "order_by": "cust_code",
+        "identity": [],
+        "allow_add": True,
+    },
+    {
+        "key": "vendor_master",
+        "label": "Vendors",
+        "pk": ["vendor_code"],
+        "order_by": "vendor_code",
+        "identity": ["vendor_code"],
+        "allow_add": False,
+    },
+    {
+        "key": "alloy_master",
+        "label": "Alloys",
+        "pk": ["alloy_id"],
+        "order_by": "alloy_id",
+        "identity": ["alloy_id"],
+        "allow_add": False,
+    },
+    {
+        "key": "alloy_master_spec",
+        "label": "Alloy specs (min/max %)",
+        "pk": ["alloy_id", "element_symbol"],
+        "order_by": "alloy_id",
+        "identity": [],
+        "allow_add": True,
+    },
+    {
+        "key": "raw_material_master",
+        "label": "Raw material master",
+        "pk": ["raw_material_name", "effective_date"],
+        "order_by": "raw_material_name",
+        "identity": [],
+        "allow_add": True,
+    },
+    {
+        "key": "raw_material_inventory",
+        "label": "Raw material inventory",
+        "pk": ["lot_id"],
+        "order_by": "lot_id",
+        "identity": ["lot_id"],
+        "allow_add": False,
+    },
+    {
+        "key": "raw_material_spec",
+        "label": "Raw material chemistry",
+        "pk": ["raw_material_name", "lot_id", "element_symbol"],
+        "order_by": "lot_id",
+        "identity": [],
+        "allow_add": True,
+    },
+    {
+        "key": "isri_code_table",
+        "label": "ISRI codes",
+        "pk": ["isri_code"],
+        "order_by": "isri_code",
+        "identity": [],
+        "allow_add": True,
+    },
+    {
+        "key": "purchase_order",
+        "label": "Purchase orders",
+        "pk": ["customer_po_no"],
+        "order_by": "customer_po_no",
+        "identity": [],
+        "allow_add": True,
+    },
+    {
+        "key": "furnace_master",
+        "label": "Furnaces",
+        "pk": ["furnace"],
+        "order_by": "furnace",
+        "identity": [],
+        "allow_add": True,
+    },
+    {
+        "key": "element_master",
+        "label": "Elements",
+        "pk": ["serial_no"],
+        "order_by": "serial_no",
+        "identity": [],
+        "allow_add": False,
+    },
+]
+
+
+def _resolve_table_name(table_name: str) -> str:
+    from sqlalchemy import inspect as sa_inspect
+
+    insp = sa_inspect(ENGINE)
+    names = insp.get_table_names()
+    if table_name in names:
+        return table_name
+    lower = table_name.lower()
+    if lower in names:
+        return lower
+    raise ValueError(f"Table not found: {table_name}")
+
+
+def editable_columns(table_name: str) -> list[str]:
+    """Column names for the editor, excluding binary photo fields."""
+    from sqlalchemy import inspect as sa_inspect
+
+    resolved = _resolve_table_name(table_name)
+    cols: list[str] = []
+    for c in sa_inspect(ENGINE).get_columns(resolved):
+        type_name = type(c["type"]).__name__.upper()
+        if "BLOB" in type_name or "BYTEA" in type_name or "LARGEBINARY" in type_name:
+            continue
+        cols.append(c["name"])
+    return cols
+
+
+def load_editable_table(table_name: str, order_by: str | None = None) -> list[dict[str, Any]]:
+    resolved = _resolve_table_name(table_name)
+    cols = editable_columns(resolved)
+    if not cols:
+        return []
+    select_list = ", ".join(f'{c} AS "{c}"' for c in cols)
+    order = order_by if order_by in cols else cols[0]
+    return fetch_all(f"SELECT {select_list} FROM {resolved} ORDER BY {order}")
+
+
+def _row_key(row: dict[str, Any], pk: list[str]) -> tuple[Any, ...]:
+    return tuple(row.get(c) for c in pk)
+
+
+def save_table_edits(
+    table_name: str,
+    pk_cols: list[str],
+    original_rows: list[dict[str, Any]],
+    edited_rows: list[dict[str, Any]],
+    identity_cols: Optional[list[str]] = None,
+) -> dict[str, int]:
+    """Upsert edited/new rows. Returns counts of inserted and updated rows."""
+    identity_cols = identity_cols or []
+    resolved = _resolve_table_name(table_name)
+    cols = editable_columns(resolved)
+    original_map = {_row_key(r, pk_cols): r for r in original_rows}
+
+    inserted = updated = 0
+    with get_connection() as conn:
+        for row in edited_rows:
+            # Skip completely empty new rows
+            if all(row.get(c) in (None, "") for c in cols):
+                continue
+            key = _row_key(row, pk_cols)
+            is_new = key not in original_map or any(v is None for v in key)
+
+            write_cols = [
+                c for c in cols
+                if c in row and not (is_new and c in identity_cols and row.get(c) in (None, ""))
+            ]
+            if not write_cols:
+                continue
+
+            # For new identity rows, omit the identity column so the DB generates it
+            if is_new and identity_cols:
+                write_cols = [c for c in write_cols if c not in identity_cols or row.get(c) not in (None, "")]
+
+            values = [row.get(c) for c in write_cols]
+            placeholders = ", ".join("?" for _ in write_cols)
+            col_sql = ", ".join(write_cols)
+
+            if is_new and identity_cols and all(row.get(c) in (None, "") for c in identity_cols):
+                _exec(
+                    conn,
+                    f"INSERT INTO {resolved} ({col_sql}) VALUES ({placeholders})",
+                    tuple(values),
+                )
+                inserted += 1
+                continue
+
+            non_pk = [c for c in write_cols if c not in pk_cols]
+            if not non_pk and key in original_map:
+                continue
+            update_sql = ", ".join(f"{c}=excluded.{c}" for c in non_pk) if non_pk else f"{pk_cols[0]}=excluded.{pk_cols[0]}"
+            pk_sql = ", ".join(pk_cols)
+            _exec(
+                conn,
+                f"""
+                INSERT INTO {resolved} ({col_sql}) VALUES ({placeholders})
+                ON CONFLICT ({pk_sql}) DO UPDATE SET {update_sql}
+                """,
+                tuple(values),
+            )
+            if key in original_map:
+                if any(original_map[key].get(c) != row.get(c) for c in write_cols):
+                    updated += 1
+            else:
+                inserted += 1
+
+    return {"inserted": inserted, "updated": updated}
+
+
 # ---------- Lookups ----------
 
 def list_customers(active_only: bool = True) -> list[str]:
