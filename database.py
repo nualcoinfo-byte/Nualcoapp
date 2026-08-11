@@ -602,9 +602,21 @@ def load_editable_table(table_name: str, order_by: str | None = None) -> list[di
     cols = editable_columns(resolved)
     if not cols:
         return []
-    select_list = ", ".join(f'{c} AS "{c}"' for c in cols)
+    select_list = ", ".join(f't.{c} AS "{c}"' for c in cols)
+    # Always sort chemistry / spec tables by Element_Master.Serial_no
+    has_element = any(c.lower() == "element_symbol" for c in cols)
+    if has_element:
+        sym_col = next(c for c in cols if c.lower() == "element_symbol")
+        return fetch_all(
+            f"""
+            SELECT {select_list}
+            FROM {resolved} t
+            LEFT JOIN Element_Master _el ON _el.Element_Symbol = t.{sym_col}
+            ORDER BY COALESCE(_el.Serial_no, 9999), t.{sym_col}
+            """
+        )
     order = order_by if order_by in cols else cols[0]
-    return fetch_all(f"SELECT {select_list} FROM {resolved} ORDER BY {order}")
+    return fetch_all(f"SELECT {select_list} FROM {resolved} t ORDER BY t.{order}")
 
 
 def _row_key(row: dict[str, Any], pk: list[str]) -> tuple[Any, ...]:
@@ -720,6 +732,18 @@ def list_elements() -> list[dict[str, Any]]:
         FROM Element_Master ORDER BY Serial_no
         """
     )
+
+
+def list_element_symbols(subset: Optional[Iterable[str]] = None) -> list[str]:
+    """Element symbols in Element_Master.Serial_no order.
+
+    If ``subset`` is given, return only those symbols (still in serial order).
+    """
+    symbols = [e["Element_Symbol"] for e in list_elements()]
+    if subset is None:
+        return symbols
+    wanted = {str(s) for s in subset}
+    return [s for s in symbols if s in wanted]
 
 
 def list_furnaces(active_only: bool = True) -> list[str]:
@@ -993,8 +1017,11 @@ def set_lot_chemistry(material: str, lot_id: int, composition: dict[str, float])
 def get_lot_chemistry(lot_id: int) -> dict[str, float]:
     rows = fetch_all(
         """
-        SELECT Element_symbol AS "Element_symbol", Percentage AS "Percentage"
-        FROM Raw_Material_Spec WHERE Lot_id = ?
+        SELECT s.Element_symbol AS "Element_symbol", s.Percentage AS "Percentage"
+        FROM Raw_Material_Spec s
+        LEFT JOIN Element_Master _el ON _el.Element_Symbol = s.Element_symbol
+        WHERE s.Lot_id = ?
+        ORDER BY COALESCE(_el.Serial_no, 9999), s.Element_symbol
         """,
         (lot_id,),
     )
@@ -1235,9 +1262,11 @@ def get_batch_inputs(batch_id: str) -> list[dict[str, Any]]:
 def get_batch_chemistry(batch_id: str) -> list[dict[str, Any]]:
     return fetch_all(
         """
-        SELECT Element_symbol AS "Element_symbol", Percentage AS "Percentage"
-        FROM Batch_Chemical_Composition WHERE Batch_ID = ?
-        ORDER BY Element_symbol
+        SELECT s.Element_symbol AS "Element_symbol", s.Percentage AS "Percentage"
+        FROM Batch_Chemical_Composition s
+        LEFT JOIN Element_Master _el ON _el.Element_Symbol = s.Element_symbol
+        WHERE s.Batch_ID = ?
+        ORDER BY COALESCE(_el.Serial_no, 9999), s.Element_symbol
         """,
         (batch_id,),
     )

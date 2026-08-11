@@ -203,9 +203,9 @@ elif PAGE == "Raw Material Logging":
         st.caption("Enter assay percentages for this lot. Common scrap elements shown first.")
         chem_cols = st.columns(6)
         composition: dict[str, float] = {}
-        primary = ["Si", "Fe", "Cu", "Mn", "Mg", "Al"]
+        primary = db.list_element_symbols(["Si", "Fe", "Cu", "Mn", "Mg", "Al"])
         for i, sym in enumerate(primary):
-            with chem_cols[i]:
+            with chem_cols[i % 6]:
                 composition[sym] = st.number_input(
                     f"{sym} %", min_value=0.0, max_value=100.0, value=0.0, step=0.01, key=f"chem_{sym}"
                 )
@@ -420,8 +420,9 @@ elif PAGE == "Production Batch & Chemistry":
         st.markdown("#### Batch chemistry (ladle / spectrometer)")
         chem_cols = st.columns(6)
         batch_chem: dict[str, float] = {}
-        for i, sym in enumerate(["Si", "Fe", "Cu", "Mn", "Mg", "Al"]):
-            with chem_cols[i]:
+        primary_batch = db.list_element_symbols(["Si", "Fe", "Cu", "Mn", "Mg", "Al"])
+        for i, sym in enumerate(primary_batch):
+            with chem_cols[i % 6]:
                 batch_chem[sym] = st.number_input(
                     f"{sym} %",
                     min_value=0.0,
@@ -877,7 +878,9 @@ elif PAGE == "Alloys":
             st.caption("Spec range (%) for key elements")
 
         specs: dict[str, tuple[float | None, float | None]] = {}
-        for sym in ["Si", "Fe", "Cu", "Mn", "Mg", "Zn", "Ni", "Ti", "Al"]:
+        for sym in db.list_element_symbols(
+            ["Si", "Fe", "Cu", "Mn", "Mg", "Zn", "Ni", "Ti", "Al"]
+        ):
             sc1, sc2, sc3 = st.columns([1, 2, 2])
             sc1.markdown(f"**{sym}**")
             mn = sc2.number_input(f"{sym} min", 0.0, 100.0, 0.0, 0.01, key=f"amin_{sym}")
@@ -912,8 +915,15 @@ elif PAGE == "Alloys":
     if aid_view > 0:
         specs_df = df_from_rows(
             db.fetch_all(
-                'SELECT Element_symbol AS "Element_symbol", Min_percent AS "Min_percent", '
-                'Max_percent AS "Max_percent" FROM Alloy_Master_spec WHERE Alloy_id = ?',
+                """
+                SELECT s.Element_symbol AS "Element_symbol",
+                       s.Min_percent AS "Min_percent",
+                       s.Max_percent AS "Max_percent"
+                FROM Alloy_Master_spec s
+                LEFT JOIN Element_Master _el ON _el.Element_Symbol = s.Element_symbol
+                WHERE s.Alloy_id = ?
+                ORDER BY COALESCE(_el.Serial_no, 9999), s.Element_symbol
+                """,
                 (int(aid_view),),
             )
         )
@@ -1166,12 +1176,19 @@ elif PAGE == "Data Browser":
                 None,
             )
             if sym_col:
+                serial_order = {
+                    e["Element_Symbol"]: e["Serial_no"] for e in db.list_elements()
+                }
                 counts = (
                     filter_df[sym_col]
                     .value_counts()
                     .rename_axis(sym_col)
                     .reset_index(name="rows")
                 )
+                counts["_ord"] = counts[sym_col].map(
+                    lambda s: serial_order.get(s, 9999)
+                )
+                counts = counts.sort_values("_ord").drop(columns="_ord")
                 c_left, c_right = st.columns(2)
                 with c_left:
                     st.markdown("**Rows by element**")
@@ -1179,11 +1196,18 @@ elif PAGE == "Data Browser":
                 if val_col and val_col in filter_df.columns:
                     with c_right:
                         st.markdown(f"**{val_col} summary**")
-                        st.dataframe(
+                        summary = (
                             filter_df.groupby(sym_col)[val_col]
                             .agg(["count", "min", "mean", "max"])
                             .round(3)
-                            .reset_index(),
+                            .reset_index()
+                        )
+                        summary["_ord"] = summary[sym_col].map(
+                            lambda s: serial_order.get(s, 9999)
+                        )
+                        summary = summary.sort_values("_ord").drop(columns="_ord")
+                        st.dataframe(
+                            summary,
                             use_container_width=True,
                             hide_index=True,
                         )
@@ -1224,10 +1248,13 @@ elif PAGE == "Masters Overview":
             df_from_rows(
                 db.fetch_all(
                     """
-                    SELECT Raw_Material_Name AS "Raw_Material_Name", Lot_id AS "Lot_id",
-                           Element_symbol AS "Element_symbol", Percentage AS "Percentage"
-                    FROM Raw_Material_Spec
-                    ORDER BY Lot_id DESC, Element_symbol
+                    SELECT s.Raw_Material_Name AS "Raw_Material_Name",
+                           s.Lot_id AS "Lot_id",
+                           s.Element_symbol AS "Element_symbol",
+                           s.Percentage AS "Percentage"
+                    FROM Raw_Material_Spec s
+                    LEFT JOIN Element_Master _el ON _el.Element_Symbol = s.Element_symbol
+                    ORDER BY s.Lot_id DESC, COALESCE(_el.Serial_no, 9999), s.Element_symbol
                     LIMIT 200
                     """
                 )
