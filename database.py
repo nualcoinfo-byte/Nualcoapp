@@ -28,23 +28,45 @@ ENV_FILE = Path(__file__).resolve().parent / ".env.local"
 
 
 def _database_url() -> str | None:
-    url = os.environ.get("DATABASE_URL")
+    def _clean(value: str | None) -> str | None:
+        if not value:
+            return None
+        text = str(value).strip().strip('"').strip("'")
+        return text or None
+
+    url = _clean(os.environ.get("DATABASE_URL"))
     if url:
         return url
-    # Streamlit Cloud / local secrets.toml (never commit real secrets).
+
+    # Streamlit Cloud / local .streamlit/secrets.toml
     try:
         import streamlit as st  # type: ignore
 
-        secret = st.secrets.get("DATABASE_URL")
-        if secret:
-            return str(secret)
+        secrets = st.secrets
+        for key in ("DATABASE_URL", "database_url"):
+            if key in secrets:
+                url = _clean(secrets[key])
+                if url:
+                    return url
+        # Nested forms some dashboards use: [postgres] url = "..."
+        for section in ("postgres", "neon", "db"):
+            if section in secrets:
+                block = secrets[section]
+                for key in ("DATABASE_URL", "database_url", "url", "uri"):
+                    try:
+                        url = _clean(block[key])
+                    except Exception:
+                        url = None
+                    if url:
+                        return url
     except Exception:
         pass
+
     if ENV_FILE.exists():
         for line in ENV_FILE.read_text().splitlines():
             line = line.strip()
             if line.startswith("DATABASE_URL="):
-                return line.partition("=")[2].strip().strip('"').strip("'")
+                return _clean(line.partition("=")[2])
     return None
 
 

@@ -6,12 +6,11 @@ Runs on Neon Postgres (DATABASE_URL) with local SQLite as fallback.
 
 from __future__ import annotations
 
+import os
 from datetime import date, datetime
 
 import pandas as pd
 import streamlit as st
-
-import database as db
 
 st.set_page_config(
     page_title="Nualco Alloy Tracker",
@@ -19,6 +18,17 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded",
 )
+
+# Inject Streamlit Cloud secrets into the environment BEFORE importing the
+# database module, which binds SQLAlchemy's engine at import time.
+if not os.environ.get("DATABASE_URL"):
+    try:
+        if "DATABASE_URL" in st.secrets:
+            os.environ["DATABASE_URL"] = str(st.secrets["DATABASE_URL"]).strip().strip('"').strip("'")
+    except Exception:
+        pass
+
+import database as db  # noqa: E402
 
 # ── Theme tweaks ─────────────────────────────────────────────────────────────
 st.markdown(
@@ -84,6 +94,13 @@ st.sidebar.markdown(
     f"**Yield target:** {db.YIELD_TARGET_PCT:.0f}%  \n"
     f"**DB:** `{db.DB_LABEL}`"
 )
+if not db.IS_POSTGRES:
+    st.sidebar.error(
+        "Not connected to Neon. In Streamlit Cloud go to "
+        "**Manage app → Settings → Secrets** and set:\n\n"
+        '```\nDATABASE_URL = "postgresql://..."\n```\n\n'
+        "Then reboot the app."
+    )
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
