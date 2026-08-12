@@ -8,13 +8,18 @@ from __future__ import annotations
 
 import os
 from datetime import date, datetime
+from pathlib import Path
 
 import pandas as pd
 import streamlit as st
 
+LOGO_PATH = Path(__file__).resolve().parent / "assets" / "nualco_logo.png"
+_BRAND_ORANGE = "#F15A22"
+_BRAND_INK = "#1A1A1A"
+
 st.set_page_config(
     page_title="Nualco Alloy Tracker",
-    page_icon="🏭",
+    page_icon=str(LOGO_PATH) if LOGO_PATH.exists() else "🏭",
     layout="wide",
     initial_sidebar_state="expanded",
 )
@@ -38,13 +43,25 @@ if not hasattr(db, "EDITABLE_TABLES"):
 
 # ── Theme tweaks ─────────────────────────────────────────────────────────────
 st.markdown(
-    """
+    f"""
     <style>
-    .block-container { padding-top: 1.2rem; max-width: 1200px; }
-    div[data-testid="stMetricValue"] { font-size: 1.6rem; }
-    .yield-ok { color: #1b7a3d; font-weight: 700; font-size: 1.4rem; }
-    .yield-bad { color: #c62828; font-weight: 700; font-size: 1.4rem; }
-    .batch-id { font-family: ui-monospace, monospace; font-weight: 700; }
+    .block-container {{ padding-top: 1.2rem; max-width: 1200px; }}
+    div[data-testid="stMetricValue"] {{ font-size: 1.6rem; }}
+    .yield-ok {{ color: #1b7a3d; font-weight: 700; font-size: 1.4rem; }}
+    .yield-bad {{ color: #c62828; font-weight: 700; font-size: 1.4rem; }}
+    .batch-id {{ font-family: ui-monospace, monospace; font-weight: 700; }}
+    [data-testid="stSidebar"] {{
+        border-right: 3px solid {_BRAND_ORANGE};
+    }}
+    [data-testid="stSidebar"] .stCaption {{
+        color: {_BRAND_INK};
+        opacity: 0.75;
+    }}
+    h1 {{
+        color: {_BRAND_INK};
+        border-bottom: 2px solid {_BRAND_ORANGE};
+        padding-bottom: 0.35rem;
+    }}
     </style>
     """,
     unsafe_allow_html=True,
@@ -75,7 +92,10 @@ def photo_bytes(uploaded) -> bytes | None:
 # ═══════════════════════════════════════════════════════════════════════════════
 # Sidebar
 # ═══════════════════════════════════════════════════════════════════════════════
-st.sidebar.title("Nualco")
+if LOGO_PATH.exists():
+    st.sidebar.image(str(LOGO_PATH), use_container_width=True)
+else:
+    st.sidebar.title("Nualco")
 st.sidebar.caption("Secondary Aluminum Alloy Manufacturing")
 
 PAGE = st.sidebar.radio(
