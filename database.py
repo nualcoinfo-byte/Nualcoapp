@@ -261,6 +261,10 @@ CREATE TABLE IF NOT EXISTS Furnace_Master (
     Furnace TEXT PRIMARY KEY,
     Status TEXT CHECK(Status IN ('Active', 'Inactive')) DEFAULT 'Active'
 );
+CREATE TABLE IF NOT EXISTS Melter_Master (
+    Melter_Name TEXT PRIMARY KEY,
+    Status TEXT CHECK(Status IN ('Active', 'Inactive')) DEFAULT 'Active'
+);
 CREATE TABLE IF NOT EXISTS Production_batch (
     Batch_ID TEXT PRIMARY KEY,
     Alloy_id INTEGER REFERENCES Alloy_Master(Alloy_id),
@@ -560,6 +564,14 @@ EDITABLE_TABLES: list[dict[str, Any]] = [
         "allow_add": True,
     },
     {
+        "key": "melter_master",
+        "label": "Melters",
+        "pk": ["melter_name"],
+        "order_by": "melter_name",
+        "identity": [],
+        "allow_add": True,
+    },
+    {
         "key": "element_master",
         "label": "Elements",
         "pk": ["serial_no"],
@@ -752,6 +764,14 @@ def list_furnaces(active_only: bool = True) -> list[str]:
         sql += " WHERE Status = 'Active'"
     sql += " ORDER BY CAST(Furnace AS INTEGER), Furnace"
     return [r["Furnace"] for r in fetch_all(sql)]
+
+
+def list_melters(active_only: bool = True) -> list[str]:
+    sql = 'SELECT Melter_Name AS "Melter_Name" FROM Melter_Master'
+    if active_only:
+        sql += " WHERE Status = 'Active'"
+    sql += " ORDER BY Melter_Name"
+    return [r["Melter_Name"] for r in fetch_all(sql)]
 
 
 def list_isri_codes() -> list[dict[str, Any]]:
@@ -1095,6 +1115,16 @@ def upsert_furnace(name: str, status: str) -> None:
         """
         INSERT INTO Furnace_Master (Furnace, Status) VALUES (?, ?)
         ON CONFLICT(Furnace) DO UPDATE SET Status = excluded.Status
+        """,
+        (name, status),
+    )
+
+
+def upsert_melter(name: str, status: str) -> None:
+    execute(
+        """
+        INSERT INTO Melter_Master (Melter_Name, Status) VALUES (?, ?)
+        ON CONFLICT(Melter_Name) DO UPDATE SET Status = excluded.Status
         """,
         (name, status),
     )

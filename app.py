@@ -110,6 +110,7 @@ PAGE = st.sidebar.radio(
         "Vendors",
         "Alloys",
         "Furnaces",
+        "Melters",
         "Bill of Materials",
         "Data Browser",
         "Masters Overview",
@@ -973,6 +974,28 @@ elif PAGE == "Furnaces":
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# Melters
+# ═══════════════════════════════════════════════════════════════════════════════
+elif PAGE == "Melters":
+    st.title("Melter Master")
+    with st.form("melter_form", clear_on_submit=True):
+        mname = st.text_input("Melter name *", placeholder="e.g. Sachin")
+        mstatus = st.selectbox("Status", db.ACTIVE_STATUS)
+        if st.form_submit_button("Save melter", type="primary"):
+            if not mname.strip():
+                st.error("Melter name is required.")
+            else:
+                db.upsert_melter(mname.strip(), mstatus)
+                st.success(f"Saved melter **{mname.strip()}**.")
+
+    st.dataframe(
+        df_from_rows(db.get_all_records("Melter_Master", order_by="Melter_Name")),
+        use_container_width=True,
+        hide_index=True,
+    )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # BOM
 # ═══════════════════════════════════════════════════════════════════════════════
 elif PAGE == "Bill of Materials":
@@ -1298,12 +1321,13 @@ elif PAGE == "Masters Overview":
             | 7 | Alloy_Master | Alloys |
             | 8 | Alloy_Master_spec | Alloy min/max % |
             | 9 | Furnace_Master | Furnaces (1–4 seeded) |
-            | 10 | Production_batch | Melts / heats |
-            | 11 | batch_input | Charge sheets |
-            | 12 | Batch_Chemical_Composition | Ladle chemistry |
-            | 13 | Build_of_Material | BOM |
-            | 14 | Purchase_Order | Customer purchase orders |
-            | 15 | ISRI_CODE_TABLE | ISRI scrap specification codes |
+            | 10 | Melter_Master | Melter operators |
+            | 11 | Production_batch | Melts / heats |
+            | 12 | batch_input | Charge sheets |
+            | 13 | Batch_Chemical_Composition | Ladle chemistry |
+            | 14 | Build_of_Material | BOM |
+            | 15 | Purchase_Order | Customer purchase orders |
+            | 16 | ISRI_CODE_TABLE | ISRI scrap specification codes |
 
             Extra production columns: `Workflow_stage`, `Output_Weight`, `Cost_per_kg`.
             """
