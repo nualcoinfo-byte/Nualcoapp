@@ -728,6 +728,26 @@ elif PAGE == "Material Recovery & Yield":
 # ═══════════════════════════════════════════════════════════════════════════════
 elif PAGE == "Customers":
     st.title("Customer Master")
+    states = db.list_states()
+    if not states:
+        st.warning("No states found. Load **State_City_Master** before saving customers.")
+
+    loc1, loc2 = st.columns(2)
+    with loc1:
+        state = st.selectbox(
+            "State *",
+            options=[""] + states,
+            key="cust_state_sel",
+        )
+    with loc2:
+        cities = db.list_cities(state) if state else []
+        city = st.selectbox(
+            "City *",
+            options=[""] + cities,
+            key="cust_city_sel",
+            disabled=not bool(state),
+        )
+
     with st.form("cust_form", clear_on_submit=True):
         c1, c2 = st.columns(2)
         with c1:
@@ -744,8 +764,6 @@ elif PAGE == "Customers":
             status = st.selectbox("Status", db.ACTIVE_STATUS)
         with c2:
             address = st.text_input("Address")
-            city = st.text_input("City")
-            state = st.text_input("State")
             pincode = st.text_input("Pincode")
             country = st.text_input("Country", value="India")
             bank_account = st.text_input("Bank account")
@@ -755,6 +773,8 @@ elif PAGE == "Customers":
         if st.form_submit_button("Save customer", type="primary"):
             if not code.strip() or not name.strip():
                 st.error("Customer code and name are required.")
+            elif not state or not city:
+                st.error("State and City must be selected from the master list.")
             else:
                 db.upsert_customer(
                     {
@@ -795,6 +815,26 @@ elif PAGE == "Customers":
 elif PAGE == "Vendors":
     st.title("Vendor Master")
     st.caption("Vendor code is auto-generated serially when a new vendor is created.")
+    states = db.list_states()
+    if not states:
+        st.warning("No states found. Load **State_City_Master** before saving vendors.")
+
+    loc1, loc2 = st.columns(2)
+    with loc1:
+        state = st.selectbox(
+            "State *",
+            options=[""] + states,
+            key="vend_state_sel",
+        )
+    with loc2:
+        cities = db.list_cities(state) if state else []
+        city = st.selectbox(
+            "City *",
+            options=[""] + cities,
+            key="vend_city_sel",
+            disabled=not bool(state),
+        )
+
     with st.form("sup_form", clear_on_submit=True):
         c1, c2 = st.columns(2)
         with c1:
@@ -804,8 +844,6 @@ elif PAGE == "Vendors":
             status = st.selectbox("Status", db.ACTIVE_STATUS)
         with c2:
             address = st.text_input("Address")
-            city = st.text_input("City")
-            state = st.text_input("State")
             pincode = st.text_input("Pincode")
             country = st.text_input("Country", value="India")
 
@@ -833,6 +871,8 @@ elif PAGE == "Vendors":
         if st.form_submit_button("Save vendor", type="primary"):
             if not name.strip():
                 st.error("Vendor name is required.")
+            elif not state or not city:
+                st.error("State and City must be selected from the master list.")
             else:
                 db.upsert_supplier(
                     {
