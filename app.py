@@ -346,6 +346,7 @@ elif PAGE == "Production Batch & Chemistry":
     )
 
     furnaces = db.list_furnaces()
+    melters = db.list_melters()
     alloys = db.list_alloys()
     alloy_labels = {
         f"{a['Alloy_id']} — {a['Alloy_name']}"
@@ -356,6 +357,8 @@ elif PAGE == "Production Batch & Chemistry":
 
     if not furnaces:
         st.error("Define at least one furnace under **Furnaces**.")
+    elif not melters:
+        st.error("Define at least one melter under **Melters**.")
     else:
         col1, col2, col3 = st.columns(3)
         with col1:
@@ -365,7 +368,7 @@ elif PAGE == "Production Batch & Chemistry":
         with col2:
             prod_date = st.date_input("Production date", value=date.today())
             shift = st.selectbox("Shift", db.SHIFTS)
-            melting_team = st.text_input("Melting team")
+            melting_team = st.selectbox("Melter name *", melters)
         with col3:
             alloy_label = st.selectbox(
                 "Alloy",
@@ -479,7 +482,7 @@ elif PAGE == "Production Batch & Chemistry":
                         production_date=prod_date.isoformat(),
                         shift=shift,
                         melt_no=melt_no,
-                        melting_team=melting_team.strip(),
+                        melting_team=melting_team,
                         notes=notes.strip(),
                         inputs=charge_inputs,
                         composition={k: v for k, v in batch_chem.items() if v and v > 0},
