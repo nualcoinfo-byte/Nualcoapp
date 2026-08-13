@@ -265,6 +265,18 @@ CREATE TABLE IF NOT EXISTS Melter_Master (
     Melter_Name TEXT PRIMARY KEY,
     Status TEXT CHECK(Status IN ('Active', 'Inactive')) DEFAULT 'Active'
 );
+CREATE TABLE IF NOT EXISTS Trolley_Master (
+    Trolley_name TEXT PRIMARY KEY,
+    Colour TEXT,
+    Weight {float},
+    Status TEXT CHECK(Status IN ('Active', 'Inactive')) DEFAULT 'Active'
+);
+CREATE TABLE IF NOT EXISTS State_City_Master (
+    State TEXT NOT NULL,
+    City TEXT NOT NULL,
+    Status TEXT CHECK(Status IN ('Active', 'Inactive')) DEFAULT 'Active',
+    PRIMARY KEY (State, City)
+);
 CREATE TABLE IF NOT EXISTS Production_batch (
     Batch_ID TEXT PRIMARY KEY,
     Alloy_id INTEGER REFERENCES Alloy_Master(Alloy_id),
@@ -572,6 +584,22 @@ EDITABLE_TABLES: list[dict[str, Any]] = [
         "allow_add": True,
     },
     {
+        "key": "trolley_master",
+        "label": "Trolleys",
+        "pk": ["trolley_name"],
+        "order_by": "trolley_name",
+        "identity": [],
+        "allow_add": True,
+    },
+    {
+        "key": "state_city_master",
+        "label": "States & cities",
+        "pk": ["state", "city"],
+        "order_by": "state",
+        "identity": [],
+        "allow_add": True,
+    },
+    {
         "key": "element_master",
         "label": "Elements",
         "pk": ["serial_no"],
@@ -772,6 +800,38 @@ def list_melters(active_only: bool = True) -> list[str]:
         sql += " WHERE Status = 'Active'"
     sql += " ORDER BY Melter_Name"
     return [r["Melter_Name"] for r in fetch_all(sql)]
+
+
+def list_trolleys(active_only: bool = True) -> list[dict[str, Any]]:
+    sql = """
+        SELECT Trolley_name AS "Trolley_name", Colour AS "Colour",
+               Weight AS "Weight", Status AS "Status"
+        FROM Trolley_Master
+    """
+    if active_only:
+        sql += " WHERE Status = 'Active'"
+    sql += " ORDER BY Trolley_name"
+    return fetch_all(sql)
+
+
+def list_states(active_only: bool = True) -> list[str]:
+    sql = 'SELECT DISTINCT State AS "State" FROM State_City_Master'
+    if active_only:
+        sql += " WHERE Status = 'Active'"
+    sql += " ORDER BY State"
+    return [r["State"] for r in fetch_all(sql)]
+
+
+def list_cities(state: Optional[str] = None, active_only: bool = True) -> list[str]:
+    sql = 'SELECT City AS "City" FROM State_City_Master WHERE 1=1'
+    params: list[Any] = []
+    if active_only:
+        sql += " AND Status = 'Active'"
+    if state:
+        sql += " AND State = ?"
+        params.append(state)
+    sql += " ORDER BY City"
+    return [r["City"] for r in fetch_all(sql, params)]
 
 
 def list_isri_codes() -> list[dict[str, Any]]:
@@ -1127,6 +1187,23 @@ def upsert_melter(name: str, status: str) -> None:
         ON CONFLICT(Melter_Name) DO UPDATE SET Status = excluded.Status
         """,
         (name, status),
+    )
+
+
+def upsert_trolley(
+    name: str,
+    colour: Optional[str],
+    weight: Optional[float],
+    status: str,
+) -> None:
+    execute(
+        """
+        INSERT INTO Trolley_Master (Trolley_name, Colour, Weight, Status)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(Trolley_name) DO UPDATE SET
+            Colour=excluded.Colour, Weight=excluded.Weight, Status=excluded.Status
+        """,
+        (name, colour, weight, status),
     )
 
 

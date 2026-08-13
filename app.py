@@ -111,6 +111,7 @@ PAGE = st.sidebar.radio(
         "Alloys",
         "Furnaces",
         "Melters",
+        "Trolleys",
         "Bill of Materials",
         "Data Browser",
         "Masters Overview",
@@ -996,6 +997,38 @@ elif PAGE == "Melters":
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# Trolleys
+# ═══════════════════════════════════════════════════════════════════════════════
+elif PAGE == "Trolleys":
+    st.title("Trolley Master")
+    with st.form("trolley_form", clear_on_submit=True):
+        t1, t2 = st.columns(2)
+        with t1:
+            tname = st.text_input("Trolley name *", placeholder="e.g. Trolley-01")
+            colour = st.text_input("Colour", placeholder="e.g. Red")
+        with t2:
+            weight = st.number_input("Weight (kg)", min_value=0.0, value=0.0, step=0.1)
+            tstatus = st.selectbox("Status", db.ACTIVE_STATUS)
+        if st.form_submit_button("Save trolley", type="primary"):
+            if not tname.strip():
+                st.error("Trolley name is required.")
+            else:
+                db.upsert_trolley(
+                    tname.strip(),
+                    colour.strip() or None,
+                    weight if weight > 0 else None,
+                    tstatus,
+                )
+                st.success(f"Saved trolley **{tname.strip()}**.")
+
+    st.dataframe(
+        df_from_rows(db.get_all_records("Trolley_Master", order_by="Trolley_name")),
+        use_container_width=True,
+        hide_index=True,
+    )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # BOM
 # ═══════════════════════════════════════════════════════════════════════════════
 elif PAGE == "Bill of Materials":
@@ -1322,12 +1355,14 @@ elif PAGE == "Masters Overview":
             | 8 | Alloy_Master_spec | Alloy min/max % |
             | 9 | Furnace_Master | Furnaces (1–4 seeded) |
             | 10 | Melter_Master | Melter operators |
-            | 11 | Production_batch | Melts / heats |
-            | 12 | batch_input | Charge sheets |
-            | 13 | Batch_Chemical_Composition | Ladle chemistry |
-            | 14 | Build_of_Material | BOM |
-            | 15 | Purchase_Order | Customer purchase orders |
-            | 16 | ISRI_CODE_TABLE | ISRI scrap specification codes |
+            | 11 | Trolley_Master | Trolleys (name, colour, weight) |
+            | 12 | State_City_Master | States and cities |
+            | 13 | Production_batch | Melts / heats |
+            | 14 | batch_input | Charge sheets |
+            | 15 | Batch_Chemical_Composition | Ladle chemistry |
+            | 16 | Build_of_Material | BOM |
+            | 17 | Purchase_Order | Customer purchase orders |
+            | 18 | ISRI_CODE_TABLE | ISRI scrap specification codes |
 
             Extra production columns: `Workflow_stage`, `Output_Weight`, `Cost_per_kg`.
             """
