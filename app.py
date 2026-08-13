@@ -732,14 +732,26 @@ elif PAGE == "Customers":
     if not states:
         st.warning("No states found. Load **State_City_Master** before saving customers.")
 
-    loc1, loc2 = st.columns(2)
-    with loc1:
+    c1, c2 = st.columns(2)
+    with c1:
+        code = st.text_input("Customer code (PK) *", placeholder="e.g. CUST_0026", key="cust_code")
+        name = st.text_input("Customer name *", key="cust_name")
+        gst = st.text_input("GST", key="cust_gst")
+        pan = st.text_input("PAN", key="cust_pan")
+        contact1 = st.text_input("Contact 1 name", key="cust_contact1")
+        phone1 = st.text_input("Phone 1", key="cust_phone1")
+        contact2 = st.text_input("Contact 2 name", key="cust_contact2")
+        phone2 = st.text_input("Phone 2", key="cust_phone2")
+        email = st.text_input("Email", key="cust_email")
+        website = st.text_input("Website", key="cust_website")
+        status = st.selectbox("Status", db.ACTIVE_STATUS, key="cust_status")
+    with c2:
+        address = st.text_input("Address", key="cust_address")
         state = st.selectbox(
             "State *",
             options=[""] + states,
             key="cust_state_sel",
         )
-    with loc2:
         cities = db.list_cities(state) if state else []
         city = st.selectbox(
             "City *",
@@ -747,60 +759,44 @@ elif PAGE == "Customers":
             key="cust_city_sel",
             disabled=not bool(state),
         )
+        pincode = st.text_input("Pincode", key="cust_pincode")
+        country = st.text_input("Country", value="India", key="cust_country")
+        bank_account = st.text_input("Bank account", key="cust_bank_account")
+        ifsc_code = st.text_input("IFSC code", key="cust_ifsc")
+        bank_name = st.text_input("Bank name", key="cust_bank_name")
+        branch_category = st.text_input("Branch", key="cust_branch")
 
-    with st.form("cust_form", clear_on_submit=True):
-        c1, c2 = st.columns(2)
-        with c1:
-            code = st.text_input("Customer code (PK) *", placeholder="e.g. CUST_0026")
-            name = st.text_input("Customer name *")
-            gst = st.text_input("GST")
-            pan = st.text_input("PAN")
-            contact1 = st.text_input("Contact 1 name")
-            phone1 = st.text_input("Phone 1")
-            contact2 = st.text_input("Contact 2 name")
-            phone2 = st.text_input("Phone 2")
-            email = st.text_input("Email")
-            website = st.text_input("Website")
-            status = st.selectbox("Status", db.ACTIVE_STATUS)
-        with c2:
-            address = st.text_input("Address")
-            pincode = st.text_input("Pincode")
-            country = st.text_input("Country", value="India")
-            bank_account = st.text_input("Bank account")
-            ifsc_code = st.text_input("IFSC code")
-            bank_name = st.text_input("Bank name")
-            branch_category = st.text_input("Branch")
-        if st.form_submit_button("Save customer", type="primary"):
-            if not code.strip() or not name.strip():
-                st.error("Customer code and name are required.")
-            elif not state or not city:
-                st.error("State and City must be selected from the master list.")
-            else:
-                db.upsert_customer(
-                    {
-                        "Cust_code": code.strip(),
-                        "Customer_name": name.strip(),
-                        "GST": gst,
-                        "PAN": pan,
-                        "Address": address,
-                        "City": city,
-                        "State": state,
-                        "Pincode": pincode,
-                        "Country": country,
-                        "Contact1_name": contact1,
-                        "Phone1": phone1,
-                        "Contact_name2": contact2,
-                        "Phone2": phone2,
-                        "Email": email,
-                        "Website": website,
-                        "Bank_account": bank_account,
-                        "IFSC_code": ifsc_code,
-                        "Bank_name": bank_name,
-                        "Branch_category": branch_category,
-                        "Status": status,
-                    }
-                )
-                st.success(f"Saved customer **{name.strip()}**.")
+    if st.button("Save customer", type="primary", key="cust_save"):
+        if not code.strip() or not name.strip():
+            st.error("Customer code and name are required.")
+        elif not state or not city:
+            st.error("State and City must be selected from the master list.")
+        else:
+            db.upsert_customer(
+                {
+                    "Cust_code": code.strip(),
+                    "Customer_name": name.strip(),
+                    "GST": gst,
+                    "PAN": pan,
+                    "Address": address,
+                    "City": city,
+                    "State": state,
+                    "Pincode": pincode,
+                    "Country": country,
+                    "Contact1_name": contact1,
+                    "Phone1": phone1,
+                    "Contact_name2": contact2,
+                    "Phone2": phone2,
+                    "Email": email,
+                    "Website": website,
+                    "Bank_account": bank_account,
+                    "IFSC_code": ifsc_code,
+                    "Bank_name": bank_name,
+                    "Branch_category": branch_category,
+                    "Status": status,
+                }
+            )
+            st.success(f"Saved customer **{name.strip()}**.")
 
     st.dataframe(
         df_from_rows(db.get_all_records("Customer_Master", order_by="Cust_code")),
@@ -819,14 +815,19 @@ elif PAGE == "Vendors":
     if not states:
         st.warning("No states found. Load **State_City_Master** before saving vendors.")
 
-    loc1, loc2 = st.columns(2)
-    with loc1:
+    c1, c2 = st.columns(2)
+    with c1:
+        name = st.text_input("Vendor name *", key="vend_name")
+        gst = st.text_input("GST", key="vend_gst")
+        pan = st.text_input("PAN", key="vend_pan")
+        status = st.selectbox("Status", db.ACTIVE_STATUS, key="vend_status")
+    with c2:
+        address = st.text_input("Address", key="vend_address")
         state = st.selectbox(
             "State *",
             options=[""] + states,
             key="vend_state_sel",
         )
-    with loc2:
         cities = db.list_cities(state) if state else []
         city = st.selectbox(
             "City *",
@@ -834,71 +835,63 @@ elif PAGE == "Vendors":
             key="vend_city_sel",
             disabled=not bool(state),
         )
+        pincode = st.text_input("Pincode", key="vend_pincode")
+        country = st.text_input("Country", value="India", key="vend_country")
 
-    with st.form("sup_form", clear_on_submit=True):
-        c1, c2 = st.columns(2)
-        with c1:
-            name = st.text_input("Vendor name *")
-            gst = st.text_input("GST")
-            pan = st.text_input("PAN")
-            status = st.selectbox("Status", db.ACTIVE_STATUS)
-        with c2:
-            address = st.text_input("Address")
-            pincode = st.text_input("Pincode")
-            country = st.text_input("Country", value="India")
+    st.markdown("#### Contacts")
+    k1, k2 = st.columns(2)
+    with k1:
+        contact1 = st.text_input("Contact person 1", key="vend_contact1")
+        phone1 = st.text_input("Phone 1", key="vend_phone1")
+        email = st.text_input("Email", key="vend_email")
+    with k2:
+        contact2 = st.text_input("Contact person 2", key="vend_contact2")
+        phone2 = st.text_input("Phone 2", key="vend_phone2")
+        website = st.text_input("Website", key="vend_website")
 
-        st.markdown("#### Contacts")
-        k1, k2 = st.columns(2)
-        with k1:
-            contact1 = st.text_input("Contact person 1")
-            phone1 = st.text_input("Phone 1")
-            email = st.text_input("Email")
-        with k2:
-            contact2 = st.text_input("Contact person 2")
-            phone2 = st.text_input("Phone 2")
-            website = st.text_input("Website")
+    st.markdown("#### Commercial & bank details")
+    b1, b2 = st.columns(2)
+    with b1:
+        credit_period = st.number_input(
+            "Credit period (days)", min_value=0, value=0, step=1, key="vend_credit"
+        )
+        bank_account = st.text_input("Bank account no.", key="vend_bank_account")
+        bank_name = st.text_input("Bank name", key="vend_bank_name")
+    with b2:
+        branch = st.text_input("Branch", key="vend_branch")
+        ifsc = st.text_input("IFSC code", key="vend_ifsc")
 
-        st.markdown("#### Commercial & bank details")
-        b1, b2 = st.columns(2)
-        with b1:
-            credit_period = st.number_input("Credit period (days)", min_value=0, value=0, step=1)
-            bank_account = st.text_input("Bank account no.")
-            bank_name = st.text_input("Bank name")
-        with b2:
-            branch = st.text_input("Branch")
-            ifsc = st.text_input("IFSC code")
-
-        if st.form_submit_button("Save vendor", type="primary"):
-            if not name.strip():
-                st.error("Vendor name is required.")
-            elif not state or not city:
-                st.error("State and City must be selected from the master list.")
-            else:
-                db.upsert_supplier(
-                    {
-                        "Vendor_name": name.strip(),
-                        "GST": gst,
-                        "PAN": pan,
-                        "Address": address,
-                        "City": city,
-                        "State": state,
-                        "Pincode": pincode,
-                        "Country": country,
-                        "Contact1": contact1.strip(),
-                        "Phone1": phone1.strip(),
-                        "Contact2": contact2.strip(),
-                        "Phone2": phone2.strip(),
-                        "Email": email.strip(),
-                        "Website": website.strip(),
-                        "Credit_period": int(credit_period),
-                        "Bank_account": bank_account.strip(),
-                        "Branch": branch.strip(),
-                        "IFSC_code": ifsc.strip().upper(),
-                        "Bank_name": bank_name.strip(),
-                        "Status": status,
-                    }
-                )
-                st.success(f"Saved vendor **{name.strip()}**.")
+    if st.button("Save vendor", type="primary", key="vend_save"):
+        if not name.strip():
+            st.error("Vendor name is required.")
+        elif not state or not city:
+            st.error("State and City must be selected from the master list.")
+        else:
+            db.upsert_supplier(
+                {
+                    "Vendor_name": name.strip(),
+                    "GST": gst,
+                    "PAN": pan,
+                    "Address": address,
+                    "City": city,
+                    "State": state,
+                    "Pincode": pincode,
+                    "Country": country,
+                    "Contact1": contact1.strip(),
+                    "Phone1": phone1.strip(),
+                    "Contact2": contact2.strip(),
+                    "Phone2": phone2.strip(),
+                    "Email": email.strip(),
+                    "Website": website.strip(),
+                    "Credit_period": int(credit_period),
+                    "Bank_account": bank_account.strip(),
+                    "Branch": branch.strip(),
+                    "IFSC_code": ifsc.strip().upper(),
+                    "Bank_name": bank_name.strip(),
+                    "Status": status,
+                }
+            )
+            st.success(f"Saved vendor **{name.strip()}**.")
 
     st.dataframe(
         df_from_rows(db.get_all_records("Vendor_Master", order_by="Vendor_code")),
