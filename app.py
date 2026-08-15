@@ -581,7 +581,7 @@ elif PAGE == "Production Workflow Tracker":
 
             st.markdown(
                 f"**Current stage:** `{batch['Workflow_stage']}` &nbsp;|&nbsp; "
-                f"**QA status:** `{batch['Status']}`"
+                f"**QA status:** `{batch['Production_status']}`"
             )
 
             # Stage progress
@@ -604,8 +604,8 @@ elif PAGE == "Production Workflow Tracker":
                     qa = st.selectbox(
                         "QA / batch status",
                         db.BATCH_QA_STATUS,
-                        index=db.BATCH_QA_STATUS.index(batch["Status"])
-                        if batch["Status"] in db.BATCH_QA_STATUS
+                        index=db.BATCH_QA_STATUS.index(batch["Production_status"])
+                        if batch["Production_status"] in db.BATCH_QA_STATUS
                         else 0,
                     )
                 save = st.form_submit_button("Update workflow", type="primary")
@@ -650,7 +650,7 @@ elif PAGE == "Production Workflow Tracker":
                         "Furnace",
                         "Heat_no",
                         "Workflow_stage",
-                        "Status",
+                        "Production_status",
                         "Output_Weight",
                         "Output_pieces",
                         "Alloy_name",
@@ -783,7 +783,7 @@ elif PAGE == "Finished Goods Inventory":
                 )
             st.caption(
                 f"Status will be locked to **{db.FG_STATUS_UNDER_TESTING}** "
-                f"(batch QA: `{linked.get('Status', '—')}`)."
+                f"(batch QA: `{linked.get('Production_status', '—')}`)."
             )
             if st.form_submit_button("Create bundle", type="primary"):
                 try:

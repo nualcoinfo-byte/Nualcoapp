@@ -308,7 +308,7 @@ CREATE TABLE IF NOT EXISTS Production_batch (
     Output_pieces {float} DEFAULT 0,
     Notes TEXT,
     Photo1 {blob}, Photo2 {blob}, Photo3 {blob},
-    Status TEXT DEFAULT 'Pending QA',
+    Production_status TEXT DEFAULT 'Pending QA',
     Workflow_stage TEXT DEFAULT 'Raw Material',
     Degassing_time TEXT,
     Sampled_pcs {float},
@@ -501,8 +501,8 @@ def _ensure_finished_goods_release_trigger(conn: Connection) -> None:
         CREATE OR REPLACE FUNCTION release_finished_goods_on_batch_approved()
         RETURNS TRIGGER AS $fn$
         BEGIN
-            IF NEW.status = 'Approved'
-               AND (OLD.status IS DISTINCT FROM 'Approved') THEN
+            IF NEW.production_status = 'Approved'
+               AND (OLD.production_status IS DISTINCT FROM 'Approved') THEN
                 UPDATE finished_goods_inventory
                 SET status = 'Available'
                 WHERE batch_id = NEW.batch_id
@@ -518,7 +518,7 @@ def _ensure_finished_goods_release_trigger(conn: Connection) -> None:
         conn,
         """
         CREATE TRIGGER trg_release_fg_on_approved
-        AFTER UPDATE OF status ON production_batch
+        AFTER UPDATE OF production_status ON production_batch
         FOR EACH ROW
         EXECUTE PROCEDURE release_finished_goods_on_batch_approved()
         """,
@@ -1414,7 +1414,7 @@ def create_batch(
             """
             INSERT INTO Production_batch
                 (Batch_ID, Alloy_id, Production_Date, Shift, Furnace, Melt_No,
-                 Heat_no, Melting_team, Output_Weight, Notes, Status, Workflow_stage,
+                 Heat_no, Melting_team, Output_Weight, Notes, Production_status, Workflow_stage,
                  Degassing_time, Sampled_pcs, Defect_pcs,
                  Top_Sample, Middle_Sample, Bottom_Sample,
                  Top_Sample_Remarks, Middle_Sample_Remarks, Bottom_Sample_Remarks,
@@ -1515,7 +1515,7 @@ def update_batch_workflow(
     fields = ["Workflow_stage = ?"]
     params: list[Any] = [workflow_stage]
     if qa_status:
-        fields.append("Status = ?")
+        fields.append("Production_status = ?")
         params.append(qa_status)
     params.append(batch_id)
     execute(
@@ -1625,7 +1625,8 @@ _BATCH_COLUMNS = """
     Furnace AS "Furnace", Melt_No AS "Melt_No", Heat_no AS "Heat_no",
     Melting_team AS "Melting_team", Output_Weight AS "Output_Weight",
     Output_pieces AS "Output_pieces",
-    Notes AS "Notes", Status AS "Status", Workflow_stage AS "Workflow_stage",
+    Notes AS "Notes", Production_status AS "Production_status",
+    Workflow_stage AS "Workflow_stage",
     Degassing_time AS "Degassing_time",
     Sampled_pcs AS "Sampled_pcs", Defect_pcs AS "Defect_pcs",
     Top_Sample AS "Top_Sample", Middle_Sample AS "Middle_Sample",
@@ -1679,7 +1680,7 @@ def list_batches() -> list[dict[str, Any]]:
                b.Furnace AS "Furnace", b.Heat_no AS "Heat_no", b.Melt_No AS "Melt_No",
                b.Shift AS "Shift", b.Output_Weight AS "Output_Weight",
                b.Output_pieces AS "Output_pieces",
-               b.Status AS "Status",
+               b.Production_status AS "Production_status",
                b.Workflow_stage AS "Workflow_stage", a.Alloy_name AS "Alloy_name",
                b.Production_supervisor AS "Production_supervisor",
                b.Top_Sample AS "Top_Sample", b.Middle_Sample AS "Middle_Sample",
