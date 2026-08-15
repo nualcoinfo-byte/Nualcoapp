@@ -805,7 +805,7 @@ elif PAGE == "Finished Goods Inventory":
     all_fg = db.list_finished_goods()
     st.dataframe(df_from_rows(all_fg), use_container_width=True, hide_index=True)
 
-    locked = [r for r in all_fg if r["Status"] == db.FG_STATUS_UNDER_TESTING]
+    locked = [r for r in all_fg if r["Finished_Goods_Status"] == db.FG_STATUS_UNDER_TESTING]
     if locked:
         st.warning(
             f"{len(locked)} bundle(s) locked as **Under_Testing** — "

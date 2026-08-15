@@ -329,8 +329,8 @@ CREATE TABLE IF NOT EXISTS Finished_Goods_Inventory (
     Batch_ID TEXT NOT NULL REFERENCES Production_batch(Batch_ID),
     Output_Weight {float},
     Output_pieces {float},
-    Status TEXT NOT NULL DEFAULT 'Under_Testing'
-        CHECK(Status IN ('Under_Testing', 'Available', 'Assigned'))
+    Finished_Goods_Status TEXT NOT NULL DEFAULT 'Under_Testing'
+        CHECK(Finished_Goods_Status IN ('Under_Testing', 'Available', 'Assigned'))
 );
 CREATE TABLE IF NOT EXISTS batch_input (
     Batch_ID TEXT NOT NULL REFERENCES Production_batch(Batch_ID),
@@ -504,9 +504,9 @@ def _ensure_finished_goods_release_trigger(conn: Connection) -> None:
             IF NEW.production_status = 'Approved'
                AND (OLD.production_status IS DISTINCT FROM 'Approved') THEN
                 UPDATE finished_goods_inventory
-                SET status = 'Available'
+                SET finished_goods_status = 'Available'
                 WHERE batch_id = NEW.batch_id
-                  AND status = 'Under_Testing';
+                  AND finished_goods_status = 'Under_Testing';
             END IF;
             RETURN NEW;
         END;
@@ -1532,8 +1532,8 @@ def release_finished_goods_for_batch(batch_id: str) -> int:
     return execute(
         """
         UPDATE Finished_Goods_Inventory
-        SET Status = ?
-        WHERE Batch_ID = ? AND Status = ?
+        SET Finished_Goods_Status = ?
+        WHERE Batch_ID = ? AND Finished_Goods_Status = ?
         """,
         (FG_STATUS_AVAILABLE, batch_id, FG_STATUS_UNDER_TESTING),
     )
@@ -1554,7 +1554,7 @@ def add_finished_goods_bundle(
             conn,
             """
             INSERT INTO Finished_Goods_Inventory
-                (Batch_ID, Output_Weight, Output_pieces, Status)
+                (Batch_ID, Output_Weight, Output_pieces, Finished_Goods_Status)
             VALUES (?, ?, ?, ?)
             RETURNING Bundle_id
             """,
@@ -1578,7 +1578,7 @@ def list_finished_goods(
     sql = """
         SELECT Bundle_id AS "Bundle_id", Batch_ID AS "Batch_ID",
                Output_Weight AS "Output_Weight", Output_pieces AS "Output_pieces",
-               Status AS "Status"
+               Finished_Goods_Status AS "Finished_Goods_Status"
         FROM Finished_Goods_Inventory
         WHERE 1=1
     """
@@ -1587,10 +1587,10 @@ def list_finished_goods(
         sql += " AND Batch_ID = ?"
         params.append(batch_id)
     if assignable_only:
-        sql += " AND Status = ?"
+        sql += " AND Finished_Goods_Status = ?"
         params.append(FG_STATUS_AVAILABLE)
     elif status:
-        sql += " AND Status = ?"
+        sql += " AND Finished_Goods_Status = ?"
         params.append(status)
     sql += " ORDER BY Bundle_id DESC"
     return fetch_all(sql, params)
@@ -1600,21 +1600,25 @@ def assign_finished_goods_bundle(bundle_id: int) -> None:
     """Assign a bundle. Under_Testing (and non-Available) stock is locked."""
     row = fetch_one(
         """
-        SELECT Bundle_id AS "Bundle_id", Status AS "Status"
+        SELECT Bundle_id AS "Bundle_id",
+               Finished_Goods_Status AS "Finished_Goods_Status"
         FROM Finished_Goods_Inventory WHERE Bundle_id = ?
         """,
         (bundle_id,),
     )
     if not row:
         raise ValueError(f"Bundle {bundle_id} not found.")
-    if row["Status"] != FG_STATUS_AVAILABLE:
+    if row["Finished_Goods_Status"] != FG_STATUS_AVAILABLE:
         raise ValueError(
             f"Bundle {bundle_id} cannot be assigned — status is "
-            f"'{row['Status']}' (must be Available). "
+            f"'{row['Finished_Goods_Status']}' (must be Available). "
             "Approve the production batch to release Under_Testing stock."
         )
     execute(
-        "UPDATE Finished_Goods_Inventory SET Status = ? WHERE Bundle_id = ?",
+        """
+        UPDATE Finished_Goods_Inventory
+        SET Finished_Goods_Status = ? WHERE Bundle_id = ?
+        """,
         (FG_STATUS_ASSIGNED, bundle_id),
     )
 
