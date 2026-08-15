@@ -576,7 +576,7 @@ elif PAGE == "Production Workflow Tracker":
             m1.metric("Batch ID", batch["Batch_ID"])
             m2.metric("Furnace", batch["Furnace"])
             m3.metric("Heat No", batch["Heat_no"])
-            m4.metric("Input kg", f"{batch['Weight'] or 0:,.1f}")
+            m4.metric("Output kg", f"{batch['Output_Weight'] or 0:,.1f}")
 
             st.markdown(
                 f"**Current stage:** `{batch['Workflow_stage']}` &nbsp;|&nbsp; "
@@ -644,7 +644,8 @@ elif PAGE == "Production Workflow Tracker":
                         "Heat_no",
                         "Workflow_stage",
                         "Status",
-                        "Weight",
+                        "Output_Weight",
+                        "Output_pieces",
                         "Alloy_name",
                     ]
                 ],
@@ -675,7 +676,7 @@ elif PAGE == "Material Recovery & Yield":
         st.info("No batches available.")
     else:
         labels = {
-            f"{b['Batch_ID']}  |  stage={b['Workflow_stage']}  |  in={b['Weight'] or 0:.0f} kg": b[
+            f"{b['Batch_ID']}  |  stage={b['Workflow_stage']}  |  out={b['Output_Weight'] or 0:.0f} kg": b[
                 "Batch_ID"
             ]
             for b in eligible
@@ -685,7 +686,9 @@ elif PAGE == "Material Recovery & Yield":
         batch = db.get_batch(bid)
         assert batch is not None
 
-        input_w = float(batch["Weight"] or 0)
+        charge_rows = db.get_batch_inputs(bid)
+        input_w = sum(float(r["Weight"] or 0) for r in charge_rows)
+        current_out = float(batch["Output_Weight"] or 0)
 
         c1, c2 = st.columns(2)
         with c1:
@@ -695,7 +698,7 @@ elif PAGE == "Material Recovery & Yield":
             output_w = st.number_input(
                 "Final output weight (kg)",
                 min_value=0.0,
-                value=0.0,
+                value=current_out if current_out > 0 else 0.0,
                 step=1.0,
             )
 
