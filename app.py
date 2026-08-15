@@ -303,7 +303,8 @@ elif PAGE == "Raw Material Logging":
                    i.Received_weight AS "Received_weight",
                    i.Remaining_Weight AS "Remaining_Weight",
                    i.Cost_per_kg AS "Cost_per_kg",
-                   i.Storage_bay AS "Storage_bay", i.Status AS "Status"
+                   i.Storage_bay AS "Storage_bay",
+                   i.Raw_Material_Status AS "Raw_Material_Status"
             FROM Raw_Material_Inventory i
             LEFT JOIN Vendor_Master v ON v.Vendor_code = i.Vendor_code
             ORDER BY i.Lot_id DESC
@@ -447,7 +448,7 @@ elif PAGE == "Production Batch & Chemistry":
                 )
             lots = db.list_inventory_lots(material=mat or None) if mat else []
             lot_opts = {
-                f"Lot {l['Lot_id']} — rem {l['Remaining_Weight']:.1f} kg ({l['Status']})": l["Lot_id"]
+                f"Lot {l['Lot_id']} — rem {l['Remaining_Weight']:.1f} kg ({l['Raw_Material_Status']})": l["Lot_id"]
                 for l in lots
             }
             with lc2:

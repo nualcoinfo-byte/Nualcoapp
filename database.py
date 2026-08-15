@@ -228,7 +228,7 @@ CREATE TABLE IF NOT EXISTS Raw_Material_Inventory (
     Received_weight {float},
     Remaining_Weight {float},
     Storage_bay TEXT,
-    Status TEXT DEFAULT 'Awaiting Assay',
+    Raw_Material_Status TEXT DEFAULT 'Awaiting Assay',
     Photo {blob},
     Cost_per_kg {float}
 );
@@ -1021,7 +1021,8 @@ def list_inventory_lots(
         SELECT i.Lot_id AS "Lot_id", i.Raw_Material_Name AS "Raw_Material_Name",
                i.Vendor_code AS "Vendor_code", v.Vendor_name AS "Vendor_name",
                i.Remaining_Weight AS "Remaining_Weight",
-               i.Status AS "Status", i.Received_date AS "Received_date"
+               i.Raw_Material_Status AS "Raw_Material_Status",
+               i.Received_date AS "Received_date"
         FROM Raw_Material_Inventory i
         LEFT JOIN Vendor_Master v ON v.Vendor_code = i.Vendor_code
         WHERE i.Remaining_Weight > 0
@@ -1031,7 +1032,7 @@ def list_inventory_lots(
         sql += " AND i.Raw_Material_Name = ?"
         params.append(material)
     if ready_only:
-        sql += " AND i.Status = 'Ready For Melt'"
+        sql += " AND i.Raw_Material_Status = 'Ready For Melt'"
     sql += " ORDER BY i.Lot_id DESC"
     return fetch_all(sql, params)
 
@@ -1196,8 +1197,8 @@ def add_inventory_lot(
             """
             INSERT INTO Raw_Material_Inventory
                 (Raw_Material_Name, Vendor_code, Supplier_Invoice, Supplier_invoice_date,
-                 Received_date, Received_weight, Remaining_Weight, Storage_bay, Status,
-                 Photo, Cost_per_kg)
+                 Received_date, Received_weight, Remaining_Weight, Storage_bay,
+                 Raw_Material_Status, Photo, Cost_per_kg)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             RETURNING Lot_id
             """,
