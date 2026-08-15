@@ -154,13 +154,6 @@ if PAGE == "Dashboard":
         st.info("No batches yet. Create one under **Production Batch & Chemistry**.")
     else:
         show = bdf.copy()
-        if "Output_Weight" in show.columns and "Weight" in show.columns:
-            show["Recovery_%"] = show.apply(
-                lambda r: round((r["Output_Weight"] / r["Weight"] * 100), 2)
-                if r["Weight"] and r["Output_Weight"] is not None
-                else None,
-                axis=1,
-            )
         st.dataframe(show, use_container_width=True, hide_index=True)
 
     st.subheader("Inventory on hand")
@@ -599,7 +592,7 @@ elif PAGE == "Production Workflow Tracker":
             st.progress(prog, text=" → ".join(db.WORKFLOW_STAGES))
 
             with st.form("workflow_form"):
-                wc1, wc2, wc3 = st.columns(3)
+                wc1, wc2 = st.columns(2)
                 with wc1:
                     new_stage = st.selectbox(
                         "Workflow stage",
@@ -614,23 +607,13 @@ elif PAGE == "Production Workflow Tracker":
                         if batch["Status"] in db.BATCH_QA_STATUS
                         else 0,
                     )
-                with wc3:
-                    out_w = st.number_input(
-                        "Output weight (kg) — optional here",
-                        min_value=0.0,
-                        value=float(batch["Output_Weight"] or 0),
-                        step=1.0,
-                        help="Also editable on the Yield page at Casting / Finished Goods.",
-                    )
                 save = st.form_submit_button("Update workflow", type="primary")
 
             if save:
-                out_val = out_w if out_w > 0 else None
                 db.update_batch_workflow(
                     selected,
                     workflow_stage=new_stage,
                     qa_status=qa,
-                    output_weight=out_val,
                 )
                 st.success(f"Batch {selected} → **{new_stage}** ({qa}).")
                 st.rerun()
@@ -662,7 +645,6 @@ elif PAGE == "Production Workflow Tracker":
                         "Workflow_stage",
                         "Status",
                         "Weight",
-                        "Output_Weight",
                         "Alloy_name",
                     ]
                 ],
@@ -704,7 +686,6 @@ elif PAGE == "Material Recovery & Yield":
         assert batch is not None
 
         input_w = float(batch["Weight"] or 0)
-        current_out = float(batch["Output_Weight"] or 0)
 
         c1, c2 = st.columns(2)
         with c1:
@@ -714,18 +695,15 @@ elif PAGE == "Material Recovery & Yield":
             output_w = st.number_input(
                 "Final output weight (kg)",
                 min_value=0.0,
-                value=current_out if current_out > 0 else 0.0,
+                value=0.0,
                 step=1.0,
             )
 
-        if st.button("Save output & calculate yield", type="primary"):
-            # Auto-advance stage if still early and output entered
+        if st.button("Calculate yield", type="primary"):
             stage = batch["Workflow_stage"]
             if output_w > 0 and stage in ("Raw Material", "Melting/Furnace"):
-                stage = "Casting"
-            db.update_batch_workflow(bid, workflow_stage=stage, output_weight=output_w)
-            st.success("Output weight saved.")
-            st.rerun()
+                db.update_batch_workflow(bid, workflow_stage="Casting")
+                st.info("Batch stage advanced to **Casting**.")
 
         if output_w > 0 and input_w > 0:
             result = db.calc_yield(input_w, output_w)
@@ -749,39 +727,10 @@ elif PAGE == "Material Recovery & Yield":
                     f"Yield is below the {db.YIELD_TARGET_PCT:.0f}% efficiency target — investigate melt loss."
                 )
 
-            # Simple visual bar
             bar = min(pct / 100.0, 1.0)
             st.progress(bar, text=f"Recovery {pct:.1f}% (target {db.YIELD_TARGET_PCT:.0f}%)")
 
-        st.divider()
-        st.subheader("Yield summary — all batches with output")
-        rows = []
-        for b in batches:
-            if b["Output_Weight"] is None:
-                continue
-            yw = db.calc_yield(float(b["Weight"] or 0), float(b["Output_Weight"]))
-            rows.append(
-                {
-                    "Batch_ID": b["Batch_ID"],
-                    "Furnace": b["Furnace"],
-                    "Heat_no": b["Heat_no"],
-                    "Stage": b["Workflow_stage"],
-                    "Input_kg": yw["input_weight"],
-                    "Output_kg": yw["output_weight"],
-                    "Recovery_%": round(yw["recovery_pct"], 2),
-                    "Flag": "OK" if yw["recovery_pct"] >= db.YIELD_TARGET_PCT else "LOW",
-                }
-            )
-        if rows:
-            ydf = pd.DataFrame(rows)
-            st.dataframe(ydf, use_container_width=True, hide_index=True)
-            low = ydf[ydf["Flag"] == "LOW"]
-            if not low.empty:
-                st.warning(
-                    f"{len(low)} batch(es) below {db.YIELD_TARGET_PCT:.0f}% recovery target."
-                )
-        else:
-            st.caption("No finished yields recorded yet.")
+        st.caption("Output weight is calculated here only and is not stored on the batch.")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1461,6 +1410,6 @@ elif PAGE == "Masters Overview":
             | 17 | Purchase_Order | Customer purchase orders |
             | 18 | ISRI_CODE_TABLE | ISRI scrap specification codes |
 
-            Extra production columns: `Workflow_stage`, `Output_Weight`, `Cost_per_kg`.
+            Extra production columns: `Workflow_stage`, sample fields, `Production_supervisor`.
             """
         )

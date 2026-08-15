@@ -306,7 +306,6 @@ CREATE TABLE IF NOT EXISTS Production_batch (
     Photo1 {blob}, Photo2 {blob}, Photo3 {blob},
     Status TEXT DEFAULT 'Pending QA',
     Workflow_stage TEXT DEFAULT 'Raw Material',
-    Output_Weight {float},
     Degassing_time TEXT,
     Sampled_pcs {float},
     Defect_pcs {float},
@@ -421,7 +420,6 @@ def init_db() -> None:
             "Production_batch",
             [
                 ("Workflow_stage", "TEXT DEFAULT 'Raw Material'"),
-                ("Output_Weight", "REAL"),
                 ("Degassing_time", "TEXT"),
                 ("Sampled_pcs", "REAL"),
                 ("Defect_pcs", "REAL"),
@@ -1457,16 +1455,12 @@ def update_batch_workflow(
     batch_id: str,
     workflow_stage: str,
     qa_status: Optional[str] = None,
-    output_weight: Optional[float] = None,
 ) -> None:
     fields = ["Workflow_stage = ?"]
     params: list[Any] = [workflow_stage]
     if qa_status:
         fields.append("Status = ?")
         params.append(qa_status)
-    if output_weight is not None:
-        fields.append("Output_Weight = ?")
-        params.append(output_weight)
     params.append(batch_id)
     execute(
         f"UPDATE Production_batch SET {', '.join(fields)} WHERE Batch_ID = ?",
@@ -1480,7 +1474,6 @@ _BATCH_COLUMNS = """
     Furnace AS "Furnace", Melt_No AS "Melt_No", Heat_no AS "Heat_no",
     Melting_team AS "Melting_team", Weight AS "Weight", pieces AS "pieces",
     Notes AS "Notes", Status AS "Status", Workflow_stage AS "Workflow_stage",
-    Output_Weight AS "Output_Weight",
     Degassing_time AS "Degassing_time",
     Sampled_pcs AS "Sampled_pcs", Defect_pcs AS "Defect_pcs",
     Top_Sample AS "Top_Sample", Middle_Sample AS "Middle_Sample",
@@ -1533,7 +1526,7 @@ def list_batches() -> list[dict[str, Any]]:
         SELECT b.Batch_ID AS "Batch_ID", b.Production_Date AS "Production_Date",
                b.Furnace AS "Furnace", b.Heat_no AS "Heat_no", b.Melt_No AS "Melt_No",
                b.Shift AS "Shift", b.Weight AS "Weight",
-               b.Output_Weight AS "Output_Weight", b.Status AS "Status",
+               b.Status AS "Status",
                b.Workflow_stage AS "Workflow_stage", a.Alloy_name AS "Alloy_name",
                b.Production_supervisor AS "Production_supervisor",
                b.Top_Sample AS "Top_Sample", b.Middle_Sample AS "Middle_Sample",
