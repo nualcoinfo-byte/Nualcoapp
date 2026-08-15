@@ -151,9 +151,10 @@ WORKFLOW_STAGES = [
     "Finished Goods",
 ]
 
-BATCH_QA_STATUS = ["Pending QA", "Approved", "Rejected"]
+BATCH_QA_STATUS = ["Pending QA", "In-Progress", "Approved", "Rejected"]
 INVENTORY_STATUS = ["Awaiting Assay", "Ready For Melt", "Not Ready for Melt"]
 ACTIVE_STATUS = ["Active", "Inactive"]
+SAMPLE_OK_STATUS = ["OK", "NOT OK"]
 ELEMENT_LEVEL = ["Low", "Medium", "High"]
 SHIFTS = ["A", "B"]
 MELT_NOS = [1, 2, 3, 4, 5, 6, 7, 9]
@@ -277,6 +278,19 @@ CREATE TABLE IF NOT EXISTS State_City_Master (
     Status TEXT CHECK(Status IN ('Active', 'Inactive')) DEFAULT 'Active',
     PRIMARY KEY (State, City)
 );
+CREATE TABLE IF NOT EXISTS Month_code (
+    Month TEXT PRIMARY KEY,
+    Code TEXT NOT NULL UNIQUE
+);
+CREATE TABLE IF NOT EXISTS Access_matrix (
+    ID TEXT PRIMARY KEY,
+    Name TEXT NOT NULL,
+    Access TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS Production_supervisor (
+    Production_supervisor TEXT PRIMARY KEY,
+    Status TEXT CHECK(Status IN ('Active', 'Inactive')) DEFAULT 'Active'
+);
 CREATE TABLE IF NOT EXISTS Production_batch (
     Batch_ID TEXT PRIMARY KEY,
     Alloy_id INTEGER REFERENCES Alloy_Master(Alloy_id),
@@ -292,7 +306,20 @@ CREATE TABLE IF NOT EXISTS Production_batch (
     Photo1 {blob}, Photo2 {blob}, Photo3 {blob},
     Status TEXT DEFAULT 'Pending QA',
     Workflow_stage TEXT DEFAULT 'Raw Material',
-    Output_Weight {float}
+    Output_Weight {float},
+    Degassing_time TEXT,
+    Sampled_pcs {float},
+    Defect_pcs {float},
+    Top_Sample TEXT CHECK(Top_Sample IS NULL OR Top_Sample IN ('OK', 'NOT OK')),
+    Middle_Sample TEXT CHECK(Middle_Sample IS NULL OR Middle_Sample IN ('OK', 'NOT OK')),
+    Bottom_Sample TEXT CHECK(Bottom_Sample IS NULL OR Bottom_Sample IN ('OK', 'NOT OK')),
+    Top_Sample_Remarks TEXT,
+    Middle_Sample_Remarks TEXT,
+    Bottom_Sample_Remarks TEXT,
+    Top_Sample_datetime TEXT,
+    Middle_Sample_datetime TEXT,
+    Bottom_Sample_datetime TEXT,
+    Production_supervisor TEXT REFERENCES Production_supervisor(Production_supervisor)
 );
 CREATE TABLE IF NOT EXISTS batch_input (
     Batch_ID TEXT NOT NULL REFERENCES Production_batch(Batch_ID),
@@ -388,8 +415,28 @@ def init_db() -> None:
                 (str(n),),
             )
 
-        # Migrate older SQLite DBs: add columns if missing (Postgres schema
-        # is always created complete, so this only applies to SQLite files).
+        # Add columns missing from older databases (SQLite and Postgres).
+        _ensure_columns(
+            conn,
+            "Production_batch",
+            [
+                ("Workflow_stage", "TEXT DEFAULT 'Raw Material'"),
+                ("Output_Weight", "REAL"),
+                ("Degassing_time", "TEXT"),
+                ("Sampled_pcs", "REAL"),
+                ("Defect_pcs", "REAL"),
+                ("Top_Sample", "TEXT"),
+                ("Middle_Sample", "TEXT"),
+                ("Bottom_Sample", "TEXT"),
+                ("Top_Sample_Remarks", "TEXT"),
+                ("Middle_Sample_Remarks", "TEXT"),
+                ("Bottom_Sample_Remarks", "TEXT"),
+                ("Top_Sample_datetime", "TEXT"),
+                ("Middle_Sample_datetime", "TEXT"),
+                ("Bottom_Sample_datetime", "TEXT"),
+                ("Production_supervisor", "TEXT"),
+            ],
+        )
         if not IS_POSTGRES:
             _ensure_columns(
                 conn,
@@ -408,14 +455,6 @@ def init_db() -> None:
                 [
                     ("Supplier_invoice_date", "TEXT"),
                     ("Cost_per_kg", "REAL"),
-                ],
-            )
-            _ensure_columns(
-                conn,
-                "Production_batch",
-                [
-                    ("Workflow_stage", "TEXT DEFAULT 'Raw Material'"),
-                    ("Output_Weight", "REAL"),
                 ],
             )
             _ensure_columns(
@@ -441,12 +480,28 @@ def init_db() -> None:
 
 
 def _ensure_columns(conn: Connection, table: str, columns: list[tuple[str, str]]) -> None:
-    existing = {
-        row["name"] for row in _exec(conn, f"PRAGMA table_info({table})").mappings()
-    }
-    for name, typedef in columns:
-        if name not in existing:
-            _exec(conn, f"ALTER TABLE {table} ADD COLUMN {name} {typedef}")
+    if IS_POSTGRES:
+        physical = table.lower()
+        rows = _exec(
+            conn,
+            """
+            SELECT column_name AS name
+            FROM information_schema.columns
+            WHERE table_schema = 'public' AND table_name = ?
+            """,
+            (physical,),
+        ).mappings()
+        existing = {row["name"] for row in rows}
+        for name, typedef in columns:
+            if name.lower() not in existing:
+                _exec(conn, f"ALTER TABLE {table} ADD COLUMN {name} {typedef}")
+    else:
+        existing = {
+            row["name"] for row in _exec(conn, f"PRAGMA table_info({table})").mappings()
+        }
+        for name, typedef in columns:
+            if name not in existing:
+                _exec(conn, f"ALTER TABLE {table} ADD COLUMN {name} {typedef}")
 
 
 # ---------- Generic helpers ----------
@@ -596,6 +651,30 @@ EDITABLE_TABLES: list[dict[str, Any]] = [
         "label": "States & cities",
         "pk": ["state", "city"],
         "order_by": "state",
+        "identity": [],
+        "allow_add": True,
+    },
+    {
+        "key": "month_code",
+        "label": "Month codes",
+        "pk": ["month"],
+        "order_by": "month",
+        "identity": [],
+        "allow_add": True,
+    },
+    {
+        "key": "access_matrix",
+        "label": "Access matrix",
+        "pk": ["id"],
+        "order_by": "id",
+        "identity": [],
+        "allow_add": True,
+    },
+    {
+        "key": "production_supervisor",
+        "label": "Production supervisors",
+        "pk": ["production_supervisor"],
+        "order_by": "production_supervisor",
         "identity": [],
         "allow_add": True,
     },
@@ -800,6 +879,17 @@ def list_melters(active_only: bool = True) -> list[str]:
         sql += " WHERE Status = 'Active'"
     sql += " ORDER BY Melter_Name"
     return [r["Melter_Name"] for r in fetch_all(sql)]
+
+
+def list_production_supervisors(active_only: bool = True) -> list[str]:
+    sql = (
+        'SELECT Production_supervisor AS "Production_supervisor" '
+        "FROM Production_supervisor"
+    )
+    if active_only:
+        sql += " WHERE Status = 'Active'"
+    sql += " ORDER BY Production_supervisor"
+    return [r["Production_supervisor"] for r in fetch_all(sql)]
 
 
 def list_trolleys(active_only: bool = True) -> list[dict[str, Any]]:
@@ -1225,6 +1315,19 @@ def create_batch(
     notes: str,
     inputs: list[dict[str, Any]],
     composition: dict[str, float],
+    degassing_time: Optional[str] = None,
+    sampled_pcs: Optional[float] = None,
+    defect_pcs: Optional[float] = None,
+    top_sample: Optional[str] = None,
+    middle_sample: Optional[str] = None,
+    bottom_sample: Optional[str] = None,
+    top_sample_remarks: Optional[str] = None,
+    middle_sample_remarks: Optional[str] = None,
+    bottom_sample_remarks: Optional[str] = None,
+    top_sample_datetime: Optional[str] = None,
+    middle_sample_datetime: Optional[str] = None,
+    bottom_sample_datetime: Optional[str] = None,
+    production_supervisor: Optional[str] = None,
 ) -> str:
     batch_id = make_batch_id(furnace, heat_no)
     existing = fetch_one(
@@ -1234,6 +1337,21 @@ def create_batch(
     if existing:
         raise ValueError(f"Batch ID {batch_id} already exists. Choose another Heat No.")
 
+    for label, value in (
+        ("Top_Sample", top_sample),
+        ("Middle_Sample", middle_sample),
+        ("Bottom_Sample", bottom_sample),
+    ):
+        if value and value not in SAMPLE_OK_STATUS:
+            raise ValueError(f"{label} must be one of {SAMPLE_OK_STATUS}.")
+
+    if production_supervisor:
+        supervisors = list_production_supervisors(active_only=False)
+        if production_supervisor not in supervisors:
+            raise ValueError(
+                f"Production supervisor '{production_supervisor}' is not in Production_supervisor."
+            )
+
     total_weight = sum(float(i["Weight"]) for i in inputs)
 
     with get_connection() as conn:
@@ -1242,8 +1360,14 @@ def create_batch(
             """
             INSERT INTO Production_batch
                 (Batch_ID, Alloy_id, Production_Date, Shift, Furnace, Melt_No,
-                 Heat_no, Melting_team, Weight, Notes, Status, Workflow_stage)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'Pending QA', 'Raw Material')
+                 Heat_no, Melting_team, Weight, Notes, Status, Workflow_stage,
+                 Degassing_time, Sampled_pcs, Defect_pcs,
+                 Top_Sample, Middle_Sample, Bottom_Sample,
+                 Top_Sample_Remarks, Middle_Sample_Remarks, Bottom_Sample_Remarks,
+                 Top_Sample_datetime, Middle_Sample_datetime, Bottom_Sample_datetime,
+                 Production_supervisor)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'Pending QA', 'Raw Material',
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 batch_id,
@@ -1256,6 +1380,19 @@ def create_batch(
                 melting_team,
                 total_weight,
                 notes,
+                degassing_time,
+                sampled_pcs,
+                defect_pcs,
+                top_sample,
+                middle_sample,
+                bottom_sample,
+                top_sample_remarks,
+                middle_sample_remarks,
+                bottom_sample_remarks,
+                top_sample_datetime,
+                middle_sample_datetime,
+                bottom_sample_datetime,
+                production_supervisor,
             ),
         )
 
@@ -1343,7 +1480,18 @@ _BATCH_COLUMNS = """
     Furnace AS "Furnace", Melt_No AS "Melt_No", Heat_no AS "Heat_no",
     Melting_team AS "Melting_team", Weight AS "Weight", pieces AS "pieces",
     Notes AS "Notes", Status AS "Status", Workflow_stage AS "Workflow_stage",
-    Output_Weight AS "Output_Weight"
+    Output_Weight AS "Output_Weight",
+    Degassing_time AS "Degassing_time",
+    Sampled_pcs AS "Sampled_pcs", Defect_pcs AS "Defect_pcs",
+    Top_Sample AS "Top_Sample", Middle_Sample AS "Middle_Sample",
+    Bottom_Sample AS "Bottom_Sample",
+    Top_Sample_Remarks AS "Top_Sample_Remarks",
+    Middle_Sample_Remarks AS "Middle_Sample_Remarks",
+    Bottom_Sample_Remarks AS "Bottom_Sample_Remarks",
+    Top_Sample_datetime AS "Top_Sample_datetime",
+    Middle_Sample_datetime AS "Middle_Sample_datetime",
+    Bottom_Sample_datetime AS "Bottom_Sample_datetime",
+    Production_supervisor AS "Production_supervisor"
 """
 
 
@@ -1386,7 +1534,10 @@ def list_batches() -> list[dict[str, Any]]:
                b.Furnace AS "Furnace", b.Heat_no AS "Heat_no", b.Melt_No AS "Melt_No",
                b.Shift AS "Shift", b.Weight AS "Weight",
                b.Output_Weight AS "Output_Weight", b.Status AS "Status",
-               b.Workflow_stage AS "Workflow_stage", a.Alloy_name AS "Alloy_name"
+               b.Workflow_stage AS "Workflow_stage", a.Alloy_name AS "Alloy_name",
+               b.Production_supervisor AS "Production_supervisor",
+               b.Top_Sample AS "Top_Sample", b.Middle_Sample AS "Middle_Sample",
+               b.Bottom_Sample AS "Bottom_Sample"
         FROM Production_batch b
         LEFT JOIN Alloy_Master a ON a.Alloy_id = b.Alloy_id
         ORDER BY b.Production_Date DESC, b.Batch_ID DESC

@@ -347,6 +347,7 @@ elif PAGE == "Production Batch & Chemistry":
 
     furnaces = db.list_furnaces()
     melters = db.list_melters()
+    supervisors = db.list_production_supervisors()
     alloys = db.list_alloys()
     alloy_labels = {
         f"{a['Alloy_id']} — {a['Alloy_name']}"
@@ -359,6 +360,8 @@ elif PAGE == "Production Batch & Chemistry":
         st.error("Define at least one furnace under **Furnaces**.")
     elif not melters:
         st.error("Define at least one melter under **Melters**.")
+    elif not supervisors:
+        st.error("Define at least one production supervisor (Data Browser → Production supervisors).")
     else:
         col1, col2, col3 = st.columns(3)
         with col1:
@@ -374,11 +377,53 @@ elif PAGE == "Production Batch & Chemistry":
                 "Alloy",
                 options=["— none —"] + list(alloy_labels.keys()),
             )
-            notes = st.text_area("Notes", height=100)
+            production_supervisor = st.selectbox(
+                "Production supervisor *",
+                supervisors,
+            )
+            notes = st.text_area("Notes", height=68)
             preview_id = db.make_batch_id(furnace, heat_no)
             st.markdown(f"**Batch ID preview:** `{preview_id}`")
 
         alloy_id = None if alloy_label == "— none —" else alloy_labels[alloy_label]
+
+        st.markdown("#### Degassing & piece counts")
+        d1, d2, d3 = st.columns(3)
+        with d1:
+            degassing_time = st.text_input(
+                "Degassing time",
+                placeholder="e.g. 14:30 or 12 min",
+            )
+        with d2:
+            sampled_pcs = st.number_input("Sampled pcs", min_value=0.0, value=0.0, step=1.0)
+        with d3:
+            defect_pcs = st.number_input("Defect pcs", min_value=0.0, value=0.0, step=1.0)
+
+        st.markdown("#### Sample results")
+        sample_blank = "— not set —"
+        sample_opts = [sample_blank] + db.SAMPLE_OK_STATUS
+        s1, s2, s3 = st.columns(3)
+        with s1:
+            top_sample = st.selectbox("Top sample", sample_opts)
+            top_sample_remarks = st.text_input("Top sample remarks")
+            top_sample_dt = st.text_input(
+                "Top sample datetime",
+                placeholder="YYYY-MM-DD HH:MM:SS",
+            )
+        with s2:
+            middle_sample = st.selectbox("Middle sample", sample_opts)
+            middle_sample_remarks = st.text_input("Middle sample remarks")
+            middle_sample_dt = st.text_input(
+                "Middle sample datetime",
+                placeholder="YYYY-MM-DD HH:MM:SS",
+            )
+        with s3:
+            bottom_sample = st.selectbox("Bottom sample", sample_opts)
+            bottom_sample_remarks = st.text_input("Bottom sample remarks")
+            bottom_sample_dt = st.text_input(
+                "Bottom sample datetime",
+                placeholder="YYYY-MM-DD HH:MM:SS",
+            )
 
         st.markdown("#### Charge / raw material inputs")
         st.caption("Select one or more lots and the weight charged to this melt.")
@@ -470,6 +515,9 @@ elif PAGE == "Production Batch & Chemistry":
                         key=f"bchem_x_{el['Element_Symbol']}",
                     )
 
+        def _sample_or_none(v: str) -> str | None:
+            return None if v == sample_blank else v
+
         if st.button("Create production batch", type="primary"):
             if not charge_inputs:
                 st.error("Add at least one charge line with weight > 0.")
@@ -486,6 +534,19 @@ elif PAGE == "Production Batch & Chemistry":
                         notes=notes.strip(),
                         inputs=charge_inputs,
                         composition={k: v for k, v in batch_chem.items() if v and v > 0},
+                        degassing_time=degassing_time.strip() or None,
+                        sampled_pcs=sampled_pcs if sampled_pcs > 0 else None,
+                        defect_pcs=defect_pcs if defect_pcs > 0 else None,
+                        top_sample=_sample_or_none(top_sample),
+                        middle_sample=_sample_or_none(middle_sample),
+                        bottom_sample=_sample_or_none(bottom_sample),
+                        top_sample_remarks=top_sample_remarks.strip() or None,
+                        middle_sample_remarks=middle_sample_remarks.strip() or None,
+                        bottom_sample_remarks=bottom_sample_remarks.strip() or None,
+                        top_sample_datetime=top_sample_dt.strip() or None,
+                        middle_sample_datetime=middle_sample_dt.strip() or None,
+                        bottom_sample_datetime=bottom_sample_dt.strip() or None,
+                        production_supervisor=production_supervisor,
                     )
                     st.success(f"Created batch **{bid}** — Heat {heat_no}, Furnace {furnace}.")
                     st.session_state.charge_lines = [
