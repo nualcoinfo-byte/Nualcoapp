@@ -152,6 +152,10 @@ WORKFLOW_STAGES = [
 ]
 
 BATCH_QA_STATUS = ["Pending QA", "In-Progress", "Approved", "Rejected"]
+FG_STATUS_UNDER_TESTING = "Under_Testing"
+FG_STATUS_AVAILABLE = "Available"
+FG_STATUS_ASSIGNED = "Assigned"
+FG_STATUSES = [FG_STATUS_UNDER_TESTING, FG_STATUS_AVAILABLE, FG_STATUS_ASSIGNED]
 INVENTORY_STATUS = ["Awaiting Assay", "Ready For Melt", "Not Ready for Melt"]
 ACTIVE_STATUS = ["Active", "Inactive"]
 SAMPLE_OK_STATUS = ["OK", "NOT OK"]
@@ -320,6 +324,14 @@ CREATE TABLE IF NOT EXISTS Production_batch (
     Bottom_Sample_datetime TEXT,
     Production_supervisor TEXT REFERENCES Production_supervisor(Production_supervisor)
 );
+CREATE TABLE IF NOT EXISTS Finished_Goods_Inventory (
+    Bundle_id {autopk},
+    Batch_ID TEXT NOT NULL REFERENCES Production_batch(Batch_ID),
+    Output_Weight {float},
+    Output_pieces {float},
+    Status TEXT NOT NULL DEFAULT 'Under_Testing'
+        CHECK(Status IN ('Under_Testing', 'Available', 'Assigned'))
+);
 CREATE TABLE IF NOT EXISTS batch_input (
     Batch_ID TEXT NOT NULL REFERENCES Production_batch(Batch_ID),
     Raw_Material_Name TEXT NOT NULL,
@@ -475,6 +487,42 @@ def init_db() -> None:
                 "Build_of_Material",
                 [("Cust_code", "TEXT REFERENCES Customer_Master(Cust_code)")],
             )
+
+        _ensure_finished_goods_release_trigger(conn)
+
+
+def _ensure_finished_goods_release_trigger(conn: Connection) -> None:
+    """When a batch is Approved, release its Under_Testing finished-goods bundles."""
+    if not IS_POSTGRES:
+        return
+    _exec(
+        conn,
+        """
+        CREATE OR REPLACE FUNCTION release_finished_goods_on_batch_approved()
+        RETURNS TRIGGER AS $fn$
+        BEGIN
+            IF NEW.status = 'Approved'
+               AND (OLD.status IS DISTINCT FROM 'Approved') THEN
+                UPDATE finished_goods_inventory
+                SET status = 'Available'
+                WHERE batch_id = NEW.batch_id
+                  AND status = 'Under_Testing';
+            END IF;
+            RETURN NEW;
+        END;
+        $fn$ LANGUAGE plpgsql
+        """,
+    )
+    _exec(conn, "DROP TRIGGER IF EXISTS trg_release_fg_on_approved ON production_batch")
+    _exec(
+        conn,
+        """
+        CREATE TRIGGER trg_release_fg_on_approved
+        AFTER UPDATE OF status ON production_batch
+        FOR EACH ROW
+        EXECUTE PROCEDURE release_finished_goods_on_batch_approved()
+        """,
+    )
 
 
 def _ensure_columns(conn: Connection, table: str, columns: list[tuple[str, str]]) -> None:
@@ -666,6 +714,14 @@ EDITABLE_TABLES: list[dict[str, Any]] = [
         "pk": ["id"],
         "order_by": "id",
         "identity": [],
+        "allow_add": True,
+    },
+    {
+        "key": "finished_goods_inventory",
+        "label": "Finished goods inventory",
+        "pk": ["bundle_id"],
+        "order_by": "bundle_id",
+        "identity": ["bundle_id"],
         "allow_add": True,
     },
     {
@@ -1465,6 +1521,101 @@ def update_batch_workflow(
     execute(
         f"UPDATE Production_batch SET {', '.join(fields)} WHERE Batch_ID = ?",
         params,
+    )
+    # App-level hook (also covered by Postgres trigger): release locked FG stock.
+    if qa_status == "Approved":
+        release_finished_goods_for_batch(batch_id)
+
+
+def release_finished_goods_for_batch(batch_id: str) -> int:
+    """Flip Under_Testing bundles for a batch to Available. Returns rows updated."""
+    return execute(
+        """
+        UPDATE Finished_Goods_Inventory
+        SET Status = ?
+        WHERE Batch_ID = ? AND Status = ?
+        """,
+        (FG_STATUS_AVAILABLE, batch_id, FG_STATUS_UNDER_TESTING),
+    )
+
+
+def add_finished_goods_bundle(
+    batch_id: str,
+    output_weight: Optional[float] = None,
+    output_pieces: Optional[float] = None,
+) -> int:
+    """Create a finished-goods bundle locked as Under_Testing until the batch is Approved."""
+    batch = get_batch(batch_id)
+    if not batch:
+        raise ValueError(f"Batch {batch_id} not found.")
+
+    with get_connection() as conn:
+        result = _exec(
+            conn,
+            """
+            INSERT INTO Finished_Goods_Inventory
+                (Batch_ID, Output_Weight, Output_pieces, Status)
+            VALUES (?, ?, ?, ?)
+            RETURNING Bundle_id
+            """,
+            (
+                batch_id,
+                output_weight,
+                output_pieces,
+                FG_STATUS_UNDER_TESTING,
+            ),
+        )
+        row = result.first()
+        return int(row[0])
+
+
+def list_finished_goods(
+    batch_id: Optional[str] = None,
+    status: Optional[str] = None,
+    assignable_only: bool = False,
+) -> list[dict[str, Any]]:
+    """List finished-goods bundles. assignable_only=True returns Available only."""
+    sql = """
+        SELECT Bundle_id AS "Bundle_id", Batch_ID AS "Batch_ID",
+               Output_Weight AS "Output_Weight", Output_pieces AS "Output_pieces",
+               Status AS "Status"
+        FROM Finished_Goods_Inventory
+        WHERE 1=1
+    """
+    params: list[Any] = []
+    if batch_id:
+        sql += " AND Batch_ID = ?"
+        params.append(batch_id)
+    if assignable_only:
+        sql += " AND Status = ?"
+        params.append(FG_STATUS_AVAILABLE)
+    elif status:
+        sql += " AND Status = ?"
+        params.append(status)
+    sql += " ORDER BY Bundle_id DESC"
+    return fetch_all(sql, params)
+
+
+def assign_finished_goods_bundle(bundle_id: int) -> None:
+    """Assign a bundle. Under_Testing (and non-Available) stock is locked."""
+    row = fetch_one(
+        """
+        SELECT Bundle_id AS "Bundle_id", Status AS "Status"
+        FROM Finished_Goods_Inventory WHERE Bundle_id = ?
+        """,
+        (bundle_id,),
+    )
+    if not row:
+        raise ValueError(f"Bundle {bundle_id} not found.")
+    if row["Status"] != FG_STATUS_AVAILABLE:
+        raise ValueError(
+            f"Bundle {bundle_id} cannot be assigned — status is "
+            f"'{row['Status']}' (must be Available). "
+            "Approve the production batch to release Under_Testing stock."
+        )
+    execute(
+        "UPDATE Finished_Goods_Inventory SET Status = ? WHERE Bundle_id = ?",
+        (FG_STATUS_ASSIGNED, bundle_id),
     )
 
 

@@ -106,6 +106,7 @@ PAGE = st.sidebar.radio(
         "Production Batch & Chemistry",
         "Production Workflow Tracker",
         "Material Recovery & Yield",
+        "Finished Goods Inventory",
         "Customers",
         "Vendors",
         "Alloys",
@@ -615,7 +616,13 @@ elif PAGE == "Production Workflow Tracker":
                     workflow_stage=new_stage,
                     qa_status=qa,
                 )
-                st.success(f"Batch {selected} → **{new_stage}** ({qa}).")
+                if qa == "Approved":
+                    st.success(
+                        f"Batch {selected} → **{new_stage}** (Approved). "
+                        "Under_Testing finished-goods bundles for this batch are now **Available**."
+                    )
+                else:
+                    st.success(f"Batch {selected} → **{new_stage}** ({qa}).")
                 st.rerun()
 
             st.subheader("Charge details")
@@ -734,6 +741,95 @@ elif PAGE == "Material Recovery & Yield":
             st.progress(bar, text=f"Recovery {pct:.1f}% (target {db.YIELD_TARGET_PCT:.0f}%)")
 
         st.caption("Output weight is calculated here only and is not stored on the batch.")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Finished Goods Inventory
+# ═══════════════════════════════════════════════════════════════════════════════
+elif PAGE == "Finished Goods Inventory":
+    st.title("Finished Goods Inventory")
+    st.caption(
+        "New bundles are created as **Under_Testing** and cannot be assigned. "
+        "When the linked production batch is set to **Approved**, those bundles "
+        "automatically become **Available**."
+    )
+
+    batches = db.list_batches()
+    batch_ids = [b["Batch_ID"] for b in batches]
+    batch_map = {b["Batch_ID"]: b for b in batches}
+
+    st.markdown("#### Add bundle")
+    if not batch_ids:
+        st.info("Create a production batch first.")
+    else:
+        with st.form("fg_add_form", clear_on_submit=True):
+            fc1, fc2, fc3 = st.columns(3)
+            with fc1:
+                fg_batch = st.selectbox("Batch ID *", batch_ids)
+            linked = batch_map.get(fg_batch, {})
+            with fc2:
+                fg_w = st.number_input(
+                    "Output weight (kg)",
+                    min_value=0.0,
+                    value=float(linked.get("Output_Weight") or 0),
+                    step=1.0,
+                )
+            with fc3:
+                fg_pcs = st.number_input(
+                    "Output pieces",
+                    min_value=0.0,
+                    value=float(linked.get("Output_pieces") or 0),
+                    step=1.0,
+                )
+            st.caption(
+                f"Status will be locked to **{db.FG_STATUS_UNDER_TESTING}** "
+                f"(batch QA: `{linked.get('Status', '—')}`)."
+            )
+            if st.form_submit_button("Create bundle", type="primary"):
+                try:
+                    bid = db.add_finished_goods_bundle(
+                        batch_id=fg_batch,
+                        output_weight=fg_w if fg_w > 0 else None,
+                        output_pieces=fg_pcs if fg_pcs > 0 else None,
+                    )
+                    st.success(
+                        f"Created bundle **{bid}** for batch {fg_batch} "
+                        f"(status {db.FG_STATUS_UNDER_TESTING})."
+                    )
+                    st.rerun()
+                except Exception as exc:
+                    st.error(str(exc))
+
+    st.divider()
+    st.markdown("#### All bundles")
+    all_fg = db.list_finished_goods()
+    st.dataframe(df_from_rows(all_fg), use_container_width=True, hide_index=True)
+
+    locked = [r for r in all_fg if r["Status"] == db.FG_STATUS_UNDER_TESTING]
+    if locked:
+        st.warning(
+            f"{len(locked)} bundle(s) locked as **Under_Testing** — "
+            "approve the production batch to release them."
+        )
+
+    st.markdown("#### Assignable stock (Available only)")
+    available = db.list_finished_goods(assignable_only=True)
+    if not available:
+        st.info("No Available bundles. Under_Testing stock stays locked until batch approval.")
+    else:
+        assign_opts = {
+            f"Bundle {r['Bundle_id']} | batch {r['Batch_ID']} | "
+            f"{r['Output_Weight'] or 0:.1f} kg / {r['Output_pieces'] or 0:.0f} pcs": r["Bundle_id"]
+            for r in available
+        }
+        pick = st.selectbox("Select Available bundle to assign", list(assign_opts.keys()))
+        if st.button("Mark as Assigned", type="primary"):
+            try:
+                db.assign_finished_goods_bundle(assign_opts[pick])
+                st.success(f"Bundle {assign_opts[pick]} marked **Assigned**.")
+                st.rerun()
+            except Exception as exc:
+                st.error(str(exc))
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1412,6 +1508,7 @@ elif PAGE == "Masters Overview":
             | 16 | Build_of_Material | BOM |
             | 17 | Purchase_Order | Customer purchase orders |
             | 18 | ISRI_CODE_TABLE | ISRI scrap specification codes |
+            | 19 | Finished_Goods_Inventory | Bundles (Under_Testing → Available on batch Approved) |
 
             Extra production columns: `Workflow_stage`, sample fields, `Production_supervisor`.
             """
