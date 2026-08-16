@@ -165,6 +165,37 @@ MELT_NOS = [1, 2, 3, 4, 5, 6, 7, 9]
 HEAT_NOS = list(range(1, 13))
 YIELD_TARGET_PCT = 70.0
 
+# Tables that track who/when last changed a row.
+AUDIT_TABLES = {
+    "alloy_master",
+    "alloy_master_spec",
+    "customer_master",
+    "element_master",
+    "melter_master",
+    "state_city_master",
+    "trolley_master",
+    "vendor_master",
+    "raw_material_master",
+    "raw_material_spec",
+}
+_ACTING_USER: str = "system"
+
+
+def set_acting_user(name: str | None) -> None:
+    """Set the user stamp used for Last_updated_by (from the Streamlit sidebar)."""
+    global _ACTING_USER
+    text = (name or "").strip()
+    _ACTING_USER = text or "system"
+
+
+def get_acting_user() -> str:
+    return _ACTING_USER or "system"
+
+
+def audit_stamp() -> tuple[str, str]:
+    """Return (Last_updated_by, Last_updated_datetime) for the current actor."""
+    return get_acting_user(), datetime.now().isoformat(timespec="seconds")
+
 
 # ---------- Schema ----------
 
@@ -178,7 +209,9 @@ CREATE TABLE IF NOT EXISTS Customer_Master (
     Email TEXT, Website TEXT,
     Bank_account TEXT, IFSC_code TEXT, Bank_name TEXT, Branch_category TEXT,
     Created_date TEXT DEFAULT {now},
-    Status TEXT CHECK(Status IN ('Active', 'Inactive')) DEFAULT 'Active'
+    Status TEXT CHECK(Status IN ('Active', 'Inactive')) DEFAULT 'Active',
+    Last_updated_by TEXT,
+    Last_updated_datetime TEXT
 );
 CREATE TABLE IF NOT EXISTS Vendor_Master (
     Vendor_code {autopk},
@@ -190,12 +223,16 @@ CREATE TABLE IF NOT EXISTS Vendor_Master (
     Credit_period INTEGER,
     Bank_account TEXT, Branch TEXT, IFSC_code TEXT, Bank_name TEXT,
     Creation_date TEXT DEFAULT {now},
-    Status TEXT CHECK(Status IN ('Active', 'Inactive')) DEFAULT 'Active'
+    Status TEXT CHECK(Status IN ('Active', 'Inactive')) DEFAULT 'Active',
+    Last_updated_by TEXT,
+    Last_updated_datetime TEXT
 );
 CREATE TABLE IF NOT EXISTS Element_Master (
     Serial_no INTEGER PRIMARY KEY,
     Element_Name TEXT NOT NULL,
-    Element_Symbol TEXT NOT NULL UNIQUE
+    Element_Symbol TEXT NOT NULL UNIQUE,
+    Last_updated_by TEXT,
+    Last_updated_datetime TEXT
 );
 CREATE TABLE IF NOT EXISTS ISRI_CODE_TABLE (
     ISRI_CODE TEXT PRIMARY KEY,
@@ -216,6 +253,8 @@ CREATE TABLE IF NOT EXISTS Raw_Material_Master (
     Fe TEXT CHECK(Fe IS NULL OR Fe IN ('Low', 'Medium', 'High')),
     Cu TEXT CHECK(Cu IS NULL OR Cu IN ('Low', 'Medium', 'High')),
     Mg TEXT CHECK(Mg IS NULL OR Mg IN ('Low', 'Medium', 'High')),
+    Last_updated_by TEXT,
+    Last_updated_datetime TEXT,
     PRIMARY KEY (Raw_Material_Name, Effective_date)
 );
 CREATE TABLE IF NOT EXISTS Raw_Material_Inventory (
@@ -237,6 +276,8 @@ CREATE TABLE IF NOT EXISTS Raw_Material_Spec (
     Lot_id INTEGER NOT NULL REFERENCES Raw_Material_Inventory(Lot_id),
     Element_symbol TEXT NOT NULL REFERENCES Element_Master(Element_Symbol),
     Percentage {float},
+    Last_updated_by TEXT,
+    Last_updated_datetime TEXT,
     PRIMARY KEY (Raw_Material_Name, Lot_id, Element_symbol)
 );
 CREATE TABLE IF NOT EXISTS Alloy_Master (
@@ -253,13 +294,17 @@ CREATE TABLE IF NOT EXISTS Alloy_Master (
     Remarks TEXT,
     Status TEXT CHECK(Status IN ('Active', 'Inactive')) DEFAULT 'Active',
     Other_elements_Each {float},
-    Other_elements_Total {float}
+    Other_elements_Total {float},
+    Last_updated_by TEXT,
+    Last_updated_datetime TEXT
 );
 CREATE TABLE IF NOT EXISTS Alloy_Master_spec (
     Alloy_id INTEGER NOT NULL REFERENCES Alloy_Master(Alloy_id),
     Element_symbol TEXT NOT NULL REFERENCES Element_Master(Element_Symbol),
     Min_percent {float},
     Max_percent {float},
+    Last_updated_by TEXT,
+    Last_updated_datetime TEXT,
     PRIMARY KEY (Alloy_id, Element_symbol)
 );
 CREATE TABLE IF NOT EXISTS Furnace_Master (
@@ -268,18 +313,24 @@ CREATE TABLE IF NOT EXISTS Furnace_Master (
 );
 CREATE TABLE IF NOT EXISTS Melter_Master (
     Melter_Name TEXT PRIMARY KEY,
-    Status TEXT CHECK(Status IN ('Active', 'Inactive')) DEFAULT 'Active'
+    Status TEXT CHECK(Status IN ('Active', 'Inactive')) DEFAULT 'Active',
+    Last_updated_by TEXT,
+    Last_updated_datetime TEXT
 );
 CREATE TABLE IF NOT EXISTS Trolley_Master (
     Trolley_name TEXT PRIMARY KEY,
     Colour TEXT,
     Weight {float},
-    Status TEXT CHECK(Status IN ('Active', 'Inactive')) DEFAULT 'Active'
+    Status TEXT CHECK(Status IN ('Active', 'Inactive')) DEFAULT 'Active',
+    Last_updated_by TEXT,
+    Last_updated_datetime TEXT
 );
 CREATE TABLE IF NOT EXISTS State_City_Master (
     State TEXT NOT NULL,
     City TEXT NOT NULL,
     Status TEXT CHECK(Status IN ('Active', 'Inactive')) DEFAULT 'Active',
+    Last_updated_by TEXT,
+    Last_updated_datetime TEXT,
     PRIMARY KEY (State, City)
 );
 CREATE TABLE IF NOT EXISTS Month_code (
@@ -337,6 +388,9 @@ CREATE TABLE IF NOT EXISTS batch_input (
     Raw_Material_Name TEXT NOT NULL,
     Lot_id INTEGER NOT NULL REFERENCES Raw_Material_Inventory(Lot_id),
     Weight {float} NOT NULL,
+    Weighment_scale_weight {float},
+    Trolley_weight {float},
+    Trolley_name TEXT REFERENCES Trolley_Master(Trolley_name),
     Charge_time TEXT DEFAULT {now},
     Notes TEXT,
     Photo1 {blob}, Photo2 {blob},
@@ -447,6 +501,32 @@ def init_db() -> None:
                 ("Production_supervisor", "TEXT"),
             ],
         )
+        _ensure_columns(
+            conn,
+            "batch_input",
+            [
+                ("Weighment_scale_weight", "REAL"),
+                ("Trolley_weight", "REAL"),
+                ("Trolley_name", "TEXT"),
+            ],
+        )
+        _audit_cols = [
+            ("Last_updated_by", "TEXT"),
+            ("Last_updated_datetime", "TEXT"),
+        ]
+        for table in (
+            "Alloy_Master",
+            "Alloy_Master_spec",
+            "Customer_Master",
+            "Element_Master",
+            "Melter_Master",
+            "State_City_Master",
+            "Trolley_Master",
+            "Vendor_Master",
+            "Raw_Material_Master",
+            "Raw_Material_Spec",
+        ):
+            _ensure_columns(conn, table, _audit_cols)
         if not IS_POSTGRES:
             _ensure_columns(
                 conn,
@@ -808,6 +888,9 @@ def save_table_edits(
     resolved = _resolve_table_name(table_name)
     cols = editable_columns(resolved)
     original_map = {_row_key(r, pk_cols): r for r in original_rows}
+    stamp_by = next((c for c in cols if c.lower() == "last_updated_by"), None)
+    stamp_dt = next((c for c in cols if c.lower() == "last_updated_datetime"), None)
+    by_val, dt_val = audit_stamp() if (stamp_by or stamp_dt) else (None, None)
 
     inserted = updated = 0
     with get_connection() as conn:
@@ -815,6 +898,10 @@ def save_table_edits(
             # Skip completely empty new rows
             if all(row.get(c) in (None, "") for c in cols):
                 continue
+            if stamp_by:
+                row[stamp_by] = by_val
+            if stamp_dt:
+                row[stamp_dt] = dt_val
             key = _row_key(row, pk_cols)
             is_new = key not in original_map or any(v is None for v in key)
 
@@ -822,6 +909,10 @@ def save_table_edits(
                 c for c in cols
                 if c in row and not (is_new and c in identity_cols and row.get(c) in (None, ""))
             ]
+            if stamp_by and stamp_by not in write_cols:
+                write_cols.append(stamp_by)
+            if stamp_dt and stamp_dt not in write_cols:
+                write_cols.append(stamp_dt)
             if not write_cols:
                 continue
 
@@ -1041,13 +1132,15 @@ def list_inventory_lots(
 
 def upsert_customer(data: dict[str, Any]) -> None:
     """Insert or update a customer keyed on Cust_code."""
+    by_val, dt_val = audit_stamp()
     execute(
         """
         INSERT INTO Customer_Master
             (Cust_code, Customer_name, GST, PAN, Address, City, State, Pincode, Country,
              Contact1_name, Phone1, Contact_name2, Phone2, Email, Website,
-             Bank_account, IFSC_code, Bank_name, Branch_category, Status)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             Bank_account, IFSC_code, Bank_name, Branch_category, Status,
+             Last_updated_by, Last_updated_datetime)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(Cust_code) DO UPDATE SET
             Customer_name=excluded.Customer_name, GST=excluded.GST, PAN=excluded.PAN,
             Address=excluded.Address, City=excluded.City, State=excluded.State,
@@ -1057,7 +1150,9 @@ def upsert_customer(data: dict[str, Any]) -> None:
             Email=excluded.Email, Website=excluded.Website,
             Bank_account=excluded.Bank_account, IFSC_code=excluded.IFSC_code,
             Bank_name=excluded.Bank_name, Branch_category=excluded.Branch_category,
-            Status=excluded.Status
+            Status=excluded.Status,
+            Last_updated_by=excluded.Last_updated_by,
+            Last_updated_datetime=excluded.Last_updated_datetime
         """,
         (
             data["Cust_code"],
@@ -1080,6 +1175,8 @@ def upsert_customer(data: dict[str, Any]) -> None:
             data.get("Bank_name"),
             data.get("Branch_category"),
             data.get("Status", "Active"),
+            by_val,
+            dt_val,
         ),
     )
 
@@ -1087,13 +1184,15 @@ def upsert_customer(data: dict[str, Any]) -> None:
 def upsert_supplier(data: dict[str, Any]) -> None:
     """Insert or update a vendor by name; Vendor_code and Creation_date are
     auto-generated on insert (Creation_date is preserved on update)."""
+    by_val, dt_val = audit_stamp()
     execute(
         """
         INSERT INTO Vendor_Master
             (Vendor_name, GST, PAN, Address, City, State, Pincode, Country,
              Contact1, Phone1, Contact2, Phone2, Email, Website,
-             Credit_period, Bank_account, Branch, IFSC_code, Bank_name, Status)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             Credit_period, Bank_account, Branch, IFSC_code, Bank_name, Status,
+             Last_updated_by, Last_updated_datetime)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(Vendor_name) DO UPDATE SET
             GST=excluded.GST, PAN=excluded.PAN,
             Address=excluded.Address, City=excluded.City, State=excluded.State,
@@ -1104,7 +1203,9 @@ def upsert_supplier(data: dict[str, Any]) -> None:
             Credit_period=excluded.Credit_period,
             Bank_account=excluded.Bank_account, Branch=excluded.Branch,
             IFSC_code=excluded.IFSC_code, Bank_name=excluded.Bank_name,
-            Status=excluded.Status
+            Status=excluded.Status,
+            Last_updated_by=excluded.Last_updated_by,
+            Last_updated_datetime=excluded.Last_updated_datetime
         """,
         (
             data["Vendor_name"],
@@ -1127,6 +1228,8 @@ def upsert_supplier(data: dict[str, Any]) -> None:
             data.get("IFSC_code"),
             data.get("Bank_name"),
             data.get("Status", "Active"),
+            by_val,
+            dt_val,
         ),
     )
 
@@ -1148,18 +1251,22 @@ def add_raw_material_master(
     cu: Optional[str] = None,
     mg: Optional[str] = None,
 ) -> None:
+    by_val, dt_val = audit_stamp()
     execute(
         """
         INSERT INTO Raw_Material_Master
             (Raw_Material_Name, Effective_date, Vendor_code, ISRI_CODE, Alloy_family,
-             Availability_class, Recovery, Photo, Status, Cost_per_kg, Fe, Cu, Mg)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             Availability_class, Recovery, Photo, Status, Cost_per_kg, Fe, Cu, Mg,
+             Last_updated_by, Last_updated_datetime)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(Raw_Material_Name, Effective_date) DO UPDATE SET
             Vendor_code=excluded.Vendor_code, ISRI_CODE=excluded.ISRI_CODE,
             Alloy_family=excluded.Alloy_family,
             Availability_class=excluded.Availability_class, Recovery=excluded.Recovery,
             Photo=excluded.Photo, Status=excluded.Status, Cost_per_kg=excluded.Cost_per_kg,
-            Fe=excluded.Fe, Cu=excluded.Cu, Mg=excluded.Mg
+            Fe=excluded.Fe, Cu=excluded.Cu, Mg=excluded.Mg,
+            Last_updated_by=excluded.Last_updated_by,
+            Last_updated_datetime=excluded.Last_updated_datetime
         """,
         (
             name,
@@ -1175,6 +1282,8 @@ def add_raw_material_master(
             fe,
             cu,
             mg,
+            by_val,
+            dt_val,
         ),
     )
 
@@ -1220,20 +1329,26 @@ def add_inventory_lot(
 
 
 def set_lot_chemistry(material: str, lot_id: int, composition: dict[str, float]) -> None:
+    by_val, dt_val = audit_stamp()
     with get_connection() as conn:
         _exec(
             conn,
             "DELETE FROM Raw_Material_Spec WHERE Raw_Material_Name = ? AND Lot_id = ?",
             (material, lot_id),
         )
-        rows = [(material, lot_id, sym, pct) for sym, pct in composition.items() if pct is not None]
+        rows = [
+            (material, lot_id, sym, pct, by_val, dt_val)
+            for sym, pct in composition.items()
+            if pct is not None
+        ]
         if rows:
             _exec(
                 conn,
                 """
                 INSERT INTO Raw_Material_Spec
-                    (Raw_Material_Name, Lot_id, Element_symbol, Percentage)
-                VALUES (?, ?, ?, ?)
+                    (Raw_Material_Name, Lot_id, Element_symbol, Percentage,
+                     Last_updated_by, Last_updated_datetime)
+                VALUES (?, ?, ?, ?, ?, ?)
                 """,
                 rows,
             )
@@ -1270,6 +1385,7 @@ def add_alloy(
     other_elements_each: Optional[float] = None,
     other_elements_total: Optional[float] = None,
 ) -> int:
+    by_val, dt_val = audit_stamp()
     with get_connection() as conn:
         result = _exec(
             conn,
@@ -1278,8 +1394,9 @@ def add_alloy(
                 (Cust_code, Alloy_name, Alloy_Family, Created_by, Created_at,
                  Colour_code, Bis_Designation, Sludge_factor,
                  Revision_datetime, Remarks, Status,
-                 Other_elements_Each, Other_elements_Total)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 Other_elements_Each, Other_elements_Total,
+                 Last_updated_by, Last_updated_datetime)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             RETURNING Alloy_id
             """,
             (
@@ -1296,6 +1413,8 @@ def add_alloy(
                 status,
                 other_elements_each,
                 other_elements_total,
+                by_val,
+                dt_val,
             ),
         )
         alloy_id = int(result.scalar_one())
@@ -1305,10 +1424,12 @@ def add_alloy(
             _exec(
                 conn,
                 """
-                INSERT INTO Alloy_Master_spec (Alloy_id, Element_symbol, Min_percent, Max_percent)
-                VALUES (?, ?, ?, ?)
+                INSERT INTO Alloy_Master_spec
+                    (Alloy_id, Element_symbol, Min_percent, Max_percent,
+                     Last_updated_by, Last_updated_datetime)
+                VALUES (?, ?, ?, ?, ?, ?)
                 """,
-                (alloy_id, sym, mn, mx),
+                (alloy_id, sym, mn, mx, by_val, dt_val),
             )
         return alloy_id
 
@@ -1326,12 +1447,18 @@ def upsert_furnace(name: str, status: str) -> None:
 
 
 def upsert_melter(name: str, status: str) -> None:
+    by_val, dt_val = audit_stamp()
     execute(
         """
-        INSERT INTO Melter_Master (Melter_Name, Status) VALUES (?, ?)
-        ON CONFLICT(Melter_Name) DO UPDATE SET Status = excluded.Status
+        INSERT INTO Melter_Master
+            (Melter_Name, Status, Last_updated_by, Last_updated_datetime)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(Melter_Name) DO UPDATE SET
+            Status = excluded.Status,
+            Last_updated_by = excluded.Last_updated_by,
+            Last_updated_datetime = excluded.Last_updated_datetime
         """,
-        (name, status),
+        (name, status, by_val, dt_val),
     )
 
 
@@ -1341,15 +1468,30 @@ def upsert_trolley(
     weight: Optional[float],
     status: str,
 ) -> None:
+    by_val, dt_val = audit_stamp()
     execute(
         """
-        INSERT INTO Trolley_Master (Trolley_name, Colour, Weight, Status)
-        VALUES (?, ?, ?, ?)
+        INSERT INTO Trolley_Master
+            (Trolley_name, Colour, Weight, Status, Last_updated_by, Last_updated_datetime)
+        VALUES (?, ?, ?, ?, ?, ?)
         ON CONFLICT(Trolley_name) DO UPDATE SET
-            Colour=excluded.Colour, Weight=excluded.Weight, Status=excluded.Status
+            Colour=excluded.Colour, Weight=excluded.Weight, Status=excluded.Status,
+            Last_updated_by=excluded.Last_updated_by,
+            Last_updated_datetime=excluded.Last_updated_datetime
         """,
-        (name, colour, weight, status),
+        (name, colour, weight, status, by_val, dt_val),
     )
+
+
+def list_access_users() -> list[str]:
+    """Names from Access_matrix for the sidebar acting-user picker."""
+    try:
+        rows = fetch_all(
+            'SELECT Name AS "Name" FROM Access_matrix ORDER BY Name'
+        )
+        return [r["Name"] for r in rows if r.get("Name")]
+    except Exception:
+        return []
 
 
 # ---------- Production batches ----------
@@ -1480,14 +1622,19 @@ def create_batch(
                 conn,
                 """
                 INSERT INTO batch_input
-                    (Batch_ID, Raw_Material_Name, Lot_id, Weight, Charge_time, Notes)
-                VALUES (?, ?, ?, ?, ?, ?)
+                    (Batch_ID, Raw_Material_Name, Lot_id, Weight,
+                     Weighment_scale_weight, Trolley_weight, Trolley_name,
+                     Charge_time, Notes)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     batch_id,
                     item["Raw_Material_Name"],
                     item["Lot_id"],
                     w,
+                    item.get("Weighment_scale_weight"),
+                    item.get("Trolley_weight"),
+                    item.get("Trolley_name"),
                     item.get("Charge_time") or datetime.now().isoformat(timespec="seconds"),
                     item.get("Notes", ""),
                 ),
@@ -1657,7 +1804,11 @@ def get_batch_inputs(batch_id: str) -> list[dict[str, Any]]:
     return fetch_all(
         """
         SELECT Raw_Material_Name AS "Raw_Material_Name", Lot_id AS "Lot_id",
-               Weight AS "Weight", Charge_time AS "Charge_time", Notes AS "Notes"
+               Weight AS "Weight",
+               Weighment_scale_weight AS "Weighment_scale_weight",
+               Trolley_weight AS "Trolley_weight",
+               Trolley_name AS "Trolley_name",
+               Charge_time AS "Charge_time", Notes AS "Notes"
         FROM batch_input WHERE Batch_ID = ?
         ORDER BY Charge_time
         """,

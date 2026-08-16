@@ -120,6 +120,22 @@ PAGE = st.sidebar.radio(
 )
 
 st.sidebar.divider()
+users = db.list_access_users()
+if users:
+    if "acting_user" not in st.session_state or st.session_state.acting_user not in users:
+        st.session_state.acting_user = users[0]
+    acting = st.sidebar.selectbox(
+        "Last updated by",
+        users,
+        index=users.index(st.session_state.acting_user),
+        help="Stamped on master-table saves as Last_updated_by.",
+    )
+    st.session_state.acting_user = acting
+    db.set_acting_user(acting)
+else:
+    db.set_acting_user("system")
+    st.sidebar.caption("Last updated by: system (no Access_matrix users)")
+
 st.sidebar.markdown(
     f"**Yield target:** {db.YIELD_TARGET_PCT:.0f}%  \n"
     f"**DB:** `{db.DB_LABEL}`"
@@ -421,10 +437,32 @@ elif PAGE == "Production Batch & Chemistry":
             )
 
         st.markdown("#### Charge / raw material inputs")
-        st.caption("Select one or more lots and the weight charged to this melt.")
+        st.caption(
+            "Select trolley (tare), enter weighment scale reading. "
+            "**Net Weight = Weighment scale − Trolley weight.**"
+        )
+
+        trolleys = db.list_trolleys(active_only=True)
+        trolley_by_name = {t["Trolley_name"]: float(t["Weight"] or 0) for t in trolleys}
+        trolley_labels = [
+            f"{t['Trolley_name']}"
+            + (f" ({t['Colour']})" if t.get("Colour") else "")
+            + f" — {float(t['Weight'] or 0):.1f} kg"
+            for t in trolleys
+        ]
+        trolley_label_to_name = {
+            (
+                f"{t['Trolley_name']}"
+                + (f" ({t['Colour']})" if t.get("Colour") else "")
+                + f" — {float(t['Weight'] or 0):.1f} kg"
+            ): t["Trolley_name"]
+            for t in trolleys
+        }
 
         if "charge_lines" not in st.session_state:
-            st.session_state.charge_lines = [{"material": "", "lot_id": None, "weight": 0.0, "notes": ""}]
+            st.session_state.charge_lines = [
+                {"material": "", "lot_id": None, "weight": 0.0, "notes": ""}
+            ]
 
         add_col, rem_col, _ = st.columns([1, 1, 4])
         if add_col.button("Add charge line"):
@@ -436,11 +474,14 @@ elif PAGE == "Production Batch & Chemistry":
             st.session_state.charge_lines.pop()
             st.rerun()
 
+        if not trolleys:
+            st.error("Define at least one active trolley under **Trolleys**.")
+
         charge_inputs: list[dict] = []
         for idx, line in enumerate(st.session_state.charge_lines):
             st.markdown(f"**Charge line {idx + 1}**")
-            lc1, lc2, lc3, lc4 = st.columns([2, 2, 1.2, 2])
-            with lc1:
+            r1c1, r1c2, r1c3 = st.columns([2, 2, 2])
+            with r1c1:
                 mat = st.selectbox(
                     "Raw material",
                     options=[""] + materials,
@@ -451,36 +492,69 @@ elif PAGE == "Production Batch & Chemistry":
                 f"Lot {l['Lot_id']} — rem {l['Remaining_Weight']:.1f} kg ({l['Raw_Material_Status']})": l["Lot_id"]
                 for l in lots
             }
-            with lc2:
+            with r1c2:
                 lot_label = st.selectbox(
                     "Lot",
                     options=[""] + list(lot_opts.keys()),
                     key=f"lot_{idx}",
                 )
-            with lc3:
-                w = st.number_input(
-                    "Weight (kg)",
+            with r1c3:
+                trolley_label = st.selectbox(
+                    "Trolley *",
+                    options=[""] + trolley_labels,
+                    key=f"trolley_{idx}",
+                    disabled=not bool(trolleys),
+                )
+
+            trolley_name = trolley_label_to_name.get(trolley_label) if trolley_label else None
+            trolley_w = float(trolley_by_name.get(trolley_name, 0)) if trolley_name else 0.0
+
+            r2c1, r2c2, r2c3, r2c4 = st.columns([1.5, 1.5, 1.5, 2])
+            with r2c1:
+                st.number_input(
+                    "Trolley weight (kg)",
+                    value=trolley_w,
+                    disabled=True,
+                    key=f"trolley_w_{idx}",
+                    help="Auto-filled from Trolley_Master when a trolley is selected.",
+                )
+            with r2c2:
+                scale_w = st.number_input(
+                    "Weighment scale weight (kg) *",
                     min_value=0.0,
                     value=0.0,
                     step=1.0,
-                    key=f"wt_{idx}",
+                    key=f"scale_w_{idx}",
                 )
-            with lc4:
+            # Net charge = weighment scale − trolley tare
+            net_w = max(scale_w - trolley_w, 0.0) if scale_w > 0 and trolley_name else 0.0
+            with r2c3:
+                st.number_input(
+                    "Net weight (kg)",
+                    value=float(net_w),
+                    disabled=True,
+                    key=f"wt_{idx}",
+                    help="Auto: weighment scale weight − trolley weight.",
+                )
+            with r2c4:
                 n = st.text_input("Line notes", key=f"ln_{idx}")
 
-            if mat and lot_label and w > 0:
+            if mat and lot_label and trolley_name and scale_w > 0 and net_w > 0:
                 charge_inputs.append(
                     {
                         "Raw_Material_Name": mat,
                         "Lot_id": lot_opts[lot_label],
-                        "Weight": w,
+                        "Weight": net_w,
+                        "Weighment_scale_weight": scale_w,
+                        "Trolley_weight": trolley_w,
+                        "Trolley_name": trolley_name,
                         "Notes": n,
                         "Charge_time": datetime.now().isoformat(timespec="seconds"),
                     }
                 )
 
         total_in = sum(c["Weight"] for c in charge_inputs)
-        st.info(f"Total input weight: **{total_in:,.2f} kg** across {len(charge_inputs)} charge line(s).")
+        st.info(f"Total net input weight: **{total_in:,.2f} kg** across {len(charge_inputs)} charge line(s).")
 
         st.markdown("#### Batch chemistry (ladle / spectrometer)")
         chem_cols = st.columns(6)
