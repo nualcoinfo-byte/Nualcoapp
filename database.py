@@ -998,6 +998,19 @@ def list_customer_codes(active_only: bool = True) -> list[dict[str, Any]]:
     return fetch_all(sql)
 
 
+def get_customer(cust_code: str) -> Optional[dict[str, Any]]:
+    return fetch_one(
+        """
+        SELECT Cust_code AS "Cust_code", Customer_name AS "Customer_name",
+               Address AS "Address", City AS "City", State AS "State",
+               Pincode AS "Pincode", Country AS "Country"
+        FROM Customer_Master
+        WHERE Cust_code = ?
+        """,
+        (cust_code,),
+    )
+
+
 def list_vendors(active_only: bool = True) -> list[dict[str, Any]]:
     """Vendors with their auto-generated codes, for code-based FK lookups."""
     sql = 'SELECT Vendor_code AS "Vendor_code", Vendor_name AS "Vendor_name" FROM Vendor_Master'
@@ -1967,12 +1980,82 @@ def list_purchase_orders() -> list[dict[str, Any]]:
                Delivery_Date AS "Delivery_Date",
                Order_Qty AS "Order_Qty",
                Rate AS "Rate",
+               Billing_Address AS "Billing_Address",
+               Billing_City AS "Billing_City",
+               Billing_state AS "Billing_state",
+               Billing_Pincode AS "Billing_Pincode",
+               Billing_country AS "Billing_country",
+               Shipping_address AS "Shipping_address",
+               Shipping_City AS "Shipping_City",
+               Shipping_state AS "Shipping_state",
+               Shipping_Pincode AS "Shipping_Pincode",
+               Shipping_country AS "Shipping_country",
                PO_Document_name AS "PO_Document_name",
                PO_Document_type AS "PO_Document_type",
                CASE WHEN PO_Document IS NULL THEN 0 ELSE 1 END AS "Has_Document"
         FROM Purchase_Order
         ORDER BY Order_Date DESC, Customer_PO_No
         """
+    )
+
+
+def upsert_purchase_order(data: dict[str, Any]) -> None:
+    """Insert or update a purchase order keyed on Customer_PO_No."""
+    po_no = (data.get("Customer_PO_No") or "").strip()
+    if not po_no:
+        raise ValueError("Customer PO No is required.")
+    if not data.get("Cust_code"):
+        raise ValueError("Customer is required.")
+    if not data.get("Customer_name"):
+        raise ValueError("Customer name is required.")
+
+    execute(
+        """
+        INSERT INTO Purchase_Order
+            (Customer_PO_No, Cust_code, Customer_name, Alloy_Id,
+             Order_Date, Delivery_Date, Order_Qty, Rate,
+             Billing_Address, Billing_City, Billing_state, Billing_Pincode, Billing_country,
+             Shipping_address, Shipping_City, Shipping_state, Shipping_Pincode, Shipping_country)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(Customer_PO_No) DO UPDATE SET
+            Cust_code=excluded.Cust_code,
+            Customer_name=excluded.Customer_name,
+            Alloy_Id=excluded.Alloy_Id,
+            Order_Date=excluded.Order_Date,
+            Delivery_Date=excluded.Delivery_Date,
+            Order_Qty=excluded.Order_Qty,
+            Rate=excluded.Rate,
+            Billing_Address=excluded.Billing_Address,
+            Billing_City=excluded.Billing_City,
+            Billing_state=excluded.Billing_state,
+            Billing_Pincode=excluded.Billing_Pincode,
+            Billing_country=excluded.Billing_country,
+            Shipping_address=excluded.Shipping_address,
+            Shipping_City=excluded.Shipping_City,
+            Shipping_state=excluded.Shipping_state,
+            Shipping_Pincode=excluded.Shipping_Pincode,
+            Shipping_country=excluded.Shipping_country
+        """,
+        (
+            po_no,
+            data["Cust_code"],
+            data["Customer_name"],
+            data.get("Alloy_Id"),
+            data.get("Order_Date"),
+            data.get("Delivery_Date"),
+            data.get("Order_Qty"),
+            data.get("Rate"),
+            data.get("Billing_Address"),
+            data.get("Billing_City"),
+            data.get("Billing_state"),
+            data.get("Billing_Pincode"),
+            data.get("Billing_country"),
+            data.get("Shipping_address"),
+            data.get("Shipping_City"),
+            data.get("Shipping_state"),
+            data.get("Shipping_Pincode"),
+            data.get("Shipping_country"),
+        ),
     )
 
 

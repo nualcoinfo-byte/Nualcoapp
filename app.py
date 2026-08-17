@@ -1265,13 +1265,164 @@ elif PAGE == "Trolleys":
 elif PAGE == "Purchase Orders":
     st.title("Purchase Orders")
     st.caption(
-        "Attach the customer Purchase Order document (PDF, Word, or Excel) to an existing PO. "
-        "PO header rows can also be maintained in **Data Browser → Purchase orders**."
+        "Create or update customer purchase orders, then attach the PO document "
+        "(PDF, Word, or Excel)."
     )
 
+    customers = db.list_customer_codes()
+    cust_opts = {
+        f"{c['Cust_code']} — {c['Customer_name']}": c["Cust_code"] for c in customers
+    }
+    alloys = db.list_alloys()
+    alloy_opts = {
+        f"{a['Alloy_id']} — {a['Alloy_name']}"
+        + (f" ({a['Customer_name']})" if a.get("Customer_name") else ""): a["Alloy_id"]
+        for a in alloys
+    }
+
+    if not customers:
+        st.warning("Add at least one customer under **Customers** before creating a PO.")
+    else:
+        st.markdown("#### New / update purchase order")
+        cust_label = st.selectbox(
+            "Customer *",
+            options=[""] + list(cust_opts.keys()),
+            key="po_customer_sel",
+        )
+        cust = db.get_customer(cust_opts[cust_label]) if cust_label else None
+
+        with st.form("po_entry_form", clear_on_submit=True):
+            h1, h2, h3 = st.columns(3)
+            with h1:
+                po_no = st.text_input("Customer PO No *", placeholder="e.g. PO-2026-001")
+                order_date = st.date_input("Order date", value=date.today())
+                delivery_date = st.date_input("Delivery date", value=date.today())
+            with h2:
+                alloy_label = st.selectbox(
+                    "Alloy",
+                    options=["— none —"] + list(alloy_opts.keys()),
+                )
+                order_qty = st.number_input("Order qty *", min_value=0.0, value=0.0, step=1.0)
+                rate = st.number_input("Rate", min_value=0.0, value=0.0, step=0.01)
+            with h3:
+                st.text_input(
+                    "Customer name",
+                    value=cust["Customer_name"] if cust else "",
+                    disabled=True,
+                )
+                st.caption("Filled from Customer Master when a customer is selected.")
+
+            st.markdown("##### Billing address")
+            b1, b2 = st.columns(2)
+            with b1:
+                bill_addr = st.text_input(
+                    "Billing address",
+                    value=(cust.get("Address") or "") if cust else "",
+                )
+                bill_city = st.text_input(
+                    "Billing city",
+                    value=(cust.get("City") or "") if cust else "",
+                )
+                bill_state = st.text_input(
+                    "Billing state",
+                    value=(cust.get("State") or "") if cust else "",
+                )
+            with b2:
+                bill_pin = st.text_input(
+                    "Billing pincode",
+                    value=(cust.get("Pincode") or "") if cust else "",
+                )
+                bill_country = st.text_input(
+                    "Billing country",
+                    value=(cust.get("Country") or "India") if cust else "India",
+                )
+                copy_ship = st.checkbox("Copy billing address to shipping", value=True)
+
+            st.markdown("##### Shipping address")
+            s1, s2 = st.columns(2)
+            with s1:
+                ship_addr = st.text_input(
+                    "Shipping address",
+                    value=(cust.get("Address") or "") if cust and copy_ship else "",
+                )
+                ship_city = st.text_input(
+                    "Shipping city",
+                    value=(cust.get("City") or "") if cust and copy_ship else "",
+                )
+                ship_state = st.text_input(
+                    "Shipping state",
+                    value=(cust.get("State") or "") if cust and copy_ship else "",
+                )
+            with s2:
+                ship_pin = st.text_input(
+                    "Shipping pincode",
+                    value=(cust.get("Pincode") or "") if cust and copy_ship else "",
+                )
+                ship_country = st.text_input(
+                    "Shipping country",
+                    value=(cust.get("Country") or "India") if cust and copy_ship else "India",
+                )
+
+            po_file = st.file_uploader(
+                "PO document (optional)",
+                type=["pdf", "doc", "docx", "xls", "xlsx"],
+                help="PDF, Word, or Excel. Can also be attached later below.",
+            )
+            save_po = st.form_submit_button("Save purchase order", type="primary")
+
+        if save_po:
+            if not po_no.strip():
+                st.error("Customer PO No is required.")
+            elif not cust_label or not cust:
+                st.error("Select a customer.")
+            elif order_qty <= 0:
+                st.error("Order qty must be greater than zero.")
+            else:
+                try:
+                    if copy_ship:
+                        ship_addr, ship_city, ship_state = bill_addr, bill_city, bill_state
+                        ship_pin, ship_country = bill_pin, bill_country
+                    db.upsert_purchase_order(
+                        {
+                            "Customer_PO_No": po_no.strip(),
+                            "Cust_code": cust["Cust_code"],
+                            "Customer_name": cust["Customer_name"],
+                            "Alloy_Id": None
+                            if alloy_label == "— none —"
+                            else alloy_opts[alloy_label],
+                            "Order_Date": order_date.isoformat(),
+                            "Delivery_Date": delivery_date.isoformat(),
+                            "Order_Qty": order_qty,
+                            "Rate": rate if rate > 0 else None,
+                            "Billing_Address": bill_addr.strip() or None,
+                            "Billing_City": bill_city.strip() or None,
+                            "Billing_state": bill_state.strip() or None,
+                            "Billing_Pincode": bill_pin.strip() or None,
+                            "Billing_country": bill_country.strip() or None,
+                            "Shipping_address": ship_addr.strip() or None,
+                            "Shipping_City": ship_city.strip() or None,
+                            "Shipping_state": ship_state.strip() or None,
+                            "Shipping_Pincode": ship_pin.strip() or None,
+                            "Shipping_country": ship_country.strip() or None,
+                        }
+                    )
+                    if po_file is not None:
+                        db.save_po_document(
+                            customer_po_no=po_no.strip(),
+                            file_bytes=po_file.getvalue(),
+                            filename=po_file.name,
+                            content_type=getattr(po_file, "type", None),
+                        )
+                    st.success(f"Saved purchase order **{po_no.strip()}**.")
+                    st.rerun()
+                except Exception as exc:
+                    st.error(str(exc))
+
+    st.divider()
+    st.markdown("#### Attach / download PO document")
     pos = db.list_purchase_orders()
     if not pos:
-        st.info("No purchase orders yet. Add rows under **Data Browser → Purchase orders**.")
+        st.info("No purchase orders yet.")
     else:
         po_labels = {
             f"{p['Customer_PO_No']}"
@@ -1283,47 +1434,44 @@ elif PAGE == "Purchase Orders":
             ): p["Customer_PO_No"]
             for p in pos
         }
-        pick = st.selectbox("Purchase order", list(po_labels.keys()))
-        po_no = po_labels[pick]
-        selected = next(p for p in pos if p["Customer_PO_No"] == po_no)
+        pick = st.selectbox("Existing purchase order", list(po_labels.keys()))
+        po_no_sel = po_labels[pick]
+        selected = next(p for p in pos if p["Customer_PO_No"] == po_no_sel)
 
         m1, m2, m3 = st.columns(3)
         m1.metric("PO No", selected["Customer_PO_No"])
         m2.metric("Order qty", f"{selected['Order_Qty'] or 0:,.0f}")
-        m3.metric(
-            "Document",
-            selected["PO_Document_name"] or "— none —",
-        )
+        m3.metric("Document", selected["PO_Document_name"] or "— none —")
 
         uploaded = st.file_uploader(
-            "Upload PO document",
+            "Upload / replace PO document",
             type=["pdf", "doc", "docx", "xls", "xlsx"],
-            help="PDF, Word (.doc/.docx), or Excel (.xls/.xlsx).",
+            key="po_attach_existing",
         )
         u1, u2, _ = st.columns([1, 1, 3])
         if u1.button("Save document", type="primary", disabled=uploaded is None):
             try:
                 db.save_po_document(
-                    customer_po_no=po_no,
+                    customer_po_no=po_no_sel,
                     file_bytes=uploaded.getvalue(),
                     filename=uploaded.name,
                     content_type=getattr(uploaded, "type", None),
                 )
-                st.success(f"Saved **{uploaded.name}** on PO {po_no}.")
+                st.success(f"Saved **{uploaded.name}** on PO {po_no_sel}.")
                 st.rerun()
             except Exception as exc:
                 st.error(str(exc))
 
-        doc = db.get_po_document(po_no)
+        doc = db.get_po_document(po_no_sel)
         if doc and doc.get("PO_Document"):
             st.download_button(
                 "Download attached document",
                 data=bytes(doc["PO_Document"]),
-                file_name=doc.get("PO_Document_name") or f"{po_no}.bin",
+                file_name=doc.get("PO_Document_name") or f"{po_no_sel}.bin",
                 mime=doc.get("PO_Document_type") or "application/octet-stream",
             )
             if u2.button("Remove document"):
-                db.clear_po_document(po_no)
+                db.clear_po_document(po_no_sel)
                 st.success("Document removed.")
                 st.rerun()
 
@@ -1331,7 +1479,9 @@ elif PAGE == "Purchase Orders":
     st.subheader("All purchase orders")
     show = df_from_rows(pos)
     if not show.empty and "Has_Document" in show.columns:
-        show["Has_Document"] = show["Has_Document"].map({1: "Yes", 0: "No", True: "Yes", False: "No"})
+        show["Has_Document"] = show["Has_Document"].map(
+            {1: "Yes", 0: "No", True: "Yes", False: "No"}
+        )
     st.dataframe(show, use_container_width=True, hide_index=True)
 
 
