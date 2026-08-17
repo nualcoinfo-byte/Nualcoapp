@@ -107,6 +107,7 @@ PAGE = st.sidebar.radio(
         "Production Workflow Tracker",
         "Material Recovery & Yield",
         "Finished Goods Inventory",
+        "Purchase Orders",
         "Customers",
         "Vendors",
         "Alloys",
@@ -1249,6 +1250,82 @@ elif PAGE == "Trolleys":
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# Purchase Orders
+# ═══════════════════════════════════════════════════════════════════════════════
+elif PAGE == "Purchase Orders":
+    st.title("Purchase Orders")
+    st.caption(
+        "Attach the customer Purchase Order document (PDF, Word, or Excel) to an existing PO. "
+        "PO header rows can also be maintained in **Data Browser → Purchase orders**."
+    )
+
+    pos = db.list_purchase_orders()
+    if not pos:
+        st.info("No purchase orders yet. Add rows under **Data Browser → Purchase orders**.")
+    else:
+        po_labels = {
+            f"{p['Customer_PO_No']}"
+            + (f" — {p['Customer_name']}" if p.get("Customer_name") else "")
+            + (
+                f"  [{p['PO_Document_name']}]"
+                if p.get("PO_Document_name")
+                else "  [no document]"
+            ): p["Customer_PO_No"]
+            for p in pos
+        }
+        pick = st.selectbox("Purchase order", list(po_labels.keys()))
+        po_no = po_labels[pick]
+        selected = next(p for p in pos if p["Customer_PO_No"] == po_no)
+
+        m1, m2, m3 = st.columns(3)
+        m1.metric("PO No", selected["Customer_PO_No"])
+        m2.metric("Order qty", f"{selected['Order_Qty'] or 0:,.0f}")
+        m3.metric(
+            "Document",
+            selected["PO_Document_name"] or "— none —",
+        )
+
+        uploaded = st.file_uploader(
+            "Upload PO document",
+            type=["pdf", "doc", "docx", "xls", "xlsx"],
+            help="PDF, Word (.doc/.docx), or Excel (.xls/.xlsx).",
+        )
+        u1, u2, _ = st.columns([1, 1, 3])
+        if u1.button("Save document", type="primary", disabled=uploaded is None):
+            try:
+                db.save_po_document(
+                    customer_po_no=po_no,
+                    file_bytes=uploaded.getvalue(),
+                    filename=uploaded.name,
+                    content_type=getattr(uploaded, "type", None),
+                )
+                st.success(f"Saved **{uploaded.name}** on PO {po_no}.")
+                st.rerun()
+            except Exception as exc:
+                st.error(str(exc))
+
+        doc = db.get_po_document(po_no)
+        if doc and doc.get("PO_Document"):
+            st.download_button(
+                "Download attached document",
+                data=bytes(doc["PO_Document"]),
+                file_name=doc.get("PO_Document_name") or f"{po_no}.bin",
+                mime=doc.get("PO_Document_type") or "application/octet-stream",
+            )
+            if u2.button("Remove document"):
+                db.clear_po_document(po_no)
+                st.success("Document removed.")
+                st.rerun()
+
+    st.divider()
+    st.subheader("All purchase orders")
+    show = df_from_rows(pos)
+    if not show.empty and "Has_Document" in show.columns:
+        show["Has_Document"] = show["Has_Document"].map({1: "Yes", 0: "No", True: "Yes", False: "No"})
+    st.dataframe(show, use_container_width=True, hide_index=True)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # BOM
 # ═══════════════════════════════════════════════════════════════════════════════
 elif PAGE == "Bill of Materials":
@@ -1581,7 +1658,7 @@ elif PAGE == "Masters Overview":
             | 14 | batch_input | Charge sheets |
             | 15 | Batch_Chemical_Composition | Ladle chemistry |
             | 16 | Build_of_Material | BOM |
-            | 17 | Purchase_Order | Customer purchase orders |
+            | 17 | Purchase_Order | Customer POs + attached PO document (PDF/Word/Excel) |
             | 18 | ISRI_CODE_TABLE | ISRI scrap specification codes |
             | 19 | Finished_Goods_Inventory | Bundles (Under_Testing → Available on batch Approved) |
 

@@ -431,7 +431,10 @@ CREATE TABLE IF NOT EXISTS Purchase_Order (
     Shipping_City TEXT,
     Shipping_state TEXT,
     Shipping_Pincode TEXT,
-    Shipping_country TEXT
+    Shipping_country TEXT,
+    PO_Document {blob},
+    PO_Document_name TEXT,
+    PO_Document_type TEXT
 );
 """
 
@@ -508,6 +511,15 @@ def init_db() -> None:
                 ("Weighment_scale_weight", "REAL"),
                 ("Trolley_weight", "REAL"),
                 ("Trolley_name", "TEXT"),
+            ],
+        )
+        _ensure_columns(
+            conn,
+            "Purchase_Order",
+            [
+                ("PO_Document", "BYTEA" if IS_POSTGRES else "BLOB"),
+                ("PO_Document_name", "TEXT"),
+                ("PO_Document_type", "TEXT"),
             ],
         )
         _audit_cols = [
@@ -1856,6 +1868,89 @@ def calc_yield(input_weight: float, output_weight: float) -> dict[str, float]:
         "recovery_pct": recovery,
         "loss_kg": input_weight - output_weight,
     }
+
+
+# ---------- Purchase orders ----------
+
+PO_DOCUMENT_EXTENSIONS = (".pdf", ".doc", ".docx", ".xls", ".xlsx")
+
+
+def list_purchase_orders() -> list[dict[str, Any]]:
+    return fetch_all(
+        """
+        SELECT Customer_PO_No AS "Customer_PO_No",
+               Cust_code AS "Cust_code",
+               Customer_name AS "Customer_name",
+               Alloy_Id AS "Alloy_Id",
+               Order_Date AS "Order_Date",
+               Delivery_Date AS "Delivery_Date",
+               Order_Qty AS "Order_Qty",
+               Rate AS "Rate",
+               PO_Document_name AS "PO_Document_name",
+               PO_Document_type AS "PO_Document_type",
+               CASE WHEN PO_Document IS NULL THEN 0 ELSE 1 END AS "Has_Document"
+        FROM Purchase_Order
+        ORDER BY Order_Date DESC, Customer_PO_No
+        """
+    )
+
+
+def save_po_document(
+    customer_po_no: str,
+    file_bytes: bytes,
+    filename: str,
+    content_type: Optional[str] = None,
+) -> None:
+    """Attach a PDF/Word/Excel purchase-order document to an existing PO."""
+    if not customer_po_no:
+        raise ValueError("Customer PO No is required.")
+    if not file_bytes:
+        raise ValueError("Document file is empty.")
+    name = (filename or "").strip()
+    lower = name.lower()
+    if not any(lower.endswith(ext) for ext in PO_DOCUMENT_EXTENSIONS):
+        raise ValueError(
+            "PO document must be PDF, Word (.doc/.docx), or Excel (.xls/.xlsx)."
+        )
+    existing = fetch_one(
+        'SELECT Customer_PO_No AS "Customer_PO_No" FROM Purchase_Order WHERE Customer_PO_No = ?',
+        (customer_po_no,),
+    )
+    if not existing:
+        raise ValueError(f"Purchase order '{customer_po_no}' not found.")
+    execute(
+        """
+        UPDATE Purchase_Order
+        SET PO_Document = ?, PO_Document_name = ?, PO_Document_type = ?
+        WHERE Customer_PO_No = ?
+        """,
+        (file_bytes, name, content_type or "", customer_po_no),
+    )
+
+
+def get_po_document(customer_po_no: str) -> Optional[dict[str, Any]]:
+    return fetch_one(
+        """
+        SELECT Customer_PO_No AS "Customer_PO_No",
+               PO_Document AS "PO_Document",
+               PO_Document_name AS "PO_Document_name",
+               PO_Document_type AS "PO_Document_type"
+        FROM Purchase_Order
+        WHERE Customer_PO_No = ?
+        """,
+        (customer_po_no,),
+    )
+
+
+def clear_po_document(customer_po_no: str) -> None:
+    execute(
+        """
+        UPDATE Purchase_Order
+        SET PO_Document = NULL, PO_Document_name = NULL, PO_Document_type = NULL
+        WHERE Customer_PO_No = ?
+        """,
+        (customer_po_no,),
+    )
 
 
 # ---------- BOM ----------
