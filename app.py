@@ -36,9 +36,8 @@ if not os.environ.get("DATABASE_URL"):
 import database as db  # noqa: E402
 import importlib
 
-# Streamlit keeps imported modules in memory; reload if this session
-# started before Data Browser helpers were added.
-if not hasattr(db, "EDITABLE_TABLES"):
+# Streamlit keeps imported modules in memory; reload when helpers are missing.
+if not hasattr(db, "EDITABLE_TABLES") or not hasattr(db, "get_customer"):
     db = importlib.reload(db)
 
 # ── Theme tweaks ─────────────────────────────────────────────────────────────
@@ -1273,12 +1272,6 @@ elif PAGE == "Purchase Orders":
     cust_opts = {
         f"{c['Cust_code']} — {c['Customer_name']}": c["Cust_code"] for c in customers
     }
-    alloys = db.list_alloys()
-    alloy_opts = {
-        f"{a['Alloy_id']} — {a['Alloy_name']}"
-        + (f" ({a['Customer_name']})" if a.get("Customer_name") else ""): a["Alloy_id"]
-        for a in alloys
-    }
 
     if not customers:
         st.warning("Add at least one customer under **Customers** before creating a PO.")
@@ -1290,6 +1283,20 @@ elif PAGE == "Purchase Orders":
             key="po_customer_sel",
         )
         cust = db.get_customer(cust_opts[cust_label]) if cust_label else None
+        cust_code = cust["Cust_code"] if cust else None
+        alloys = [
+            a
+            for a in db.list_alloys()
+            if cust_code and a.get("Cust_code") == cust_code
+        ]
+        alloy_opts = {
+            f"{a['Alloy_id']} — {a['Alloy_name']}": a["Alloy_id"] for a in alloys
+        }
+        if cust and not alloy_opts:
+            st.info(
+                f"No alloys linked to customer **{cust['Customer_name']}**. "
+                "Add alloys under **Alloys** with this customer’s code."
+            )
 
         with st.form("po_entry_form", clear_on_submit=True):
             h1, h2, h3 = st.columns(3)
@@ -1301,6 +1308,8 @@ elif PAGE == "Purchase Orders":
                 alloy_label = st.selectbox(
                     "Alloy",
                     options=["— none —"] + list(alloy_opts.keys()),
+                    disabled=not bool(cust),
+                    help="Only alloys for the selected customer (Alloy_Master.Cust_code).",
                 )
                 order_qty = st.number_input("Order qty *", min_value=0.0, value=0.0, step=1.0)
                 rate = st.number_input("Rate", min_value=0.0, value=0.0, step=0.01)
