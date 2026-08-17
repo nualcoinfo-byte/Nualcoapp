@@ -44,6 +44,8 @@ if (
     or not hasattr(db, "list_lots_for_material")
     or not hasattr(db, "list_entry_elements")
     or not hasattr(db, "ENTRY_CHEM_ELEMENT_LIMIT")
+    or not hasattr(db, "PURCHASE_ORDER_STATUS")
+    or not hasattr(db, "update_purchase_order_status")
 ):
     db = importlib.reload(db)
 
@@ -288,6 +290,7 @@ PAGE = st.sidebar.radio(
         "Material Recovery & Yield",
         "Finished Goods Inventory",
         "Purchase Orders",
+        "All Purchase Orders",
         "Customers",
         "Vendors",
         "Alloys",
@@ -1835,8 +1838,8 @@ elif PAGE == "Trolleys":
 elif PAGE == "Purchase Orders":
     st.title("Purchase Orders")
     st.caption(
-        "Create or update customer purchase orders, then attach the PO document "
-        "(PDF, Word, or Excel)."
+        "Create or update a customer purchase order and optionally attach the PO document "
+        "(PDF, Word, or Excel). Review all POs and take actions under **All Purchase Orders**."
     )
 
     customers = db.list_customer_codes()
@@ -1891,6 +1894,12 @@ elif PAGE == "Purchase Orders":
                     disabled=True,
                 )
                 st.caption("Filled from Customer Master when a customer is selected.")
+                po_status = st.selectbox(
+                    "Purchase order status *",
+                    options=db.PURCHASE_ORDER_STATUS,
+                    index=0,
+                    help="Open, Closed, or Cancelled.",
+                )
 
             st.markdown("##### Billing address")
             b1, b2 = st.columns(2)
@@ -1946,7 +1955,7 @@ elif PAGE == "Purchase Orders":
             po_file = st.file_uploader(
                 "PO document (optional)",
                 type=["pdf", "doc", "docx", "xls", "xlsx"],
-                help="PDF, Word, or Excel. Can also be attached later below.",
+                help="PDF, Word, or Excel. Attach later from All Purchase Orders if needed.",
             )
             save_po = st.form_submit_button("Save purchase order", type="primary")
 
@@ -1984,6 +1993,7 @@ elif PAGE == "Purchase Orders":
                             "Shipping_state": ship_state.strip() or None,
                             "Shipping_Pincode": ship_pin.strip() or None,
                             "Shipping_country": ship_country.strip() or None,
+                            "Purchase_Order_Status": po_status,
                         }
                     )
                     if po_file is not None:
@@ -1993,43 +2003,205 @@ elif PAGE == "Purchase Orders":
                             filename=po_file.name,
                             content_type=getattr(po_file, "type", None),
                         )
-                    st.success(f"Saved purchase order **{po_no.strip()}**.")
+                    st.success(
+                        f"Saved purchase order **{po_no.strip()}**. "
+                        "Open **All Purchase Orders** to review or take further actions."
+                    )
                     st.rerun()
                 except Exception as exc:
                     st.error(str(exc))
 
-    st.divider()
-    st.markdown("#### Attach / download PO document")
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# All Purchase Orders (browse / actions)
+# ═══════════════════════════════════════════════════════════════════════════════
+elif PAGE == "All Purchase Orders":
+    st.title("All Purchase Orders")
+    st.caption(
+        "Summary of every customer PO. Filter, review details, change status, "
+        "and attach or download documents. Create new POs under **Purchase Orders**."
+    )
+
     pos = db.list_purchase_orders()
     if not pos:
-        st.info("No purchase orders yet.")
+        st.info("No purchase orders yet. Create one under **Purchase Orders**.")
     else:
-        po_labels = {
+        open_n = sum(1 for p in pos if (p.get("Purchase_Order_Status") or "Open") == "Open")
+        closed_n = sum(1 for p in pos if p.get("Purchase_Order_Status") == "Closed")
+        cancel_n = sum(1 for p in pos if p.get("Purchase_Order_Status") == "Cancelled")
+        with_doc = sum(1 for p in pos if int(p.get("Has_Document") or 0) == 1)
+
+        c1, c2, c3, c4, c5 = st.columns(5)
+        c1.metric("Total POs", len(pos))
+        c2.metric("Open", open_n)
+        c3.metric("Closed", closed_n)
+        c4.metric("Cancelled", cancel_n)
+        c5.metric("With document", with_doc)
+
+        f1, f2, f3 = st.columns([1.2, 1.5, 1.5])
+        with f1:
+            status_filter = st.selectbox(
+                "Status",
+                options=["All"] + db.PURCHASE_ORDER_STATUS,
+                key="apo_status_filter",
+            )
+        with f2:
+            def _po_cust_label(p: dict) -> str:
+                code = p.get("Cust_code") or ""
+                name = p.get("Customer_name") or ""
+                if code and name:
+                    return f"{code} — {name}"
+                return name or code or "—"
+
+            customers_in_pos = sorted({_po_cust_label(p) for p in pos})
+            cust_filter = st.selectbox(
+                "Customer",
+                options=["All"] + customers_in_pos,
+                key="apo_cust_filter",
+            )
+        with f3:
+            search = st.text_input(
+                "Search PO / alloy",
+                placeholder="PO number or alloy…",
+                key="apo_search",
+            ).strip().lower()
+
+        filtered = []
+        for p in pos:
+            st_val = p.get("Purchase_Order_Status") or "Open"
+            if status_filter != "All" and st_val != status_filter:
+                continue
+            if cust_filter != "All" and _po_cust_label(p) != cust_filter:
+                continue
+            if search:
+                blob = " ".join(
+                    str(p.get(k) or "")
+                    for k in (
+                        "Customer_PO_No",
+                        "Customer_name",
+                        "Cust_code",
+                        "Alloy_name",
+                        "Alloy_Id",
+                    )
+                ).lower()
+                if search not in blob:
+                    continue
+            filtered.append(p)
+
+        summary_rows = [
+            {
+                "PO No": p["Customer_PO_No"],
+                "Customer": p.get("Customer_name") or p.get("Cust_code") or "—",
+                "Alloy": p.get("Alloy_name")
+                or (f"#{p['Alloy_Id']}" if p.get("Alloy_Id") else "—"),
+                "Order date": p.get("Order_Date") or "—",
+                "Delivery": p.get("Delivery_Date") or "—",
+                "Qty": float(p["Order_Qty"] or 0),
+                "Rate": float(p["Rate"] or 0) if p.get("Rate") is not None else None,
+                "Status": p.get("Purchase_Order_Status") or "Open",
+                "Document": "Yes" if int(p.get("Has_Document") or 0) == 1 else "No",
+            }
+            for p in filtered
+        ]
+        st.subheader(f"Purchase orders ({len(summary_rows)})")
+        if not summary_rows:
+            st.warning("No purchase orders match the current filters.")
+        else:
+            st.dataframe(
+                pd.DataFrame(summary_rows),
+                use_container_width=True,
+                hide_index=True,
+            )
+
+        st.divider()
+        st.markdown("#### Actions on a purchase order")
+        action_opts = {
             f"{p['Customer_PO_No']}"
             + (f" — {p['Customer_name']}" if p.get("Customer_name") else "")
-            + (
-                f"  [{p['PO_Document_name']}]"
-                if p.get("PO_Document_name")
-                else "  [no document]"
-            ): p["Customer_PO_No"]
-            for p in pos
+            + f" · {p.get('Purchase_Order_Status') or 'Open'}": p["Customer_PO_No"]
+            for p in filtered or pos
         }
-        pick = st.selectbox("Existing purchase order", list(po_labels.keys()))
-        po_no_sel = po_labels[pick]
+        pick = st.selectbox(
+            "Select purchase order",
+            options=list(action_opts.keys()),
+            key="apo_action_pick",
+        )
+        po_no_sel = action_opts[pick]
         selected = next(p for p in pos if p["Customer_PO_No"] == po_no_sel)
 
-        m1, m2, m3 = st.columns(3)
-        m1.metric("PO No", selected["Customer_PO_No"])
-        m2.metric("Order qty", f"{selected['Order_Qty'] or 0:,.0f}")
-        m3.metric("Document", selected["PO_Document_name"] or "— none —")
+        d1, d2, d3, d4 = st.columns(4)
+        d1.metric("PO No", selected["Customer_PO_No"])
+        d2.metric("Customer", selected.get("Customer_name") or "—")
+        d3.metric(
+            "Alloy",
+            selected.get("Alloy_name")
+            or (f"#{selected['Alloy_Id']}" if selected.get("Alloy_Id") else "—"),
+        )
+        d4.metric("Qty", f"{float(selected.get('Order_Qty') or 0):,.0f}")
 
+        with st.expander("Order details", expanded=False):
+            st.write(
+                {
+                    "Order date": selected.get("Order_Date"),
+                    "Delivery date": selected.get("Delivery_Date"),
+                    "Rate": selected.get("Rate"),
+                    "Status": selected.get("Purchase_Order_Status") or "Open",
+                    "Billing": ", ".join(
+                        x
+                        for x in [
+                            selected.get("Billing_Address"),
+                            selected.get("Billing_City"),
+                            selected.get("Billing_state"),
+                            selected.get("Billing_Pincode"),
+                            selected.get("Billing_country"),
+                        ]
+                        if x
+                    )
+                    or "—",
+                    "Shipping": ", ".join(
+                        x
+                        for x in [
+                            selected.get("Shipping_address"),
+                            selected.get("Shipping_City"),
+                            selected.get("Shipping_state"),
+                            selected.get("Shipping_Pincode"),
+                            selected.get("Shipping_country"),
+                        ]
+                        if x
+                    )
+                    or "—",
+                    "Document": selected.get("PO_Document_name") or "None",
+                }
+            )
+
+        st.markdown("##### Update status")
+        cur_status = selected.get("Purchase_Order_Status") or "Open"
+        try:
+            cur_idx = db.PURCHASE_ORDER_STATUS.index(cur_status)
+        except ValueError:
+            cur_idx = 0
+        new_status = st.selectbox(
+            "Purchase order status",
+            options=db.PURCHASE_ORDER_STATUS,
+            index=cur_idx,
+            key="apo_status_edit",
+        )
+        if st.button("Save status", type="primary", key="apo_save_status"):
+            try:
+                db.update_purchase_order_status(po_no_sel, new_status)
+                st.success(f"PO **{po_no_sel}** set to **{new_status}**.")
+                st.rerun()
+            except Exception as exc:
+                st.error(str(exc))
+
+        st.markdown("##### Document")
         uploaded = st.file_uploader(
             "Upload / replace PO document",
             type=["pdf", "doc", "docx", "xls", "xlsx"],
-            key="po_attach_existing",
+            key="apo_attach",
         )
         u1, u2, _ = st.columns([1, 1, 3])
-        if u1.button("Save document", type="primary", disabled=uploaded is None):
+        if u1.button("Save document", type="primary", disabled=uploaded is None, key="apo_save_doc"):
             try:
                 db.save_po_document(
                     customer_po_no=po_no_sel,
@@ -2049,20 +2221,14 @@ elif PAGE == "Purchase Orders":
                 data=bytes(doc["PO_Document"]),
                 file_name=doc.get("PO_Document_name") or f"{po_no_sel}.bin",
                 mime=doc.get("PO_Document_type") or "application/octet-stream",
+                key="apo_download",
             )
-            if u2.button("Remove document"):
+            if u2.button("Remove document", key="apo_remove_doc"):
                 db.clear_po_document(po_no_sel)
                 st.success("Document removed.")
                 st.rerun()
-
-    st.divider()
-    st.subheader("All purchase orders")
-    show = df_from_rows(pos)
-    if not show.empty and "Has_Document" in show.columns:
-        show["Has_Document"] = show["Has_Document"].map(
-            {1: "Yes", 0: "No", True: "Yes", False: "No"}
-        )
-    st.dataframe(show, use_container_width=True, hide_index=True)
+        else:
+            st.caption("No document attached to this PO yet.")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -2400,7 +2566,7 @@ elif PAGE == "Masters Overview":
             | 16 | Build_of_Material | BOM |
             | 17 | Purchase_Order | Customer POs + attached PO document (PDF/Word/Excel) |
             | 18 | ISRI_CODE_TABLE | ISRI scrap specification codes |
-            | 19 | Finished_Goods_Inventory | Bundles (Under_Testing → Available on batch Approved) |
+            | 19 | Finished_Goods_Inventory | Bundles (Under_Testing → Available → Assigned / Dispatched / Rejected) |
 
             Extra production columns: `Workflow_stage`, sample fields, `Production_supervisor`.
             """

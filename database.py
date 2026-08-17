@@ -92,7 +92,10 @@ def _q(sql: str) -> str:
 
 
 def _exec(conn: Connection, sql: str, params: Any = None) -> CursorResult:
-    return conn.exec_driver_sql(_q(sql), params)
+    q = _q(sql)
+    if params is None:
+        return conn.exec_driver_sql(q)
+    return conn.exec_driver_sql(q, params)
 
 
 @contextmanager
@@ -155,9 +158,18 @@ BATCH_QA_STATUS = ["Pending QA", "In-Progress", "Approved", "Rejected"]
 FG_STATUS_UNDER_TESTING = "Under_Testing"
 FG_STATUS_AVAILABLE = "Available"
 FG_STATUS_ASSIGNED = "Assigned"
-FG_STATUSES = [FG_STATUS_UNDER_TESTING, FG_STATUS_AVAILABLE, FG_STATUS_ASSIGNED]
+FG_STATUS_DISPATCHED = "Dispatched"
+FG_STATUS_REJECTED = "Rejected"
+FG_STATUSES = [
+    FG_STATUS_UNDER_TESTING,
+    FG_STATUS_AVAILABLE,
+    FG_STATUS_ASSIGNED,
+    FG_STATUS_DISPATCHED,
+    FG_STATUS_REJECTED,
+]
 INVENTORY_STATUS = ["Awaiting Assay", "Ready For Melt", "Not Ready for Melt"]
 ACTIVE_STATUS = ["Active", "Inactive"]
+PURCHASE_ORDER_STATUS = ["Open", "Closed", "Cancelled"]
 SAMPLE_OK_STATUS = ["OK", "NOT OK"]
 ELEMENT_LEVEL = ["Low", "Medium", "High"]
 SHIFTS = ["A", "B"]
@@ -384,7 +396,9 @@ CREATE TABLE IF NOT EXISTS Finished_Goods_Inventory (
     Output_Weight {float},
     Output_pieces {float},
     Finished_Goods_Status TEXT NOT NULL DEFAULT 'Under_Testing'
-        CHECK(Finished_Goods_Status IN ('Under_Testing', 'Available', 'Assigned'))
+        CHECK(Finished_Goods_Status IN (
+            'Under_Testing', 'Available', 'Assigned', 'Dispatched', 'Rejected'
+        ))
 );
 CREATE TABLE IF NOT EXISTS batch_input (
     Batch_ID TEXT NOT NULL REFERENCES Production_batch(Batch_ID),
@@ -437,7 +451,9 @@ CREATE TABLE IF NOT EXISTS Purchase_Order (
     Shipping_country TEXT,
     PO_Document {blob},
     PO_Document_name TEXT,
-    PO_Document_type TEXT
+    PO_Document_type TEXT,
+    Purchase_Order_Status TEXT DEFAULT 'Open'
+        CHECK(Purchase_Order_Status IN ('Open', 'Closed', 'Cancelled'))
 );
 """
 
@@ -539,8 +555,10 @@ def init_db() -> None:
                 ("PO_Document", "BYTEA" if IS_POSTGRES else "BLOB"),
                 ("PO_Document_name", "TEXT"),
                 ("PO_Document_type", "TEXT"),
+                ("Purchase_Order_Status", "TEXT DEFAULT 'Open'"),
             ],
         )
+        _ensure_purchase_order_status(conn)
         _ensure_columns(
             conn,
             "Raw_Material_Inventory",
@@ -608,7 +626,83 @@ def init_db() -> None:
                 [("Cust_code", "TEXT REFERENCES Customer_Master(Cust_code)")],
             )
 
+        _ensure_purchase_order_status(conn)
+        _ensure_finished_goods_status(conn)
         _ensure_finished_goods_release_trigger(conn)
+
+
+def _ensure_purchase_order_status(conn: Connection) -> None:
+    """Backfill and enforce Purchase_Order_Status ∈ Open / Closed / Cancelled."""
+    _exec(
+        conn,
+        """
+        UPDATE Purchase_Order
+        SET Purchase_Order_Status = 'Open'
+        WHERE Purchase_Order_Status IS NULL
+           OR TRIM(Purchase_Order_Status) = ''
+        """,
+    )
+    if IS_POSTGRES:
+        exists = _exec(
+            conn,
+            """
+            SELECT 1 AS ok
+            FROM pg_constraint
+            WHERE conname = 'purchase_order_status_check'
+            """,
+        ).first()
+        if not exists:
+            _exec(
+                conn,
+                """
+                ALTER TABLE Purchase_Order
+                ADD CONSTRAINT purchase_order_status_check
+                CHECK (Purchase_Order_Status IN ('Open', 'Closed', 'Cancelled'))
+                """,
+            )
+    else:
+        # SQLite: table-level CHECK is only on CREATE; column already has DEFAULT.
+        pass
+
+
+def _ensure_finished_goods_status(conn: Connection) -> None:
+    """Allow Finished_Goods_Status: Under_Testing, Available, Assigned, Dispatched, Rejected."""
+    if not IS_POSTGRES:
+        return
+    rows = list(
+        _exec(
+            conn,
+            """
+            SELECT conname, pg_get_constraintdef(oid) AS def
+            FROM pg_constraint
+            WHERE conrelid = 'finished_goods_inventory'::regclass
+              AND contype = 'c'
+              AND position(
+                    'finished_goods_status' IN lower(pg_get_constraintdef(oid))
+                  ) > 0
+            """,
+        ).mappings()
+    )
+    if any(
+        "Dispatched" in (r["def"] or "") and "Rejected" in (r["def"] or "")
+        for r in rows
+    ):
+        return
+    for row in rows:
+        _exec(
+            conn,
+            f'ALTER TABLE Finished_Goods_Inventory DROP CONSTRAINT "{row["conname"]}"',
+        )
+    _exec(
+        conn,
+        """
+        ALTER TABLE Finished_Goods_Inventory
+        ADD CONSTRAINT finished_goods_status_check
+        CHECK (Finished_Goods_Status IN (
+            'Under_Testing', 'Available', 'Assigned', 'Dispatched', 'Rejected'
+        ))
+        """,
+    )
 
 
 def _ensure_finished_goods_release_trigger(conn: Connection) -> None:
@@ -2072,31 +2166,55 @@ PO_DOCUMENT_EXTENSIONS = (".pdf", ".doc", ".docx", ".xls", ".xlsx")
 def list_purchase_orders() -> list[dict[str, Any]]:
     return fetch_all(
         """
-        SELECT Customer_PO_No AS "Customer_PO_No",
-               Cust_code AS "Cust_code",
-               Customer_name AS "Customer_name",
-               Alloy_Id AS "Alloy_Id",
-               Order_Date AS "Order_Date",
-               Delivery_Date AS "Delivery_Date",
-               Order_Qty AS "Order_Qty",
-               Rate AS "Rate",
-               Billing_Address AS "Billing_Address",
-               Billing_City AS "Billing_City",
-               Billing_state AS "Billing_state",
-               Billing_Pincode AS "Billing_Pincode",
-               Billing_country AS "Billing_country",
-               Shipping_address AS "Shipping_address",
-               Shipping_City AS "Shipping_City",
-               Shipping_state AS "Shipping_state",
-               Shipping_Pincode AS "Shipping_Pincode",
-               Shipping_country AS "Shipping_country",
-               PO_Document_name AS "PO_Document_name",
-               PO_Document_type AS "PO_Document_type",
-               CASE WHEN PO_Document IS NULL THEN 0 ELSE 1 END AS "Has_Document"
-        FROM Purchase_Order
-        ORDER BY Order_Date DESC, Customer_PO_No
+        SELECT p.Customer_PO_No AS "Customer_PO_No",
+               p.Cust_code AS "Cust_code",
+               p.Customer_name AS "Customer_name",
+               p.Alloy_Id AS "Alloy_Id",
+               a.Alloy_name AS "Alloy_name",
+               p.Order_Date AS "Order_Date",
+               p.Delivery_Date AS "Delivery_Date",
+               p.Order_Qty AS "Order_Qty",
+               p.Rate AS "Rate",
+               p.Billing_Address AS "Billing_Address",
+               p.Billing_City AS "Billing_City",
+               p.Billing_state AS "Billing_state",
+               p.Billing_Pincode AS "Billing_Pincode",
+               p.Billing_country AS "Billing_country",
+               p.Shipping_address AS "Shipping_address",
+               p.Shipping_City AS "Shipping_City",
+               p.Shipping_state AS "Shipping_state",
+               p.Shipping_Pincode AS "Shipping_Pincode",
+               p.Shipping_country AS "Shipping_country",
+               p.PO_Document_name AS "PO_Document_name",
+               p.PO_Document_type AS "PO_Document_type",
+               COALESCE(p.Purchase_Order_Status, 'Open') AS "Purchase_Order_Status",
+               CASE WHEN p.PO_Document IS NULL THEN 0 ELSE 1 END AS "Has_Document"
+        FROM Purchase_Order p
+        LEFT JOIN Alloy_Master a ON a.Alloy_id = p.Alloy_Id
+        ORDER BY p.Order_Date DESC, p.Customer_PO_No
         """
     )
+
+
+def update_purchase_order_status(customer_po_no: str, status: str) -> None:
+    status = (status or "").strip()
+    if status not in PURCHASE_ORDER_STATUS:
+        raise ValueError(
+            f"Purchase_Order_Status must be one of {', '.join(PURCHASE_ORDER_STATUS)}."
+        )
+    po_no = (customer_po_no or "").strip()
+    if not po_no:
+        raise ValueError("Customer PO No is required.")
+    n = execute(
+        """
+        UPDATE Purchase_Order
+        SET Purchase_Order_Status = ?
+        WHERE Customer_PO_No = ?
+        """,
+        (status, po_no),
+    )
+    if n == 0:
+        raise ValueError(f"Purchase order '{po_no}' not found.")
 
 
 def upsert_purchase_order(data: dict[str, Any]) -> None:
@@ -2109,14 +2227,21 @@ def upsert_purchase_order(data: dict[str, Any]) -> None:
     if not data.get("Customer_name"):
         raise ValueError("Customer name is required.")
 
+    status = (data.get("Purchase_Order_Status") or "Open").strip()
+    if status not in PURCHASE_ORDER_STATUS:
+        raise ValueError(
+            f"Purchase_Order_Status must be one of {', '.join(PURCHASE_ORDER_STATUS)}."
+        )
+
     execute(
         """
         INSERT INTO Purchase_Order
             (Customer_PO_No, Cust_code, Customer_name, Alloy_Id,
              Order_Date, Delivery_Date, Order_Qty, Rate,
              Billing_Address, Billing_City, Billing_state, Billing_Pincode, Billing_country,
-             Shipping_address, Shipping_City, Shipping_state, Shipping_Pincode, Shipping_country)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             Shipping_address, Shipping_City, Shipping_state, Shipping_Pincode, Shipping_country,
+             Purchase_Order_Status)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(Customer_PO_No) DO UPDATE SET
             Cust_code=excluded.Cust_code,
             Customer_name=excluded.Customer_name,
@@ -2134,7 +2259,8 @@ def upsert_purchase_order(data: dict[str, Any]) -> None:
             Shipping_City=excluded.Shipping_City,
             Shipping_state=excluded.Shipping_state,
             Shipping_Pincode=excluded.Shipping_Pincode,
-            Shipping_country=excluded.Shipping_country
+            Shipping_country=excluded.Shipping_country,
+            Purchase_Order_Status=excluded.Purchase_Order_Status
         """,
         (
             po_no,
@@ -2155,6 +2281,7 @@ def upsert_purchase_order(data: dict[str, Any]) -> None:
             data.get("Shipping_state"),
             data.get("Shipping_Pincode"),
             data.get("Shipping_country"),
+            status,
         ),
     )
 
