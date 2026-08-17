@@ -269,7 +269,10 @@ CREATE TABLE IF NOT EXISTS Raw_Material_Inventory (
     Storage_bay TEXT,
     Raw_Material_Status TEXT DEFAULT 'Awaiting Assay',
     Photo {blob},
-    Cost_per_kg {float}
+    Cost_per_kg {float},
+    Invoice_Document {blob},
+    Invoice_Document_name TEXT,
+    Invoice_Document_type TEXT
 );
 CREATE TABLE IF NOT EXISTS Raw_Material_Spec (
     Raw_Material_Name TEXT NOT NULL,
@@ -520,6 +523,15 @@ def init_db() -> None:
                 ("PO_Document", "BYTEA" if IS_POSTGRES else "BLOB"),
                 ("PO_Document_name", "TEXT"),
                 ("PO_Document_type", "TEXT"),
+            ],
+        )
+        _ensure_columns(
+            conn,
+            "Raw_Material_Inventory",
+            [
+                ("Invoice_Document", "BYTEA" if IS_POSTGRES else "BLOB"),
+                ("Invoice_Document_name", "TEXT"),
+                ("Invoice_Document_type", "TEXT"),
             ],
         )
         _audit_cols = [
@@ -1311,7 +1323,12 @@ def add_inventory_lot(
     photo: Optional[bytes] = None,
     supplier_invoice_date: Optional[str] = None,
     cost_per_kg: Optional[float] = None,
+    invoice_document: Optional[bytes] = None,
+    invoice_document_name: Optional[str] = None,
+    invoice_document_type: Optional[str] = None,
 ) -> int:
+    if invoice_document and invoice_document_name:
+        _validate_invoice_document_name(invoice_document_name)
     with get_connection() as conn:
         result = _exec(
             conn,
@@ -1319,8 +1336,9 @@ def add_inventory_lot(
             INSERT INTO Raw_Material_Inventory
                 (Raw_Material_Name, Vendor_code, Supplier_Invoice, Supplier_invoice_date,
                  Received_date, Received_weight, Remaining_Weight, Storage_bay,
-                 Raw_Material_Status, Photo, Cost_per_kg)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 Raw_Material_Status, Photo, Cost_per_kg,
+                 Invoice_Document, Invoice_Document_name, Invoice_Document_type)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             RETURNING Lot_id
             """,
             (
@@ -1335,9 +1353,72 @@ def add_inventory_lot(
                 status,
                 photo,
                 cost_per_kg,
+                invoice_document,
+                invoice_document_name,
+                invoice_document_type,
             ),
         )
         return int(result.scalar_one())
+
+
+INVOICE_DOCUMENT_EXTENSIONS = (
+    ".pdf",
+    ".doc",
+    ".docx",
+    ".xls",
+    ".xlsx",
+    ".jpg",
+    ".jpeg",
+    ".png",
+)
+
+
+def _validate_invoice_document_name(filename: str) -> None:
+    lower = (filename or "").strip().lower()
+    if not any(lower.endswith(ext) for ext in INVOICE_DOCUMENT_EXTENSIONS):
+        raise ValueError(
+            "Invoice document must be Photo (JPEG/PNG), PDF, Word (.doc/.docx), "
+            "or Excel (.xls/.xlsx)."
+        )
+
+
+def save_inventory_invoice_document(
+    lot_id: int,
+    file_bytes: bytes,
+    filename: str,
+    content_type: Optional[str] = None,
+) -> None:
+    if not file_bytes:
+        raise ValueError("Invoice file is empty.")
+    _validate_invoice_document_name(filename)
+    existing = fetch_one(
+        'SELECT Lot_id AS "Lot_id" FROM Raw_Material_Inventory WHERE Lot_id = ?',
+        (lot_id,),
+    )
+    if not existing:
+        raise ValueError(f"Lot {lot_id} not found.")
+    execute(
+        """
+        UPDATE Raw_Material_Inventory
+        SET Invoice_Document = ?, Invoice_Document_name = ?, Invoice_Document_type = ?
+        WHERE Lot_id = ?
+        """,
+        (file_bytes, filename.strip(), content_type or "", lot_id),
+    )
+
+
+def get_inventory_invoice_document(lot_id: int) -> Optional[dict[str, Any]]:
+    return fetch_one(
+        """
+        SELECT Lot_id AS "Lot_id",
+               Invoice_Document AS "Invoice_Document",
+               Invoice_Document_name AS "Invoice_Document_name",
+               Invoice_Document_type AS "Invoice_Document_type"
+        FROM Raw_Material_Inventory
+        WHERE Lot_id = ?
+        """,
+        (lot_id,),
+    )
 
 
 def set_lot_chemistry(material: str, lot_id: int, composition: dict[str, float]) -> None:

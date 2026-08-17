@@ -231,6 +231,12 @@ elif PAGE == "Raw Material Logging":
             inv_status = st.selectbox("Inventory status", db.INVENTORY_STATUS, index=1)
             rm_status = st.selectbox("Master status", db.ACTIVE_STATUS)
             photo = st.file_uploader("Photo", type=["png", "jpg", "jpeg", "webp"])
+            invoice_doc = st.file_uploader(
+                "Invoice document",
+                type=["png", "jpg", "jpeg", "pdf", "doc", "docx", "xls", "xlsx"],
+                help="Photo (JPEG/PNG), PDF, Word, or Excel.",
+                key="rm_invoice_doc",
+            )
 
         st.markdown("#### Chemical composition (%)")
         st.caption("Enter assay percentages for this lot. Common scrap elements shown first.")
@@ -295,6 +301,9 @@ elif PAGE == "Raw Material Logging":
                     photo=photo_bytes(photo),
                     supplier_invoice_date=invoice_date.isoformat(),
                     cost_per_kg=cost,
+                    invoice_document=photo_bytes(invoice_doc),
+                    invoice_document_name=invoice_doc.name if invoice_doc else None,
+                    invoice_document_type=getattr(invoice_doc, "type", None) if invoice_doc else None,
                 )
                 cleaned = {k: v for k, v in composition.items() if v and v > 0}
                 if cleaned:
@@ -321,7 +330,8 @@ elif PAGE == "Raw Material Logging":
                    i.Remaining_Weight AS "Remaining_Weight",
                    i.Cost_per_kg AS "Cost_per_kg",
                    i.Storage_bay AS "Storage_bay",
-                   i.Raw_Material_Status AS "Raw_Material_Status"
+                   i.Raw_Material_Status AS "Raw_Material_Status",
+                   i.Invoice_Document_name AS "Invoice_Document_name"
             FROM Raw_Material_Inventory i
             LEFT JOIN Vendor_Master v ON v.Vendor_code = i.Vendor_code
             ORDER BY i.Lot_id DESC
