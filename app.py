@@ -6,6 +6,7 @@ Runs on Neon Postgres (DATABASE_URL) with local SQLite as fallback.
 
 from __future__ import annotations
 
+import html
 import os
 from datetime import date, datetime
 from pathlib import Path
@@ -41,6 +42,8 @@ if (
     not hasattr(db, "EDITABLE_TABLES")
     or not hasattr(db, "get_customer")
     or not hasattr(db, "list_lots_for_material")
+    or not hasattr(db, "list_entry_elements")
+    or not hasattr(db, "ENTRY_CHEM_ELEMENT_LIMIT")
 ):
     db = importlib.reload(db)
 
@@ -92,6 +95,178 @@ def photo_bytes(uploaded) -> bytes | None:
     return uploaded.getvalue()
 
 
+@st.dialog("All elements — chemical composition (%)", width="large")
+def dialog_all_element_percentages(
+    state_key: str,
+    defaults: dict[str, float] | None = None,
+    sync_keys: dict[str, str] | None = None,
+) -> None:
+    """Popup to enter percentages for every Element_Master row."""
+    defaults = defaults or {}
+    stored = st.session_state.get(state_key) or {}
+    elements = db.list_elements()
+    st.caption(
+        f"Enter assay / chemistry % for all **{len(elements)}** elements "
+        "in Element_Master (Serial_no order). Click **Apply & close** to use these values."
+    )
+    values: dict[str, float] = {}
+    cols = st.columns(4)
+    for i, el in enumerate(elements):
+        sym = el["Element_Symbol"]
+        default = float(stored.get(sym, defaults.get(sym, 0.0)) or 0.0)
+        with cols[i % 4]:
+            values[sym] = st.number_input(
+                f"{sym} %",
+                min_value=0.0,
+                max_value=100.0,
+                value=default,
+                step=0.001,
+                format="%.3f",
+                key=f"{state_key}_dlg_{sym}",
+                help=el["Element_Name"],
+            )
+    b1, b2 = st.columns(2)
+    with b1:
+        apply = st.button("Apply & close", type="primary", use_container_width=True)
+    with b2:
+        cancel = st.button("Cancel", use_container_width=True)
+    if apply:
+        st.session_state[state_key] = values
+        if sync_keys:
+            for sym, widget_key in sync_keys.items():
+                if sym in values:
+                    st.session_state[widget_key] = float(values[sym])
+        st.rerun()
+    if cancel:
+        st.rerun()
+
+
+@st.dialog("All elements — alloy specification", width="large")
+def dialog_all_element_specs(
+    state_key: str,
+    sync_min_keys: dict[str, str] | None = None,
+    sync_max_keys: dict[str, str] | None = None,
+) -> None:
+    """Popup to enter min/max % for every Element_Master row."""
+    stored = st.session_state.get(state_key) or {}
+    elements = db.list_elements()
+    st.caption(
+        f"Enter min / max % for all **{len(elements)}** elements in Element_Master. "
+        "Click **Apply & close** to use these ranges on Create alloy."
+    )
+    values: dict[str, tuple[float, float]] = {}
+    for el in elements:
+        sym = el["Element_Symbol"]
+        prev = stored.get(sym) or (0.0, 0.0)
+        try:
+            prev_min, prev_max = float(prev[0] or 0.0), float(prev[1] or 0.0)
+        except (TypeError, IndexError, ValueError):
+            prev_min, prev_max = 0.0, 0.0
+        c1, c2, c3 = st.columns([1.2, 2, 2])
+        c1.markdown(f"**{sym}**")
+        c1.caption(el["Element_Name"])
+        mn = c2.number_input(
+            f"{sym} min",
+            min_value=0.0,
+            max_value=100.0,
+            value=prev_min,
+            step=0.01,
+            key=f"{state_key}_dlg_min_{sym}",
+        )
+        mx = c3.number_input(
+            f"{sym} max",
+            min_value=0.0,
+            max_value=100.0,
+            value=prev_max,
+            step=0.01,
+            key=f"{state_key}_dlg_max_{sym}",
+        )
+        values[sym] = (mn, mx)
+
+    b1, b2 = st.columns(2)
+    with b1:
+        apply = st.button("Apply & close", type="primary", use_container_width=True)
+    with b2:
+        cancel = st.button("Cancel", use_container_width=True)
+    if apply:
+        st.session_state[state_key] = values
+        if sync_min_keys:
+            for sym, widget_key in sync_min_keys.items():
+                if sym in values:
+                    st.session_state[widget_key] = float(values[sym][0])
+        if sync_max_keys:
+            for sym, widget_key in sync_max_keys.items():
+                if sym in values:
+                    st.session_state[widget_key] = float(values[sym][1])
+        st.rerun()
+    if cancel:
+        st.rerun()
+
+
+def merge_percent_composition(
+    page_values: dict[str, float],
+    full_state_key: str,
+) -> dict[str, float]:
+    """Merge main-page entry values over an optional full Element_Master dialog map."""
+    merged = dict(st.session_state.get(full_state_key) or {})
+    merged.update(page_values)
+    return merged
+
+
+def merge_spec_ranges(
+    page_specs: dict[str, tuple[float | None, float | None]],
+    full_state_key: str,
+) -> dict[str, tuple[float | None, float | None]]:
+    """Merge main-page specs over an optional full Element_Master dialog map."""
+    merged: dict[str, tuple[float | None, float | None]] = {}
+    for sym, pair in (st.session_state.get(full_state_key) or {}).items():
+        try:
+            mn, mx = pair
+        except (TypeError, ValueError):
+            continue
+        merged[sym] = (mn if mn and mn > 0 else None, mx if mx and mx > 0 else None)
+    merged.update(page_specs)
+    return merged
+
+
+def _trolley_css_color(colour: str | None) -> str | None:
+    """Map Trolley_Master.Colour text to a CSS colour (hex or named)."""
+    if colour is None:
+        return None
+    raw = str(colour).strip()
+    if not raw:
+        return None
+    if raw.startswith("#") and len(raw) in (4, 7, 9):
+        return raw
+    named = {
+        "red": "#E53935",
+        "blue": "#1E88E5",
+        "green": "#43A047",
+        "yellow": "#FDD835",
+        "orange": "#FB8C00",
+        "purple": "#8E24AA",
+        "pink": "#D81B60",
+        "brown": "#6D4C41",
+        "black": "#212121",
+        "white": "#FAFAFA",
+        "grey": "#757575",
+        "gray": "#757575",
+        "silver": "#B0BEC5",
+        "gold": "#F9A825",
+        "cyan": "#00ACC1",
+        "teal": "#00897B",
+        "navy": "#1565C0",
+        "maroon": "#C62828",
+        "violet": "#7E57C2",
+        "lime": "#C0CA33",
+    }
+    key = raw.lower()
+    if key in named:
+        return named[key]
+    # Allow CSS colour names / values already stored in the master
+    return raw
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # Sidebar
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -106,7 +281,9 @@ PAGE = st.sidebar.radio(
     [
         "Dashboard",
         "Raw Material Logging",
+        "Raw Material Inventory",
         "Production Batch & Chemistry",
+        "Production Batches",
         "Production Workflow Tracker",
         "Material Recovery & Yield",
         "Finished Goods Inventory",
@@ -191,8 +368,9 @@ if PAGE == "Dashboard":
 elif PAGE == "Raw Material Logging":
     st.title("Raw Material Logging")
     st.caption(
-        "Select an existing raw material or enter a new name, receive a lot "
-        "(weight & cost), and capture chemistry (copy from a prior lot or enter fresh)."
+        "Mobile-optimized entry: select or create a raw material, receive a lot "
+        "(weight & cost), and capture chemistry. "
+        "Browse existing lots under **Raw Material Inventory**."
     )
 
     vendors = db.list_vendors()
@@ -275,86 +453,131 @@ elif PAGE == "Raw Material Logging":
                         hide_index=True,
                     )
 
-    with st.form("rm_log_form", clear_on_submit=True):
-        st.markdown("#### Material & receipt")
-        col_a, col_b = st.columns(2)
-        with col_a:
-            st.text_input(
-                "Raw material name (locked)",
-                value=rm_name_clean,
-                disabled=True,
-            )
-            isri_opts = {
-                f"{c['ISRI_CODE']} — {c['Description']}": c["ISRI_CODE"]
-                for c in db.list_isri_codes()
+    # Seed full Element_Master chemistry when copying a prior lot.
+    if source_lot_id and copied_chem:
+        if st.session_state.get("rm_full_chem_seed") != source_lot_id:
+            st.session_state["rm_full_chem"] = {
+                k: float(v or 0.0) for k, v in copied_chem.items()
             }
-            isri_label = st.selectbox("ISRI code", options=[""] + list(isri_opts.keys()))
-            alloy_family = st.text_input("Alloy family", placeholder="e.g. Al-Si")
-            fe_level = st.selectbox("Fe", [""] + db.ELEMENT_LEVEL)
-            cu_level = st.selectbox("Cu", [""] + db.ELEMENT_LEVEL)
-            mg_level = st.selectbox("Mg", [""] + db.ELEMENT_LEVEL)
-            availability = st.selectbox(
-                "Availability class",
-                ["Standard", "Spot", "Contract", "Internal"],
+            st.session_state["rm_full_chem_seed"] = source_lot_id
+
+    chem_key_suffix = (
+        f"{source_lot_id}" if source_lot_id and chem_mode.startswith("Copy") else "fresh"
+    )
+    entry_elements = db.list_entry_elements()
+    sync_chem_keys = {
+        el["Element_Symbol"]: f"chem_{el['Element_Symbol']}_{chem_key_suffix}"
+        for el in entry_elements
+    }
+    dlg_defaults = dict(st.session_state.get("rm_full_chem") or {})
+    dlg_defaults.update({k: float(v or 0.0) for k, v in copied_chem.items()})
+    full_chem = st.session_state.get("rm_full_chem") or {}
+
+    st.markdown("#### Material & receipt")
+    col_a, col_b = st.columns(2)
+    with col_a:
+        st.text_input(
+            "Raw material name (locked)",
+            value=rm_name_clean,
+            disabled=True,
+            key="rm_locked_name",
+        )
+        isri_opts = {
+            f"{c['ISRI_CODE']} — {c['Description']}": c["ISRI_CODE"]
+            for c in db.list_isri_codes()
+        }
+        isri_label = st.selectbox(
+            "ISRI code", options=[""] + list(isri_opts.keys()), key="rm_isri"
+        )
+        alloy_family = st.text_input(
+            "Alloy family", placeholder="e.g. Al-Si", key="rm_alloy_family"
+        )
+        fe_level = st.selectbox("Fe", [""] + db.ELEMENT_LEVEL, key="rm_fe")
+        cu_level = st.selectbox("Cu", [""] + db.ELEMENT_LEVEL, key="rm_cu")
+        mg_level = st.selectbox("Mg", [""] + db.ELEMENT_LEVEL, key="rm_mg")
+        availability = st.selectbox(
+            "Availability class",
+            ["Standard", "Spot", "Contract", "Internal"],
+            key="rm_availability",
+        )
+        recovery = st.number_input(
+            "Expected recovery %", 0.0, 100.0, 95.0, 0.1, key="rm_recovery"
+        )
+        cost = st.number_input(
+            "Cost per kg", min_value=0.0, value=0.0, step=0.01, key="rm_cost"
+        )
+    with col_b:
+        vendor_label = st.selectbox(
+            "Vendor", options=[""] + list(vendor_opts.keys()), key="rm_vendor"
+        )
+        effective = st.date_input("Effective date", value=date.today(), key="rm_effective")
+        received = st.date_input("Received date", value=date.today(), key="rm_received")
+        invoice = st.text_input("Vendor invoice", key="rm_invoice")
+        invoice_date = st.date_input(
+            "Supplier invoice date", value=date.today(), key="rm_invoice_date"
+        )
+        weight = st.number_input(
+            "Total weight (kg) *", min_value=0.0, value=1000.0, step=1.0, key="rm_weight"
+        )
+        storage = st.text_input("Storage bay", placeholder="e.g. Bay-A1", key="rm_storage")
+        inv_status = st.selectbox(
+            "Inventory status", db.INVENTORY_STATUS, index=1, key="rm_inv_status"
+        )
+        rm_status = st.selectbox("Master status", db.ACTIVE_STATUS, key="rm_master_status")
+        photo = st.file_uploader("Photo", type=["png", "jpg", "jpeg", "webp"], key="rm_photo")
+        invoice_doc = st.file_uploader(
+            "Invoice document",
+            type=["png", "jpg", "jpeg", "pdf", "doc", "docx", "xls", "xlsx"],
+            help="Photo (JPEG/PNG), PDF, Word, or Excel.",
+            key="rm_invoice_doc",
+        )
+
+    st.markdown("#### Chemical composition (%)")
+    if chem_mode == "Copy from previous lot" and copied_chem:
+        st.caption(
+            f"Defaults loaded from Lot **{source_lot_id}**. Adjust if needed, then save."
+        )
+    else:
+        st.caption(
+            f"First {db.ENTRY_CHEM_ELEMENT_LIMIT} elements by Serial_no. "
+            "Use **Open all elements…** for the full Element_Master list."
+        )
+
+    chem_cols = st.columns(6)
+    composition: dict[str, float] = {}
+    for i, el in enumerate(entry_elements):
+        sym = el["Element_Symbol"]
+        default_val = float(full_chem.get(sym, copied_chem.get(sym, 0.0)) or 0.0)
+        with chem_cols[i % 6]:
+            composition[sym] = st.number_input(
+                f"{sym} %",
+                min_value=0.0,
+                max_value=100.0,
+                value=default_val,
+                step=0.01,
+                key=f"chem_{sym}_{chem_key_suffix}",
+                help=el["Element_Name"],
             )
-            recovery = st.number_input("Expected recovery %", 0.0, 100.0, 95.0, 0.1)
-            cost = st.number_input("Cost per kg", min_value=0.0, value=0.0, step=0.01)
-        with col_b:
-            vendor_label = st.selectbox("Vendor", options=[""] + list(vendor_opts.keys()))
-            effective = st.date_input("Effective date", value=date.today())
-            received = st.date_input("Received date", value=date.today())
-            invoice = st.text_input("Vendor invoice")
-            invoice_date = st.date_input("Supplier invoice date", value=date.today())
-            weight = st.number_input("Total weight (kg) *", min_value=0.0, value=1000.0, step=1.0)
-            storage = st.text_input("Storage bay", placeholder="e.g. Bay-A1")
-            inv_status = st.selectbox("Inventory status", db.INVENTORY_STATUS, index=1)
-            rm_status = st.selectbox("Master status", db.ACTIVE_STATUS)
-            photo = st.file_uploader("Photo", type=["png", "jpg", "jpeg", "webp"])
-            invoice_doc = st.file_uploader(
-                "Invoice document",
-                type=["png", "jpg", "jpeg", "pdf", "doc", "docx", "xls", "xlsx"],
-                help="Photo (JPEG/PNG), PDF, Word, or Excel.",
-                key="rm_invoice_doc",
+
+    chem_btn_cols = st.columns([2, 3])
+    with chem_btn_cols[0]:
+        if st.button(
+            "Open all elements…",
+            key="rm_open_all_elements",
+            help="Enter composition for every row in Element_Master",
+            use_container_width=True,
+        ):
+            dialog_all_element_percentages(
+                "rm_full_chem",
+                defaults=dlg_defaults,
+                sync_keys=sync_chem_keys,
             )
+    with chem_btn_cols[1]:
+        full_n = len([v for v in full_chem.values() if v and v > 0])
+        if full_n:
+            st.caption(f"Full Element_Master entry applied ({full_n} non-zero value(s)).")
 
-        st.markdown("#### Chemical composition (%)")
-        if chem_mode == "Copy from previous lot" and copied_chem:
-            st.caption(
-                f"Defaults loaded from Lot **{source_lot_id}**. Adjust if needed, then save."
-            )
-        else:
-            st.caption("Enter assay percentages for this lot. Common scrap elements shown first.")
-
-        chem_key_suffix = f"{source_lot_id}" if source_lot_id and chem_mode.startswith("Copy") else "fresh"
-        chem_cols = st.columns(6)
-        composition: dict[str, float] = {}
-        primary = db.list_element_symbols(["Si", "Fe", "Cu", "Mn", "Mg", "Al"])
-        for i, sym in enumerate(primary):
-            with chem_cols[i % 6]:
-                composition[sym] = st.number_input(
-                    f"{sym} %",
-                    min_value=0.0,
-                    max_value=100.0,
-                    value=float(copied_chem.get(sym) or 0.0),
-                    step=0.01,
-                    key=f"chem_{sym}_{chem_key_suffix}",
-                )
-
-        with st.expander("Additional elements"):
-            extras = [e for e in db.list_elements() if e["Element_Symbol"] not in primary]
-            extra_cols = st.columns(4)
-            for i, el in enumerate(extras):
-                with extra_cols[i % 4]:
-                    composition[el["Element_Symbol"]] = st.number_input(
-                        f"{el['Element_Symbol']} ({el['Element_Name']})",
-                        min_value=0.0,
-                        max_value=100.0,
-                        value=float(copied_chem.get(el["Element_Symbol"]) or 0.0),
-                        step=0.001,
-                        key=f"chem_x_{el['Element_Symbol']}_{chem_key_suffix}",
-                    )
-
-        submitted = st.form_submit_button("Save raw material lot", type="primary")
+    submitted = st.button("Save raw material lot", type="primary", key="rm_save_lot")
 
     if submitted:
         if not rm_name_clean:
@@ -398,9 +621,17 @@ elif PAGE == "Raw Material Logging":
                     if invoice_doc
                     else None,
                 )
-                cleaned = {k: v for k, v in composition.items() if v and v > 0}
+                cleaned = {
+                    k: v
+                    for k, v in merge_percent_composition(
+                        composition, "rm_full_chem"
+                    ).items()
+                    if v and v > 0
+                }
                 if cleaned:
                     db.set_lot_chemistry(rm_name_clean, lot_id, cleaned)
+                st.session_state.pop("rm_full_chem", None)
+                st.session_state.pop("rm_full_chem_seed", None)
                 msg = (
                     f"Saved **{rm_name_clean}** as Lot **{lot_id}** "
                     f"({weight:,.1f} kg @ {cost:,.2f}/kg)."
@@ -412,8 +643,17 @@ elif PAGE == "Raw Material Logging":
             except Exception as exc:
                 st.error(f"Could not save: {exc}")
 
-    st.divider()
-    st.subheader("Recent inventory lots")
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 1b. Raw Material Inventory (browse / review — kept separate for mobile logging)
+# ═══════════════════════════════════════════════════════════════════════════════
+elif PAGE == "Raw Material Inventory":
+    st.title("Raw Material Inventory")
+    st.caption(
+        "Review recent lots and lot chemistry. "
+        "New receipts are entered on **Raw Material Logging**."
+    )
+
     recent = df_from_rows(
         db.fetch_all(
             """
@@ -435,6 +675,7 @@ elif PAGE == "Raw Material Logging":
             """
         )
     )
+    st.subheader("Recent inventory lots")
     if recent.empty:
         st.info("No lots logged yet.")
     else:
@@ -459,8 +700,9 @@ elif PAGE == "Raw Material Logging":
 elif PAGE == "Production Batch & Chemistry":
     st.title("Production Batch & Chemistry Input")
     st.caption(
-        "Batch ID is automatically built as **F{Furnace}-H{Heat}** "
-        "(e.g. Furnace 3 + Heat 7 → `F3-H07`)."
+        "Optimized for shop-floor capture: batch ID is built as **F{Furnace}-H{Heat}** "
+        "(e.g. Furnace 3 + Heat 7 → `F3-H07`). "
+        "Browse existing batches under **Production Batches**."
     )
 
     furnaces = db.list_furnaces()
@@ -551,6 +793,9 @@ elif PAGE == "Production Batch & Chemistry":
 
         trolleys = db.list_trolleys(active_only=True)
         trolley_by_name = {t["Trolley_name"]: float(t["Weight"] or 0) for t in trolleys}
+        trolley_colour_by_name = {
+            t["Trolley_name"]: (t.get("Colour") or "").strip() or None for t in trolleys
+        }
         trolley_labels = [
             f"{t['Trolley_name']}"
             + (f" ({t['Colour']})" if t.get("Colour") else "")
@@ -606,23 +851,89 @@ elif PAGE == "Production Batch & Chemistry":
                     key=f"lot_{idx}",
                 )
             with r1c3:
-                trolley_label = st.selectbox(
-                    "Trolley *",
-                    options=[""] + trolley_labels,
-                    key=f"trolley_{idx}",
-                    disabled=not bool(trolleys),
+                # Style from current selection (session) so highlight updates on rerun
+                _pending_label = st.session_state.get(f"trolley_{idx}", "") or ""
+                _pending_name = trolley_label_to_name.get(_pending_label)
+                _pending_colour = (
+                    trolley_colour_by_name.get(_pending_name) if _pending_name else None
                 )
+                _css = _trolley_css_color(_pending_colour)
+                safe_colour = html.escape(str(_pending_colour)) if _pending_colour else ""
+                sw, fld = st.columns([0.18, 0.82], gap="small")
+                with sw:
+                    if _css:
+                        st.markdown(
+                            f"""
+                            <div title="{safe_colour}" style="
+                                margin-top: 1.7rem;
+                                height: 2.55rem;
+                                border-radius: 8px;
+                                background: {_css};
+                                border: 1px solid rgba(0,0,0,0.28);
+                                box-shadow: inset 0 0 0 1px rgba(255,255,255,0.25);
+                            "></div>
+                            """,
+                            unsafe_allow_html=True,
+                        )
+                    else:
+                        st.markdown(
+                            """
+                            <div style="
+                                margin-top: 1.7rem;
+                                height: 2.55rem;
+                                border-radius: 8px;
+                                background: #ECEFF1;
+                                border: 1px dashed #90A4AE;
+                            "></div>
+                            """,
+                            unsafe_allow_html=True,
+                        )
+                with fld:
+                    if _css:
+                        st.markdown(
+                            f"""
+                            <div style="
+                                border: 2px solid {_css};
+                                border-radius: 10px;
+                                padding: 0.15rem 0.35rem 0.35rem;
+                                background: linear-gradient(90deg, {_css}30 0%, transparent 70%);
+                                margin-bottom: 0.05rem;
+                            ">
+                              <div style="font-size:0.72rem;font-weight:600;opacity:0.9;">
+                                {safe_colour}
+                              </div>
+                            </div>
+                            """,
+                            unsafe_allow_html=True,
+                        )
+                    trolley_label = st.selectbox(
+                        "Trolley *",
+                        options=[""] + trolley_labels,
+                        key=f"trolley_{idx}",
+                        disabled=not bool(trolleys),
+                    )
 
             trolley_name = trolley_label_to_name.get(trolley_label) if trolley_label else None
             trolley_w = float(trolley_by_name.get(trolley_name, 0)) if trolley_name else 0.0
+
+            # Streamlit number_input ignores `value` after first render when `key` is set.
+            # Sync tare whenever the selected trolley changes.
+            tare_key = f"trolley_w_{idx}"
+            prev_trolley_key = f"_prev_trolley_label_{idx}"
+            if st.session_state.get(prev_trolley_key) != trolley_label:
+                st.session_state[tare_key] = float(trolley_w)
+                st.session_state[prev_trolley_key] = trolley_label
+            elif tare_key not in st.session_state:
+                st.session_state[tare_key] = float(trolley_w)
 
             r2c1, r2c2, r2c3, r2c4 = st.columns([1.5, 1.5, 1.5, 2])
             with r2c1:
                 st.number_input(
                     "Trolley weight (kg)",
-                    value=trolley_w,
+                    min_value=0.0,
+                    step=0.1,
                     disabled=True,
-                    key=f"trolley_w_{idx}",
+                    key=tare_key,
                     help="Auto-filled from Trolley_Master when a trolley is selected.",
                 )
             with r2c2:
@@ -633,29 +944,104 @@ elif PAGE == "Production Batch & Chemistry":
                     step=1.0,
                     key=f"scale_w_{idx}",
                 )
-            # Net charge = weighment scale − trolley tare
-            net_w = max(scale_w - trolley_w, 0.0) if scale_w > 0 and trolley_name else 0.0
+                wsp_open_key = f"wsp_open_{idx}"
+                if st.button(
+                    "📷 Weighment scale photo",
+                    key=f"wsp_btn_{idx}",
+                    help="Open camera or choose a photo from the phone gallery",
+                    use_container_width=True,
+                ):
+                    st.session_state[wsp_open_key] = not bool(
+                        st.session_state.get(wsp_open_key)
+                    )
+                    st.rerun()
+
+                scale_photo_bytes: bytes | None = None
+                if st.session_state.get(wsp_open_key):
+                    st.caption("Capture with camera or pick from gallery")
+                    wsp_cam = st.camera_input(
+                        "Camera",
+                        key=f"wsp_cam_{idx}",
+                        help="Uses the phone camera when available.",
+                    )
+                    wsp_file = st.file_uploader(
+                        "Gallery / files",
+                        type=["png", "jpg", "jpeg", "webp"],
+                        key=f"wsp_file_{idx}",
+                        help="Choose an existing photo from the device gallery.",
+                    )
+                    scale_photo_bytes = photo_bytes(wsp_cam) or photo_bytes(wsp_file)
+                    if scale_photo_bytes:
+                        st.session_state[f"wsp_bytes_{idx}"] = scale_photo_bytes
+                        st.success("Weighment scale photo ready to save with this charge line.")
+                else:
+                    scale_photo_bytes = st.session_state.get(f"wsp_bytes_{idx}")
+                    if scale_photo_bytes:
+                        st.caption("Weighment scale photo attached.")
+
+            # Net charge = weighment scale − trolley tare (always recompute into widget state)
+            tare_w = float(st.session_state.get(tare_key, trolley_w) or 0.0)
+            net_w = max(float(scale_w) - tare_w, 0.0) if trolley_name and float(scale_w) > 0 else 0.0
+            net_key = f"wt_{idx}"
+            st.session_state[net_key] = float(net_w)
             with r2c3:
                 st.number_input(
                     "Net weight (kg)",
-                    value=float(net_w),
+                    min_value=0.0,
+                    step=0.1,
                     disabled=True,
-                    key=f"wt_{idx}",
+                    key=net_key,
                     help="Auto: weighment scale weight − trolley weight.",
                 )
             with r2c4:
                 n = st.text_input("Line notes", key=f"ln_{idx}")
+                inp_open_key = f"inp_open_{idx}"
+                if st.button(
+                    "📷 Input photo",
+                    key=f"inp_btn_{idx}",
+                    help="Open camera or choose a photo from the phone gallery for input_photo",
+                    use_container_width=True,
+                ):
+                    st.session_state[inp_open_key] = not bool(
+                        st.session_state.get(inp_open_key)
+                    )
+                    st.rerun()
 
-            if mat and lot_label and trolley_name and scale_w > 0 and net_w > 0:
+            input_photo_bytes: bytes | None = None
+            if st.session_state.get(inp_open_key):
+                st.caption(f"Charge line {idx + 1} — input photo (camera or gallery)")
+                inp_cam = st.camera_input(
+                    "Input camera",
+                    key=f"inp_cam_{idx}",
+                    help="Uses the phone camera when available.",
+                )
+                inp_file = st.file_uploader(
+                    "Input gallery / files",
+                    type=["png", "jpg", "jpeg", "webp"],
+                    key=f"inp_file_{idx}",
+                    help="Choose an existing photo from the device gallery.",
+                )
+                input_photo_bytes = photo_bytes(inp_cam) or photo_bytes(inp_file)
+                if input_photo_bytes:
+                    st.session_state[f"inp_bytes_{idx}"] = input_photo_bytes
+                    st.success("Input photo ready to save with this charge line.")
+            else:
+                input_photo_bytes = st.session_state.get(f"inp_bytes_{idx}")
+                if input_photo_bytes:
+                    st.caption(f"Charge line {idx + 1}: input photo attached.")
+
+            if mat and lot_label and trolley_name and float(scale_w) > 0 and net_w > 0:
                 charge_inputs.append(
                     {
                         "Raw_Material_Name": mat,
                         "Lot_id": lot_opts[lot_label],
                         "Weight": net_w,
-                        "Weighment_scale_weight": scale_w,
-                        "Trolley_weight": trolley_w,
+                        "Weighment_scale_weight": float(scale_w),
+                        "Trolley_weight": tare_w,
                         "Trolley_name": trolley_name,
                         "Notes": n,
+                        "Weighment_scale_photo": scale_photo_bytes,
+                        "Input_photo": input_photo_bytes,
                         "Charge_time": datetime.now().isoformat(timespec="seconds"),
                     }
                 )
@@ -664,32 +1050,47 @@ elif PAGE == "Production Batch & Chemistry":
         st.info(f"Total net input weight: **{total_in:,.2f} kg** across {len(charge_inputs)} charge line(s).")
 
         st.markdown("#### Batch chemistry (ladle / spectrometer)")
+        st.caption(
+            f"First {db.ENTRY_CHEM_ELEMENT_LIMIT} elements by Serial_no from Element_Master. "
+            "Use **Open all elements…** for the full list."
+        )
+        entry_elements = db.list_entry_elements()
+        sync_batch_keys = {
+            el["Element_Symbol"]: f"bchem_{el['Element_Symbol']}" for el in entry_elements
+        }
+        full_batch = st.session_state.get("batch_full_chem") or {}
+        bbtn1, bbtn2 = st.columns([2, 3])
+        with bbtn1:
+            if st.button(
+                "Open all elements…",
+                key="batch_open_all_elements",
+                help="Enter chemistry for every row in Element_Master",
+                use_container_width=True,
+            ):
+                dialog_all_element_percentages(
+                    "batch_full_chem",
+                    defaults=full_batch,
+                    sync_keys=sync_batch_keys,
+                )
+        with bbtn2:
+            full_n = len([v for v in full_batch.values() if v and v > 0])
+            if full_n:
+                st.caption(f"Full Element_Master entry applied ({full_n} non-zero value(s)).")
+
         chem_cols = st.columns(6)
         batch_chem: dict[str, float] = {}
-        primary_batch = db.list_element_symbols(["Si", "Fe", "Cu", "Mn", "Mg", "Al"])
-        for i, sym in enumerate(primary_batch):
+        for i, el in enumerate(entry_elements):
+            sym = el["Element_Symbol"]
             with chem_cols[i % 6]:
                 batch_chem[sym] = st.number_input(
                     f"{sym} %",
                     min_value=0.0,
                     max_value=100.0,
-                    value=0.0,
+                    value=float(full_batch.get(sym) or 0.0),
                     step=0.01,
                     key=f"bchem_{sym}",
+                    help=el["Element_Name"],
                 )
-        with st.expander("More elements"):
-            extras = [e for e in db.list_elements() if e["Element_Symbol"] not in batch_chem]
-            xs = st.columns(4)
-            for i, el in enumerate(extras):
-                with xs[i % 4]:
-                    batch_chem[el["Element_Symbol"]] = st.number_input(
-                        el["Element_Symbol"],
-                        min_value=0.0,
-                        max_value=100.0,
-                        value=0.0,
-                        step=0.001,
-                        key=f"bchem_x_{el['Element_Symbol']}",
-                    )
 
         def _sample_or_none(v: str) -> str | None:
             return None if v == sample_blank else v
@@ -699,6 +1100,7 @@ elif PAGE == "Production Batch & Chemistry":
                 st.error("Add at least one charge line with weight > 0.")
             else:
                 try:
+                    merged_chem = merge_percent_composition(batch_chem, "batch_full_chem")
                     bid = db.create_batch(
                         furnace=furnace,
                         heat_no=heat_no,
@@ -709,7 +1111,7 @@ elif PAGE == "Production Batch & Chemistry":
                         melting_team=melting_team,
                         notes=notes.strip(),
                         inputs=charge_inputs,
-                        composition={k: v for k, v in batch_chem.items() if v and v > 0},
+                        composition={k: v for k, v in merged_chem.items() if v and v > 0},
                         degassing_time=degassing_time.strip() or None,
                         sampled_pcs=sampled_pcs if sampled_pcs > 0 else None,
                         defect_pcs=defect_pcs if defect_pcs > 0 else None,
@@ -728,13 +1130,27 @@ elif PAGE == "Production Batch & Chemistry":
                     st.session_state.charge_lines = [
                         {"material": "", "lot_id": None, "weight": 0.0, "notes": ""}
                     ]
+                    st.session_state.pop("batch_full_chem", None)
                     st.balloons()
                 except Exception as exc:
                     st.error(str(exc))
 
-    st.divider()
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 2b. Production Batches (browse — kept separate for efficient batch capture)
+# ═══════════════════════════════════════════════════════════════════════════════
+elif PAGE == "Production Batches":
+    st.title("Production Batches")
+    st.caption(
+        "Review existing production batches. "
+        "New batches are created on **Production Batch & Chemistry**."
+    )
     st.subheader("Existing batches")
-    st.dataframe(df_from_rows(db.list_batches()), use_container_width=True, hide_index=True)
+    batches_df = df_from_rows(db.list_batches())
+    if batches_df.empty:
+        st.info("No batches yet. Create one under **Production Batch & Chemistry**.")
+    else:
+        st.dataframe(batches_df, use_container_width=True, hide_index=True)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1201,62 +1617,120 @@ elif PAGE == "Alloys":
         for c in db.list_customer_codes()
     }
 
-    with st.form("alloy_form", clear_on_submit=True):
-        a1, a2 = st.columns(2)
-        with a1:
-            aname = st.text_input("Alloy name *", placeholder="e.g. ADC12, LM6")
-            family = st.text_input("Alloy family", placeholder="e.g. Al-Si-Cu")
-            created_by = st.text_input("Created by", value="operator")
-        with a2:
-            customer = st.selectbox("Customer", [""] + list(cust_opts.keys()))
-            colour = st.text_input("Colour code", placeholder="e.g. Red, #FF0000")
-            bis_desig = st.text_input("BIS designation", placeholder="e.g. IS 617")
-            sludge = st.number_input("Sludge factor", min_value=0.0, value=0.0, step=0.01)
-            other_each = st.number_input(
-                "Other elements each %", min_value=0.0, value=0.0, step=0.01
-            )
-            other_total = st.number_input(
-                "Other elements total %", min_value=0.0, value=0.0, step=0.01
-            )
-            rev_dt = st.text_input(
-                "Revision datetime",
-                value=datetime.now().isoformat(timespec="seconds"),
-            )
-            remarks = st.text_area("Remarks")
-            alloy_status = st.selectbox("Status", db.ACTIVE_STATUS)
-            st.caption("Spec range (%) for key elements")
+    entry_elements = db.list_entry_elements()
+    sync_min = {el["Element_Symbol"]: f"amin_{el['Element_Symbol']}" for el in entry_elements}
+    sync_max = {el["Element_Symbol"]: f"amax_{el['Element_Symbol']}" for el in entry_elements}
+    full_specs = st.session_state.get("alloy_full_specs") or {}
 
-        specs: dict[str, tuple[float | None, float | None]] = {}
-        for sym in db.list_element_symbols(
-            ["Si", "Fe", "Cu", "Mn", "Mg", "Zn", "Ni", "Ti", "Al"]
+    a1, a2 = st.columns(2)
+    with a1:
+        aname = st.text_input(
+            "Alloy name *", placeholder="e.g. ADC12, LM6", key="alloy_name"
+        )
+        family = st.text_input(
+            "Alloy family", placeholder="e.g. Al-Si-Cu", key="alloy_family"
+        )
+        created_by = st.text_input("Created by", value="operator", key="alloy_created_by")
+    with a2:
+        customer = st.selectbox(
+            "Customer", [""] + list(cust_opts.keys()), key="alloy_customer"
+        )
+        colour = st.text_input(
+            "Colour code", placeholder="e.g. Red, #FF0000", key="alloy_colour"
+        )
+        bis_desig = st.text_input(
+            "BIS designation", placeholder="e.g. IS 617", key="alloy_bis"
+        )
+        sludge = st.number_input(
+            "Sludge factor", min_value=0.0, value=0.0, step=0.01, key="alloy_sludge"
+        )
+        other_each = st.number_input(
+            "Other elements each %", min_value=0.0, value=0.0, step=0.01, key="alloy_other_each"
+        )
+        other_total = st.number_input(
+            "Other elements total %",
+            min_value=0.0,
+            value=0.0,
+            step=0.01,
+            key="alloy_other_total",
+        )
+        rev_dt = st.text_input(
+            "Revision datetime",
+            value=datetime.now().isoformat(timespec="seconds"),
+            key="alloy_rev_dt",
+        )
+        remarks = st.text_area("Remarks", key="alloy_remarks")
+        alloy_status = st.selectbox("Status", db.ACTIVE_STATUS, key="alloy_status")
+
+    st.markdown("#### Spec range (%)")
+    st.caption(
+        f"First {db.ENTRY_CHEM_ELEMENT_LIMIT} elements by Serial_no. "
+        "Use **Open all elements…** for the full Element_Master list."
+    )
+
+    specs: dict[str, tuple[float | None, float | None]] = {}
+    for el in entry_elements:
+        sym = el["Element_Symbol"]
+        prev = full_specs.get(sym) or (0.0, 0.0)
+        try:
+            dmin, dmax = float(prev[0] or 0.0), float(prev[1] or 0.0)
+        except (TypeError, IndexError, ValueError):
+            dmin, dmax = 0.0, 0.0
+        sc1, sc2, sc3 = st.columns([1, 2, 2])
+        sc1.markdown(f"**{sym}**")
+        mn = sc2.number_input(
+            f"{sym} min", 0.0, 100.0, dmin, 0.01, key=f"amin_{sym}"
+        )
+        mx = sc3.number_input(
+            f"{sym} max", 0.0, 100.0, dmax, 0.01, key=f"amax_{sym}"
+        )
+        specs[sym] = (mn if mn > 0 else None, mx if mx > 0 else None)
+
+    ab1, ab2 = st.columns([2, 3])
+    with ab1:
+        if st.button(
+            "Open all elements…",
+            key="alloy_open_all_elements",
+            help="Enter min/max for every row in Element_Master",
+            use_container_width=True,
         ):
-            sc1, sc2, sc3 = st.columns([1, 2, 2])
-            sc1.markdown(f"**{sym}**")
-            mn = sc2.number_input(f"{sym} min", 0.0, 100.0, 0.0, 0.01, key=f"amin_{sym}")
-            mx = sc3.number_input(f"{sym} max", 0.0, 100.0, 0.0, 0.01, key=f"amax_{sym}")
-            specs[sym] = (mn if mn > 0 else None, mx if mx > 0 else None)
+            dialog_all_element_specs(
+                "alloy_full_specs",
+                sync_min_keys=sync_min,
+                sync_max_keys=sync_max,
+            )
+    with ab2:
+        full_n = len(
+            [
+                1
+                for pair in full_specs.values()
+                if pair and ((pair[0] or 0) > 0 or (pair[1] or 0) > 0)
+            ]
+        )
+        if full_n:
+            st.caption(f"Full Element_Master specs applied ({full_n} element(s) with ranges).")
 
-        if st.form_submit_button("Create alloy", type="primary"):
-            if not aname.strip():
-                st.error("Alloy name is required.")
-            else:
-                aid = db.add_alloy(
-                    cust_code=cust_opts[customer] if customer else None,
-                    alloy_name=aname.strip(),
-                    family=family.strip(),
-                    created_by=created_by.strip(),
-                    specs=specs,
-                    colour_code=colour.strip() or None,
-                    bis_designation=bis_desig.strip() or None,
-                    sludge_factor=sludge if sludge > 0 else None,
-                    revision_datetime=rev_dt.strip() or None,
-                    remarks=remarks.strip() or None,
-                    status=alloy_status,
-                    other_elements_each=other_each if other_each > 0 else None,
-                    other_elements_total=other_total if other_total > 0 else None,
-                )
-                st.success(f"Created alloy **{aname}** (ID {aid}).")
-
+    if st.button("Create alloy", type="primary", key="alloy_create"):
+        if not aname.strip():
+            st.error("Alloy name is required.")
+        else:
+            aid = db.add_alloy(
+                cust_code=cust_opts[customer] if customer else None,
+                alloy_name=aname.strip(),
+                family=family.strip(),
+                created_by=created_by.strip(),
+                specs=merge_spec_ranges(specs, "alloy_full_specs"),
+                colour_code=colour.strip() or None,
+                bis_designation=bis_desig.strip() or None,
+                sludge_factor=sludge if sludge > 0 else None,
+                revision_datetime=rev_dt.strip() or None,
+                remarks=remarks.strip() or None,
+                status=alloy_status,
+                other_elements_each=other_each if other_each > 0 else None,
+                other_elements_total=other_total if other_total > 0 else None,
+            )
+            st.session_state.pop("alloy_full_specs", None)
+            st.success(f"Created alloy **{aname}** (ID {aid}).")
     st.subheader("Alloys")
     st.dataframe(df_from_rows(db.list_alloys()), use_container_width=True, hide_index=True)
 

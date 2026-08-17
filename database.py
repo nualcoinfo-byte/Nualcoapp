@@ -396,7 +396,7 @@ CREATE TABLE IF NOT EXISTS batch_input (
     Trolley_name TEXT REFERENCES Trolley_Master(Trolley_name),
     Charge_time TEXT DEFAULT {now},
     Notes TEXT,
-    Photo1 {blob}, Photo2 {blob},
+    Weighment_scale_photo {blob}, Input_photo {blob},
     PRIMARY KEY (Batch_ID, Raw_Material_Name, Lot_id, Charge_time)
 );
 CREATE TABLE IF NOT EXISTS Batch_Chemical_Composition (
@@ -514,6 +514,22 @@ def init_db() -> None:
                 ("Weighment_scale_weight", "REAL"),
                 ("Trolley_weight", "REAL"),
                 ("Trolley_name", "TEXT"),
+            ],
+        )
+        _rename_column(conn, "batch_input", "Photo1", "Weighment_scale_photo")
+        _rename_column(conn, "batch_input", "Photo2", "Input_photo")
+        _ensure_columns(
+            conn,
+            "batch_input",
+            [
+                (
+                    "Weighment_scale_photo",
+                    "BYTEA" if IS_POSTGRES else "BLOB",
+                ),
+                (
+                    "Input_photo",
+                    "BYTEA" if IS_POSTGRES else "BLOB",
+                ),
             ],
         )
         _ensure_columns(
@@ -652,6 +668,35 @@ def _ensure_columns(conn: Connection, table: str, columns: list[tuple[str, str]]
         for name, typedef in columns:
             if name not in existing:
                 _exec(conn, f"ALTER TABLE {table} ADD COLUMN {name} {typedef}")
+
+
+def _rename_column(
+    conn: Connection, table: str, old_name: str, new_name: str
+) -> None:
+    """Rename a column when the old name exists and the new name does not."""
+    if IS_POSTGRES:
+        physical = table.lower()
+        rows = _exec(
+            conn,
+            """
+            SELECT column_name AS name
+            FROM information_schema.columns
+            WHERE table_schema = 'public' AND table_name = ?
+            """,
+            (physical,),
+        ).mappings()
+        existing = {row["name"] for row in rows}
+        if old_name.lower() in existing and new_name.lower() not in existing:
+            _exec(
+                conn,
+                f'ALTER TABLE {table} RENAME COLUMN "{old_name.lower()}" TO "{new_name.lower()}"',
+            )
+    else:
+        existing = {
+            row["name"] for row in _exec(conn, f"PRAGMA table_info({table})").mappings()
+        }
+        if old_name in existing and new_name not in existing:
+            _exec(conn, f"ALTER TABLE {table} RENAME COLUMN {old_name} TO {new_name}")
 
 
 # ---------- Generic helpers ----------
@@ -1025,26 +1070,59 @@ def list_suppliers(active_only: bool = True) -> list[str]:
     return [v["Vendor_name"] for v in list_vendors(active_only)]
 
 
-def list_elements() -> list[dict[str, Any]]:
-    return fetch_all(
-        """
+# Chemistry entry UIs show only the first N elements by Serial_no.
+ENTRY_CHEM_ELEMENT_LIMIT = 15
+
+
+def list_elements(limit: Optional[int] = None) -> list[dict[str, Any]]:
+    """Return Element_Master rows ordered by Serial_no.
+
+    If ``limit`` is set, only the first ``limit`` rows (by Serial_no) are returned.
+    """
+    sql = """
         SELECT Serial_no AS "Serial_no", Element_Name AS "Element_Name",
                Element_Symbol AS "Element_Symbol"
-        FROM Element_Master ORDER BY Serial_no
-        """
-    )
+        FROM Element_Master
+        ORDER BY Serial_no
+    """
+    if limit is not None:
+        sql += " LIMIT ?"
+        return fetch_all(sql, (int(limit),))
+    return fetch_all(sql)
 
 
-def list_element_symbols(subset: Optional[Iterable[str]] = None) -> list[str]:
+def list_entry_elements() -> list[dict[str, Any]]:
+    """Elements shown on chemistry / spec entry forms (Serial_no order, first 15)."""
+    return list_elements(limit=ENTRY_CHEM_ELEMENT_LIMIT)
+
+
+def list_extra_elements() -> list[dict[str, Any]]:
+    """Element_Master rows after the default entry list (Serial_no > first 15)."""
+    entry_syms = {e["Element_Symbol"] for e in list_entry_elements()}
+    return [e for e in list_elements() if e["Element_Symbol"] not in entry_syms]
+
+
+def list_element_symbols(
+    subset: Optional[Iterable[str]] = None,
+    *,
+    limit: Optional[int] = None,
+) -> list[str]:
     """Element symbols in Element_Master.Serial_no order.
 
     If ``subset`` is given, return only those symbols (still in serial order).
+    If ``limit`` is given, only the first ``limit`` elements by Serial_no are
+    considered (applied before subset filtering).
     """
-    symbols = [e["Element_Symbol"] for e in list_elements()]
+    symbols = [e["Element_Symbol"] for e in list_elements(limit=limit)]
     if subset is None:
         return symbols
     wanted = {str(s) for s in subset}
     return [s for s in symbols if s in wanted]
+
+
+def list_entry_element_symbols() -> list[str]:
+    """Symbols for chemistry / spec entry forms (first 15 by Serial_no)."""
+    return list_element_symbols(limit=ENTRY_CHEM_ELEMENT_LIMIT)
 
 
 def list_furnaces(active_only: bool = True) -> list[str]:
@@ -1750,8 +1828,8 @@ def create_batch(
                 INSERT INTO batch_input
                     (Batch_ID, Raw_Material_Name, Lot_id, Weight,
                      Weighment_scale_weight, Trolley_weight, Trolley_name,
-                     Charge_time, Notes)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     Charge_time, Notes, Weighment_scale_photo, Input_photo)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     batch_id,
@@ -1763,6 +1841,8 @@ def create_batch(
                     item.get("Trolley_name"),
                     item.get("Charge_time") or datetime.now().isoformat(timespec="seconds"),
                     item.get("Notes", ""),
+                    item.get("Weighment_scale_photo"),
+                    item.get("Input_photo"),
                 ),
             )
 
