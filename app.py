@@ -37,7 +37,11 @@ import database as db  # noqa: E402
 import importlib
 
 # Streamlit keeps imported modules in memory; reload when helpers are missing.
-if not hasattr(db, "EDITABLE_TABLES") or not hasattr(db, "get_customer"):
+if (
+    not hasattr(db, "EDITABLE_TABLES")
+    or not hasattr(db, "get_customer")
+    or not hasattr(db, "list_lots_for_material")
+):
     db = importlib.reload(db)
 
 # ── Theme tweaks ─────────────────────────────────────────────────────────────
@@ -187,22 +191,98 @@ if PAGE == "Dashboard":
 elif PAGE == "Raw Material Logging":
     st.title("Raw Material Logging")
     st.caption(
-        "Register a raw material grade, receive a lot (weight & cost), "
-        "and capture chemistry (Si, Fe, Cu, Mn, Mg, …)."
+        "Select an existing raw material or enter a new name, receive a lot "
+        "(weight & cost), and capture chemistry (copy from a prior lot or enter fresh)."
     )
 
     vendors = db.list_vendors()
     vendor_opts = {f"{v['Vendor_name']} (#{v['Vendor_code']})": v["Vendor_code"] for v in vendors}
+    existing_materials = db.list_raw_materials(active_only=False)
     if not vendors:
         st.warning("Add at least one vendor under **Vendors** before logging material.")
+
+    st.markdown("#### Raw material")
+    rm_mode = st.radio(
+        "Material source",
+        ["Select existing", "Enter new name"],
+        horizontal=True,
+        key="rm_mode",
+    )
+    if rm_mode == "Select existing":
+        if not existing_materials:
+            st.info("No materials in Raw_Material_Master yet — switch to **Enter new name**.")
+            rm_name = ""
+        else:
+            rm_name = st.selectbox(
+                "Raw material name *",
+                options=[""] + existing_materials,
+                key="rm_existing_name",
+            )
+    else:
+        rm_name = st.text_input(
+            "New raw material name *",
+            placeholder="e.g. Tense, Taint/Tabor, UBC, Pure Al",
+            key="rm_new_name",
+        )
+
+    rm_name_clean = (rm_name or "").strip()
+    prior_lots = db.list_lots_for_material(rm_name_clean) if rm_name_clean else []
+    lots_with_chem = [l for l in prior_lots if int(l.get("Chem_count") or 0) > 0]
+
+    chem_mode = "Enter fresh"
+    source_lot_id: int | None = None
+    copied_chem: dict[str, float] = {}
+    if rm_mode == "Select existing" and rm_name_clean:
+        chem_mode = st.radio(
+            "Chemical composition for this new lot",
+            ["Copy from previous lot", "Enter fresh"],
+            horizontal=True,
+            key="rm_chem_mode",
+        )
+        if chem_mode == "Copy from previous lot":
+            if not lots_with_chem:
+                st.warning(
+                    f"No prior lots with chemistry found for **{rm_name_clean}**. "
+                    "Enter chemistry fresh below."
+                )
+                chem_mode = "Enter fresh"
+            else:
+                lot_labels = {
+                    f"Lot {l['Lot_id']} — {l['Received_date'] or '?'} — "
+                    f"{float(l['Received_weight'] or 0):,.0f} kg"
+                    + (f" — inv {l['Supplier_Invoice']}" if l.get("Supplier_Invoice") else ""): l[
+                        "Lot_id"
+                    ]
+                    for l in lots_with_chem
+                }
+                src_label = st.selectbox(
+                    "Copy chemistry from lot",
+                    options=list(lot_labels.keys()),
+                    key="rm_copy_lot",
+                )
+                source_lot_id = lot_labels[src_label]
+                copied_chem = db.get_lot_chemistry(int(source_lot_id))
+                if copied_chem:
+                    st.caption(
+                        f"Will copy {len(copied_chem)} element(s) from Lot **{source_lot_id}**. "
+                        "You can still adjust values below before saving."
+                    )
+                    st.dataframe(
+                        pd.DataFrame(
+                            [{"Element": k, "Percentage": v} for k, v in copied_chem.items()]
+                        ),
+                        use_container_width=True,
+                        hide_index=True,
+                    )
 
     with st.form("rm_log_form", clear_on_submit=True):
         st.markdown("#### Material & receipt")
         col_a, col_b = st.columns(2)
         with col_a:
-            rm_name = st.text_input(
-                "Raw material name *",
-                placeholder="e.g. Tense, Taint/Tabor, UBC, Pure Al",
+            st.text_input(
+                "Raw material name (locked)",
+                value=rm_name_clean,
+                disabled=True,
             )
             isri_opts = {
                 f"{c['ISRI_CODE']} — {c['Description']}": c["ISRI_CODE"]
@@ -238,14 +318,26 @@ elif PAGE == "Raw Material Logging":
             )
 
         st.markdown("#### Chemical composition (%)")
-        st.caption("Enter assay percentages for this lot. Common scrap elements shown first.")
+        if chem_mode == "Copy from previous lot" and copied_chem:
+            st.caption(
+                f"Defaults loaded from Lot **{source_lot_id}**. Adjust if needed, then save."
+            )
+        else:
+            st.caption("Enter assay percentages for this lot. Common scrap elements shown first.")
+
+        chem_key_suffix = f"{source_lot_id}" if source_lot_id and chem_mode.startswith("Copy") else "fresh"
         chem_cols = st.columns(6)
         composition: dict[str, float] = {}
         primary = db.list_element_symbols(["Si", "Fe", "Cu", "Mn", "Mg", "Al"])
         for i, sym in enumerate(primary):
             with chem_cols[i % 6]:
                 composition[sym] = st.number_input(
-                    f"{sym} %", min_value=0.0, max_value=100.0, value=0.0, step=0.01, key=f"chem_{sym}"
+                    f"{sym} %",
+                    min_value=0.0,
+                    max_value=100.0,
+                    value=float(copied_chem.get(sym) or 0.0),
+                    step=0.01,
+                    key=f"chem_{sym}_{chem_key_suffix}",
                 )
 
         with st.expander("Additional elements"):
@@ -257,15 +349,15 @@ elif PAGE == "Raw Material Logging":
                         f"{el['Element_Symbol']} ({el['Element_Name']})",
                         min_value=0.0,
                         max_value=100.0,
-                        value=0.0,
+                        value=float(copied_chem.get(el["Element_Symbol"]) or 0.0),
                         step=0.001,
-                        key=f"chem_x_{el['Element_Symbol']}",
+                        key=f"chem_x_{el['Element_Symbol']}_{chem_key_suffix}",
                     )
 
         submitted = st.form_submit_button("Save raw material lot", type="primary")
 
     if submitted:
-        if not rm_name.strip():
+        if not rm_name_clean:
             st.error("Raw material name is required.")
         elif weight <= 0:
             st.error("Total weight must be greater than zero.")
@@ -275,7 +367,7 @@ elif PAGE == "Raw Material Logging":
             try:
                 vendor_code = vendor_opts[vendor_label] if vendor_label else None
                 db.add_raw_material_master(
-                    name=rm_name.strip(),
+                    name=rm_name_clean,
                     effective_date=effective.isoformat(),
                     vendor_code=vendor_code,
                     alloy_family=alloy_family.strip(),
@@ -290,7 +382,7 @@ elif PAGE == "Raw Material Logging":
                     mg=mg_level or None,
                 )
                 lot_id = db.add_inventory_lot(
-                    material=rm_name.strip(),
+                    material=rm_name_clean,
                     vendor_code=vendor_code,
                     invoice=invoice.strip(),
                     received_date=received.isoformat(),
@@ -302,15 +394,20 @@ elif PAGE == "Raw Material Logging":
                     cost_per_kg=cost,
                     invoice_document=photo_bytes(invoice_doc),
                     invoice_document_name=invoice_doc.name if invoice_doc else None,
-                    invoice_document_type=getattr(invoice_doc, "type", None) if invoice_doc else None,
+                    invoice_document_type=getattr(invoice_doc, "type", None)
+                    if invoice_doc
+                    else None,
                 )
                 cleaned = {k: v for k, v in composition.items() if v and v > 0}
                 if cleaned:
-                    db.set_lot_chemistry(rm_name.strip(), lot_id, cleaned)
-                st.success(
-                    f"Saved **{rm_name.strip()}** as Lot **{lot_id}** "
+                    db.set_lot_chemistry(rm_name_clean, lot_id, cleaned)
+                msg = (
+                    f"Saved **{rm_name_clean}** as Lot **{lot_id}** "
                     f"({weight:,.1f} kg @ {cost:,.2f}/kg)."
                 )
+                if source_lot_id and chem_mode == "Copy from previous lot":
+                    msg += f" Chemistry based on Lot **{source_lot_id}**."
+                st.success(msg)
                 st.cache_data.clear()
             except Exception as exc:
                 st.error(f"Could not save: {exc}")

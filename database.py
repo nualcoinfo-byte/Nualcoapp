@@ -1123,6 +1123,26 @@ def list_raw_materials(active_only: bool = True) -> list[str]:
     return [r["Raw_Material_Name"] for r in fetch_all(sql)]
 
 
+def list_lots_for_material(material: str) -> list[dict[str, Any]]:
+    """Prior inventory lots for a material, newest first (for chemistry copy)."""
+    return fetch_all(
+        """
+        SELECT i.Lot_id AS "Lot_id",
+               i.Received_date AS "Received_date",
+               i.Received_weight AS "Received_weight",
+               i.Supplier_Invoice AS "Supplier_Invoice",
+               (
+                   SELECT COUNT(*) FROM Raw_Material_Spec s
+                   WHERE s.Lot_id = i.Lot_id
+               ) AS "Chem_count"
+        FROM Raw_Material_Inventory i
+        WHERE i.Raw_Material_Name = ?
+        ORDER BY i.Lot_id DESC
+        """,
+        (material,),
+    )
+
+
 def list_alloys() -> list[dict[str, Any]]:
     return fetch_all(
         """
