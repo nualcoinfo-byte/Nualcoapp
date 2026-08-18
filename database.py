@@ -172,6 +172,7 @@ ACTIVE_STATUS = ["Active", "Inactive"]
 PURCHASE_ORDER_STATUS = ["Open", "Closed", "Cancelled"]
 SAMPLE_OK_STATUS = ["OK", "NOT OK"]
 ELEMENT_LEVEL = ["Low", "Medium", "High"]
+RAW_MATERIAL_AVAILABILITY = ["Standard", "Spot", "Contract", "Internal"]
 SHIFTS = ["A", "B"]
 MELT_NOS = [1, 2, 3, 4, 5, 6, 7, 9]
 HEAT_NOS = list(range(1, 13))
@@ -1414,6 +1415,30 @@ def list_raw_materials(active_only: bool = True) -> list[str]:
     return [r["Raw_Material_Name"] for r in fetch_all(sql)]
 
 
+def list_raw_material_master() -> list[dict[str, Any]]:
+    """All raw-material grades, excluding the Photo blob."""
+    return fetch_all(
+        """
+        SELECT m.Raw_Material_Name AS "Raw_Material_Name",
+               m.Effective_date AS "Effective_date",
+               m.Vendor_code AS "Vendor_code",
+               v.Vendor_name AS "Vendor_name",
+               m.ISRI_CODE AS "ISRI_CODE",
+               m.Alloy_family AS "Alloy_family",
+               m.Fe AS "Fe", m.Cu AS "Cu", m.Mg AS "Mg",
+               m.Availability_class AS "Availability_class",
+               m.Recovery AS "Recovery",
+               m.Cost_per_kg AS "Cost_per_kg",
+               m.Status AS "Status",
+               m.Last_updated_by AS "Last_updated_by",
+               m.Last_updated_datetime AS "Last_updated_datetime"
+        FROM Raw_Material_Master m
+        LEFT JOIN Vendor_Master v ON v.Vendor_code = m.Vendor_code
+        ORDER BY m.Raw_Material_Name, m.Effective_date DESC
+        """
+    )
+
+
 def list_lots_for_material(material: str) -> list[dict[str, Any]]:
     """Prior inventory lots for a material, newest first (for chemistry copy)."""
     return fetch_all(
@@ -1611,7 +1636,8 @@ def add_raw_material_master(
             Vendor_code=excluded.Vendor_code, ISRI_CODE=excluded.ISRI_CODE,
             Alloy_family=excluded.Alloy_family,
             Availability_class=excluded.Availability_class, Recovery=excluded.Recovery,
-            Photo=excluded.Photo, Status=excluded.Status, Cost_per_kg=excluded.Cost_per_kg,
+            Photo=COALESCE(excluded.Photo, Raw_Material_Master.Photo),
+            Status=excluded.Status, Cost_per_kg=excluded.Cost_per_kg,
             Fe=excluded.Fe, Cu=excluded.Cu, Mg=excluded.Mg,
             Last_updated_by=excluded.Last_updated_by,
             Last_updated_datetime=excluded.Last_updated_datetime

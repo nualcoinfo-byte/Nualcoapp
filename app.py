@@ -46,6 +46,8 @@ if (
     or not hasattr(db, "ENTRY_CHEM_ELEMENT_LIMIT")
     or not hasattr(db, "PURCHASE_ORDER_STATUS")
     or not hasattr(db, "update_purchase_order_status")
+    or not hasattr(db, "list_raw_material_master")
+    or not hasattr(db, "RAW_MATERIAL_AVAILABILITY")
 ):
     db = importlib.reload(db)
 
@@ -293,6 +295,7 @@ PAGE = st.sidebar.radio(
         "All Purchase Orders",
         "Customers",
         "Vendors",
+        "Raw Material Master",
         "Alloys",
         "Furnaces",
         "Melters",
@@ -371,9 +374,9 @@ if PAGE == "Dashboard":
 elif PAGE == "Raw Material Logging":
     st.title("Raw Material Logging")
     st.caption(
-        "Mobile-optimized entry: select or create a raw material, receive a lot "
-        "(weight & cost), and capture chemistry. "
-        "Browse existing lots under **Raw Material Inventory**."
+        "Start with the vendor and invoice, then add every raw material on that invoice. "
+        "Define grades under **Raw Material Master**. "
+        "Browse lots under **Raw Material Inventory**."
     )
 
     vendors = db.list_vendors()
@@ -381,268 +384,184 @@ elif PAGE == "Raw Material Logging":
     existing_materials = db.list_raw_materials(active_only=False)
     if not vendors:
         st.warning("Add at least one vendor under **Vendors** before logging material.")
+    if not existing_materials:
+        st.info("No grades in Raw Material Master yet — you can type a new name on each row.")
 
-    st.markdown("#### Raw material")
-    rm_mode = st.radio(
-        "Material source",
-        ["Select existing", "Enter new name"],
-        horizontal=True,
-        key="rm_mode",
+    st.markdown("#### Vendor invoice")
+    vendor_label = st.selectbox(
+        "Vendor name *",
+        options=[""] + list(vendor_opts.keys()),
+        key="rm_log_vendor",
     )
-    if rm_mode == "Select existing":
-        if not existing_materials:
-            st.info("No materials in Raw_Material_Master yet — switch to **Enter new name**.")
-            rm_name = ""
-        else:
-            rm_name = st.selectbox(
-                "Raw material name *",
-                options=[""] + existing_materials,
-                key="rm_existing_name",
-            )
-    else:
-        rm_name = st.text_input(
-            "New raw material name *",
-            placeholder="e.g. Tense, Taint/Tabor, UBC, Pure Al",
-            key="rm_new_name",
-        )
-
-    rm_name_clean = (rm_name or "").strip()
-    prior_lots = db.list_lots_for_material(rm_name_clean) if rm_name_clean else []
-    lots_with_chem = [l for l in prior_lots if int(l.get("Chem_count") or 0) > 0]
-
-    chem_mode = "Enter fresh"
-    source_lot_id: int | None = None
-    copied_chem: dict[str, float] = {}
-    if rm_mode == "Select existing" and rm_name_clean:
-        chem_mode = st.radio(
-            "Chemical composition for this new lot",
-            ["Copy from previous lot", "Enter fresh"],
-            horizontal=True,
-            key="rm_chem_mode",
-        )
-        if chem_mode == "Copy from previous lot":
-            if not lots_with_chem:
-                st.warning(
-                    f"No prior lots with chemistry found for **{rm_name_clean}**. "
-                    "Enter chemistry fresh below."
-                )
-                chem_mode = "Enter fresh"
-            else:
-                lot_labels = {
-                    f"Lot {l['Lot_id']} — {l['Received_date'] or '?'} — "
-                    f"{float(l['Received_weight'] or 0):,.0f} kg"
-                    + (f" — inv {l['Supplier_Invoice']}" if l.get("Supplier_Invoice") else ""): l[
-                        "Lot_id"
-                    ]
-                    for l in lots_with_chem
-                }
-                src_label = st.selectbox(
-                    "Copy chemistry from lot",
-                    options=list(lot_labels.keys()),
-                    key="rm_copy_lot",
-                )
-                source_lot_id = lot_labels[src_label]
-                copied_chem = db.get_lot_chemistry(int(source_lot_id))
-                if copied_chem:
-                    st.caption(
-                        f"Will copy {len(copied_chem)} element(s) from Lot **{source_lot_id}**. "
-                        "You can still adjust values below before saving."
-                    )
-                    st.dataframe(
-                        pd.DataFrame(
-                            [{"Element": k, "Percentage": v} for k, v in copied_chem.items()]
-                        ),
-                        use_container_width=True,
-                        hide_index=True,
-                    )
-
-    # Seed full Element_Master chemistry when copying a prior lot.
-    if source_lot_id and copied_chem:
-        if st.session_state.get("rm_full_chem_seed") != source_lot_id:
-            st.session_state["rm_full_chem"] = {
-                k: float(v or 0.0) for k, v in copied_chem.items()
-            }
-            st.session_state["rm_full_chem_seed"] = source_lot_id
-
-    chem_key_suffix = (
-        f"{source_lot_id}" if source_lot_id and chem_mode.startswith("Copy") else "fresh"
-    )
-    entry_elements = db.list_entry_elements()
-    sync_chem_keys = {
-        el["Element_Symbol"]: f"chem_{el['Element_Symbol']}_{chem_key_suffix}"
-        for el in entry_elements
-    }
-    dlg_defaults = dict(st.session_state.get("rm_full_chem") or {})
-    dlg_defaults.update({k: float(v or 0.0) for k, v in copied_chem.items()})
-    full_chem = st.session_state.get("rm_full_chem") or {}
-
-    st.markdown("#### Material & receipt")
-    col_a, col_b = st.columns(2)
-    with col_a:
-        st.text_input(
-            "Raw material name (locked)",
-            value=rm_name_clean,
-            disabled=True,
-            key="rm_locked_name",
-        )
-        isri_opts = {
-            f"{c['ISRI_CODE']} — {c['Description']}": c["ISRI_CODE"]
-            for c in db.list_isri_codes()
-        }
-        isri_label = st.selectbox(
-            "ISRI code", options=[""] + list(isri_opts.keys()), key="rm_isri"
-        )
-        alloy_family = st.text_input(
-            "Alloy family", placeholder="e.g. Al-Si", key="rm_alloy_family"
-        )
-        fe_level = st.selectbox("Fe", [""] + db.ELEMENT_LEVEL, key="rm_fe")
-        cu_level = st.selectbox("Cu", [""] + db.ELEMENT_LEVEL, key="rm_cu")
-        mg_level = st.selectbox("Mg", [""] + db.ELEMENT_LEVEL, key="rm_mg")
-        availability = st.selectbox(
-            "Availability class",
-            ["Standard", "Spot", "Contract", "Internal"],
-            key="rm_availability",
-        )
-        recovery = st.number_input(
-            "Expected recovery %", 0.0, 100.0, 95.0, 0.1, key="rm_recovery"
-        )
-        cost = st.number_input(
-            "Cost per kg", min_value=0.0, value=0.0, step=0.01, key="rm_cost"
-        )
-    with col_b:
-        vendor_label = st.selectbox(
-            "Vendor", options=[""] + list(vendor_opts.keys()), key="rm_vendor"
-        )
-        effective = st.date_input("Effective date", value=date.today(), key="rm_effective")
-        received = st.date_input("Received date", value=date.today(), key="rm_received")
-        invoice = st.text_input("Vendor invoice", key="rm_invoice")
+    inv1, inv2, inv3 = st.columns(3)
+    with inv1:
         invoice_date = st.date_input(
-            "Supplier invoice date", value=date.today(), key="rm_invoice_date"
+            "Supplier invoice date *", value=date.today(), key="rm_log_invoice_date"
         )
-        weight = st.number_input(
-            "Total weight (kg) *", min_value=0.0, value=1000.0, step=1.0, key="rm_weight"
+    with inv2:
+        invoice = st.text_input(
+            "Vendor invoice *",
+            placeholder="e.g. INV-2026-001",
+            key="rm_log_invoice",
         )
-        storage = st.text_input("Storage bay", placeholder="e.g. Bay-A1", key="rm_storage")
+    with inv3:
+        received = st.date_input(
+            "Received date", value=date.today(), key="rm_log_received"
+        )
+
+    rec1, rec2, rec3 = st.columns(3)
+    with rec1:
+        storage = st.text_input(
+            "Storage bay", placeholder="e.g. Bay-A1", key="rm_log_storage"
+        )
+    with rec2:
         inv_status = st.selectbox(
-            "Inventory status", db.INVENTORY_STATUS, index=1, key="rm_inv_status"
+            "Inventory status", db.INVENTORY_STATUS, index=1, key="rm_log_inv_status"
         )
-        rm_status = st.selectbox("Master status", db.ACTIVE_STATUS, key="rm_master_status")
-        photo = st.file_uploader("Photo", type=["png", "jpg", "jpeg", "webp"], key="rm_photo")
+    with rec3:
         invoice_doc = st.file_uploader(
             "Invoice document",
             type=["png", "jpg", "jpeg", "pdf", "doc", "docx", "xls", "xlsx"],
-            help="Photo (JPEG/PNG), PDF, Word, or Excel.",
-            key="rm_invoice_doc",
+            help="Optional. Attached to every lot on this invoice.",
+            key="rm_log_invoice_doc",
         )
 
-    st.markdown("#### Chemical composition (%)")
-    if chem_mode == "Copy from previous lot" and copied_chem:
-        st.caption(
-            f"Defaults loaded from Lot **{source_lot_id}**. Adjust if needed, then save."
-        )
-    else:
-        st.caption(
-            f"First {db.ENTRY_CHEM_ELEMENT_LIMIT} elements by Serial_no. "
-            "Use **Open all elements…** for the full Element_Master list."
-        )
+    st.markdown("#### Raw materials on this invoice")
+    st.caption(
+        "One vendor invoice can include multiple raw materials. "
+        "Add a row for each: name, cost per kg, and received weight."
+    )
 
-    chem_cols = st.columns(6)
-    composition: dict[str, float] = {}
-    for i, el in enumerate(entry_elements):
-        sym = el["Element_Symbol"]
-        default_val = float(full_chem.get(sym, copied_chem.get(sym, 0.0)) or 0.0)
-        with chem_cols[i % 6]:
-            composition[sym] = st.number_input(
-                f"{sym} %",
+    if "rm_invoice_lines" not in st.session_state:
+        st.session_state.rm_invoice_lines = [{"name": "", "cost": 0.0, "weight": 0.0}]
+    if "rm_log_token" not in st.session_state:
+        st.session_state.rm_log_token = 0
+    line_token = st.session_state.rm_log_token
+
+    add_col, rem_col, _ = st.columns([1, 1, 4])
+    if add_col.button("Add raw material", key="rm_log_add_line"):
+        st.session_state.rm_invoice_lines.append(
+            {"name": "", "cost": 0.0, "weight": 0.0}
+        )
+        st.rerun()
+    if rem_col.button("Remove last row", key="rm_log_rem_line") and len(
+        st.session_state.rm_invoice_lines
+    ) > 1:
+        st.session_state.rm_invoice_lines.pop()
+        st.rerun()
+
+    collected_lines: list[dict] = []
+    for idx, _line in enumerate(st.session_state.rm_invoice_lines):
+        st.markdown(f"**Row {idx + 1}**")
+        n1, n2, n3 = st.columns([2.2, 1.2, 1.4])
+        with n1:
+            if existing_materials:
+                name = st.selectbox(
+                    "Raw material name *",
+                    options=existing_materials,
+                    index=None,
+                    accept_new_options=True,
+                    placeholder="Select or type a name",
+                    key=f"rm_line_name_{line_token}_{idx}",
+                )
+            else:
+                name = st.text_input(
+                    "Raw material name *",
+                    placeholder="e.g. Tense, UBC",
+                    key=f"rm_line_name_{line_token}_{idx}",
+                )
+        with n2:
+            cost = st.number_input(
+                "Cost per kg",
                 min_value=0.0,
-                max_value=100.0,
-                value=default_val,
+                value=0.0,
                 step=0.01,
-                key=f"chem_{sym}_{chem_key_suffix}",
-                help=el["Element_Name"],
+                key=f"rm_line_cost_{line_token}_{idx}",
             )
-
-    chem_btn_cols = st.columns([2, 3])
-    with chem_btn_cols[0]:
-        if st.button(
-            "Open all elements…",
-            key="rm_open_all_elements",
-            help="Enter composition for every row in Element_Master",
-            use_container_width=True,
-        ):
-            dialog_all_element_percentages(
-                "rm_full_chem",
-                defaults=dlg_defaults,
-                sync_keys=sync_chem_keys,
+        with n3:
+            weight = st.number_input(
+                "Received weight (kg) *",
+                min_value=0.0,
+                value=0.0,
+                step=1.0,
+                key=f"rm_line_weight_{line_token}_{idx}",
             )
-    with chem_btn_cols[1]:
-        full_n = len([v for v in full_chem.values() if v and v > 0])
-        if full_n:
-            st.caption(f"Full Element_Master entry applied ({full_n} non-zero value(s)).")
+        collected_lines.append(
+            {
+                "name": (name or "").strip(),
+                "cost": float(cost or 0.0),
+                "weight": float(weight or 0.0),
+            }
+        )
 
-    submitted = st.button("Save raw material lot", type="primary", key="rm_save_lot")
+    total_weight = sum(ln["weight"] for ln in collected_lines if ln["name"])
+    total_value = sum(ln["weight"] * ln["cost"] for ln in collected_lines if ln["name"])
+    t1, t2, t3 = st.columns(3)
+    t1.metric("Materials", sum(1 for ln in collected_lines if ln["name"]))
+    t2.metric("Total weight (kg)", f"{total_weight:,.1f}")
+    t3.metric("Invoice value", f"{total_value:,.2f}")
+
+    submitted = st.button("Save invoice lots", type="primary", key="rm_log_save")
 
     if submitted:
-        if not rm_name_clean:
-            st.error("Raw material name is required.")
-        elif weight <= 0:
-            st.error("Total weight must be greater than zero.")
-        elif not vendors:
+        vendor_code = vendor_opts[vendor_label] if vendor_label else None
+        invoice_no = (invoice or "").strip()
+        complete = [ln for ln in collected_lines if ln["name"] and ln["weight"] > 0]
+        incomplete = [ln for ln in collected_lines if ln["name"] and ln["weight"] <= 0]
+        if not vendors:
             st.error("Create a vendor first.")
+        elif not vendor_code:
+            st.error("Select a vendor name.")
+        elif not invoice_no:
+            st.error("Vendor invoice is required.")
+        elif incomplete:
+            st.error("Each raw material row needs a received weight greater than zero.")
+        elif not complete:
+            st.error("Add at least one raw material with a name and received weight.")
         else:
             try:
-                vendor_code = vendor_opts[vendor_label] if vendor_label else None
-                db.add_raw_material_master(
-                    name=rm_name_clean,
-                    effective_date=effective.isoformat(),
-                    vendor_code=vendor_code,
-                    alloy_family=alloy_family.strip(),
-                    availability_class=availability,
-                    recovery=recovery,
-                    status=rm_status,
-                    cost_per_kg=cost,
-                    photo=photo_bytes(photo),
-                    isri_code=isri_opts[isri_label] if isri_label else None,
-                    fe=fe_level or None,
-                    cu=cu_level or None,
-                    mg=mg_level or None,
+                doc_bytes = photo_bytes(invoice_doc)
+                doc_name = invoice_doc.name if invoice_doc else None
+                doc_type = getattr(invoice_doc, "type", None) if invoice_doc else None
+                lot_ids: list[int] = []
+                for ln in complete:
+                    if ln["name"] not in existing_materials:
+                        db.add_raw_material_master(
+                            name=ln["name"],
+                            effective_date=invoice_date.isoformat(),
+                            vendor_code=vendor_code,
+                            alloy_family="",
+                            availability_class=db.RAW_MATERIAL_AVAILABILITY[0],
+                            recovery=None,
+                            status="Active",
+                            cost_per_kg=ln["cost"],
+                        )
+                    lot_id = db.add_inventory_lot(
+                        material=ln["name"],
+                        vendor_code=vendor_code,
+                        invoice=invoice_no,
+                        received_date=received.isoformat(),
+                        weight=ln["weight"],
+                        storage_bay=storage.strip(),
+                        status=inv_status,
+                        supplier_invoice_date=invoice_date.isoformat(),
+                        cost_per_kg=ln["cost"],
+                        invoice_document=doc_bytes,
+                        invoice_document_name=doc_name,
+                        invoice_document_type=doc_type,
+                    )
+                    lot_ids.append(lot_id)
+                names = ", ".join(ln["name"] for ln in complete)
+                st.success(
+                    f"Saved invoice **{invoice_no}** with {len(lot_ids)} lot(s) "
+                    f"({names}). Lot IDs: {', '.join(str(i) for i in lot_ids)}."
                 )
-                lot_id = db.add_inventory_lot(
-                    material=rm_name_clean,
-                    vendor_code=vendor_code,
-                    invoice=invoice.strip(),
-                    received_date=received.isoformat(),
-                    weight=weight,
-                    storage_bay=storage.strip(),
-                    status=inv_status,
-                    photo=photo_bytes(photo),
-                    supplier_invoice_date=invoice_date.isoformat(),
-                    cost_per_kg=cost,
-                    invoice_document=photo_bytes(invoice_doc),
-                    invoice_document_name=invoice_doc.name if invoice_doc else None,
-                    invoice_document_type=getattr(invoice_doc, "type", None)
-                    if invoice_doc
-                    else None,
-                )
-                cleaned = {
-                    k: v
-                    for k, v in merge_percent_composition(
-                        composition, "rm_full_chem"
-                    ).items()
-                    if v and v > 0
-                }
-                if cleaned:
-                    db.set_lot_chemistry(rm_name_clean, lot_id, cleaned)
-                st.session_state.pop("rm_full_chem", None)
-                st.session_state.pop("rm_full_chem_seed", None)
-                msg = (
-                    f"Saved **{rm_name_clean}** as Lot **{lot_id}** "
-                    f"({weight:,.1f} kg @ {cost:,.2f}/kg)."
-                )
-                if source_lot_id and chem_mode == "Copy from previous lot":
-                    msg += f" Chemistry based on Lot **{source_lot_id}**."
-                st.success(msg)
+                st.session_state.rm_invoice_lines = [
+                    {"name": "", "cost": 0.0, "weight": 0.0}
+                ]
+                st.session_state.rm_log_token = int(line_token) + 1
                 st.cache_data.clear()
+                st.rerun()
             except Exception as exc:
                 st.error(f"Could not save: {exc}")
 
@@ -1611,6 +1530,108 @@ elif PAGE == "Vendors":
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# Raw Material Master
+# ═══════════════════════════════════════════════════════════════════════════════
+elif PAGE == "Raw Material Master":
+    st.title("Raw Material Master")
+    st.caption(
+        "Enter material grades used when logging inventory lots. "
+        "The same **name + effective date** updates the existing row. "
+        "Receive lots under **Raw Material Logging**."
+    )
+
+    vendors = db.list_vendors()
+    vendor_opts = {
+        f"{v['Vendor_name']} (#{v['Vendor_code']})": v["Vendor_code"] for v in vendors
+    }
+    isri_opts = {
+        f"{c['ISRI_CODE']} — {c['Description']}": c["ISRI_CODE"]
+        for c in db.list_isri_codes()
+    }
+    if not vendors:
+        st.warning("Add at least one vendor under **Vendors** before saving a grade.")
+
+    c1, c2 = st.columns(2)
+    with c1:
+        rm_name = st.text_input(
+            "Raw material name *",
+            placeholder="e.g. Tense, Taint/Tabor, UBC, Pure Al",
+            key="rmm_name",
+        )
+        isri_label = st.selectbox(
+            "ISRI code", options=[""] + list(isri_opts.keys()), key="rmm_isri"
+        )
+        alloy_family = st.text_input(
+            "Alloy family", placeholder="e.g. Al-Si", key="rmm_alloy_family"
+        )
+        availability = st.selectbox(
+            "Availability class",
+            db.RAW_MATERIAL_AVAILABILITY,
+            key="rmm_availability",
+        )
+        fe_level = st.selectbox("Fe", [""] + db.ELEMENT_LEVEL, key="rmm_fe")
+        cu_level = st.selectbox("Cu", [""] + db.ELEMENT_LEVEL, key="rmm_cu")
+        mg_level = st.selectbox("Mg", [""] + db.ELEMENT_LEVEL, key="rmm_mg")
+    with c2:
+        vendor_label = st.selectbox(
+            "Vendor", options=[""] + list(vendor_opts.keys()), key="rmm_vendor"
+        )
+        effective = st.date_input(
+            "Effective date *", value=date.today(), key="rmm_effective"
+        )
+        recovery = st.number_input(
+            "Expected recovery %", 0.0, 100.0, 95.0, 0.1, key="rmm_recovery"
+        )
+        cost = st.number_input(
+            "Cost per kg", min_value=0.0, value=0.0, step=0.01, key="rmm_cost"
+        )
+        rm_status = st.selectbox("Status", db.ACTIVE_STATUS, key="rmm_status")
+        photo = st.file_uploader(
+            "Photo", type=["png", "jpg", "jpeg", "webp"], key="rmm_photo"
+        )
+
+    if st.button("Save raw material", type="primary", key="rmm_save"):
+        name_clean = (rm_name or "").strip()
+        if not name_clean:
+            st.error("Raw material name is required.")
+        else:
+            try:
+                db.add_raw_material_master(
+                    name=name_clean,
+                    effective_date=effective.isoformat(),
+                    vendor_code=vendor_opts[vendor_label] if vendor_label else None,
+                    alloy_family=alloy_family.strip(),
+                    availability_class=availability,
+                    recovery=recovery,
+                    status=rm_status,
+                    cost_per_kg=cost,
+                    photo=photo_bytes(photo),
+                    isri_code=isri_opts[isri_label] if isri_label else None,
+                    fe=fe_level or None,
+                    cu=cu_level or None,
+                    mg=mg_level or None,
+                )
+                st.success(
+                    f"Saved raw material **{name_clean}** "
+                    f"(effective {effective.isoformat()})."
+                )
+                st.cache_data.clear()
+            except Exception as exc:
+                st.error(f"Could not save: {exc}")
+
+    rows = db.list_raw_material_master()
+    st.subheader(f"Raw material grades ({len(rows)})")
+    if not rows:
+        st.info("No raw material grades yet. Save one using the form above.")
+    else:
+        st.dataframe(
+            df_from_rows(rows),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # Alloys
 # ═══════════════════════════════════════════════════════════════════════════════
 elif PAGE == "Alloys":
@@ -2521,24 +2542,7 @@ elif PAGE == "Masters Overview":
         st.dataframe(df_from_rows(db.list_elements()), use_container_width=True, hide_index=True)
     with tab2:
         st.dataframe(
-            df_from_rows(
-                db.fetch_all(
-                    """
-                    SELECT m.Raw_Material_Name AS "Raw_Material_Name",
-                           m.Effective_date AS "Effective_date",
-                           v.Vendor_name AS "Vendor_name",
-                           m.ISRI_CODE AS "ISRI_CODE",
-                           m.Alloy_family AS "Alloy_family",
-                           m.Fe AS "Fe", m.Cu AS "Cu", m.Mg AS "Mg",
-                           m.Availability_class AS "Availability_class",
-                           m.Recovery AS "Recovery", m.Cost_per_kg AS "Cost_per_kg",
-                           m.Status AS "Status"
-                    FROM Raw_Material_Master m
-                    LEFT JOIN Vendor_Master v ON v.Vendor_code = m.Vendor_code
-                    ORDER BY m.Raw_Material_Name, m.Effective_date DESC
-                    """
-                )
-            ),
+            df_from_rows(db.list_raw_material_master()),
             use_container_width=True,
             hide_index=True,
         )
