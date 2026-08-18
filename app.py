@@ -684,7 +684,7 @@ elif PAGE == "Production Batch & Chemistry":
         st.markdown("#### Sample results")
         sample_blank = "— not set —"
         sample_opts = [sample_blank] + db.SAMPLE_OK_STATUS
-        s1, s2, s3 = st.columns(3)
+        s1, s2, s3, s4 = st.columns(4)
         with s1:
             top_sample = st.selectbox("Top sample", sample_opts)
             top_sample_remarks = st.text_input("Top sample remarks")
@@ -706,6 +706,8 @@ elif PAGE == "Production Batch & Chemistry":
                 "Bottom sample datetime",
                 placeholder="YYYY-MM-DD HH:MM:SS",
             )
+        with s4:
+            vacum_sample = st.selectbox("Vacum sample", sample_opts)
 
         st.markdown("#### Charge / raw material inputs")
         st.caption(
@@ -1040,6 +1042,7 @@ elif PAGE == "Production Batch & Chemistry":
                         top_sample=_sample_or_none(top_sample),
                         middle_sample=_sample_or_none(middle_sample),
                         bottom_sample=_sample_or_none(bottom_sample),
+                        vacum_sample=_sample_or_none(vacum_sample),
                         top_sample_remarks=top_sample_remarks.strip() or None,
                         middle_sample_remarks=middle_sample_remarks.strip() or None,
                         bottom_sample_remarks=bottom_sample_remarks.strip() or None,

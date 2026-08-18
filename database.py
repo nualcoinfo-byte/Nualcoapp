@@ -383,6 +383,7 @@ CREATE TABLE IF NOT EXISTS Production_batch (
     Top_Sample TEXT CHECK(Top_Sample IS NULL OR Top_Sample IN ('OK', 'NOT OK')),
     Middle_Sample TEXT CHECK(Middle_Sample IS NULL OR Middle_Sample IN ('OK', 'NOT OK')),
     Bottom_Sample TEXT CHECK(Bottom_Sample IS NULL OR Bottom_Sample IN ('OK', 'NOT OK')),
+    Vacum_Sample TEXT CHECK(Vacum_Sample IS NULL OR Vacum_Sample IN ('OK', 'NOT OK')),
     Top_Sample_Remarks TEXT,
     Middle_Sample_Remarks TEXT,
     Bottom_Sample_Remarks TEXT,
@@ -523,6 +524,7 @@ def init_db() -> None:
                 ("Middle_Sample_datetime", "TEXT"),
                 ("Bottom_Sample_datetime", "TEXT"),
                 ("Production_supervisor", "TEXT"),
+                ("Vacum_Sample", "TEXT"),
             ],
         )
         _ensure_columns(
@@ -632,6 +634,7 @@ def init_db() -> None:
         _ensure_purchase_order_composite_pk(conn)
         _ensure_finished_goods_status(conn)
         _ensure_finished_goods_release_trigger(conn)
+        _ensure_vacum_sample_check(conn)
 
 
 def _ensure_purchase_order_status(conn: Connection) -> None:
@@ -666,6 +669,30 @@ def _ensure_purchase_order_status(conn: Connection) -> None:
     else:
         # SQLite: table-level CHECK is only on CREATE; column already has DEFAULT.
         pass
+
+
+def _ensure_vacum_sample_check(conn: Connection) -> None:
+    """Enforce Vacum_Sample ∈ OK / NOT OK (NULL allowed)."""
+    if not IS_POSTGRES:
+        return
+    exists = _exec(
+        conn,
+        """
+        SELECT 1 AS ok
+        FROM pg_constraint
+        WHERE conname = 'production_batch_vacum_sample_check'
+        """,
+    ).first()
+    if exists:
+        return
+    _exec(
+        conn,
+        """
+        ALTER TABLE Production_batch
+        ADD CONSTRAINT production_batch_vacum_sample_check
+        CHECK (Vacum_Sample IS NULL OR Vacum_Sample IN ('OK', 'NOT OK'))
+        """,
+    )
 
 
 def _purchase_order_pk_columns(conn: Connection) -> list[str]:
@@ -1961,6 +1988,7 @@ def create_batch(
     top_sample: Optional[str] = None,
     middle_sample: Optional[str] = None,
     bottom_sample: Optional[str] = None,
+    vacum_sample: Optional[str] = None,
     top_sample_remarks: Optional[str] = None,
     middle_sample_remarks: Optional[str] = None,
     bottom_sample_remarks: Optional[str] = None,
@@ -1981,6 +2009,7 @@ def create_batch(
         ("Top_Sample", top_sample),
         ("Middle_Sample", middle_sample),
         ("Bottom_Sample", bottom_sample),
+        ("Vacum_Sample", vacum_sample),
     ):
         if value and value not in SAMPLE_OK_STATUS:
             raise ValueError(f"{label} must be one of {SAMPLE_OK_STATUS}.")
@@ -2002,12 +2031,12 @@ def create_batch(
                 (Batch_ID, Alloy_id, Production_Date, Shift, Furnace, Melt_No,
                  Heat_no, Melting_team, Output_Weight, Notes, Production_status, Workflow_stage,
                  Degassing_time, Sampled_pcs, Defect_pcs,
-                 Top_Sample, Middle_Sample, Bottom_Sample,
+                 Top_Sample, Middle_Sample, Bottom_Sample, Vacum_Sample,
                  Top_Sample_Remarks, Middle_Sample_Remarks, Bottom_Sample_Remarks,
                  Top_Sample_datetime, Middle_Sample_datetime, Bottom_Sample_datetime,
                  Production_supervisor)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'Pending QA', 'Raw Material',
-                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 batch_id,
@@ -2026,6 +2055,7 @@ def create_batch(
                 top_sample,
                 middle_sample,
                 bottom_sample,
+                vacum_sample,
                 top_sample_remarks,
                 middle_sample_remarks,
                 bottom_sample_remarks,
@@ -2227,7 +2257,7 @@ _BATCH_COLUMNS = """
     Degassing_time AS "Degassing_time",
     Sampled_pcs AS "Sampled_pcs", Defect_pcs AS "Defect_pcs",
     Top_Sample AS "Top_Sample", Middle_Sample AS "Middle_Sample",
-    Bottom_Sample AS "Bottom_Sample",
+    Bottom_Sample AS "Bottom_Sample", Vacum_Sample AS "Vacum_Sample",
     Top_Sample_Remarks AS "Top_Sample_Remarks",
     Middle_Sample_Remarks AS "Middle_Sample_Remarks",
     Bottom_Sample_Remarks AS "Bottom_Sample_Remarks",
@@ -2285,7 +2315,7 @@ def list_batches() -> list[dict[str, Any]]:
                b.Workflow_stage AS "Workflow_stage", a.Alloy_name AS "Alloy_name",
                b.Production_supervisor AS "Production_supervisor",
                b.Top_Sample AS "Top_Sample", b.Middle_Sample AS "Middle_Sample",
-               b.Bottom_Sample AS "Bottom_Sample"
+               b.Bottom_Sample AS "Bottom_Sample", b.Vacum_Sample AS "Vacum_Sample"
         FROM Production_batch b
         LEFT JOIN Alloy_Master a ON a.Alloy_id = b.Alloy_id
         ORDER BY b.Production_Date DESC, b.Batch_ID DESC
