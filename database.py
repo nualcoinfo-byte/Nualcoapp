@@ -431,10 +431,10 @@ CREATE TABLE IF NOT EXISTS Build_of_Material (
     PRIMARY KEY (BOMID, Effective_date)
 );
 CREATE TABLE IF NOT EXISTS Purchase_Order (
-    Customer_PO_No TEXT PRIMARY KEY,
+    Customer_PO_No TEXT NOT NULL,
     Cust_code TEXT REFERENCES Customer_Master(Cust_code),
     Customer_name TEXT REFERENCES Customer_Master(Customer_name),
-    Alloy_Id INTEGER REFERENCES Alloy_Master(Alloy_id),
+    Alloy_Id INTEGER NOT NULL REFERENCES Alloy_Master(Alloy_id),
     Order_Date TEXT,
     Delivery_Date TEXT,
     Order_Qty {float},
@@ -453,7 +453,8 @@ CREATE TABLE IF NOT EXISTS Purchase_Order (
     PO_Document_name TEXT,
     PO_Document_type TEXT,
     Purchase_Order_Status TEXT DEFAULT 'Open'
-        CHECK(Purchase_Order_Status IN ('Open', 'Closed', 'Cancelled'))
+        CHECK(Purchase_Order_Status IN ('Open', 'Closed', 'Cancelled')),
+    PRIMARY KEY (Customer_PO_No, Alloy_Id)
 );
 """
 
@@ -627,6 +628,7 @@ def init_db() -> None:
             )
 
         _ensure_purchase_order_status(conn)
+        _ensure_purchase_order_composite_pk(conn)
         _ensure_finished_goods_status(conn)
         _ensure_finished_goods_release_trigger(conn)
 
@@ -663,6 +665,123 @@ def _ensure_purchase_order_status(conn: Connection) -> None:
     else:
         # SQLite: table-level CHECK is only on CREATE; column already has DEFAULT.
         pass
+
+
+def _purchase_order_pk_columns(conn: Connection) -> list[str]:
+    if IS_POSTGRES:
+        rows = list(
+            _exec(
+                conn,
+                """
+                SELECT a.attname AS name
+                FROM pg_index i
+                CROSS JOIN LATERAL unnest(i.indkey) WITH ORDINALITY AS x(attnum, ordinality)
+                JOIN pg_attribute a
+                  ON a.attrelid = i.indrelid AND a.attnum = x.attnum
+                WHERE i.indrelid = 'purchase_order'::regclass
+                  AND i.indisprimary
+                ORDER BY x.ordinality
+                """,
+            ).mappings()
+        )
+        return [str(r["name"]) for r in rows]
+    rows = list(_exec(conn, "PRAGMA table_info(Purchase_Order)").mappings())
+    pk_rows = [r for r in rows if int(r["pk"] or 0) > 0]
+    pk_rows.sort(key=lambda r: int(r["pk"]))
+    return [str(r["name"]) for r in pk_rows]
+
+
+def _ensure_purchase_order_composite_pk(conn: Connection) -> None:
+    """Identify each PO line by (Customer_PO_No, Alloy_Id) so one PO can cover many alloys."""
+    normalized = [c.lower() for c in _purchase_order_pk_columns(conn)]
+    if normalized == ["customer_po_no", "alloy_id"]:
+        return
+
+    null_alloy = (
+        _exec(
+            conn,
+            "SELECT COUNT(*) AS n FROM Purchase_Order WHERE Alloy_Id IS NULL",
+        )
+        .mappings()
+        .first()
+    )
+    if int((null_alloy or {}).get("n") or 0) > 0:
+        raise ValueError(
+            "Cannot make Alloy_Id part of the Purchase_Order key: "
+            "some purchase orders have no alloy. Assign an alloy to every PO first."
+        )
+
+    if IS_POSTGRES:
+        pk_name_row = (
+            _exec(
+                conn,
+                """
+                SELECT conname
+                FROM pg_constraint
+                WHERE conrelid = 'purchase_order'::regclass AND contype = 'p'
+                """,
+            )
+            .mappings()
+            .first()
+        )
+        if pk_name_row:
+            _exec(
+                conn,
+                f"ALTER TABLE Purchase_Order DROP CONSTRAINT {pk_name_row['conname']}",
+            )
+        _exec(conn, "ALTER TABLE Purchase_Order ALTER COLUMN Alloy_Id SET NOT NULL")
+        _exec(
+            conn,
+            "ALTER TABLE Purchase_Order ADD PRIMARY KEY (Customer_PO_No, Alloy_Id)",
+        )
+        return
+
+    _exec(
+        conn,
+        """
+        CREATE TABLE Purchase_Order__pk (
+            Customer_PO_No TEXT NOT NULL,
+            Cust_code TEXT REFERENCES Customer_Master(Cust_code),
+            Customer_name TEXT REFERENCES Customer_Master(Customer_name),
+            Alloy_Id INTEGER NOT NULL REFERENCES Alloy_Master(Alloy_id),
+            Order_Date TEXT,
+            Delivery_Date TEXT,
+            Order_Qty REAL,
+            Rate REAL,
+            Billing_Address TEXT,
+            Billing_City TEXT,
+            Billing_state TEXT,
+            Billing_Pincode TEXT,
+            Billing_country TEXT,
+            Shipping_address TEXT,
+            Shipping_City TEXT,
+            Shipping_state TEXT,
+            Shipping_Pincode TEXT,
+            Shipping_country TEXT,
+            PO_Document BLOB,
+            PO_Document_name TEXT,
+            PO_Document_type TEXT,
+            Purchase_Order_Status TEXT DEFAULT 'Open'
+                CHECK(Purchase_Order_Status IN ('Open', 'Closed', 'Cancelled')),
+            PRIMARY KEY (Customer_PO_No, Alloy_Id)
+        )
+        """,
+    )
+    _exec(
+        conn,
+        """
+        INSERT INTO Purchase_Order__pk
+        SELECT Customer_PO_No, Cust_code, Customer_name, Alloy_Id,
+               Order_Date, Delivery_Date, Order_Qty, Rate,
+               Billing_Address, Billing_City, Billing_state, Billing_Pincode,
+               Billing_country, Shipping_address, Shipping_City, Shipping_state,
+               Shipping_Pincode, Shipping_country, PO_Document, PO_Document_name,
+               PO_Document_type, Purchase_Order_Status
+        FROM Purchase_Order
+        """,
+    )
+    _exec(conn, "DROP TABLE Purchase_Order")
+    _exec(conn, "ALTER TABLE Purchase_Order__pk RENAME TO Purchase_Order")
 
 
 def _ensure_finished_goods_status(conn: Connection) -> None:
@@ -906,7 +1025,7 @@ EDITABLE_TABLES: list[dict[str, Any]] = [
     {
         "key": "purchase_order",
         "label": "Purchase orders",
-        "pk": ["customer_po_no"],
+        "pk": ["customer_po_no", "alloy_id"],
         "order_by": "customer_po_no",
         "identity": [],
         "allow_add": True,
@@ -2191,12 +2310,26 @@ def list_purchase_orders() -> list[dict[str, Any]]:
                CASE WHEN p.PO_Document IS NULL THEN 0 ELSE 1 END AS "Has_Document"
         FROM Purchase_Order p
         LEFT JOIN Alloy_Master a ON a.Alloy_id = p.Alloy_Id
-        ORDER BY p.Order_Date DESC, p.Customer_PO_No
+        ORDER BY p.Order_Date DESC, p.Customer_PO_No, p.Alloy_Id
         """
     )
 
 
-def update_purchase_order_status(customer_po_no: str, status: str) -> None:
+def _require_alloy_id(alloy_id: Any) -> int:
+    if alloy_id is None or alloy_id == "":
+        raise ValueError(
+            "Alloy is required. Each purchase-order line is identified by "
+            "Customer PO No and Alloy."
+        )
+    try:
+        return int(alloy_id)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Alloy is required.") from exc
+
+
+def update_purchase_order_status(
+    customer_po_no: str, status: str, alloy_id: int
+) -> None:
     status = (status or "").strip()
     if status not in PURCHASE_ORDER_STATUS:
         raise ValueError(
@@ -2205,20 +2338,21 @@ def update_purchase_order_status(customer_po_no: str, status: str) -> None:
     po_no = (customer_po_no or "").strip()
     if not po_no:
         raise ValueError("Customer PO No is required.")
+    alloy = _require_alloy_id(alloy_id)
     n = execute(
         """
         UPDATE Purchase_Order
         SET Purchase_Order_Status = ?
-        WHERE Customer_PO_No = ?
+        WHERE Customer_PO_No = ? AND Alloy_Id = ?
         """,
-        (status, po_no),
+        (status, po_no, alloy),
     )
     if n == 0:
-        raise ValueError(f"Purchase order '{po_no}' not found.")
+        raise ValueError(f"Purchase order '{po_no}' for alloy {alloy} not found.")
 
 
 def upsert_purchase_order(data: dict[str, Any]) -> None:
-    """Insert or update a purchase order keyed on Customer_PO_No."""
+    """Insert or update a purchase-order line keyed on (Customer_PO_No, Alloy_Id)."""
     po_no = (data.get("Customer_PO_No") or "").strip()
     if not po_no:
         raise ValueError("Customer PO No is required.")
@@ -2226,6 +2360,7 @@ def upsert_purchase_order(data: dict[str, Any]) -> None:
         raise ValueError("Customer is required.")
     if not data.get("Customer_name"):
         raise ValueError("Customer name is required.")
+    alloy_id = _require_alloy_id(data.get("Alloy_Id"))
 
     status = (data.get("Purchase_Order_Status") or "Open").strip()
     if status not in PURCHASE_ORDER_STATUS:
@@ -2242,10 +2377,9 @@ def upsert_purchase_order(data: dict[str, Any]) -> None:
              Shipping_address, Shipping_City, Shipping_state, Shipping_Pincode, Shipping_country,
              Purchase_Order_Status)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(Customer_PO_No) DO UPDATE SET
+        ON CONFLICT(Customer_PO_No, Alloy_Id) DO UPDATE SET
             Cust_code=excluded.Cust_code,
             Customer_name=excluded.Customer_name,
-            Alloy_Id=excluded.Alloy_Id,
             Order_Date=excluded.Order_Date,
             Delivery_Date=excluded.Delivery_Date,
             Order_Qty=excluded.Order_Qty,
@@ -2266,7 +2400,7 @@ def upsert_purchase_order(data: dict[str, Any]) -> None:
             po_no,
             data["Cust_code"],
             data["Customer_name"],
-            data.get("Alloy_Id"),
+            alloy_id,
             data.get("Order_Date"),
             data.get("Delivery_Date"),
             data.get("Order_Qty"),
@@ -2291,10 +2425,12 @@ def save_po_document(
     file_bytes: bytes,
     filename: str,
     content_type: Optional[str] = None,
+    alloy_id: Optional[int] = None,
 ) -> None:
-    """Attach a PDF/Word/Excel purchase-order document to an existing PO."""
+    """Attach a PDF/Word/Excel purchase-order document to an existing PO line."""
     if not customer_po_no:
         raise ValueError("Customer PO No is required.")
+    alloy = _require_alloy_id(alloy_id)
     if not file_bytes:
         raise ValueError("Document file is empty.")
     name = (filename or "").strip()
@@ -2304,43 +2440,50 @@ def save_po_document(
             "PO document must be PDF, Word (.doc/.docx), or Excel (.xls/.xlsx)."
         )
     existing = fetch_one(
-        'SELECT Customer_PO_No AS "Customer_PO_No" FROM Purchase_Order WHERE Customer_PO_No = ?',
-        (customer_po_no,),
+        """
+        SELECT Customer_PO_No AS "Customer_PO_No"
+        FROM Purchase_Order
+        WHERE Customer_PO_No = ? AND Alloy_Id = ?
+        """,
+        (customer_po_no, alloy),
     )
     if not existing:
-        raise ValueError(f"Purchase order '{customer_po_no}' not found.")
+        raise ValueError(f"Purchase order '{customer_po_no}' for alloy {alloy} not found.")
     execute(
         """
         UPDATE Purchase_Order
         SET PO_Document = ?, PO_Document_name = ?, PO_Document_type = ?
-        WHERE Customer_PO_No = ?
+        WHERE Customer_PO_No = ? AND Alloy_Id = ?
         """,
-        (file_bytes, name, content_type or "", customer_po_no),
+        (file_bytes, name, content_type or "", customer_po_no, alloy),
     )
 
 
-def get_po_document(customer_po_no: str) -> Optional[dict[str, Any]]:
+def get_po_document(customer_po_no: str, alloy_id: int) -> Optional[dict[str, Any]]:
+    alloy = _require_alloy_id(alloy_id)
     return fetch_one(
         """
         SELECT Customer_PO_No AS "Customer_PO_No",
+               Alloy_Id AS "Alloy_Id",
                PO_Document AS "PO_Document",
                PO_Document_name AS "PO_Document_name",
                PO_Document_type AS "PO_Document_type"
         FROM Purchase_Order
-        WHERE Customer_PO_No = ?
+        WHERE Customer_PO_No = ? AND Alloy_Id = ?
         """,
-        (customer_po_no,),
+        (customer_po_no, alloy),
     )
 
 
-def clear_po_document(customer_po_no: str) -> None:
+def clear_po_document(customer_po_no: str, alloy_id: int) -> None:
+    alloy = _require_alloy_id(alloy_id)
     execute(
         """
         UPDATE Purchase_Order
         SET PO_Document = NULL, PO_Document_name = NULL, PO_Document_type = NULL
-        WHERE Customer_PO_No = ?
+        WHERE Customer_PO_No = ? AND Alloy_Id = ?
         """,
-        (customer_po_no,),
+        (customer_po_no, alloy),
     )
 
 

@@ -1838,8 +1838,9 @@ elif PAGE == "Trolleys":
 elif PAGE == "Purchase Orders":
     st.title("Purchase Orders")
     st.caption(
-        "Create or update a customer purchase order and optionally attach the PO document "
-        "(PDF, Word, or Excel). Review all POs and take actions under **All Purchase Orders**."
+        "Create or update a customer purchase-order line. The same Customer PO No can be "
+        "used for more than one alloy. Optionally attach the PO document (PDF, Word, or Excel). "
+        "Review all PO lines under **All Purchase Orders**."
     )
 
     customers = db.list_customer_codes()
@@ -1880,10 +1881,10 @@ elif PAGE == "Purchase Orders":
                 delivery_date = st.date_input("Delivery date", value=date.today())
             with h2:
                 alloy_label = st.selectbox(
-                    "Alloy",
-                    options=["— none —"] + list(alloy_opts.keys()),
+                    "Alloy *",
+                    options=["— select alloy —"] + list(alloy_opts.keys()),
                     disabled=not bool(cust),
-                    help="Only alloys for the selected customer (Alloy_Master.Cust_code).",
+                    help="Required. The same Customer PO No can be saved once per alloy.",
                 )
                 order_qty = st.number_input("Order qty *", min_value=0.0, value=0.0, step=1.0)
                 rate = st.number_input("Rate", min_value=0.0, value=0.0, step=0.01)
@@ -1964,6 +1965,8 @@ elif PAGE == "Purchase Orders":
                 st.error("Customer PO No is required.")
             elif not cust_label or not cust:
                 st.error("Select a customer.")
+            elif alloy_label == "— select alloy —" or not alloy_opts:
+                st.error("Select an alloy. The same PO number can be used for multiple alloys.")
             elif order_qty <= 0:
                 st.error("Order qty must be greater than zero.")
             else:
@@ -1971,14 +1974,13 @@ elif PAGE == "Purchase Orders":
                     if copy_ship:
                         ship_addr, ship_city, ship_state = bill_addr, bill_city, bill_state
                         ship_pin, ship_country = bill_pin, bill_country
+                    alloy_id = alloy_opts[alloy_label]
                     db.upsert_purchase_order(
                         {
                             "Customer_PO_No": po_no.strip(),
                             "Cust_code": cust["Cust_code"],
                             "Customer_name": cust["Customer_name"],
-                            "Alloy_Id": None
-                            if alloy_label == "— none —"
-                            else alloy_opts[alloy_label],
+                            "Alloy_Id": alloy_id,
                             "Order_Date": order_date.isoformat(),
                             "Delivery_Date": delivery_date.isoformat(),
                             "Order_Qty": order_qty,
@@ -2002,9 +2004,10 @@ elif PAGE == "Purchase Orders":
                             file_bytes=po_file.getvalue(),
                             filename=po_file.name,
                             content_type=getattr(po_file, "type", None),
+                            alloy_id=alloy_id,
                         )
                     st.success(
-                        f"Saved purchase order **{po_no.strip()}**. "
+                        f"Saved purchase order **{po_no.strip()}** for **{alloy_label}**. "
                         "Open **All Purchase Orders** to review or take further actions."
                     )
                     st.rerun()
@@ -2018,8 +2021,9 @@ elif PAGE == "Purchase Orders":
 elif PAGE == "All Purchase Orders":
     st.title("All Purchase Orders")
     st.caption(
-        "Summary of every customer PO. Filter, review details, change status, "
-        "and attach or download documents. Create new POs under **Purchase Orders**."
+        "Summary of every customer PO line (one row per PO number and alloy). "
+        "Filter, review details, change status, and attach or download documents. "
+        "Create new POs under **Purchase Orders**."
     )
 
     pos = db.list_purchase_orders()
@@ -2118,16 +2122,28 @@ elif PAGE == "All Purchase Orders":
         action_opts = {
             f"{p['Customer_PO_No']}"
             + (f" — {p['Customer_name']}" if p.get("Customer_name") else "")
-            + f" · {p.get('Purchase_Order_Status') or 'Open'}": p["Customer_PO_No"]
+            + " / "
+            + (
+                p.get("Alloy_name")
+                or (f"#{p['Alloy_Id']}" if p.get("Alloy_Id") else "no alloy")
+            )
+            + f" · {p.get('Purchase_Order_Status') or 'Open'}": (
+                p["Customer_PO_No"],
+                p.get("Alloy_Id"),
+            )
             for p in filtered or pos
         }
         pick = st.selectbox(
-            "Select purchase order",
+            "Select purchase order line",
             options=list(action_opts.keys()),
             key="apo_action_pick",
         )
-        po_no_sel = action_opts[pick]
-        selected = next(p for p in pos if p["Customer_PO_No"] == po_no_sel)
+        po_no_sel, alloy_id_sel = action_opts[pick]
+        selected = next(
+            p
+            for p in pos
+            if p["Customer_PO_No"] == po_no_sel and p.get("Alloy_Id") == alloy_id_sel
+        )
 
         d1, d2, d3, d4 = st.columns(4)
         d1.metric("PO No", selected["Customer_PO_No"])
@@ -2188,8 +2204,11 @@ elif PAGE == "All Purchase Orders":
         )
         if st.button("Save status", type="primary", key="apo_save_status"):
             try:
-                db.update_purchase_order_status(po_no_sel, new_status)
-                st.success(f"PO **{po_no_sel}** set to **{new_status}**.")
+                db.update_purchase_order_status(po_no_sel, new_status, alloy_id_sel)
+                st.success(
+                    f"PO **{po_no_sel}** / alloy **{selected.get('Alloy_name') or alloy_id_sel}** "
+                    f"set to **{new_status}**."
+                )
                 st.rerun()
             except Exception as exc:
                 st.error(str(exc))
@@ -2208,13 +2227,14 @@ elif PAGE == "All Purchase Orders":
                     file_bytes=uploaded.getvalue(),
                     filename=uploaded.name,
                     content_type=getattr(uploaded, "type", None),
+                    alloy_id=alloy_id_sel,
                 )
                 st.success(f"Saved **{uploaded.name}** on PO {po_no_sel}.")
                 st.rerun()
             except Exception as exc:
                 st.error(str(exc))
 
-        doc = db.get_po_document(po_no_sel)
+        doc = db.get_po_document(po_no_sel, alloy_id_sel)
         if doc and doc.get("PO_Document"):
             st.download_button(
                 "Download attached document",
@@ -2224,7 +2244,7 @@ elif PAGE == "All Purchase Orders":
                 key="apo_download",
             )
             if u2.button("Remove document", key="apo_remove_doc"):
-                db.clear_po_document(po_no_sel)
+                db.clear_po_document(po_no_sel, alloy_id_sel)
                 st.success("Document removed.")
                 st.rerun()
         else:
@@ -2564,7 +2584,7 @@ elif PAGE == "Masters Overview":
             | 14 | batch_input | Charge sheets |
             | 15 | Batch_Chemical_Composition | Ladle chemistry |
             | 16 | Build_of_Material | BOM |
-            | 17 | Purchase_Order | Customer POs + attached PO document (PDF/Word/Excel) |
+            | 17 | Purchase_Order | Customer POs + attached PO document (PDF/Word/Excel); key is Customer_PO_No + Alloy_Id |
             | 18 | ISRI_CODE_TABLE | ISRI scrap specification codes |
             | 19 | Finished_Goods_Inventory | Bundles (Under_Testing → Available → Assigned / Dispatched / Rejected) |
 
