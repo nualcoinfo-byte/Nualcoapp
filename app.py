@@ -710,7 +710,7 @@ elif PAGE == "Production Batch & Chemistry":
             st.caption("K Mold Value = Defect pcs / Sampled pcs")
             if sampled_pcs and sampled_pcs > 0:
                 k_mold = float(defect_pcs) / float(sampled_pcs)
-                css = "yield-bad" if k_mold < 0.5 else "yield-ok"
+                css = "yield-bad" if k_mold >= 0.5 else "yield-ok"
                 st.markdown(
                     f'<p class="{css}">K Mold Value<br>{k_mold:.3f}</p>',
                     unsafe_allow_html=True,
