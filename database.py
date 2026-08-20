@@ -2,9 +2,10 @@
 Database layer for Nualco Aluminum Alloy Manufacturing Tracker.
 
 Runs on Neon Postgres when DATABASE_URL is available (from the environment or
-.env.local), otherwise falls back to the local SQLite file. All SQL goes
-through a single SQLAlchemy engine; queries are written in the portable
-subset both dialects support:
+.env.local), otherwise falls back to the local SQLite file. Native Postgres
+on port 5432 is preferred; if that path is blocked, queries go over Neon's
+HTTPS SQL endpoint instead. All SQL is written in the portable subset both
+dialects support:
 
 - placeholders use `?` and are translated to `%s` for Postgres
 - upserts use `ON CONFLICT` (supported by both Postgres and SQLite 3.24+)
@@ -16,63 +17,177 @@ subset both dialects support:
 from __future__ import annotations
 
 import os
+import socket
+import struct
+import sys
+import time
 from contextlib import contextmanager
 from datetime import date, datetime
 from pathlib import Path
-from typing import Any, Generator, Iterable, Optional
+from typing import Any, Callable, Generator, Iterable, Optional, TypeVar
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 from sqlalchemy import Connection, CursorResult, MetaData, Table, create_engine, select
+from sqlalchemy.exc import OperationalError
 
 DB_PATH = Path(__file__).resolve().parent / "nualco.db"
 ENV_FILE = Path(__file__).resolve().parent / ".env.local"
 
 
+def _force_sqlite() -> bool:
+    return os.environ.get("NUALCO_FORCE_SQLITE", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _prepare_postgres_url(url: str) -> str:
+    """Strip options that hang Windows libpq, and disable GSS encryption."""
+    parsed = urlparse(url)
+    query = dict(parse_qsl(parsed.query, keep_blank_values=True))
+    query.pop("channel_binding", None)
+    query["sslmode"] = query.get("sslmode") or "require"
+    query["gssencmode"] = "disable"
+    return urlunparse(
+        (
+            parsed.scheme,
+            parsed.netloc,
+            parsed.path,
+            parsed.params,
+            urlencode(query),
+            parsed.fragment,
+        )
+    )
+
+
 def _database_url() -> str | None:
+    if _force_sqlite():
+        return None
+
     def _clean(value: str | None) -> str | None:
         if not value:
             return None
         text = str(value).strip().strip('"').strip("'")
         return text or None
 
-    url = _clean(os.environ.get("DATABASE_URL"))
-    if url:
-        return url
+    unpooled: list[str] = []
+    pooled: list[str] = []
+
+    def _consider(value: str | None) -> None:
+        url = _clean(value)
+        if not url:
+            return
+        if "-pooler" in url:
+            pooled.append(url)
+        else:
+            unpooled.append(url)
+
+    _consider(os.environ.get("DATABASE_URL_UNPOOLED"))
+    _consider(os.environ.get("DATABASE_URL"))
 
     # Streamlit Cloud / local .streamlit/secrets.toml
-    try:
-        import streamlit as st  # type: ignore
+    # Only touch Streamlit if it is already loaded; importing it outside
+    # `streamlit run` can hang the interpreter.
+    if "streamlit" in sys.modules:
+        try:
+            import streamlit as st  # type: ignore
 
-        secrets = st.secrets
-        for key in ("DATABASE_URL", "database_url"):
-            if key in secrets:
-                url = _clean(secrets[key])
-                if url:
-                    return url
-        # Nested forms some dashboards use: [postgres] url = "..."
-        for section in ("postgres", "neon", "db"):
-            if section in secrets:
+            secrets = st.secrets
+            for key in (
+                "DATABASE_URL_UNPOOLED",
+                "database_url_unpooled",
+                "DATABASE_URL",
+                "database_url",
+            ):
+                if key in secrets:
+                    _consider(secrets[key])
+            for section in ("postgres", "neon", "db"):
+                if section not in secrets:
+                    continue
                 block = secrets[section]
-                for key in ("DATABASE_URL", "database_url", "url", "uri"):
+                for key in (
+                    "DATABASE_URL_UNPOOLED",
+                    "database_url_unpooled",
+                    "DATABASE_URL",
+                    "database_url",
+                    "url",
+                    "uri",
+                ):
                     try:
-                        url = _clean(block[key])
+                        _consider(block[key])
                     except Exception:
-                        url = None
-                    if url:
-                        return url
-    except Exception:
-        pass
+                        pass
+        except Exception:
+            pass
 
     if ENV_FILE.exists():
         for line in ENV_FILE.read_text().splitlines():
             line = line.strip()
-            if line.startswith("DATABASE_URL="):
-                return _clean(line.partition("=")[2])
-    return None
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, raw = line.partition("=")
+            if key.strip() in {
+                "DATABASE_URL_UNPOOLED",
+                "DATABASE_URL",
+            }:
+                _consider(raw)
+
+    # Streamlit is a long-running process: prefer the direct Neon endpoint.
+    # The pooler URL often fails after idle with "server closed unexpectedly".
+    chosen = unpooled[0] if unpooled else (pooled[0] if pooled else None)
+    return _prepare_postgres_url(chosen) if chosen else None
+
+
+def _postgres_ssl_ready(url: str, timeout: float = 4.0) -> bool:
+    """True only if Neon answers the Postgres SSLRequest. TCP-open is not enough."""
+    host = urlparse(url).hostname
+    if not host:
+        return False
+    sock = None
+    try:
+        sock = socket.create_connection((host, 5432), timeout=timeout)
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        sock.settimeout(timeout)
+        sock.sendall(struct.pack("!ii", 8, 80877103))
+        return sock.recv(1) == b"S"
+    except OSError:
+        return False
+    finally:
+        if sock is not None:
+            try:
+                sock.close()
+            except OSError:
+                pass
 
 
 _URL = _database_url()
-if _URL:
-    ENGINE = create_engine(_URL, pool_pre_ping=True)
+_USE_NEON_HTTP = False
+if _URL and _postgres_ssl_ready(_URL):
+    # Neon compute can scale to zero. Recycle before the typical 5-minute
+    # suspend, ping before checkout, and disable GSS (Windows libpq can hang
+    # for minutes on gssencmode=prefer).
+    ENGINE = create_engine(
+        _URL,
+        pool_pre_ping=True,
+        pool_recycle=280,
+        pool_size=5,
+        max_overflow=5,
+        connect_args={
+            "connect_timeout": 8,
+            "sslmode": "require",
+            "gssencmode": "disable",
+        },
+    )
+    DB_LABEL = "Neon Postgres"
+elif _URL:
+    # Port 5432 often times out on this Windows network (TCP open, SSL never
+    # completes). Neon SQL-over-HTTPS on 443 still works.
+    from neon_http import HttpEngine
+
+    _USE_NEON_HTTP = True
+    ENGINE = HttpEngine(_URL)
     DB_LABEL = "Neon Postgres"
 else:
     # check_same_thread=False because Streamlit reruns scripts on worker
@@ -84,6 +199,68 @@ else:
     DB_LABEL = DB_PATH.name
 
 IS_POSTGRES = ENGINE.dialect.name == "postgresql"
+
+_T = TypeVar("_T")
+_CONNECT_RETRIES = 1
+_CONNECT_BACKOFF_S = 1.5
+
+
+def switch_to_sqlite() -> None:
+    """Drop the Neon engine and keep using a local SQLite file."""
+    global ENGINE, DB_LABEL, IS_POSTGRES, _URL, _USE_NEON_HTTP
+    try:
+        ENGINE.dispose()
+    except Exception:
+        pass
+    _URL = None
+    _USE_NEON_HTTP = False
+    ENGINE = create_engine(
+        f"sqlite:///{DB_PATH}",
+        connect_args={"check_same_thread": False},
+    )
+    DB_LABEL = DB_PATH.name
+    IS_POSTGRES = False
+
+
+def _is_transient_db_error(exc: BaseException) -> bool:
+    text = str(exc).lower()
+    return any(
+        needle in text
+        for needle in (
+            "server closed the connection",
+            "server terminated abnormally",
+            "ssl connection has been closed",
+            "ssl syscall",
+            "connection reset",
+            "could not connect",
+            "timeout expired",
+            "the connection is closed",
+            "consuming input failed",
+        )
+    )
+
+
+def _retry_on_disconnect(op: Callable[[], _T]) -> _T:
+    """Retry a connect/query after Neon scale-to-zero or a dropped pooler socket."""
+    delay = _CONNECT_BACKOFF_S
+    last: OperationalError | None = None
+    for attempt in range(_CONNECT_RETRIES):
+        try:
+            return op()
+        except OperationalError as exc:
+            last = exc
+            if not IS_POSTGRES or not _is_transient_db_error(exc):
+                raise
+            if attempt == _CONNECT_RETRIES - 1:
+                raise
+            try:
+                ENGINE.dispose()
+            except Exception:
+                pass
+            time.sleep(delay)
+            delay = min(delay * 2, 8)
+    assert last is not None
+    raise last
 
 
 def _q(sql: str) -> str:
@@ -101,8 +278,39 @@ def _exec(conn: Connection, sql: str, params: Any = None) -> CursorResult:
 @contextmanager
 def get_connection() -> Generator[Connection, None, None]:
     """Open a connection wrapped in a transaction (commit/rollback on exit)."""
-    with ENGINE.begin() as conn:
-        yield conn
+    delay = _CONNECT_BACKOFF_S
+    for attempt in range(_CONNECT_RETRIES):
+        cm = None
+        try:
+            cm = ENGINE.begin()
+            conn = cm.__enter__()
+        except OperationalError as exc:
+            if cm is not None:
+                try:
+                    cm.__exit__(type(exc), exc, exc.__traceback__)
+                except Exception:
+                    pass
+            if (
+                not IS_POSTGRES
+                or not _is_transient_db_error(exc)
+                or attempt == _CONNECT_RETRIES - 1
+            ):
+                raise
+            try:
+                ENGINE.dispose()
+            except Exception:
+                pass
+            time.sleep(delay)
+            delay = min(delay * 2, 8)
+            continue
+        try:
+            yield conn
+        except BaseException:
+            cm.__exit__(*sys.exc_info())
+            raise
+        else:
+            cm.__exit__(None, None, None)
+        return
 
 
 ELEMENTS: list[tuple[int, str, str]] = [
@@ -943,14 +1151,20 @@ def _rename_column(
 # ---------- Generic helpers ----------
 
 def fetch_all(sql: str, params: Iterable[Any] = ()) -> list[dict[str, Any]]:
-    with ENGINE.connect() as conn:
-        return [dict(r) for r in _exec(conn, sql, tuple(params)).mappings()]
+    def _run() -> list[dict[str, Any]]:
+        with ENGINE.connect() as conn:
+            return [dict(r) for r in _exec(conn, sql, tuple(params)).mappings()]
+
+    return _retry_on_disconnect(_run)
 
 
 def fetch_one(sql: str, params: Iterable[Any] = ()) -> Optional[dict[str, Any]]:
-    with ENGINE.connect() as conn:
-        row = _exec(conn, sql, tuple(params)).mappings().first()
-        return dict(row) if row is not None else None
+    def _run() -> Optional[dict[str, Any]]:
+        with ENGINE.connect() as conn:
+            row = _exec(conn, sql, tuple(params)).mappings().first()
+            return dict(row) if row is not None else None
+
+    return _retry_on_disconnect(_run)
 
 
 def execute(sql: str, params: Iterable[Any] = ()) -> int:
@@ -973,12 +1187,21 @@ def get_all_records(table_name: str, order_by: str | None = None) -> list[dict[s
         # Postgres stores unquoted identifiers in lowercase
         table_name = table_name.lower()
         order_by = order_by.lower() if order_by else None
-    table = Table(table_name, MetaData(), autoload_with=ENGINE)
-    stmt = select(table)
-    if order_by is not None:
-        stmt = stmt.order_by(table.c[order_by])
-    with ENGINE.connect() as conn:
-        return [dict(row) for row in conn.execute(stmt).mappings()]
+    def _run() -> list[dict[str, Any]]:
+        if _USE_NEON_HTTP:
+            sql = f"SELECT * FROM {table_name}"
+            if order_by is not None:
+                sql += f" ORDER BY {order_by}"
+            with ENGINE.connect() as conn:
+                return [dict(r) for r in _exec(conn, sql).mappings()]
+        table = Table(table_name, MetaData(), autoload_with=ENGINE)
+        stmt = select(table)
+        if order_by is not None:
+            stmt = stmt.order_by(table.c[order_by])
+        with ENGINE.connect() as conn:
+            return [dict(row) for row in conn.execute(stmt).mappings()]
+
+    return _retry_on_disconnect(_run)
 
 
 # ---------- Data browser / editor ----------
@@ -1136,14 +1359,17 @@ EDITABLE_TABLES: list[dict[str, Any]] = [
 def _resolve_table_name(table_name: str) -> str:
     from sqlalchemy import inspect as sa_inspect
 
-    insp = sa_inspect(ENGINE)
-    names = insp.get_table_names()
-    if table_name in names:
-        return table_name
-    lower = table_name.lower()
-    if lower in names:
-        return lower
-    raise ValueError(f"Table not found: {table_name}")
+    def _run() -> str:
+        insp = sa_inspect(ENGINE)
+        names = insp.get_table_names()
+        if table_name in names:
+            return table_name
+        lower = table_name.lower()
+        if lower in names:
+            return lower
+        raise ValueError(f"Table not found: {table_name}")
+
+    return _retry_on_disconnect(_run)
 
 
 def editable_columns(table_name: str) -> list[str]:
@@ -1151,13 +1377,17 @@ def editable_columns(table_name: str) -> list[str]:
     from sqlalchemy import inspect as sa_inspect
 
     resolved = _resolve_table_name(table_name)
-    cols: list[str] = []
-    for c in sa_inspect(ENGINE).get_columns(resolved):
-        type_name = type(c["type"]).__name__.upper()
-        if "BLOB" in type_name or "BYTEA" in type_name or "LARGEBINARY" in type_name:
-            continue
-        cols.append(c["name"])
-    return cols
+
+    def _run() -> list[str]:
+        cols: list[str] = []
+        for c in sa_inspect(ENGINE).get_columns(resolved):
+            type_name = type(c["type"]).__name__.upper()
+            if "BLOB" in type_name or "BYTEA" in type_name or "LARGEBINARY" in type_name:
+                continue
+            cols.append(c["name"])
+        return cols
+
+    return _retry_on_disconnect(_run)
 
 
 def load_editable_table(table_name: str, order_by: str | None = None) -> list[dict[str, Any]]:

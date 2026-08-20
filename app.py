@@ -27,7 +27,9 @@ st.set_page_config(
 
 # Inject Streamlit Cloud secrets into the environment BEFORE importing the
 # database module, which binds SQLAlchemy's engine at import time.
-if not os.environ.get("DATABASE_URL"):
+if st.session_state.get("use_sqlite"):
+    os.environ["NUALCO_FORCE_SQLITE"] = "1"
+elif not os.environ.get("DATABASE_URL"):
     try:
         if "DATABASE_URL" in st.secrets:
             os.environ["DATABASE_URL"] = str(st.secrets["DATABASE_URL"]).strip().strip('"').strip("'")
@@ -37,18 +39,16 @@ if not os.environ.get("DATABASE_URL"):
 import database as db  # noqa: E402
 import importlib
 
-# Streamlit keeps imported modules in memory; reload when helpers are missing.
-if (
-    not hasattr(db, "EDITABLE_TABLES")
-    or not hasattr(db, "get_customer")
-    or not hasattr(db, "list_lots_for_material")
-    or not hasattr(db, "list_entry_elements")
-    or not hasattr(db, "ENTRY_CHEM_ELEMENT_LIMIT")
-    or not hasattr(db, "PURCHASE_ORDER_STATUS")
-    or not hasattr(db, "update_purchase_order_status")
-    or not hasattr(db, "list_raw_material_master")
-    or not hasattr(db, "RAW_MATERIAL_AVAILABILITY")
-):
+# Reload only when switching Neon <-> SQLite. Reloading on every rerun
+# drops the engine and forces a new handshake each click.
+_want_sqlite = bool(st.session_state.get("use_sqlite"))
+if _want_sqlite:
+    if getattr(db, "IS_POSTGRES", False):
+        os.environ["NUALCO_FORCE_SQLITE"] = "1"
+        db = importlib.reload(db)
+    st.session_state["_offline_sqlite"] = True
+elif st.session_state.pop("_offline_sqlite", False):
+    os.environ.pop("NUALCO_FORCE_SQLITE", None)
     db = importlib.reload(db)
 
 # ── Theme tweaks ─────────────────────────────────────────────────────────────
@@ -79,12 +79,25 @@ st.markdown(
 
 
 @st.cache_resource
-def bootstrap() -> bool:
+def bootstrap() -> str:
+    """Create tables. If Neon cannot be reached, continue on local SQLite."""
+    if db.IS_POSTGRES:
+        try:
+            db.init_db()
+            return "neon"
+        except Exception:
+            db.switch_to_sqlite()
+            db.init_db()
+            return "sqlite"
     db.init_db()
-    return True
+    return "sqlite"
 
 
-bootstrap()
+_db_mode = bootstrap()
+if _db_mode == "sqlite":
+    st.session_state["use_sqlite"] = True
+    st.session_state["_offline_sqlite"] = True
+    os.environ["NUALCO_FORCE_SQLITE"] = "1"
 
 
 def df_from_rows(rows) -> pd.DataFrame:
@@ -327,7 +340,17 @@ st.sidebar.markdown(
     f"**Yield target:** {db.YIELD_TARGET_PCT:.0f}%  \n"
     f"**DB:** `{db.DB_LABEL}`"
 )
-if not db.IS_POSTGRES:
+if st.session_state.get("use_sqlite") or os.environ.get("NUALCO_FORCE_SQLITE"):
+    st.sidebar.warning(
+        "Offline SQLite mode. Rows you save stay on this PC and are not "
+        "written to Neon."
+    )
+    if st.sidebar.button("Reconnect to Neon"):
+        st.session_state.pop("use_sqlite", None)
+        os.environ.pop("NUALCO_FORCE_SQLITE", None)
+        st.cache_resource.clear()
+        st.rerun()
+elif not db.IS_POSTGRES:
     st.sidebar.error(
         "Not connected to Neon. In Streamlit Cloud go to "
         "**Manage app → Settings → Secrets** and set:\n\n"
@@ -341,10 +364,13 @@ if not db.IS_POSTGRES:
 # ═══════════════════════════════════════════════════════════════════════════════
 if PAGE == "Dashboard":
     st.title("Production Dashboard")
-    batches = db.list_batches()
-    materials = db.list_raw_materials()
-    lots = db.list_inventory_lots()
-    alloys = db.list_alloys()
+    try:
+        batches = db.list_batches()
+        materials = db.list_raw_materials()
+        lots = db.list_inventory_lots()
+        alloys = db.list_alloys()
+    except Exception as exc:
+        _show_db_connection_error(exc)
 
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Batches", len(batches))
@@ -670,7 +696,7 @@ elif PAGE == "Production Batch & Chemistry":
         alloy_id = None if alloy_label == "— none —" else alloy_labels[alloy_label]
 
         st.markdown("#### Degassing & piece counts")
-        d1, d2, d3 = st.columns(3)
+        d1, d2, d3, d4 = st.columns(4)
         with d1:
             degassing_time = st.text_input(
                 "Degassing time",
@@ -680,6 +706,20 @@ elif PAGE == "Production Batch & Chemistry":
             sampled_pcs = st.number_input("Sampled pcs", min_value=0.0, value=0.0, step=1.0)
         with d3:
             defect_pcs = st.number_input("Defect pcs", min_value=0.0, value=0.0, step=1.0)
+        with d4:
+            st.caption("K Mold Value = Defect pcs / Sampled pcs")
+            if sampled_pcs and sampled_pcs > 0:
+                k_mold = float(defect_pcs) / float(sampled_pcs)
+                css = "yield-bad" if k_mold < 0.5 else "yield-ok"
+                st.markdown(
+                    f'<p class="{css}">K Mold Value<br>{k_mold:.3f}</p>',
+                    unsafe_allow_html=True,
+                )
+            else:
+                st.markdown(
+                    '<p class="yield-ok">K Mold Value<br>—</p>',
+                    unsafe_allow_html=True,
+                )
 
         st.markdown("#### Sample results")
         sample_blank = "— not set —"
@@ -688,23 +728,35 @@ elif PAGE == "Production Batch & Chemistry":
         with s1:
             top_sample = st.selectbox("Top sample", sample_opts)
             top_sample_remarks = st.text_input("Top sample remarks")
-            top_sample_dt = st.text_input(
+            top_sample_dt = st.datetime_input(
                 "Top sample datetime",
-                placeholder="YYYY-MM-DD HH:MM:SS",
+                value=None,
+                format="YYYY-MM-DD",
+                step=60,
+                key="top_sample_dt",
+                help="Open the calendar icon to pick date and time.",
             )
         with s2:
             middle_sample = st.selectbox("Middle sample", sample_opts)
             middle_sample_remarks = st.text_input("Middle sample remarks")
-            middle_sample_dt = st.text_input(
+            middle_sample_dt = st.datetime_input(
                 "Middle sample datetime",
-                placeholder="YYYY-MM-DD HH:MM:SS",
+                value=None,
+                format="YYYY-MM-DD",
+                step=60,
+                key="middle_sample_dt",
+                help="Open the calendar icon to pick date and time.",
             )
         with s3:
             bottom_sample = st.selectbox("Bottom sample", sample_opts)
             bottom_sample_remarks = st.text_input("Bottom sample remarks")
-            bottom_sample_dt = st.text_input(
+            bottom_sample_dt = st.datetime_input(
                 "Bottom sample datetime",
-                placeholder="YYYY-MM-DD HH:MM:SS",
+                value=None,
+                format="YYYY-MM-DD",
+                step=60,
+                key="bottom_sample_dt",
+                help="Open the calendar icon to pick date and time.",
             )
         with s4:
             vacum_sample = st.selectbox("Vacum sample", sample_opts)
@@ -1046,9 +1098,21 @@ elif PAGE == "Production Batch & Chemistry":
                         top_sample_remarks=top_sample_remarks.strip() or None,
                         middle_sample_remarks=middle_sample_remarks.strip() or None,
                         bottom_sample_remarks=bottom_sample_remarks.strip() or None,
-                        top_sample_datetime=top_sample_dt.strip() or None,
-                        middle_sample_datetime=middle_sample_dt.strip() or None,
-                        bottom_sample_datetime=bottom_sample_dt.strip() or None,
+                        top_sample_datetime=(
+                            top_sample_dt.isoformat(timespec="seconds")
+                            if top_sample_dt
+                            else None
+                        ),
+                        middle_sample_datetime=(
+                            middle_sample_dt.isoformat(timespec="seconds")
+                            if middle_sample_dt
+                            else None
+                        ),
+                        bottom_sample_datetime=(
+                            bottom_sample_dt.isoformat(timespec="seconds")
+                            if bottom_sample_dt
+                            else None
+                        ),
                         production_supervisor=production_supervisor,
                     )
                     st.success(f"Created batch **{bid}** — Heat {heat_no}, Furnace {furnace}.")
