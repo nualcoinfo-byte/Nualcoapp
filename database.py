@@ -2637,25 +2637,7 @@ def update_purchase_order_status(
         raise ValueError(f"Purchase order '{po_no}' for alloy {alloy} not found.")
 
 
-def upsert_purchase_order(data: dict[str, Any]) -> None:
-    """Insert or update a purchase-order line keyed on (Customer_PO_No, Alloy_Id)."""
-    po_no = (data.get("Customer_PO_No") or "").strip()
-    if not po_no:
-        raise ValueError("Customer PO No is required.")
-    if not data.get("Cust_code"):
-        raise ValueError("Customer is required.")
-    if not data.get("Customer_name"):
-        raise ValueError("Customer name is required.")
-    alloy_id = _require_alloy_id(data.get("Alloy_Id"))
-
-    status = (data.get("Purchase_Order_Status") or "Open").strip()
-    if status not in PURCHASE_ORDER_STATUS:
-        raise ValueError(
-            f"Purchase_Order_Status must be one of {', '.join(PURCHASE_ORDER_STATUS)}."
-        )
-
-    execute(
-        """
+_PO_UPSERT_SQL = """
         INSERT INTO Purchase_Order
             (Customer_PO_No, Cust_code, Customer_name, Alloy_Id,
              Order_Date, Delivery_Date, Order_Qty, Rate,
@@ -2681,7 +2663,35 @@ def upsert_purchase_order(data: dict[str, Any]) -> None:
             Shipping_Pincode=excluded.Shipping_Pincode,
             Shipping_country=excluded.Shipping_country,
             Purchase_Order_Status=excluded.Purchase_Order_Status
-        """,
+        """
+
+
+def _purchase_order_status(data: dict[str, Any]) -> str:
+    status = (data.get("Purchase_Order_Status") or "Open").strip()
+    if status not in PURCHASE_ORDER_STATUS:
+        raise ValueError(
+            f"Purchase_Order_Status must be one of {', '.join(PURCHASE_ORDER_STATUS)}."
+        )
+    return status
+
+
+def _purchase_order_header(data: dict[str, Any]) -> tuple[str, str]:
+    po_no = (data.get("Customer_PO_No") or "").strip()
+    if not po_no:
+        raise ValueError("Customer PO No is required.")
+    if not data.get("Cust_code"):
+        raise ValueError("Customer is required.")
+    if not data.get("Customer_name"):
+        raise ValueError("Customer name is required.")
+    return po_no, _purchase_order_status(data)
+
+
+def _upsert_purchase_order_row(
+    conn: Connection, data: dict[str, Any], po_no: str, alloy_id: int, status: str
+) -> None:
+    _exec(
+        conn,
+        _PO_UPSERT_SQL,
         (
             po_no,
             data["Cust_code"],
@@ -2704,6 +2714,46 @@ def upsert_purchase_order(data: dict[str, Any]) -> None:
             status,
         ),
     )
+
+
+def upsert_purchase_order(data: dict[str, Any]) -> None:
+    """Insert or update a purchase-order line keyed on (Customer_PO_No, Alloy_Id)."""
+    po_no, status = _purchase_order_header(data)
+    alloy_id = _require_alloy_id(data.get("Alloy_Id"))
+    with get_connection() as conn:
+        _upsert_purchase_order_row(conn, data, po_no, alloy_id, status)
+
+
+def upsert_purchase_order_lines(
+    header: dict[str, Any], lines: list[dict[str, Any]]
+) -> list[int]:
+    """Save several alloy lines for one customer PO. Returns the alloy ids written."""
+    po_no, status = _purchase_order_header(header)
+    if not lines:
+        raise ValueError("Add at least one alloy line with qty greater than zero.")
+
+    prepared: list[tuple[int, dict[str, Any]]] = []
+    seen: set[int] = set()
+    for line in lines:
+        alloy_id = _require_alloy_id(line.get("Alloy_Id"))
+        if alloy_id in seen:
+            raise ValueError(
+                f"Alloy {alloy_id} is listed more than once on this purchase order."
+            )
+        try:
+            qty = float(line.get("Order_Qty") or 0)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("Order qty must be a number.") from exc
+        if qty <= 0:
+            raise ValueError("Each alloy line needs an order qty greater than zero.")
+        seen.add(alloy_id)
+        prepared.append((alloy_id, line))
+
+    with get_connection() as conn:
+        for alloy_id, line in prepared:
+            row = {**header, **line}
+            _upsert_purchase_order_row(conn, row, po_no, alloy_id, status)
+    return [alloy_id for alloy_id, _ in prepared]
 
 
 def save_po_document(
