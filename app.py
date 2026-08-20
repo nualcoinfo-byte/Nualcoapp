@@ -731,39 +731,53 @@ elif PAGE == "Production Batch & Chemistry":
         s1, s2, s3, s4 = st.columns(4)
         with s1:
             top_sample = st.selectbox("Top sample", sample_opts)
-            top_sample_remarks = st.text_input("Top sample remarks")
+        with s2:
+            middle_sample = st.selectbox("Middle sample", sample_opts)
+        with s3:
+            bottom_sample = st.selectbox("Bottom sample", sample_opts)
+        with s4:
+            vacum_sample = st.selectbox("Vacum sample", sample_opts)
+
+        r1, r2, r3, r4 = st.columns(4)
+        with r1:
+            top_sample_remarks = st.text_input("Remarks", key="top_sample_remarks")
+        with r2:
+            middle_sample_remarks = st.text_input("Remarks", key="middle_sample_remarks")
+        with r3:
+            bottom_sample_remarks = st.text_input("Remarks", key="bottom_sample_remarks")
+        with r4:
+            st.empty()
+
+        d1, d2, d3, d4 = st.columns(4)
+        with d1:
             top_sample_dt = st.datetime_input(
-                "Top sample datetime",
+                "Datetime",
                 value=None,
                 format="YYYY-MM-DD",
                 step=60,
                 key="top_sample_dt",
                 help="Open the calendar icon to pick date and time.",
             )
-        with s2:
-            middle_sample = st.selectbox("Middle sample", sample_opts)
-            middle_sample_remarks = st.text_input("Middle sample remarks")
+        with d2:
             middle_sample_dt = st.datetime_input(
-                "Middle sample datetime",
+                "Datetime",
                 value=None,
                 format="YYYY-MM-DD",
                 step=60,
                 key="middle_sample_dt",
                 help="Open the calendar icon to pick date and time.",
             )
-        with s3:
-            bottom_sample = st.selectbox("Bottom sample", sample_opts)
-            bottom_sample_remarks = st.text_input("Bottom sample remarks")
+        with d3:
             bottom_sample_dt = st.datetime_input(
-                "Bottom sample datetime",
+                "Datetime",
                 value=None,
                 format="YYYY-MM-DD",
                 step=60,
                 key="bottom_sample_dt",
                 help="Open the calendar icon to pick date and time.",
             )
-        with s4:
-            vacum_sample = st.selectbox("Vacum sample", sample_opts)
+        with d4:
+            st.empty()
 
         st.markdown("#### Charge / raw material inputs")
         st.caption(
@@ -977,9 +991,9 @@ elif PAGE == "Production Batch & Chemistry":
                 n = st.text_input("Line notes", key=f"ln_{idx}")
                 inp_open_key = f"inp_open_{idx}"
                 if st.button(
-                    "📷 Input photo",
+                    "📷 Material Photo",
                     key=f"inp_btn_{idx}",
-                    help="Open camera or choose a photo from the phone gallery for input_photo",
+                    help="Open camera or choose a photo from the phone gallery for Material Photo",
                     use_container_width=True,
                 ):
                     st.session_state[inp_open_key] = not bool(
@@ -989,7 +1003,7 @@ elif PAGE == "Production Batch & Chemistry":
 
             input_photo_bytes: bytes | None = None
             if st.session_state.get(inp_open_key):
-                st.caption(f"Charge line {idx + 1} — input photo (camera or gallery)")
+                st.caption(f"Charge line {idx + 1} — Material Photo (camera or gallery)")
                 inp_cam = st.camera_input(
                     "Input camera",
                     key=f"inp_cam_{idx}",
@@ -1004,11 +1018,11 @@ elif PAGE == "Production Batch & Chemistry":
                 input_photo_bytes = photo_bytes(inp_cam) or photo_bytes(inp_file)
                 if input_photo_bytes:
                     st.session_state[f"inp_bytes_{idx}"] = input_photo_bytes
-                    st.success("Input photo ready to save with this charge line.")
+                    st.success("Material Photo ready to save with this charge line.")
             else:
                 input_photo_bytes = st.session_state.get(f"inp_bytes_{idx}")
                 if input_photo_bytes:
-                    st.caption(f"Charge line {idx + 1}: input photo attached.")
+                    st.caption(f"Charge line {idx + 1}: Material Photo attached.")
 
             if mat and lot_label and trolley_name and float(scale_w) > 0 and net_w > 0:
                 charge_inputs.append(
