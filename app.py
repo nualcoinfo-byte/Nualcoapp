@@ -522,10 +522,14 @@ elif PAGE == "Raw Material Logging":
 
     total_weight = sum(ln["weight"] for ln in collected_lines if ln["name"])
     total_value = sum(ln["weight"] * ln["cost"] for ln in collected_lines if ln["name"])
-    t1, t2, t3 = st.columns(3)
+    gst_value = total_value * 0.18
+    grand_total = total_value + gst_value
+    t1, t2, t3, t4, t5 = st.columns(5)
     t1.metric("Materials", sum(1 for ln in collected_lines if ln["name"]))
     t2.metric("Total weight (kg)", f"{total_weight:,.1f}")
     t3.metric("Invoice value", f"{total_value:,.2f}")
+    t4.metric("GST value (18%)", f"{gst_value:,.2f}")
+    t5.metric("Total value", f"{grand_total:,.2f}")
 
     submitted = st.button("Save invoice lots", type="primary", key="rm_log_save")
 
@@ -2047,13 +2051,15 @@ elif PAGE == "Purchase Orders":
             ln for ln in collected_lines if ln["alloy_label"] != "— select alloy —"
         ]
         total_qty = sum(ln["qty"] for ln in filled_lines)
-        t1, t2, t3 = st.columns(3)
+        po_value = sum(ln["qty"] * ln["rate"] for ln in filled_lines)
+        gst_value = po_value * 0.18
+        grand_total = po_value + gst_value
+        t1, t2, t3, t4, t5 = st.columns(5)
         t1.metric("Alloys", len(filled_lines))
         t2.metric("Total order qty", f"{total_qty:,.1f}")
-        t3.metric(
-            "PO value",
-            f"{sum(ln['qty'] * ln['rate'] for ln in filled_lines):,.2f}",
-        )
+        t3.metric("PO value", f"{po_value:,.2f}")
+        t4.metric("GST value (18%)", f"{gst_value:,.2f}")
+        t5.metric("Total value", f"{grand_total:,.2f}")
 
         st.markdown("##### Billing address")
         b1, b2 = st.columns(2)
