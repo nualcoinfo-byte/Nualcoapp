@@ -350,6 +350,9 @@ ELEMENTS: list[tuple[int, str, str]] = [
     (34, "Zirconium", "Zr"),
     (35, "Potassium", "K"),
     (36, "Aluminium", "Al"),
+    (37, "Other Elements Each", "OEE"),
+    (38, "Other Elements Total", "OET"),
+    (39, "Sludge Factor", "SF"),
 ]
 
 CORE_ELEMENTS = ["Si", "Fe", "Cu", "Mn", "Mg", "Al"]
@@ -513,12 +516,9 @@ CREATE TABLE IF NOT EXISTS Alloy_Master (
     Created_at TEXT DEFAULT {now},
     Colour_code TEXT,
     Bis_Designation TEXT,
-    Sludge_factor {float},
     Revision_datetime TEXT,
     Remarks TEXT,
     Status TEXT CHECK(Status IN ('Active', 'Inactive')) DEFAULT 'Active',
-    Other_elements_Each {float},
-    Other_elements_Total {float},
     Last_updated_by TEXT,
     Last_updated_datetime TEXT
 );
@@ -824,12 +824,18 @@ def init_db() -> None:
                     ("Cust_code", "TEXT REFERENCES Customer_Master(Cust_code)"),
                     ("Colour_code", "TEXT"),
                     ("Bis_Designation", "TEXT"),
-                    ("Sludge_factor", "REAL"),
                     ("Revision_datetime", "TEXT"),
                     ("Remarks", "TEXT"),
                     ("Status", "TEXT DEFAULT 'Active'"),
-                    ("Other_elements_Each", "REAL"),
-                    ("Other_elements_Total", "REAL"),
+                ],
+            )
+            _drop_columns(
+                conn,
+                "Alloy_Master",
+                [
+                    "Sludge_factor",
+                    "Other_elements_Each",
+                    "Other_elements_Total",
                 ],
             )
             _ensure_columns(
@@ -1117,6 +1123,32 @@ def _ensure_columns(conn: Connection, table: str, columns: list[tuple[str, str]]
         for name, typedef in columns:
             if name not in existing:
                 _exec(conn, f"ALTER TABLE {table} ADD COLUMN {name} {typedef}")
+
+
+def _drop_columns(conn: Connection, table: str, columns: list[str]) -> None:
+    """Drop leftover columns from older schemas when they still exist."""
+    if IS_POSTGRES:
+        physical = table.lower()
+        rows = _exec(
+            conn,
+            """
+            SELECT column_name AS name
+            FROM information_schema.columns
+            WHERE table_schema = 'public' AND table_name = ?
+            """,
+            (physical,),
+        ).mappings()
+        existing = {row["name"] for row in rows}
+        for name in columns:
+            if name.lower() in existing:
+                _exec(conn, f'ALTER TABLE {table} DROP COLUMN IF EXISTS "{name.lower()}"')
+    else:
+        existing = {
+            row["name"] for row in _exec(conn, f"PRAGMA table_info({table})").mappings()
+        }
+        for name in columns:
+            if name in existing:
+                _exec(conn, f"ALTER TABLE {table} DROP COLUMN {name}")
 
 
 def _rename_column(
@@ -1543,6 +1575,7 @@ def list_suppliers(active_only: bool = True) -> list[str]:
 
 # Chemistry entry UIs show only the first N elements by Serial_no.
 ENTRY_CHEM_ELEMENT_LIMIT = 15
+BATCH_CHEM_EXTRA_SYMBOLS = ("OEE", "OET", "SF")
 
 
 def list_elements(limit: Optional[int] = None) -> list[dict[str, Any]]:
@@ -1565,6 +1598,20 @@ def list_elements(limit: Optional[int] = None) -> list[dict[str, Any]]:
 def list_entry_elements() -> list[dict[str, Any]]:
     """Elements shown on chemistry / spec entry forms (Serial_no order, first 15)."""
     return list_elements(limit=ENTRY_CHEM_ELEMENT_LIMIT)
+
+
+def list_batch_chem_elements() -> list[dict[str, Any]]:
+    """Ladle/spectrometer entry: first 15 elements plus OEE, OET, and SF."""
+    entry = list_entry_elements()
+    seen = {e["Element_Symbol"] for e in entry}
+    extra = [
+        e
+        for e in list_elements()
+        if e["Element_Symbol"] in BATCH_CHEM_EXTRA_SYMBOLS
+        and e["Element_Symbol"] not in seen
+    ]
+    extra.sort(key=lambda e: int(e.get("Serial_no") or 0))
+    return entry + extra
 
 
 def list_extra_elements() -> list[dict[str, Any]]:
@@ -1723,16 +1770,30 @@ def list_alloys() -> list[dict[str, Any]]:
                a.Cust_code AS "Cust_code", c.Customer_name AS "Customer_name",
                a.Alloy_Family AS "Alloy_Family", a.Colour_code AS "Colour_code",
                a.Bis_Designation AS "Bis_Designation",
-               a.Sludge_factor AS "Sludge_factor",
                a.Revision_datetime AS "Revision_datetime",
-               a.Remarks AS "Remarks", a.Status AS "Status",
-               a.Other_elements_Each AS "Other_elements_Each",
-               a.Other_elements_Total AS "Other_elements_Total"
+               a.Remarks AS "Remarks", a.Status AS "Status"
         FROM Alloy_Master a
         LEFT JOIN Customer_Master c ON c.Cust_code = a.Cust_code
         ORDER BY a.Alloy_name
         """
     )
+
+
+def get_alloy_specs(alloy_id: int) -> dict[str, dict[str, Any]]:
+    """Min/max % from Alloy_Master_spec keyed by Element_symbol."""
+    rows = fetch_all(
+        """
+        SELECT s.Element_symbol AS "Element_symbol",
+               s.Min_percent AS "Min_percent",
+               s.Max_percent AS "Max_percent"
+        FROM Alloy_Master_spec s
+        LEFT JOIN Element_Master _el ON _el.Element_Symbol = s.Element_symbol
+        WHERE s.Alloy_id = ?
+        ORDER BY COALESCE(_el.Serial_no, 9999), s.Element_symbol
+        """,
+        (int(alloy_id),),
+    )
+    return {str(r["Element_symbol"]): r for r in rows}
 
 
 def list_inventory_lots(
@@ -2078,12 +2139,9 @@ def add_alloy(
     specs: dict[str, tuple[Optional[float], Optional[float]]],
     colour_code: Optional[str] = None,
     bis_designation: Optional[str] = None,
-    sludge_factor: Optional[float] = None,
     revision_datetime: Optional[str] = None,
     remarks: Optional[str] = None,
     status: str = "Active",
-    other_elements_each: Optional[float] = None,
-    other_elements_total: Optional[float] = None,
 ) -> int:
     by_val, dt_val = audit_stamp()
     with get_connection() as conn:
@@ -2092,11 +2150,10 @@ def add_alloy(
             """
             INSERT INTO Alloy_Master
                 (Cust_code, Alloy_name, Alloy_Family, Created_by, Created_at,
-                 Colour_code, Bis_Designation, Sludge_factor,
+                 Colour_code, Bis_Designation,
                  Revision_datetime, Remarks, Status,
-                 Other_elements_Each, Other_elements_Total,
                  Last_updated_by, Last_updated_datetime)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             RETURNING Alloy_id
             """,
             (
@@ -2107,12 +2164,9 @@ def add_alloy(
                 datetime.now().isoformat(timespec="seconds"),
                 colour_code,
                 bis_designation,
-                sludge_factor,
                 revision_datetime,
                 remarks,
                 status,
-                other_elements_each,
-                other_elements_total,
                 by_val,
                 dt_val,
             ),

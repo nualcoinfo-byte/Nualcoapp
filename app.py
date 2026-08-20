@@ -39,6 +39,14 @@ elif not os.environ.get("DATABASE_URL"):
 import database as db  # noqa: E402
 import importlib
 
+# Streamlit keeps imported modules in memory. Reload database.py when the
+# file on disk is newer than the copy currently loaded in this process.
+_db_mtime = Path(db.__file__).resolve().stat().st_mtime
+if getattr(db, "_LOADED_MTIME", None) != _db_mtime:
+    db = importlib.reload(db)
+    db._LOADED_MTIME = _db_mtime
+    st.cache_resource.clear()
+
 # Reload only when switching Neon <-> SQLite. Reloading on every rerun
 # drops the engine and forces a new handshake each click.
 _want_sqlite = bool(st.session_state.get("use_sqlite"))
@@ -59,6 +67,8 @@ st.markdown(
     div[data-testid="stMetricValue"] {{ font-size: 1.6rem; }}
     .yield-ok {{ color: #1b7a3d; font-weight: 700; font-size: 1.4rem; }}
     .yield-bad {{ color: #c62828; font-weight: 700; font-size: 1.4rem; }}
+    .chem-spec {{ font-size: 0.8rem; color: {_BRAND_INK}; opacity: 0.75; margin: 0 0 0.35rem 0; }}
+    .chem-spec-bad {{ font-size: 0.8rem; color: #c62828; font-weight: 700; margin: 0 0 0.35rem 0; }}
     .batch-id {{ font-family: ui-monospace, monospace; font-weight: 700; }}
     [data-testid="stSidebar"] {{
         border-right: 3px solid {_BRAND_ORANGE};
@@ -104,6 +114,10 @@ def df_from_rows(rows) -> pd.DataFrame:
     if not rows:
         return pd.DataFrame()
     return pd.DataFrame([dict(r) for r in rows])
+
+
+def _show_db_connection_error(exc: BaseException) -> None:
+    st.error(f"Could not load data from the database: {exc}")
 
 
 def photo_bytes(uploaded) -> bytes | None:
@@ -371,6 +385,7 @@ if PAGE == "Dashboard":
         alloys = db.list_alloys()
     except Exception as exc:
         _show_db_connection_error(exc)
+        batches, materials, lots, alloys = [], [], [], []
 
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Batches", len(batches))
@@ -1045,10 +1060,16 @@ elif PAGE == "Production Batch & Chemistry":
 
         st.markdown("#### Batch chemistry (ladle / spectrometer)")
         st.caption(
-            f"First {db.ENTRY_CHEM_ELEMENT_LIMIT} elements by Serial_no from Element_Master. "
-            "Use **Open all elements…** for the full list."
+            f"First {db.ENTRY_CHEM_ELEMENT_LIMIT} elements by Serial_no from Element_Master, "
+            "plus **OEE**, **OET**, and **SF**. "
+            "Use **Open all elements…** for the full list. "
+            "Each field shows this alloy’s min/max from Alloy_Master_spec. "
+            "An entered % is highlighted in red if it is at or below min, or at or above max."
         )
-        entry_elements = db.list_entry_elements()
+        if not alloy_id:
+            st.info("Select an alloy above to display spec ranges and validate ladle chemistry.")
+        alloy_specs = db.get_alloy_specs(alloy_id) if alloy_id else {}
+        entry_elements = db.list_batch_chem_elements()
         sync_batch_keys = {
             el["Element_Symbol"]: f"bchem_{el['Element_Symbol']}" for el in entry_elements
         }
@@ -1071,10 +1092,30 @@ elif PAGE == "Production Batch & Chemistry":
             if full_n:
                 st.caption(f"Full Element_Master entry applied ({full_n} non-zero value(s)).")
 
+        def _fmt_spec_pct(v: object) -> str:
+            if v is None or v == "":
+                return "—"
+            try:
+                return f"{float(v):.3f}".rstrip("0").rstrip(".")
+            except (TypeError, ValueError):
+                return "—"
+
+        def _spec_out_of_range(value: float, spec: dict | None) -> bool:
+            if not spec or value <= 0:
+                return False
+            mn, mx = spec.get("Min_percent"), spec.get("Max_percent")
+            if mn is not None and mn != "" and value <= float(mn):
+                return True
+            if mx is not None and mx != "" and value >= float(mx):
+                return True
+            return False
+
         chem_cols = st.columns(6)
         batch_chem: dict[str, float] = {}
+        out_of_spec_keys: list[str] = []
         for i, el in enumerate(entry_elements):
             sym = el["Element_Symbol"]
+            spec = alloy_specs.get(sym)
             with chem_cols[i % 6]:
                 batch_chem[sym] = st.number_input(
                     f"{sym} %",
@@ -1085,6 +1126,28 @@ elif PAGE == "Production Batch & Chemistry":
                     key=f"bchem_{sym}",
                     help=el["Element_Name"],
                 )
+                entered = float(batch_chem[sym] or 0.0)
+                bad = _spec_out_of_range(entered, spec)
+                if spec:
+                    spec_line = (
+                        f"Spec min {_fmt_spec_pct(spec.get('Min_percent'))} / "
+                        f"max {_fmt_spec_pct(spec.get('Max_percent'))}"
+                    )
+                elif alloy_id:
+                    spec_line = "No spec for this element"
+                else:
+                    spec_line = "Select an alloy to see spec"
+                css = "chem-spec-bad" if bad else "chem-spec"
+                st.markdown(f'<p class="{css}">{spec_line}</p>', unsafe_allow_html=True)
+                if bad:
+                    out_of_spec_keys.append(f"bchem_{sym}")
+
+        if out_of_spec_keys:
+            rules = "\n".join(
+                f"div.st-key-{key} input {{ color: #c62828 !important; font-weight: 700; }}"
+                for key in out_of_spec_keys
+            )
+            st.markdown(f"<style>{rules}</style>", unsafe_allow_html=True)
 
         def _sample_or_none(v: str) -> str | None:
             return None if v == sample_blank else v
@@ -1750,19 +1813,6 @@ elif PAGE == "Alloys":
         bis_desig = st.text_input(
             "BIS designation", placeholder="e.g. IS 617", key="alloy_bis"
         )
-        sludge = st.number_input(
-            "Sludge factor", min_value=0.0, value=0.0, step=0.01, key="alloy_sludge"
-        )
-        other_each = st.number_input(
-            "Other elements each %", min_value=0.0, value=0.0, step=0.01, key="alloy_other_each"
-        )
-        other_total = st.number_input(
-            "Other elements total %",
-            min_value=0.0,
-            value=0.0,
-            step=0.01,
-            key="alloy_other_total",
-        )
         rev_dt = st.text_input(
             "Revision datetime",
             value=datetime.now().isoformat(timespec="seconds"),
@@ -1831,12 +1881,9 @@ elif PAGE == "Alloys":
                 specs=merge_spec_ranges(specs, "alloy_full_specs"),
                 colour_code=colour.strip() or None,
                 bis_designation=bis_desig.strip() or None,
-                sludge_factor=sludge if sludge > 0 else None,
                 revision_datetime=rev_dt.strip() or None,
                 remarks=remarks.strip() or None,
                 status=alloy_status,
-                other_elements_each=other_each if other_each > 0 else None,
-                other_elements_total=other_total if other_total > 0 else None,
             )
             st.session_state.pop("alloy_full_specs", None)
             st.success(f"Created alloy **{aname}** (ID {aid}).")
