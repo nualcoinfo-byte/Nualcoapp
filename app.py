@@ -177,12 +177,14 @@ def dialog_all_element_specs(
     state_key: str,
     sync_min_keys: dict[str, str] | None = None,
     sync_max_keys: dict[str, str] | None = None,
+    elements: list[dict] | None = None,
 ) -> None:
-    """Popup to enter min/max % for every Element_Master row."""
+    """Popup to enter min/max % for other Element_Master rows (Serial_no 16–36)."""
     stored = st.session_state.get(state_key) or {}
-    elements = db.list_elements()
+    elements = elements if elements is not None else db.list_other_spec_elements()
     st.caption(
-        f"Enter min / max % for all **{len(elements)}** elements in Element_Master. "
+        f"Enter min / max % for **{len(elements)}** other elements "
+        f"(Serial_no {db.OTHER_SPEC_SERIAL_MIN}–{db.OTHER_SPEC_SERIAL_MAX}). "
         "Click **Apply & close** to use these ranges on Create alloy."
     )
     values: dict[str, tuple[float, float]] = {}
@@ -195,7 +197,6 @@ def dialog_all_element_specs(
             prev_min, prev_max = 0.0, 0.0
         c1, c2, c3 = st.columns([1.2, 2, 2])
         c1.markdown(f"**{sym}**")
-        c1.caption(el["Element_Name"])
         mn = c2.number_input(
             f"{sym} min",
             min_value=0.0,
@@ -1061,10 +1062,11 @@ elif PAGE == "Production Batch & Chemistry":
         st.markdown("#### Batch chemistry (ladle / spectrometer)")
         st.caption(
             f"First {db.ENTRY_CHEM_ELEMENT_LIMIT} elements by Serial_no from Element_Master, "
-            "plus **OEE**, **OET**, and **SF**. "
+            "plus **OE**, **OT**, and **SF**. "
             "Use **Open all elements…** for the full list. "
             "Each field shows this alloy’s min/max from Alloy_Master_spec. "
-            "An entered % is highlighted in red if it is at or below min, or at or above max."
+            "An entered % is highlighted in red if it is at or below min, or at or above max. "
+            "**SF %** is calculated as Fe + 2×Mn + 3×Cr, rounded to the nearest tenth."
         )
         if not alloy_id:
             st.info("Select an alloy above to display spec ranges and validate ladle chemistry.")
@@ -1110,6 +1112,17 @@ elif PAGE == "Production Batch & Chemistry":
                 return True
             return False
 
+        def _entered_chem(sym: str) -> float:
+            if sym in batch_chem:
+                try:
+                    return float(batch_chem[sym] or 0.0)
+                except (TypeError, ValueError):
+                    return 0.0
+            try:
+                return float(st.session_state.get(f"bchem_{sym}") or 0.0)
+            except (TypeError, ValueError):
+                return 0.0
+
         chem_cols = st.columns(6)
         batch_chem: dict[str, float] = {}
         out_of_spec_keys: list[str] = []
@@ -1117,15 +1130,32 @@ elif PAGE == "Production Batch & Chemistry":
             sym = el["Element_Symbol"]
             spec = alloy_specs.get(sym)
             with chem_cols[i % 6]:
-                batch_chem[sym] = st.number_input(
-                    f"{sym} %",
-                    min_value=0.0,
-                    max_value=100.0,
-                    value=float(full_batch.get(sym) or 0.0),
-                    step=0.01,
-                    key=f"bchem_{sym}",
-                    help=el["Element_Name"],
-                )
+                if sym == "SF":
+                    sludge = (
+                        1.0 * _entered_chem("Fe")
+                        + 2.0 * _entered_chem("Mn")
+                        + 3.0 * _entered_chem("Cr")
+                    )
+                    st.session_state["bchem_SF"] = round(sludge, 1)
+                    batch_chem[sym] = st.number_input(
+                        "SF %",
+                        min_value=0.0,
+                        max_value=600.0,
+                        step=0.1,
+                        key="bchem_SF",
+                        disabled=True,
+                        help="Auto: Sludge Factor = Fe + 2×Mn + 3×Cr, rounded to 0.1%.",
+                    )
+                else:
+                    batch_chem[sym] = st.number_input(
+                        f"{sym} %",
+                        min_value=0.0,
+                        max_value=100.0,
+                        value=float(full_batch.get(sym) or 0.0),
+                        step=0.01,
+                        key=f"bchem_{sym}",
+                        help=el["Element_Name"],
+                    )
                 entered = float(batch_chem[sym] or 0.0)
                 bad = _spec_out_of_range(entered, spec)
                 if spec:
@@ -1789,7 +1819,7 @@ elif PAGE == "Alloys":
         for c in db.list_customer_codes()
     }
 
-    entry_elements = db.list_entry_elements()
+    entry_elements = db.list_batch_chem_elements()
     sync_min = {el["Element_Symbol"]: f"amin_{el['Element_Symbol']}" for el in entry_elements}
     sync_max = {el["Element_Symbol"]: f"amax_{el['Element_Symbol']}" for el in entry_elements}
     full_specs = st.session_state.get("alloy_full_specs") or {}
@@ -1823,8 +1853,10 @@ elif PAGE == "Alloys":
 
     st.markdown("#### Spec range (%)")
     st.caption(
-        f"First {db.ENTRY_CHEM_ELEMENT_LIMIT} elements by Serial_no. "
-        "Use **Open all elements…** for the full Element_Master list."
+        f"First {db.ENTRY_CHEM_ELEMENT_LIMIT} elements by Serial_no, "
+        "plus **OE**, **OT**, and **SF**. "
+        "Use **Open other elements** for Serial_no "
+        f"{db.OTHER_SPEC_SERIAL_MIN}–{db.OTHER_SPEC_SERIAL_MAX}."
     )
 
     specs: dict[str, tuple[float | None, float | None]] = {}
@@ -1848,15 +1880,19 @@ elif PAGE == "Alloys":
     ab1, ab2 = st.columns([2, 3])
     with ab1:
         if st.button(
-            "Open all elements…",
+            "Open other elements",
             key="alloy_open_all_elements",
-            help="Enter min/max for every row in Element_Master",
+            help=(
+                "Enter min/max for Element_Master symbols with "
+                f"Serial_no {db.OTHER_SPEC_SERIAL_MIN}–{db.OTHER_SPEC_SERIAL_MAX}"
+            ),
             use_container_width=True,
         ):
             dialog_all_element_specs(
                 "alloy_full_specs",
                 sync_min_keys=sync_min,
                 sync_max_keys=sync_max,
+                elements=db.list_other_spec_elements(),
             )
     with ab2:
         full_n = len(
@@ -1867,7 +1903,7 @@ elif PAGE == "Alloys":
             ]
         )
         if full_n:
-            st.caption(f"Full Element_Master specs applied ({full_n} element(s) with ranges).")
+            st.caption(f"Other element specs applied ({full_n} element(s) with ranges).")
 
     if st.button("Create alloy", type="primary", key="alloy_create"):
         if not aname.strip():

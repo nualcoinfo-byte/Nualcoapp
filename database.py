@@ -350,8 +350,8 @@ ELEMENTS: list[tuple[int, str, str]] = [
     (34, "Zirconium", "Zr"),
     (35, "Potassium", "K"),
     (36, "Aluminium", "Al"),
-    (37, "Other Elements Each", "OEE"),
-    (38, "Other Elements Total", "OET"),
+    (37, "Other Elements Each", "OE"),
+    (38, "Other Elements Total", "OT"),
     (39, "Sludge Factor", "SF"),
 ]
 
@@ -665,6 +665,16 @@ CREATE TABLE IF NOT EXISTS Purchase_Order (
     Purchase_Order_Status TEXT DEFAULT 'Open'
         CHECK(Purchase_Order_Status IN ('Open', 'Closed', 'Cancelled')),
     PRIMARY KEY (Customer_PO_No, Alloy_Id)
+);
+CREATE TABLE IF NOT EXISTS Alloy_Data_Checker (
+    Customer_Name TEXT,
+    alloy_family TEXT,
+    Alloy_Name TEXT,
+    Bis_Designation TEXT,
+    Element_Name TEXT,
+    Colour_Code TEXT,
+    min_percent {float},
+    max_percent {float}
 );
 """
 
@@ -1575,7 +1585,7 @@ def list_suppliers(active_only: bool = True) -> list[str]:
 
 # Chemistry entry UIs show only the first N elements by Serial_no.
 ENTRY_CHEM_ELEMENT_LIMIT = 15
-BATCH_CHEM_EXTRA_SYMBOLS = ("OEE", "OET", "SF")
+BATCH_CHEM_EXTRA_SYMBOLS = ("OE", "OT", "SF")
 
 
 def list_elements(limit: Optional[int] = None) -> list[dict[str, Any]]:
@@ -1601,7 +1611,7 @@ def list_entry_elements() -> list[dict[str, Any]]:
 
 
 def list_batch_chem_elements() -> list[dict[str, Any]]:
-    """Ladle/spectrometer entry: first 15 elements plus OEE, OET, and SF."""
+    """First 15 Element_Master rows plus OE, OT, and SF (ladle chemistry and alloy specs)."""
     entry = list_entry_elements()
     seen = {e["Element_Symbol"] for e in entry}
     extra = [
@@ -1618,6 +1628,22 @@ def list_extra_elements() -> list[dict[str, Any]]:
     """Element_Master rows after the default entry list (Serial_no > first 15)."""
     entry_syms = {e["Element_Symbol"] for e in list_entry_elements()}
     return [e for e in list_elements() if e["Element_Symbol"] not in entry_syms]
+
+
+OTHER_SPEC_SERIAL_MIN = 16
+OTHER_SPEC_SERIAL_MAX = 36
+
+
+def list_other_spec_elements() -> list[dict[str, Any]]:
+    """Element_Master rows with Serial_no from 16 through 36 (alloy spec extras)."""
+    sql = """
+        SELECT Serial_no AS "Serial_no", Element_Name AS "Element_Name",
+               Element_Symbol AS "Element_Symbol"
+        FROM Element_Master
+        WHERE Serial_no BETWEEN ? AND ?
+        ORDER BY Serial_no
+    """
+    return fetch_all(sql, (OTHER_SPEC_SERIAL_MIN, OTHER_SPEC_SERIAL_MAX))
 
 
 def list_element_symbols(
