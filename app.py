@@ -126,6 +126,48 @@ def photo_bytes(uploaded) -> bytes | None:
     return uploaded.getvalue()
 
 
+def _optional_percent(value: object) -> float | None:
+    """Treat blank / 0 as empty so percentage fields can start without 0.00."""
+    if value is None or value == "":
+        return None
+    try:
+        num = float(value)
+    except (TypeError, ValueError):
+        return None
+    return num if num > 0 else None
+
+
+def empty_percent_input(
+    label: str,
+    *,
+    key: str,
+    default: object = None,
+    min_value: float = 0.0,
+    max_value: float | None = 100.0,
+    step: float = 0.01,
+    help: str | None = None,
+    disabled: bool = False,
+) -> float | None:
+    """Number input that starts blank instead of 0.00."""
+    if key in st.session_state:
+        if st.session_state[key] in (0, 0.0):
+            st.session_state[key] = None
+    else:
+        st.session_state[key] = _optional_percent(default)
+    kwargs: dict[str, object] = {
+        "min_value": min_value,
+        "value": None,
+        "step": step,
+        "key": key,
+        "help": help,
+        "disabled": disabled,
+        "placeholder": "",
+    }
+    if max_value is not None:
+        kwargs["max_value"] = max_value
+    return st.number_input(label, **kwargs)
+
+
 @st.dialog("All elements — chemical composition (%)", width="large")
 def dialog_all_element_percentages(
     state_key: str,
@@ -140,20 +182,16 @@ def dialog_all_element_percentages(
         f"Enter assay / chemistry % for all **{len(elements)}** elements "
         "in Element_Master (Serial_no order). Click **Apply & close** to use these values."
     )
-    values: dict[str, float] = {}
+    values: dict[str, float | None] = {}
     cols = st.columns(4)
     for i, el in enumerate(elements):
         sym = el["Element_Symbol"]
-        default = float(stored.get(sym, defaults.get(sym, 0.0)) or 0.0)
         with cols[i % 4]:
-            values[sym] = st.number_input(
+            values[sym] = empty_percent_input(
                 f"{sym} %",
-                min_value=0.0,
-                max_value=100.0,
-                value=default,
-                step=0.001,
-                format="%.3f",
                 key=f"{state_key}_dlg_{sym}",
+                default=stored.get(sym, defaults.get(sym)),
+                step=0.001,
                 help=el["Element_Name"],
             )
     b1, b2 = st.columns(2)
@@ -162,11 +200,12 @@ def dialog_all_element_percentages(
     with b2:
         cancel = st.button("Cancel", use_container_width=True)
     if apply:
-        st.session_state[state_key] = values
+        st.session_state[state_key] = {
+            sym: val for sym, val in values.items() if val
+        }
         if sync_keys:
             for sym, widget_key in sync_keys.items():
-                if sym in values:
-                    st.session_state[widget_key] = float(values[sym])
+                st.session_state[widget_key] = _optional_percent(values.get(sym))
         st.rerun()
     if cancel:
         st.rerun()
@@ -236,12 +275,18 @@ def dialog_all_element_specs(
 
 
 def merge_percent_composition(
-    page_values: dict[str, float],
+    page_values: dict[str, float | None],
     full_state_key: str,
 ) -> dict[str, float]:
     """Merge main-page entry values over an optional full Element_Master dialog map."""
-    merged = dict(st.session_state.get(full_state_key) or {})
-    merged.update(page_values)
+    merged: dict[str, float] = {}
+    for source in (st.session_state.get(full_state_key) or {}, page_values):
+        for sym, val in source.items():
+            num = _optional_percent(val)
+            if num is not None:
+                merged[sym] = num
+            elif sym in merged:
+                del merged[sym]
     return merged
 
 
@@ -736,13 +781,23 @@ elif PAGE == "Production Batch & Chemistry":
                 placeholder="e.g. 14:30 or 12 min",
             )
         with d2:
-            sampled_pcs = st.number_input("Sampled pcs", min_value=0.0, value=0.0, step=1.0)
+            sampled_pcs = empty_percent_input(
+                "Sampled pcs",
+                key="sampled_pcs",
+                max_value=None,
+                step=1.0,
+            )
         with d3:
-            defect_pcs = st.number_input("Defect pcs", min_value=0.0, value=0.0, step=1.0)
+            defect_pcs = empty_percent_input(
+                "Defect pcs",
+                key="defect_pcs",
+                max_value=None,
+                step=1.0,
+            )
         with d4:
             st.caption("K Mold Value = Defect pcs / Sampled pcs")
             if sampled_pcs and sampled_pcs > 0:
-                k_mold = float(defect_pcs) / float(sampled_pcs)
+                k_mold = float(defect_pcs or 0) / float(sampled_pcs)
                 css = "yield-bad" if k_mold >= 0.5 else "yield-ok"
                 st.markdown(
                     f'<p class="{css}">K Mold Value<br>{k_mold:.3f}</p>',
@@ -960,12 +1015,11 @@ elif PAGE == "Production Batch & Chemistry":
                     help="Auto-filled from Trolley_Master when a trolley is selected.",
                 )
             with r2c2:
-                scale_w = st.number_input(
+                scale_w = empty_percent_input(
                     "Weighment scale weight (kg) *",
-                    min_value=0.0,
-                    value=0.0,
-                    step=1.0,
                     key=f"scale_w_{idx}",
+                    max_value=None,
+                    step=1.0,
                 )
                 wsp_open_key = f"wsp_open_{idx}"
                 if st.button(
@@ -1004,7 +1058,8 @@ elif PAGE == "Production Batch & Chemistry":
 
             # Net charge = weighment scale − trolley tare (always recompute into widget state)
             tare_w = float(st.session_state.get(tare_key, trolley_w) or 0.0)
-            net_w = max(float(scale_w) - tare_w, 0.0) if trolley_name and float(scale_w) > 0 else 0.0
+            scale_val = float(scale_w or 0)
+            net_w = max(scale_val - tare_w, 0.0) if trolley_name and scale_val > 0 else 0.0
             net_key = f"wt_{idx}"
             st.session_state[net_key] = float(net_w)
             with r2c3:
@@ -1053,13 +1108,13 @@ elif PAGE == "Production Batch & Chemistry":
                 if input_photo_bytes:
                     st.caption(f"Charge line {idx + 1}: Material Photo attached.")
 
-            if mat and lot_label and trolley_name and float(scale_w) > 0 and net_w > 0:
+            if mat and lot_label and trolley_name and scale_val > 0 and net_w > 0:
                 charge_inputs.append(
                     {
                         "Raw_Material_Name": mat,
                         "Lot_id": lot_opts[lot_label],
                         "Weight": net_w,
-                        "Weighment_scale_weight": float(scale_w),
+                        "Weighment_scale_weight": scale_val,
                         "Trolley_weight": tare_w,
                         "Trolley_name": trolley_name,
                         "Notes": n,
@@ -1137,7 +1192,7 @@ elif PAGE == "Production Batch & Chemistry":
                 return 0.0
 
         chem_cols = st.columns(6)
-        batch_chem: dict[str, float] = {}
+        batch_chem: dict[str, float | None] = {}
         out_of_spec_keys: list[str] = []
         for i, el in enumerate(entry_elements):
             sym = el["Element_Symbol"]
@@ -1149,24 +1204,24 @@ elif PAGE == "Production Batch & Chemistry":
                         + 2.0 * _entered_chem("Mn")
                         + 3.0 * _entered_chem("Cr")
                     )
-                    st.session_state["bchem_SF"] = round(sludge, 1)
+                    sf_val = round(sludge, 1)
+                    st.session_state["bchem_SF"] = sf_val if sf_val > 0 else None
                     batch_chem[sym] = st.number_input(
                         "SF %",
                         min_value=0.0,
                         max_value=600.0,
+                        value=None,
                         step=0.1,
                         key="bchem_SF",
                         disabled=True,
+                        placeholder="",
                         help="Auto: Sludge Factor = Fe + 2×Mn + 3×Cr, rounded to 0.1%.",
                     )
                 else:
-                    batch_chem[sym] = st.number_input(
+                    batch_chem[sym] = empty_percent_input(
                         f"{sym} %",
-                        min_value=0.0,
-                        max_value=100.0,
-                        value=float(full_batch.get(sym) or 0.0),
-                        step=0.01,
                         key=f"bchem_{sym}",
+                        default=full_batch.get(sym),
                         help=el["Element_Name"],
                     )
                 entered = float(batch_chem[sym] or 0.0)
@@ -1219,8 +1274,8 @@ elif PAGE == "Production Batch & Chemistry":
                         inputs=charge_inputs,
                         composition={k: v for k, v in merged_chem.items() if v and v > 0},
                         degassing_time=degassing_time.strip() or None,
-                        sampled_pcs=sampled_pcs if sampled_pcs > 0 else None,
-                        defect_pcs=defect_pcs if defect_pcs > 0 else None,
+                        sampled_pcs=sampled_pcs if sampled_pcs and sampled_pcs > 0 else None,
+                        defect_pcs=defect_pcs if defect_pcs and defect_pcs > 0 else None,
                         top_sample=_sample_or_none(top_sample),
                         middle_sample=_sample_or_none(middle_sample),
                         bottom_sample=_sample_or_none(bottom_sample),
