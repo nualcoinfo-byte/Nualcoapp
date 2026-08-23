@@ -494,6 +494,7 @@ CREATE TABLE IF NOT EXISTS Raw_Material_Inventory (
     Storage_bay TEXT,
     Raw_Material_Status TEXT DEFAULT 'Awaiting Assay',
     Photo {blob},
+    Vehicle_photo {blob},
     Cost_per_kg {float},
     Invoice_Document {blob},
     Invoice_Document_name TEXT,
@@ -797,6 +798,7 @@ def init_db() -> None:
                 ("Invoice_Document", "BYTEA" if IS_POSTGRES else "BLOB"),
                 ("Invoice_Document_name", "TEXT"),
                 ("Invoice_Document_type", "TEXT"),
+                ("Vehicle_photo", "BYTEA" if IS_POSTGRES else "BLOB"),
             ],
         )
         _audit_cols = [
@@ -2264,6 +2266,7 @@ def add_inventory_lot(
     invoice_document: Optional[bytes] = None,
     invoice_document_name: Optional[str] = None,
     invoice_document_type: Optional[str] = None,
+    vehicle_photo: Optional[bytes] = None,
 ) -> int:
     if invoice_document and invoice_document_name:
         _validate_invoice_document_name(invoice_document_name)
@@ -2274,9 +2277,9 @@ def add_inventory_lot(
             INSERT INTO Raw_Material_Inventory
                 (Raw_Material_Name, Vendor_code, Supplier_Invoice, Supplier_invoice_date,
                  Received_date, Received_weight, Remaining_Weight, Storage_bay,
-                 Raw_Material_Status, Photo, Cost_per_kg,
+                 Raw_Material_Status, Photo, Vehicle_photo, Cost_per_kg,
                  Invoice_Document, Invoice_Document_name, Invoice_Document_type)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             RETURNING Lot_id
             """,
             (
@@ -2290,6 +2293,7 @@ def add_inventory_lot(
                 storage_bay,
                 status,
                 photo,
+                vehicle_photo,
                 cost_per_kg,
                 invoice_document,
                 invoice_document_name,
@@ -2343,6 +2347,19 @@ def save_inventory_invoice_document(
         """,
         (file_bytes, filename.strip(), content_type or "", lot_id),
     )
+
+
+def get_inventory_vehicle_photo(lot_id: int) -> Optional[bytes]:
+    row = fetch_one(
+        """
+        SELECT Vehicle_photo AS "Vehicle_photo"
+        FROM Raw_Material_Inventory
+        WHERE Lot_id = ?
+        """,
+        (lot_id,),
+    )
+    data = (row or {}).get("Vehicle_photo")
+    return data if data else None
 
 
 def get_inventory_invoice_document(lot_id: int) -> Optional[dict[str, Any]]:

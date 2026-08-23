@@ -516,6 +516,37 @@ elif PAGE == "Raw Material Logging":
             key="rm_log_invoice_doc",
         )
 
+    vp_open_key = "rm_log_vphoto_open"
+    if st.button(
+        "📷 Vehicle photo",
+        key="rm_log_vphoto_btn",
+        help="Photo of the delivery vehicle. Saved on every lot on this invoice.",
+    ):
+        st.session_state[vp_open_key] = not bool(st.session_state.get(vp_open_key))
+        st.rerun()
+    vehicle_photo_bytes: bytes | None = None
+    if st.session_state.get(vp_open_key):
+        st.caption("Capture the vehicle with camera or pick a photo from the gallery.")
+        vp_cam = st.camera_input(
+            "Vehicle camera",
+            key="rm_log_vphoto_cam",
+            help="Uses the phone camera when available.",
+        )
+        vp_file = st.file_uploader(
+            "Vehicle gallery / files",
+            type=["png", "jpg", "jpeg", "webp"],
+            key="rm_log_vphoto_file",
+            help="Choose an existing vehicle photo from the device gallery.",
+        )
+        vehicle_photo_bytes = photo_bytes(vp_cam) or photo_bytes(vp_file)
+        if vehicle_photo_bytes:
+            st.session_state["rm_log_vphoto_bytes"] = vehicle_photo_bytes
+            st.success("Vehicle photo ready to save with this invoice.")
+    else:
+        vehicle_photo_bytes = st.session_state.get("rm_log_vphoto_bytes")
+        if vehicle_photo_bytes:
+            st.caption("Vehicle photo attached.")
+
     st.markdown("#### Raw materials on this invoice")
     st.caption(
         "One vendor invoice can include multiple raw materials. "
@@ -641,6 +672,7 @@ elif PAGE == "Raw Material Logging":
                         invoice_document=doc_bytes,
                         invoice_document_name=doc_name,
                         invoice_document_type=doc_type,
+                        vehicle_photo=vehicle_photo_bytes,
                     )
                     lot_ids.append(lot_id)
                 names = ", ".join(ln["name"] for ln in complete)
@@ -652,6 +684,8 @@ elif PAGE == "Raw Material Logging":
                     {"name": "", "cost": 0.0, "weight": 0.0}
                 ]
                 st.session_state.rm_log_token = int(line_token) + 1
+                st.session_state.pop("rm_log_vphoto_bytes", None)
+                st.session_state.pop("rm_log_vphoto_open", None)
                 st.cache_data.clear()
                 st.rerun()
             except Exception as exc:
@@ -681,7 +715,9 @@ elif PAGE == "Raw Material Inventory":
                    i.Cost_per_kg AS "Cost_per_kg",
                    i.Storage_bay AS "Storage_bay",
                    i.Raw_Material_Status AS "Raw_Material_Status",
-                   i.Invoice_Document_name AS "Invoice_Document_name"
+                   i.Invoice_Document_name AS "Invoice_Document_name",
+                   CASE WHEN i.Vehicle_photo IS NULL THEN NULL ELSE 'Yes' END
+                       AS "Vehicle_photo"
             FROM Raw_Material_Inventory i
             LEFT JOIN Vendor_Master v ON v.Vendor_code = i.Vendor_code
             ORDER BY i.Lot_id DESC
@@ -706,6 +742,10 @@ elif PAGE == "Raw Material Inventory":
             )
         else:
             st.warning("No chemistry recorded for that lot.")
+        vehicle_photo = db.get_inventory_vehicle_photo(int(lot_pick))
+        if vehicle_photo:
+            st.markdown("**Vehicle photo**")
+            st.image(vehicle_photo)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -3021,7 +3061,7 @@ elif PAGE == "Masters Overview":
             | 3 | Element_Master | 36 chemistry elements (seeded) |
             | 4 | Raw_Material_Master | Material grades |
             | 5 | Raw_Material_Spec | Lot chemistry |
-            | 6 | Raw_Material_Inventory | Lots / stock |
+            | 6 | Raw_Material_Inventory | Lots / stock (includes Vehicle_photo) |
             | 7 | Alloy_Master | Alloys |
             | 8 | Alloy_Master_spec | Alloy min/max % |
             | 9 | Furnace_Master | Furnaces (1–4 seeded) |
