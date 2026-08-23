@@ -524,8 +524,8 @@ CREATE TABLE IF NOT EXISTS Alloy_Master (
 CREATE TABLE IF NOT EXISTS Alloy_Master_spec (
     Alloy_id INTEGER NOT NULL REFERENCES Alloy_Master(Alloy_id),
     Element_symbol TEXT NOT NULL REFERENCES Element_Master(Element_Symbol),
-    Min_percent {float},
-    Max_percent {float},
+    Min_percent {pct4},
+    Max_percent {pct4},
     Last_updated_by TEXT,
     Last_updated_datetime TEXT,
     PRIMARY KEY (Alloy_id, Element_symbol)
@@ -1055,7 +1055,10 @@ def _ensure_raw_material_spec_as_master_child(conn: Connection) -> None:
 
 
 PERCENT_SCALE = 4
-PERCENT_4DP_TABLES = frozenset({"raw_material_spec", "batch_chemical_composition"})
+PERCENT_4DP_TABLES = frozenset(
+    {"raw_material_spec", "batch_chemical_composition", "alloy_master_spec"}
+)
+PERCENT_4DP_COLUMNS = frozenset({"percentage", "min_percent", "max_percent"})
 
 
 def round_percent_4(value: Any) -> Optional[float]:
@@ -1069,18 +1072,23 @@ def round_percent_4(value: Any) -> Optional[float]:
 
 
 def _ensure_percentage_4dp(conn: Connection) -> None:
-    """Store Raw_Material_Spec and Batch_Chemical_Composition % as NUMERIC(10,4)."""
+    """Store chemistry % columns as NUMERIC(10,4)."""
     if not IS_POSTGRES:
         return
-    for table in ("raw_material_spec", "batch_chemical_composition"):
-        _exec(
-            conn,
-            f"""
-            ALTER TABLE {table}
-            ALTER COLUMN percentage TYPE NUMERIC(10, 4)
-            USING ROUND(percentage::numeric, {PERCENT_SCALE})
-            """,
-        )
+    for table, columns in (
+        ("raw_material_spec", ("percentage",)),
+        ("batch_chemical_composition", ("percentage",)),
+        ("alloy_master_spec", ("min_percent", "max_percent")),
+    ):
+        for column in columns:
+            _exec(
+                conn,
+                f"""
+                ALTER TABLE {table}
+                ALTER COLUMN {column} TYPE NUMERIC(10, 4)
+                USING ROUND({column}::numeric, {PERCENT_SCALE})
+                """,
+            )
 
 
 def _ensure_purchase_order_status(conn: Connection) -> None:
@@ -1904,7 +1912,7 @@ def save_table_edits(
                 round_percent_4(row.get(c))
                 if (
                     resolved.lower() in PERCENT_4DP_TABLES
-                    and c.lower() == "percentage"
+                    and c.lower() in PERCENT_4DP_COLUMNS
                 )
                 else row.get(c)
                 for c in write_cols
@@ -2844,7 +2852,7 @@ def add_alloy(
                      Last_updated_by, Last_updated_datetime)
                 VALUES (?, ?, ?, ?, ?, ?)
                 """,
-                (alloy_id, sym, mn, mx, by_val, dt_val),
+                (alloy_id, sym, round_percent_4(mn), round_percent_4(mx), by_val, dt_val),
             )
         return alloy_id
 

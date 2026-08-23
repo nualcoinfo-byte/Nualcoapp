@@ -254,12 +254,16 @@ def dialog_all_element_specs(
                 f"{sym} min",
                 key=f"{state_key}_dlg_min_{sym}",
                 default=prev_min,
+                step=CHEM_PERCENT_STEP,
+                format=CHEM_PERCENT_FORMAT,
             )
         with c3:
             mx = empty_percent_input(
                 f"{sym} max",
                 key=f"{state_key}_dlg_max_{sym}",
                 default=prev_max,
+                step=CHEM_PERCENT_STEP,
+                format=CHEM_PERCENT_FORMAT,
             )
         values[sym] = (mn, mx)
 
@@ -289,16 +293,152 @@ def dialog_all_element_specs(
         st.rerun()
 
 
-def _parse_master_date(value: object) -> date:
+UI_DATE_FORMAT = "%d-%b-%Y"  # 23-AUG-2026
+UI_DATE_WIDGET_FORMAT = "DD-MM-YYYY"
+
+
+def _is_blank_date(value: object) -> bool:
+    if value is None or value == "":
+        return True
+    try:
+        return bool(pd.isna(value))
+    except (TypeError, ValueError):
+        return False
+
+
+def _column_is_datetime(name: object) -> bool:
+    lowered = str(name).lower()
+    return lowered.endswith("datetime") or lowered.endswith("_time") or lowered.endswith(" time")
+
+
+def _column_is_date(name: object) -> bool:
+    lowered = str(name).lower()
+    return lowered.endswith("date") or _column_is_datetime(name)
+
+
+def parse_any_date(value: object) -> date | datetime | None:
+    """Parse ISO, widget, or DD-MON-YYYY values into a date or datetime."""
+    if _is_blank_date(value):
+        return None
     if isinstance(value, datetime):
-        return value.date()
+        return value
     if isinstance(value, date):
         return value
-    text = str(value or "")[:10]
-    try:
-        return date.fromisoformat(text)
-    except ValueError:
-        return date.today()
+    if isinstance(value, pd.Timestamp):
+        return value.to_pydatetime()
+    text = str(value).strip()
+    if not text or text in {"—", "-", "None", "NaT", "nat"}:
+        return None
+    date_part, time_part = text, ""
+    if "T" in text:
+        date_part, time_part = text.split("T", 1)
+    elif " " in text and not text[2:3] == " ":
+        date_part, time_part = text.split(" ", 1)
+    time_part = time_part.replace("Z", "").split(".")[0]
+    parsed_date = None
+    if len(date_part) >= 11 and date_part[2] == "-" and date_part[6] == "-":
+        bits = date_part[:11].split("-")
+        try:
+            parsed_date = datetime.strptime(
+                f"{bits[0]}-{bits[1].title()}-{bits[2]}", UI_DATE_FORMAT
+            ).date()
+        except ValueError:
+            parsed_date = None
+    if parsed_date is None:
+        try:
+            parsed_date = date.fromisoformat(date_part[:10])
+        except ValueError:
+            return None
+    if time_part:
+        try:
+            parsed_time = datetime.strptime(time_part[:8], "%H:%M:%S").time()
+        except ValueError:
+            try:
+                parsed_time = datetime.strptime(time_part[:5], "%H:%M").time()
+            except ValueError:
+                return parsed_date
+        return datetime.combine(parsed_date, parsed_time)
+    return parsed_date
+
+
+def format_ui_date(value: object, *, with_time: bool | None = None, empty: str = "") -> str:
+    """Format a stored date for the UI as DD-MON-YYYY (optional time)."""
+    parsed = parse_any_date(value)
+    if parsed is None:
+        return empty if _is_blank_date(value) else str(value)
+    include_time = with_time
+    if include_time is None:
+        include_time = isinstance(parsed, datetime) and (
+            parsed.hour or parsed.minute or parsed.second
+        )
+    if isinstance(parsed, datetime) and include_time:
+        return parsed.strftime(f"{UI_DATE_FORMAT} %H:%M:%S").upper()
+    day = parsed.date() if isinstance(parsed, datetime) else parsed
+    return day.strftime(UI_DATE_FORMAT).upper()
+
+
+def to_storage_date(value: object, *, with_time: bool = False) -> str | None:
+    """Convert a UI or ISO date back to the ISO string stored in the database."""
+    parsed = parse_any_date(value)
+    if parsed is None:
+        return None
+    if with_time:
+        if isinstance(parsed, datetime):
+            return parsed.isoformat(timespec="seconds")
+        return datetime.combine(parsed, datetime.min.time()).isoformat(timespec="seconds")
+    if isinstance(parsed, datetime):
+        return parsed.date().isoformat()
+    return parsed.isoformat()
+
+
+def row_dates_to_storage(row: dict) -> dict:
+    out = dict(row)
+    for key, value in list(out.items()):
+        if _column_is_date(key) and not _is_blank_date(value):
+            out[key] = to_storage_date(value, with_time=_column_is_datetime(key))
+    return out
+
+
+def format_df_dates(data: pd.DataFrame) -> pd.DataFrame:
+    if data is None or data.empty:
+        return data
+    out = data.copy()
+    for col in out.columns:
+        if not _column_is_date(col):
+            continue
+        with_time = _column_is_datetime(col)
+        out[col] = out[col].map(
+            lambda v, t=with_time: None if _is_blank_date(v) else format_ui_date(v, with_time=t)
+        )
+    return out
+
+
+def show_dataframe(data, **kwargs):
+    """Display a table with date columns as DD-MON-YYYY."""
+    if isinstance(data, pd.DataFrame):
+        data = format_df_dates(data)
+    kwargs.setdefault("use_container_width", True)
+    kwargs.setdefault("hide_index", True)
+    return st.dataframe(data, **kwargs)
+
+
+def ui_date_input(label: str, value="today", **kwargs):
+    kwargs.setdefault("format", UI_DATE_WIDGET_FORMAT)
+    return st.date_input(label, value=value, **kwargs)
+
+
+def ui_datetime_input(label: str, **kwargs):
+    kwargs.setdefault("format", UI_DATE_WIDGET_FORMAT)
+    return st.datetime_input(label, **kwargs)
+
+
+def _parse_master_date(value: object) -> date:
+    parsed = parse_any_date(value)
+    if isinstance(parsed, datetime):
+        return parsed.date()
+    if isinstance(parsed, date):
+        return parsed
+    return date.today()
 
 
 def _option_label(options: dict, value: object) -> str:
@@ -482,14 +622,14 @@ if PAGE == "Dashboard":
         st.info("No batches yet. Create one under **Production Batch & Chemistry**.")
     else:
         show = bdf.copy()
-        st.dataframe(show, use_container_width=True, hide_index=True)
+        show_dataframe(show)
 
     st.subheader("Inventory on hand")
     idf = df_from_rows(lots)
     if idf.empty:
         st.info("No inventory lots with remaining weight.")
     else:
-        st.dataframe(idf, use_container_width=True, hide_index=True)
+        show_dataframe(idf)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -519,7 +659,7 @@ elif PAGE == "Raw Material Logging":
     )
     inv1, inv2, inv3 = st.columns(3)
     with inv1:
-        invoice_date = st.date_input(
+        invoice_date = ui_date_input(
             "Supplier invoice date *", value=date.today(), key="rm_log_invoice_date"
         )
     with inv2:
@@ -529,7 +669,7 @@ elif PAGE == "Raw Material Logging":
             key="rm_log_invoice",
         )
     with inv3:
-        received = st.date_input(
+        received = ui_date_input(
             "Received date", value=date.today(), key="rm_log_received"
         )
 
@@ -764,17 +904,15 @@ elif PAGE == "Raw Material Inventory":
     if recent.empty:
         st.info("No lots logged yet.")
     else:
-        st.dataframe(recent, use_container_width=True, hide_index=True)
+        show_dataframe(recent)
 
     lot_pick = st.number_input("View chemistry for Lot ID", min_value=0, step=1, value=0)
     if lot_pick > 0:
         chem = db.get_lot_chemistry(int(lot_pick))
         if chem:
             st.caption("Specification from **Raw Material Spec** for this lot's grade.")
-            st.dataframe(
+            show_dataframe(
                 pd.DataFrame([{"Element": k, "Percentage": v} for k, v in chem.items()]),
-                use_container_width=True,
-                hide_index=True,
             )
         else:
             st.warning("No specification recorded for this lot's raw material grade.")
@@ -831,7 +969,7 @@ elif PAGE == "Production Batch & Chemistry":
             heat_no = st.selectbox("Heat no *", db.HEAT_NOS)
             melt_no = st.selectbox("Melt no", db.MELT_NOS)
         with col2:
-            prod_date = st.date_input("Production date", value=date.today())
+            prod_date = ui_date_input("Production date", value=date.today())
             shift = st.selectbox("Shift", db.SHIFTS)
             melting_team = st.selectbox("Melter name *", melters)
         with col3:
@@ -910,28 +1048,25 @@ elif PAGE == "Production Batch & Chemistry":
 
         d1, d2, d3, d4 = st.columns(4)
         with d1:
-            top_sample_dt = st.datetime_input(
+            top_sample_dt = ui_datetime_input(
                 "Datetime",
                 value=None,
-                format="YYYY-MM-DD",
                 step=60,
                 key="top_sample_dt",
                 help="Open the calendar icon to pick date and time.",
             )
         with d2:
-            middle_sample_dt = st.datetime_input(
+            middle_sample_dt = ui_datetime_input(
                 "Datetime",
                 value=None,
-                format="YYYY-MM-DD",
                 step=60,
                 key="middle_sample_dt",
                 help="Open the calendar icon to pick date and time.",
             )
         with d3:
-            bottom_sample_dt = st.datetime_input(
+            bottom_sample_dt = ui_datetime_input(
                 "Datetime",
                 value=None,
-                format="YYYY-MM-DD",
                 step=60,
                 key="bottom_sample_dt",
                 help="Open the calendar icon to pick date and time.",
@@ -1242,7 +1377,7 @@ elif PAGE == "Production Batch & Chemistry":
             if v is None or v == "":
                 return "—"
             try:
-                return f"{float(v):.3f}".rstrip("0").rstrip(".")
+                return f"{float(v):.4f}".rstrip("0").rstrip(".")
             except (TypeError, ValueError):
                 return "—"
 
@@ -1402,7 +1537,7 @@ elif PAGE == "Production Batches":
     if batches_df.empty:
         st.info("No batches yet. Create one under **Production Batch & Chemistry**.")
     else:
-        st.dataframe(batches_df, use_container_width=True, hide_index=True)
+        show_dataframe(batches_df)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1477,23 +1612,19 @@ elif PAGE == "Production Workflow Tracker":
                 st.rerun()
 
             st.subheader("Charge details")
-            st.dataframe(
-                df_from_rows(db.get_batch_inputs(selected)),
-                use_container_width=True,
-                hide_index=True,
-            )
+            show_dataframe(df_from_rows(db.get_batch_inputs(selected)))
             st.subheader("Chemistry")
             chem_df = df_from_rows(db.get_batch_chemistry(selected))
             if chem_df.empty:
                 st.caption("No chemistry recorded.")
             else:
-                st.dataframe(chem_df, use_container_width=True, hide_index=True)
+                show_dataframe(chem_df)
 
         st.divider()
         st.subheader("All batches by stage")
         overview = df_from_rows(batches)
         if not overview.empty:
-            st.dataframe(
+            show_dataframe(
                 overview[
                     [
                         "Batch_ID",
@@ -1506,9 +1637,7 @@ elif PAGE == "Production Workflow Tracker":
                         "Output_pieces",
                         "Alloy_name",
                     ]
-                ],
-                use_container_width=True,
-                hide_index=True,
+                ]
             )
 
 
@@ -1654,7 +1783,7 @@ elif PAGE == "Finished Goods Inventory":
     st.divider()
     st.markdown("#### All bundles")
     all_fg = db.list_finished_goods()
-    st.dataframe(df_from_rows(all_fg), use_container_width=True, hide_index=True)
+    show_dataframe(df_from_rows(all_fg))
 
     locked = [r for r in all_fg if r["Finished_Goods_Status"] == db.FG_STATUS_UNDER_TESTING]
     if locked:
@@ -1758,11 +1887,7 @@ elif PAGE == "Customers":
             )
             st.success(f"Saved customer **{name.strip()}**.")
 
-    st.dataframe(
-        df_from_rows(db.get_all_records("Customer_Master", order_by="Cust_code")),
-        use_container_width=True,
-        hide_index=True,
-    )
+    show_dataframe(df_from_rows(db.get_all_records("Customer_Master", order_by="Cust_code")))
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1853,11 +1978,7 @@ elif PAGE == "Vendors":
             )
             st.success(f"Saved vendor **{name.strip()}**.")
 
-    st.dataframe(
-        df_from_rows(db.get_all_records("Vendor_Master", order_by="Vendor_code")),
-        use_container_width=True,
-        hide_index=True,
-    )
+    show_dataframe(df_from_rows(db.get_all_records("Vendor_Master", order_by="Vendor_code")))
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1981,7 +2102,7 @@ elif PAGE == "Raw Material Master":
                 options=[""] + list(vendor_opts.keys()),
                 key=f"{prefix}_vendor",
             )
-            effective = st.date_input(
+            effective = ui_date_input(
                 "Effective date *",
                 key=f"{prefix}_effective",
             )
@@ -2101,7 +2222,7 @@ elif PAGE == "Raw Material Master":
                     verb = "Updated" if is_modify else "Added"
                     st.success(
                         f"{verb} raw material **{saved_name}** "
-                        f"(effective {effective.isoformat()})."
+                        f"(effective {format_ui_date(effective)})."
                     )
                     st.session_state.pop(full_spec_key, None)
                     if is_modify:
@@ -2115,11 +2236,7 @@ elif PAGE == "Raw Material Master":
     if not rows:
         st.info("No raw material grades yet. Add one using the form above.")
     else:
-        st.dataframe(
-            df_from_rows(rows),
-            use_container_width=True,
-            hide_index=True,
-        )
+        show_dataframe(df_from_rows(rows))
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -2158,7 +2275,7 @@ elif PAGE == "Alloys":
         )
         rev_dt = st.text_input(
             "Revision datetime",
-            value=datetime.now().isoformat(timespec="seconds"),
+            value=format_ui_date(datetime.now(), with_time=True),
             key="alloy_rev_dt",
         )
         remarks = st.text_area("Remarks", key="alloy_remarks")
@@ -2187,12 +2304,16 @@ elif PAGE == "Alloys":
                 f"{sym} min",
                 key=f"amin_{sym}",
                 default=dmin,
+                step=CHEM_PERCENT_STEP,
+                format=CHEM_PERCENT_FORMAT,
             )
         with sc3:
             mx = empty_percent_input(
                 f"{sym} max",
                 key=f"amax_{sym}",
                 default=dmax,
+                step=CHEM_PERCENT_STEP,
+                format=CHEM_PERCENT_FORMAT,
             )
         specs[sym] = (
             mn if mn and mn > 0 else None,
@@ -2239,14 +2360,14 @@ elif PAGE == "Alloys":
                 specs=merge_spec_ranges(specs, "alloy_full_specs"),
                 colour_code=colour.strip() or None,
                 bis_designation=bis_desig.strip() or None,
-                revision_datetime=rev_dt.strip() or None,
+                revision_datetime=to_storage_date(rev_dt.strip(), with_time=True) if rev_dt.strip() else None,
                 remarks=remarks.strip() or None,
                 status=alloy_status,
             )
             st.session_state.pop("alloy_full_specs", None)
             st.success(f"Created alloy **{aname}** (ID {aid}).")
     st.subheader("Alloys")
-    st.dataframe(df_from_rows(db.list_alloys()), use_container_width=True, hide_index=True)
+    show_dataframe(df_from_rows(db.list_alloys()))
 
     aid_view = st.number_input("View specs for Alloy ID", min_value=0, step=1, value=0)
     if aid_view > 0:
@@ -2264,7 +2385,7 @@ elif PAGE == "Alloys":
                 (int(aid_view),),
             )
         )
-        st.dataframe(specs_df, use_container_width=True, hide_index=True)
+        show_dataframe(specs_df)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -2282,11 +2403,7 @@ elif PAGE == "Furnaces":
                 db.upsert_furnace(fname.strip(), fstatus)
                 st.success(f"Saved furnace **{fname.strip()}**.")
 
-    st.dataframe(
-        df_from_rows(db.get_all_records("Furnace_Master", order_by="Furnace")),
-        use_container_width=True,
-        hide_index=True,
-    )
+    show_dataframe(df_from_rows(db.get_all_records("Furnace_Master", order_by="Furnace")))
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -2412,11 +2529,7 @@ elif PAGE == "Melters":
                 db.upsert_melter(mname.strip(), mstatus)
                 st.success(f"Saved melter **{mname.strip()}**.")
 
-    st.dataframe(
-        df_from_rows(db.get_all_records("Melter_Master", order_by="Melter_Name")),
-        use_container_width=True,
-        hide_index=True,
-    )
+    show_dataframe(df_from_rows(db.get_all_records("Melter_Master", order_by="Melter_Name")))
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -2444,11 +2557,7 @@ elif PAGE == "Trolleys":
                 )
                 st.success(f"Saved trolley **{tname.strip()}**.")
 
-    st.dataframe(
-        df_from_rows(db.get_all_records("Trolley_Master", order_by="Trolley_name")),
-        use_container_width=True,
-        hide_index=True,
-    )
+    show_dataframe(df_from_rows(db.get_all_records("Trolley_Master", order_by="Trolley_name")))
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -2506,8 +2615,8 @@ elif PAGE == "Purchase Orders":
         h1, h2, h3 = st.columns(3)
         with h1:
             po_no = st.text_input("Customer PO No *", placeholder="e.g. PO-2026-001")
-            order_date = st.date_input("Order date", value=date.today())
-            delivery_date = st.date_input("Delivery date", value=date.today())
+            order_date = ui_date_input("Order date", value=date.today())
+            delivery_date = ui_date_input("Delivery date", value=date.today())
         with h2:
             st.text_input(
                 "Customer name",
@@ -2801,8 +2910,8 @@ elif PAGE == "All Purchase Orders":
                 "Customer": p.get("Customer_name") or p.get("Cust_code") or "—",
                 "Alloy": p.get("Alloy_name")
                 or (f"#{p['Alloy_Id']}" if p.get("Alloy_Id") else "—"),
-                "Order date": p.get("Order_Date") or "—",
-                "Delivery": p.get("Delivery_Date") or "—",
+                "Order date": format_ui_date(p.get("Order_Date"), empty="—"),
+                "Delivery": format_ui_date(p.get("Delivery_Date"), empty="—"),
                 "Qty": float(p["Order_Qty"] or 0),
                 "Rate": float(p["Rate"] or 0) if p.get("Rate") is not None else None,
                 "Status": p.get("Purchase_Order_Status") or "Open",
@@ -2814,11 +2923,7 @@ elif PAGE == "All Purchase Orders":
         if not summary_rows:
             st.warning("No purchase orders match the current filters.")
         else:
-            st.dataframe(
-                pd.DataFrame(summary_rows),
-                use_container_width=True,
-                hide_index=True,
-            )
+            show_dataframe(pd.DataFrame(summary_rows))
 
         st.divider()
         st.markdown("#### Actions on a purchase order")
@@ -2861,8 +2966,8 @@ elif PAGE == "All Purchase Orders":
         with st.expander("Order details", expanded=False):
             st.write(
                 {
-                    "Order date": selected.get("Order_Date"),
-                    "Delivery date": selected.get("Delivery_Date"),
+                    "Order date": format_ui_date(selected.get("Order_Date"), empty="—"),
+                    "Delivery date": format_ui_date(selected.get("Delivery_Date"), empty="—"),
                     "Rate": selected.get("Rate"),
                     "Status": selected.get("Purchase_Order_Status") or "Open",
                     "Billing": ", ".join(
@@ -2970,7 +3075,7 @@ elif PAGE == "Bill of Materials":
         b1, b2 = st.columns(2)
         with b1:
             bom_id = st.number_input("BOM ID *", min_value=1.0, value=1.0, step=1.0)
-            eff = st.date_input("Effective date", value=date.today())
+            eff = ui_date_input("Effective date", value=date.today())
             customer = st.selectbox("Customer", [""] + list(cust_opts.keys()))
             alloy_name = st.selectbox("Alloy name", [""] + alloys)
         with b2:
@@ -2989,9 +3094,9 @@ elif PAGE == "Bill of Materials":
                 sequence=seq,
                 notes=notes,
             )
-            st.success(f"Saved BOM {bom_id} / {eff.isoformat()}.")
+            st.success(f"Saved BOM {bom_id} / {format_ui_date(eff)}.")
 
-    st.dataframe(
+    show_dataframe(
         df_from_rows(
             db.fetch_all(
                 """
@@ -3005,9 +3110,7 @@ elif PAGE == "Bill of Materials":
                 ORDER BY b.BOMID, b.Sequence_Order
                 """
             )
-        ),
-        use_container_width=True,
-        hide_index=True,
+        )
     )
 
 
@@ -3049,6 +3152,7 @@ elif PAGE == "Data Browser":
                 .str.upper()
                 .isin(db.RAW_MATERIAL_SPEC_HIDDEN_SYMBOLS)
             ].copy()
+    full_df = format_df_dates(full_df)
 
     with t2:
         search = st.text_input(
@@ -3126,8 +3230,12 @@ elif PAGE == "Data Browser":
         column_config = {}
         for c in filter_df.columns:
             if (
-                c.lower() == "percentage"
-                and table_key in {"raw_material_spec", "batch_chemical_composition"}
+                c.lower() in {"percentage", "min_percent", "max_percent"}
+                and table_key in {
+                    "raw_material_spec",
+                    "batch_chemical_composition",
+                    "alloy_master_spec",
+                }
             ):
                 column_config[c] = st.column_config.NumberColumn(
                     c, format="%.4f", step=CHEM_PERCENT_STEP
@@ -3160,8 +3268,12 @@ elif PAGE == "Data Browser":
             try:
                 # Merge edits: apply changes from filtered view onto full original by PK
                 original = st.session_state[original_key]
-                orig_rows = original.to_dict(orient="records")
-                edited_rows = edited.to_dict(orient="records")
+                orig_rows = [
+                    row_dates_to_storage(r) for r in original.to_dict(orient="records")
+                ]
+                edited_rows = [
+                    row_dates_to_storage(r) for r in edited.to_dict(orient="records")
+                ]
 
                 # If user filtered, only upsert rows present in the editor
                 # (plus any newly added blank-key rows when allow_add)
@@ -3213,7 +3325,7 @@ elif PAGE == "Data Browser":
                 c_left, c_right = st.columns(2)
                 with c_left:
                     st.markdown("**Rows by element**")
-                    st.dataframe(counts, use_container_width=True, hide_index=True)
+                    show_dataframe(counts)
                 if val_col and val_col in filter_df.columns:
                     with c_right:
                         st.markdown(f"**{val_col} summary**")
@@ -3227,11 +3339,7 @@ elif PAGE == "Data Browser":
                             lambda s: serial_order.get(s, 9999)
                         )
                         summary = summary.sort_values("_ord").drop(columns="_ord")
-                        st.dataframe(
-                            summary,
-                            use_container_width=True,
-                            hide_index=True,
-                        )
+                        show_dataframe(summary)
 
 
 elif PAGE == "Masters Overview":
@@ -3240,19 +3348,15 @@ elif PAGE == "Masters Overview":
         ["Elements", "Raw material master", "Raw material specs", "Schema info"]
     )
     with tab1:
-        st.dataframe(df_from_rows(db.list_elements()), use_container_width=True, hide_index=True)
+        show_dataframe(df_from_rows(db.list_elements()))
     with tab2:
-        st.dataframe(
-            df_from_rows(db.list_raw_material_master()),
-            use_container_width=True,
-            hide_index=True,
-        )
+        show_dataframe(df_from_rows(db.list_raw_material_master()))
     with tab3:
         st.caption(
             "Each specification row belongs to a **Raw Material Master** grade "
             "(name + effective date)."
         )
-        st.dataframe(
+        show_dataframe(
             df_from_rows(
                 db.fetch_all(
                     """
@@ -3270,9 +3374,7 @@ elif PAGE == "Masters Overview":
                     LIMIT 200
                     """
                 )
-            ),
-            use_container_width=True,
-            hide_index=True,
+            )
         )
     with tab4:
         st.markdown(
