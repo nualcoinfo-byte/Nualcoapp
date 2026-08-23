@@ -380,6 +380,7 @@ FG_STATUSES = [
 ]
 INVENTORY_STATUS = ["Awaiting Assay", "Ready For Melt", "Not Ready for Melt"]
 ACTIVE_STATUS = ["Active", "Inactive"]
+CRUCIBLE_STATUS = ["Available", "Damaged"]
 PURCHASE_ORDER_STATUS = ["Open", "Closed", "Cancelled"]
 SAMPLE_OK_STATUS = ["OK", "NOT OK"]
 ELEMENT_LEVEL = ["Low", "Medium", "High"]
@@ -535,6 +536,12 @@ CREATE TABLE IF NOT EXISTS Furnace_Master (
     Furnace TEXT PRIMARY KEY,
     Status TEXT CHECK(Status IN ('Active', 'Inactive')) DEFAULT 'Active'
 );
+CREATE TABLE IF NOT EXISTS Crucible_Master (
+    Crucible_no TEXT PRIMARY KEY,
+    furnace TEXT REFERENCES Furnace_Master(Furnace),
+    Crucible_status TEXT CHECK(Crucible_status IN ('Available', 'Damaged')) DEFAULT 'Available',
+    Vendor_name TEXT REFERENCES Vendor_Master(Vendor_name)
+);
 CREATE TABLE IF NOT EXISTS Melter_Master (
     Melter_Name TEXT PRIMARY KEY,
     Status TEXT CHECK(Status IN ('Active', 'Inactive')) DEFAULT 'Active',
@@ -576,6 +583,7 @@ CREATE TABLE IF NOT EXISTS Production_batch (
     Production_Date TEXT,
     Shift TEXT CHECK(Shift IN ('A', 'B')),
     Furnace TEXT REFERENCES Furnace_Master(Furnace),
+    Crucible_no TEXT REFERENCES Crucible_Master(Crucible_no),
     Melt_No INTEGER,
     Heat_no TEXT,
     Melting_team TEXT,
@@ -743,6 +751,7 @@ def init_db() -> None:
                 ("Bottom_Sample_datetime", "TEXT"),
                 ("Production_supervisor", "TEXT"),
                 ("Vacum_Sample", "TEXT"),
+                ("Crucible_no", "TEXT REFERENCES Crucible_Master(Crucible_no)"),
             ],
         )
         _ensure_columns(
@@ -859,6 +868,9 @@ def init_db() -> None:
         _ensure_finished_goods_status(conn)
         _ensure_finished_goods_release_trigger(conn)
         _ensure_vacum_sample_check(conn)
+        _ensure_crucible_status(conn)
+        _ensure_one_available_crucible(conn)
+        _ensure_case_insensitive_text_pks(conn)
 
 
 def _ensure_purchase_order_status(conn: Connection) -> None:
@@ -893,6 +905,166 @@ def _ensure_purchase_order_status(conn: Connection) -> None:
     else:
         # SQLite: table-level CHECK is only on CREATE; column already has DEFAULT.
         pass
+
+
+def _ensure_crucible_status(conn: Connection) -> None:
+    """Enforce Crucible_status ∈ Available / Damaged and map older values."""
+    _exec(
+        conn,
+        """
+        UPDATE Crucible_Master
+        SET Crucible_status = CASE
+            WHEN Crucible_status IN ('Available', 'Damaged') THEN Crucible_status
+            WHEN Crucible_status IN ('Inactive', 'Damaged') THEN 'Damaged'
+            ELSE 'Available'
+        END
+        """,
+    )
+    if not IS_POSTGRES:
+        return
+    rows = list(
+        _exec(
+            conn,
+            """
+            SELECT conname, pg_get_constraintdef(oid) AS def
+            FROM pg_constraint
+            WHERE conrelid = 'crucible_master'::regclass
+              AND contype = 'c'
+              AND position(
+                    'crucible_status' IN lower(pg_get_constraintdef(oid))
+                  ) > 0
+            """,
+        ).mappings()
+    )
+    if any(
+        "Available" in (r["def"] or "") and "Damaged" in (r["def"] or "")
+        for r in rows
+    ):
+        return
+    for row in rows:
+        _exec(
+            conn,
+            f'ALTER TABLE Crucible_Master DROP CONSTRAINT "{row["conname"]}"',
+        )
+    _exec(
+        conn,
+        """
+        ALTER TABLE Crucible_Master
+        ADD CONSTRAINT crucible_master_crucible_status_check
+        CHECK (Crucible_status IN ('Available', 'Damaged'))
+        """,
+    )
+
+
+def _ensure_one_available_crucible(conn: Connection) -> None:
+    """A furnace may have only one Available crucible at a time."""
+    _exec(
+        conn,
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS crucible_master_one_available_per_furnace
+        ON Crucible_Master (furnace)
+        WHERE Crucible_status = 'Available'
+        """,
+    )
+
+
+# TEXT columns that participate in a PRIMARY KEY. True = fold case with LOWER().
+_TEXT_PK_CI: list[tuple[str, list[tuple[str, bool]]]] = [
+    ("Customer_Master", [("Cust_code", True)]),
+    ("ISRI_CODE_TABLE", [("ISRI_CODE", True)]),
+    ("Raw_Material_Master", [("Raw_Material_Name", True), ("Effective_date", True)]),
+    (
+        "Raw_Material_Spec",
+        [("Raw_Material_Name", True), ("Lot_id", False), ("Element_symbol", True)],
+    ),
+    ("Furnace_Master", [("Furnace", True)]),
+    ("Crucible_Master", [("Crucible_no", True)]),
+    ("Melter_Master", [("Melter_Name", True)]),
+    ("Trolley_Master", [("Trolley_name", True)]),
+    ("State_City_Master", [("State", True), ("City", True)]),
+    ("Month_code", [("Month", True)]),
+    ("Access_matrix", [("ID", True)]),
+    ("Production_supervisor", [("Production_supervisor", True)]),
+    ("Production_batch", [("Batch_ID", True)]),
+    (
+        "batch_input",
+        [
+            ("Batch_ID", True),
+            ("Raw_Material_Name", True),
+            ("Lot_id", False),
+            ("Charge_time", True),
+        ],
+    ),
+    ("Batch_Chemical_Composition", [("Batch_ID", True), ("Element_symbol", True)]),
+    ("Build_of_Material", [("BOMID", False), ("Effective_date", True)]),
+    ("Purchase_Order", [("Customer_PO_No", True), ("Alloy_Id", False)]),
+    ("Alloy_Master_spec", [("Alloy_id", False), ("Element_symbol", True)]),
+]
+
+
+def _text_pk_column_names(table: str) -> set[str]:
+    key = table.lower()
+    for name, parts in _TEXT_PK_CI:
+        if name.lower() == key:
+            return {col.lower() for col, fold in parts if fold}
+    return set()
+
+
+def _ci_group_sql(parts: list[tuple[str, bool]]) -> str:
+    return ", ".join(f"LOWER({col})" if fold else col for col, fold in parts)
+
+
+def _ensure_case_insensitive_text_pks(conn: Connection) -> None:
+    """TEXT primary keys treat letter case as the same value (C-01 == c-01)."""
+    id_col = "ctid" if IS_POSTGRES else "rowid"
+    for table, parts in _TEXT_PK_CI:
+        group_sql = _ci_group_sql(parts)
+        index_name = f"{table.lower()}_text_pk_ci"
+        try:
+            nested = conn.begin_nested()
+            try:
+                _exec(
+                    conn,
+                    f"""
+                    DELETE FROM {table}
+                    WHERE {id_col} NOT IN (
+                        SELECT MIN({id_col}) FROM {table} GROUP BY {group_sql}
+                    )
+                    """,
+                )
+                nested.commit()
+            except Exception:
+                nested.rollback()
+        except Exception:
+            pass
+        try:
+            nested = conn.begin_nested()
+            try:
+                _exec(
+                    conn,
+                    f"""
+                    CREATE UNIQUE INDEX IF NOT EXISTS {index_name}
+                    ON {table} ({group_sql})
+                    """,
+                )
+                nested.commit()
+            except Exception:
+                nested.rollback()
+        except Exception:
+            pass
+
+
+def existing_text_key(table: str, column: str, value: Any) -> str:
+    """Strip a TEXT key and reuse the stored spelling if a case-insensitive match exists."""
+    text = "" if value is None else str(value).strip()
+    if not text:
+        return text
+    row = fetch_one(
+        f'SELECT {column} AS "k" FROM {table} WHERE LOWER({column}) = LOWER(?)',
+        (text,),
+    )
+    stored = (row or {}).get("k")
+    return str(stored) if stored not in (None, "") else text
 
 
 def _ensure_vacum_sample_check(conn: Connection) -> None:
@@ -1332,6 +1504,14 @@ EDITABLE_TABLES: list[dict[str, Any]] = [
         "allow_add": True,
     },
     {
+        "key": "crucible_master",
+        "label": "Crucibles",
+        "pk": ["crucible_no"],
+        "order_by": "crucible_no",
+        "identity": [],
+        "allow_add": True,
+    },
+    {
         "key": "melter_master",
         "label": "Melters",
         "pk": ["melter_name"],
@@ -1484,6 +1664,10 @@ def save_table_edits(
                 row[stamp_by] = by_val
             if stamp_dt:
                 row[stamp_dt] = dt_val
+            text_pk = _text_pk_column_names(resolved)
+            for col in pk_cols:
+                if col.lower() in text_pk and row.get(col) not in (None, ""):
+                    row[col] = existing_text_key(resolved, col, row[col])
             key = _row_key(row, pk_cols)
             is_new = key not in original_map or any(v is None for v in key)
 
@@ -1677,6 +1861,60 @@ def list_furnaces(active_only: bool = True) -> list[str]:
     return [r["Furnace"] for r in fetch_all(sql)]
 
 
+def list_crucibles(
+    furnace: Optional[str] = None,
+    status: Optional[str] = None,
+) -> list[dict[str, Any]]:
+    sql = """
+        SELECT Crucible_no AS "Crucible_no", furnace AS "furnace",
+               Crucible_status AS "Crucible_status",
+               Vendor_name AS "Vendor_name"
+        FROM Crucible_Master
+    """
+    params: list[Any] = []
+    clauses: list[str] = []
+    if furnace:
+        clauses.append("LOWER(furnace) = LOWER(?)")
+        params.append(furnace)
+    if status:
+        clauses.append("Crucible_status = ?")
+        params.append(status)
+    if clauses:
+        sql += " WHERE " + " AND ".join(clauses)
+    sql += " ORDER BY furnace, Crucible_no"
+    return fetch_all(sql, params)
+
+
+def get_available_crucible(furnace: str) -> Optional[dict[str, Any]]:
+    """Return the Available crucible for a furnace, if any."""
+    if not furnace:
+        return None
+    rows = list_crucibles(furnace=furnace, status="Available")
+    return rows[0] if rows else None
+
+
+def require_available_crucible(furnace: str) -> str:
+    """Return the Available Crucible_no for a furnace, or raise."""
+    current = get_available_crucible(furnace)
+    if not current:
+        raise ValueError(
+            "No crucible available for the respective furnace."
+        )
+    return str(current["Crucible_no"])
+
+
+def _require_single_available(furnace: Optional[str], crucible_no: str) -> None:
+    if not furnace:
+        return
+    current = get_available_crucible(furnace)
+    if current and str(current["Crucible_no"]).casefold() != str(crucible_no).casefold():
+        raise ValueError(
+            f"Furnace {furnace} already has Available crucible "
+            f"{current['Crucible_no']}. Mark that one Damaged before "
+            "making another Available."
+        )
+
+
 def list_melters(active_only: bool = True) -> list[str]:
     sql = 'SELECT Melter_Name AS "Melter_Name" FROM Melter_Master'
     if active_only:
@@ -1849,6 +2087,10 @@ def list_inventory_lots(
 
 def upsert_customer(data: dict[str, Any]) -> None:
     """Insert or update a customer keyed on Cust_code."""
+    data = dict(data)
+    data["Cust_code"] = existing_text_key(
+        "Customer_Master", "Cust_code", data.get("Cust_code")
+    )
     by_val, dt_val = audit_stamp()
     execute(
         """
@@ -1968,6 +2210,8 @@ def add_raw_material_master(
     cu: Optional[str] = None,
     mg: Optional[str] = None,
 ) -> None:
+    name = existing_text_key("Raw_Material_Master", "Raw_Material_Name", name)
+    effective_date = (effective_date or "").strip()
     by_val, dt_val = audit_stamp()
     execute(
         """
@@ -2217,6 +2461,7 @@ def add_alloy(
 # ---------- Furnace ----------
 
 def upsert_furnace(name: str, status: str) -> None:
+    name = existing_text_key("Furnace_Master", "Furnace", name)
     execute(
         """
         INSERT INTO Furnace_Master (Furnace, Status) VALUES (?, ?)
@@ -2226,7 +2471,69 @@ def upsert_furnace(name: str, status: str) -> None:
     )
 
 
+def upsert_crucible(
+    crucible_no: str,
+    furnace: Optional[str],
+    crucible_status: str,
+    vendor_name: Optional[str],
+) -> None:
+    crucible_no = existing_text_key("Crucible_Master", "Crucible_no", crucible_no)
+    if furnace:
+        furnace = existing_text_key("Furnace_Master", "Furnace", furnace)
+    if vendor_name:
+        vendor_name = existing_text_key("Vendor_Master", "Vendor_name", vendor_name)
+    if crucible_status not in CRUCIBLE_STATUS:
+        raise ValueError(f"Crucible_status must be one of {CRUCIBLE_STATUS}.")
+    if crucible_status == "Available":
+        _require_single_available(furnace, crucible_no)
+    execute(
+        """
+        INSERT INTO Crucible_Master
+            (Crucible_no, furnace, Crucible_status, Vendor_name)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(Crucible_no) DO UPDATE SET
+            furnace = excluded.furnace,
+            Crucible_status = excluded.Crucible_status,
+            Vendor_name = excluded.Vendor_name
+        """,
+        (crucible_no, furnace, crucible_status, vendor_name),
+    )
+
+
+def update_crucible_status(crucible_no: str, status: str) -> None:
+    if status not in CRUCIBLE_STATUS:
+        raise ValueError(f"Crucible_status must be one of {CRUCIBLE_STATUS}.")
+    crucible_no = existing_text_key("Crucible_Master", "Crucible_no", crucible_no)
+    if status == "Available":
+        row = fetch_one(
+            """
+            SELECT furnace AS "furnace"
+            FROM Crucible_Master
+            WHERE LOWER(Crucible_no) = LOWER(?)
+            """,
+            (crucible_no,),
+        )
+        furnace = (row or {}).get("furnace")
+        _require_single_available(furnace, crucible_no)
+    execute(
+        """
+        UPDATE Crucible_Master
+        SET Crucible_status = ?
+        WHERE LOWER(Crucible_no) = LOWER(?)
+        """,
+        (status, crucible_no),
+    )
+
+
+def delete_crucible(crucible_no: str) -> None:
+    execute(
+        "DELETE FROM Crucible_Master WHERE LOWER(Crucible_no) = LOWER(?)",
+        (crucible_no,),
+    )
+
+
 def upsert_melter(name: str, status: str) -> None:
+    name = existing_text_key("Melter_Master", "Melter_Name", name)
     by_val, dt_val = audit_stamp()
     execute(
         """
@@ -2248,6 +2555,7 @@ def upsert_trolley(
     weight: Optional[float],
     status: str,
 ) -> None:
+    name = existing_text_key("Trolley_Master", "Trolley_name", name)
     by_val, dt_val = audit_stamp()
     execute(
         """
@@ -2331,6 +2639,7 @@ def create_batch(
                 f"Production supervisor '{production_supervisor}' is not in Production_supervisor."
             )
 
+    crucible_no = require_available_crucible(furnace)
     total_weight = sum(float(i["Weight"]) for i in inputs)
 
     with get_connection() as conn:
@@ -2338,14 +2647,14 @@ def create_batch(
             conn,
             """
             INSERT INTO Production_batch
-                (Batch_ID, Alloy_id, Production_Date, Shift, Furnace, Melt_No,
+                (Batch_ID, Alloy_id, Production_Date, Shift, Furnace, Crucible_no, Melt_No,
                  Heat_no, Melting_team, Output_Weight, Notes, Production_status, Workflow_stage,
                  Degassing_time, Sampled_pcs, Defect_pcs,
                  Top_Sample, Middle_Sample, Bottom_Sample, Vacum_Sample,
                  Top_Sample_Remarks, Middle_Sample_Remarks, Bottom_Sample_Remarks,
                  Top_Sample_datetime, Middle_Sample_datetime, Bottom_Sample_datetime,
                  Production_supervisor)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'Pending QA', 'Raw Material',
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'Pending QA', 'Raw Material',
                     ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
@@ -2354,6 +2663,7 @@ def create_batch(
                 production_date,
                 shift,
                 furnace,
+                crucible_no,
                 melt_no,
                 str(heat_no),
                 melting_team,
@@ -2559,7 +2869,8 @@ def assign_finished_goods_bundle(bundle_id: int) -> None:
 _BATCH_COLUMNS = """
     Batch_ID AS "Batch_ID", Alloy_id AS "Alloy_id",
     Production_Date AS "Production_Date", Shift AS "Shift",
-    Furnace AS "Furnace", Melt_No AS "Melt_No", Heat_no AS "Heat_no",
+    Furnace AS "Furnace", Crucible_no AS "Crucible_no",
+    Melt_No AS "Melt_No", Heat_no AS "Heat_no",
     Melting_team AS "Melting_team", Output_Weight AS "Output_Weight",
     Output_pieces AS "Output_pieces",
     Notes AS "Notes", Production_status AS "Production_status",
@@ -2618,7 +2929,8 @@ def list_batches() -> list[dict[str, Any]]:
     return fetch_all(
         """
         SELECT b.Batch_ID AS "Batch_ID", b.Production_Date AS "Production_Date",
-               b.Furnace AS "Furnace", b.Heat_no AS "Heat_no", b.Melt_No AS "Melt_No",
+               b.Furnace AS "Furnace", b.Crucible_no AS "Crucible_no",
+               b.Heat_no AS "Heat_no", b.Melt_No AS "Melt_No",
                b.Shift AS "Shift", b.Output_Weight AS "Output_Weight",
                b.Output_pieces AS "Output_pieces",
                b.Production_status AS "Production_status",
@@ -2756,7 +3068,9 @@ def _purchase_order_status(data: dict[str, Any]) -> str:
 
 
 def _purchase_order_header(data: dict[str, Any]) -> tuple[str, str]:
-    po_no = (data.get("Customer_PO_No") or "").strip()
+    po_no = existing_text_key(
+        "Purchase_Order", "Customer_PO_No", data.get("Customer_PO_No")
+    )
     if not po_no:
         raise ValueError("Customer PO No is required.")
     if not data.get("Cust_code"):

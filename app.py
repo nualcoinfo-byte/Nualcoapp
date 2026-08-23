@@ -326,6 +326,7 @@ PAGE = st.sidebar.radio(
         "Raw Material Master",
         "Alloys",
         "Furnaces",
+        "Crucibles",
         "Melters",
         "Trolleys",
         "Bill of Materials",
@@ -693,7 +694,19 @@ elif PAGE == "Production Batch & Chemistry":
     else:
         col1, col2, col3 = st.columns(3)
         with col1:
-            furnace = st.selectbox("Furnace *", furnaces)
+            furnace = st.selectbox("Furnace *", furnaces, key="batch_furnace")
+            available_crucible = (
+                db.get_available_crucible(furnace) if furnace else None
+            )
+            if available_crucible:
+                crucible_no = str(available_crucible["Crucible_no"])
+                st.markdown("**Crucible no**")
+                st.info(crucible_no)
+            else:
+                st.markdown("**Crucible no**")
+                st.error(
+                    "No crucible available for the respective furnace."
+                )
             heat_no = st.selectbox("Heat no *", db.HEAT_NOS)
             melt_no = st.selectbox("Melt no", db.MELT_NOS)
         with col2:
@@ -1182,8 +1195,14 @@ elif PAGE == "Production Batch & Chemistry":
         def _sample_or_none(v: str) -> str | None:
             return None if v == sample_blank else v
 
-        if st.button("Create production batch", type="primary"):
-            if not charge_inputs:
+        if st.button(
+            "Create production batch",
+            type="primary",
+            disabled=available_crucible is None,
+        ):
+            if available_crucible is None:
+                st.error("No crucible available for the respective furnace.")
+            elif not charge_inputs:
                 st.error("Add at least one charge line with weight > 0.")
             else:
                 try:
@@ -1271,11 +1290,12 @@ elif PAGE == "Production Workflow Tracker":
         selected = st.selectbox("Select Batch ID", batch_ids)
         batch = db.get_batch(selected)
         if batch:
-            m1, m2, m3, m4 = st.columns(4)
+            m1, m2, m3, m4, m5 = st.columns(5)
             m1.metric("Batch ID", batch["Batch_ID"])
             m2.metric("Furnace", batch["Furnace"])
-            m3.metric("Heat No", batch["Heat_no"])
-            m4.metric("Output kg", f"{batch['Output_Weight'] or 0:,.1f}")
+            m3.metric("Crucible", batch.get("Crucible_no") or "—")
+            m4.metric("Heat No", batch["Heat_no"])
+            m5.metric("Output kg", f"{batch['Output_Weight'] or 0:,.1f}")
 
             st.markdown(
                 f"**Current stage:** `{batch['Workflow_stage']}` &nbsp;|&nbsp; "
@@ -1965,6 +1985,114 @@ elif PAGE == "Furnaces":
         use_container_width=True,
         hide_index=True,
     )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Crucibles
+# ═══════════════════════════════════════════════════════════════════════════════
+elif PAGE == "Crucibles":
+    st.title("Crucible Master")
+    st.caption(
+        "Add or delete crucibles for a furnace, and set each crucible to "
+        "**Available** or **Damaged**. A furnace can have only one "
+        "**Available** crucible at a time."
+    )
+    furnaces = db.list_furnaces()
+    vendors = db.list_suppliers()
+    if not furnaces:
+        st.warning("Add at least one furnace under **Furnaces** before managing crucibles.")
+    if not vendors:
+        st.warning("Add at least one vendor under **Vendors** if you want to record the supplier.")
+
+    furnace = st.selectbox(
+        "Furnace *",
+        furnaces,
+        key="crucible_furnace",
+        disabled=not furnaces,
+        help="All add, status, and delete actions apply to this furnace.",
+    )
+
+    available = db.get_available_crucible(furnace) if furnace else None
+    if available:
+        st.info(
+            f"Available on furnace **{furnace}**: **{available['Crucible_no']}**. "
+            "Mark it Damaged before another crucible can be Available."
+        )
+    elif furnace:
+        st.info(f"No Available crucible on furnace **{furnace}** yet.")
+
+    st.markdown("#### Add crucible")
+    add_default = "Damaged" if available else "Available"
+    with st.form("crucible_add_form", clear_on_submit=True):
+        a1, a2, a3 = st.columns(3)
+        with a1:
+            cno = st.text_input("Crucible no *", placeholder="e.g. C-01")
+        with a2:
+            vendor_name = st.selectbox("Vendor name", [""] + vendors)
+        with a3:
+            cstatus = st.selectbox(
+                "Crucible status",
+                db.CRUCIBLE_STATUS,
+                index=db.CRUCIBLE_STATUS.index(add_default),
+            )
+        if st.form_submit_button("Add crucible", type="primary"):
+            if not furnace:
+                st.error("Select a furnace first.")
+            elif not cno.strip():
+                st.error("Crucible no is required.")
+            else:
+                try:
+                    db.upsert_crucible(
+                        cno.strip(),
+                        furnace,
+                        cstatus,
+                        vendor_name or None,
+                    )
+                    st.success(f"Added crucible **{cno.strip()}** to furnace **{furnace}**.")
+                    st.rerun()
+                except Exception as exc:
+                    st.error(f"Could not add crucible: {exc}")
+
+    st.markdown(f"#### Crucibles on furnace {furnace or '—'}")
+    rows = db.list_crucibles(furnace=furnace) if furnace else []
+    if not rows:
+        st.info("No crucibles for this furnace yet.")
+    else:
+        h1, h2, h3, h4, h5 = st.columns([2, 3, 2, 1.4, 1.2])
+        h1.caption("Crucible no")
+        h2.caption("Vendor")
+        h3.caption("Status")
+        h4.caption("Update")
+        h5.caption("Delete")
+        for row in rows:
+            cno_val = str(row["Crucible_no"])
+            current = str(row["Crucible_status"] or db.CRUCIBLE_STATUS[0])
+            if current not in db.CRUCIBLE_STATUS:
+                current = db.CRUCIBLE_STATUS[0]
+            r1, r2, r3, r4, r5 = st.columns([2, 3, 2, 1.4, 1.2])
+            r1.markdown(f"**{cno_val}**")
+            r2.markdown(row["Vendor_name"] or "—")
+            new_status = r3.selectbox(
+                "Status",
+                db.CRUCIBLE_STATUS,
+                index=db.CRUCIBLE_STATUS.index(current),
+                key=f"cstat_{furnace}_{cno_val}",
+                label_visibility="collapsed",
+            )
+            if r4.button("Update", key=f"cupd_{furnace}_{cno_val}", use_container_width=True):
+                try:
+                    db.update_crucible_status(cno_val, new_status)
+                    st.success(f"Updated **{cno_val}** to **{new_status}**.")
+                    st.rerun()
+                except Exception as exc:
+                    st.error(f"Could not update status: {exc}")
+            if r5.button("Delete", key=f"cdel_{furnace}_{cno_val}", use_container_width=True):
+                try:
+                    db.delete_crucible(cno_val)
+                    st.success(f"Deleted crucible **{cno_val}**.")
+                    st.rerun()
+                except Exception as exc:
+                    st.error(f"Could not delete crucible: {exc}")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -2833,16 +2961,17 @@ elif PAGE == "Masters Overview":
             | 7 | Alloy_Master | Alloys |
             | 8 | Alloy_Master_spec | Alloy min/max % |
             | 9 | Furnace_Master | Furnaces (1–4 seeded) |
-            | 10 | Melter_Master | Melter operators |
-            | 11 | Trolley_Master | Trolleys (name, colour, weight) |
-            | 12 | State_City_Master | States and cities |
-            | 13 | Production_batch | Melts / heats |
-            | 14 | batch_input | Charge sheets |
-            | 15 | Batch_Chemical_Composition | Ladle chemistry |
-            | 16 | Build_of_Material | BOM |
-            | 17 | Purchase_Order | Customer POs + attached PO document (PDF/Word/Excel); key is Customer_PO_No + Alloy_Id |
-            | 18 | ISRI_CODE_TABLE | ISRI scrap specification codes |
-            | 19 | Finished_Goods_Inventory | Bundles (Under_Testing → Available → Assigned / Dispatched / Rejected) |
+            | 10 | Crucible_Master | Crucibles (Crucible_no PK; furnace and Vendor_name FKs) |
+            | 11 | Melter_Master | Melter operators |
+            | 12 | Trolley_Master | Trolleys (name, colour, weight) |
+            | 13 | State_City_Master | States and cities |
+            | 14 | Production_batch | Melts / heats |
+            | 15 | batch_input | Charge sheets |
+            | 16 | Batch_Chemical_Composition | Ladle chemistry |
+            | 17 | Build_of_Material | BOM |
+            | 18 | Purchase_Order | Customer POs + attached PO document (PDF/Word/Excel); key is Customer_PO_No + Alloy_Id |
+            | 19 | ISRI_CODE_TABLE | ISRI scrap specification codes |
+            | 20 | Finished_Goods_Inventory | Bundles (Under_Testing → Available → Assigned / Dispatched / Rejected) |
 
             Extra production columns: `Workflow_stage`, sample fields, `Production_supervisor`.
             """
