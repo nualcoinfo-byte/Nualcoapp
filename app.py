@@ -559,18 +559,6 @@ elif PAGE == "Raw Material Logging":
         st.session_state.rm_log_token = 0
     line_token = st.session_state.rm_log_token
 
-    add_col, rem_col, _ = st.columns([1, 1, 4])
-    if add_col.button("Add raw material", key="rm_log_add_line"):
-        st.session_state.rm_invoice_lines.append(
-            {"name": "", "cost": 0.0, "weight": 0.0}
-        )
-        st.rerun()
-    if rem_col.button("Remove last row", key="rm_log_rem_line") and len(
-        st.session_state.rm_invoice_lines
-    ) > 1:
-        st.session_state.rm_invoice_lines.pop()
-        st.rerun()
-
     collected_lines: list[dict] = []
     for idx, _line in enumerate(st.session_state.rm_invoice_lines):
         st.markdown(f"**Row {idx + 1}**")
@@ -623,6 +611,18 @@ elif PAGE == "Raw Material Logging":
     t3.metric("Invoice value", f"{total_value:,.2f}")
     t4.metric("GST value (18%)", f"{gst_value:,.2f}")
     t5.metric("Total value", f"{grand_total:,.2f}")
+
+    add_col, rem_col, _ = st.columns([1, 1, 4])
+    if add_col.button("Add raw material", key="rm_log_add_line"):
+        st.session_state.rm_invoice_lines.append(
+            {"name": "", "cost": 0.0, "weight": 0.0}
+        )
+        st.rerun()
+    if rem_col.button("Remove last row", key="rm_log_rem_line") and len(
+        st.session_state.rm_invoice_lines
+    ) > 1:
+        st.session_state.rm_invoice_lines.pop()
+        st.rerun()
 
     submitted = st.button("Save invoice lots", type="primary", key="rm_log_save")
 
@@ -934,16 +934,6 @@ elif PAGE == "Production Batch & Chemistry":
                 {"material": "", "lot_id": None, "weight": 0.0, "notes": ""}
             ]
 
-        add_col, rem_col, _ = st.columns([1, 1, 4])
-        if add_col.button("Add charge line"):
-            st.session_state.charge_lines.append(
-                {"material": "", "lot_id": None, "weight": 0.0, "notes": ""}
-            )
-            st.rerun()
-        if rem_col.button("Remove last line") and len(st.session_state.charge_lines) > 1:
-            st.session_state.charge_lines.pop()
-            st.rerun()
-
         if not trolleys:
             st.error("Define at least one active trolley under **Trolleys**.")
 
@@ -1163,6 +1153,16 @@ elif PAGE == "Production Batch & Chemistry":
                         "Charge_time": datetime.now().isoformat(timespec="seconds"),
                     }
                 )
+
+        add_col, rem_col, _ = st.columns([1, 1, 4])
+        if add_col.button("Add charge line"):
+            st.session_state.charge_lines.append(
+                {"material": "", "lot_id": None, "weight": 0.0, "notes": ""}
+            )
+            st.rerun()
+        if rem_col.button("Remove last line") and len(st.session_state.charge_lines) > 1:
+            st.session_state.charge_lines.pop()
+            st.rerun()
 
         total_in = sum(c["Weight"] for c in charge_inputs)
         st.info(f"Total net input weight: **{total_in:,.2f} kg** across {len(charge_inputs)} charge line(s).")
