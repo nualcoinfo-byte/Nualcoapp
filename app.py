@@ -226,32 +226,28 @@ def dialog_all_element_specs(
         f"(Serial_no {db.OTHER_SPEC_SERIAL_MIN}–{db.OTHER_SPEC_SERIAL_MAX}). "
         "Click **Apply & close** to use these ranges on Create alloy."
     )
-    values: dict[str, tuple[float, float]] = {}
+    values: dict[str, tuple[float | None, float | None]] = {}
     for el in elements:
         sym = el["Element_Symbol"]
-        prev = stored.get(sym) or (0.0, 0.0)
+        prev = stored.get(sym) or (None, None)
         try:
-            prev_min, prev_max = float(prev[0] or 0.0), float(prev[1] or 0.0)
+            prev_min, prev_max = prev[0], prev[1]
         except (TypeError, IndexError, ValueError):
-            prev_min, prev_max = 0.0, 0.0
+            prev_min, prev_max = None, None
         c1, c2, c3 = st.columns([1.2, 2, 2])
         c1.markdown(f"**{sym}**")
-        mn = c2.number_input(
-            f"{sym} min",
-            min_value=0.0,
-            max_value=100.0,
-            value=prev_min,
-            step=0.01,
-            key=f"{state_key}_dlg_min_{sym}",
-        )
-        mx = c3.number_input(
-            f"{sym} max",
-            min_value=0.0,
-            max_value=100.0,
-            value=prev_max,
-            step=0.01,
-            key=f"{state_key}_dlg_max_{sym}",
-        )
+        with c2:
+            mn = empty_percent_input(
+                f"{sym} min",
+                key=f"{state_key}_dlg_min_{sym}",
+                default=prev_min,
+            )
+        with c3:
+            mx = empty_percent_input(
+                f"{sym} max",
+                key=f"{state_key}_dlg_max_{sym}",
+                default=prev_max,
+            )
         values[sym] = (mn, mx)
 
     b1, b2 = st.columns(2)
@@ -260,15 +256,21 @@ def dialog_all_element_specs(
     with b2:
         cancel = st.button("Cancel", use_container_width=True)
     if apply:
-        st.session_state[state_key] = values
+        st.session_state[state_key] = {
+            sym: (_optional_percent(mn), _optional_percent(mx))
+            for sym, (mn, mx) in values.items()
+            if _optional_percent(mn) or _optional_percent(mx)
+        }
         if sync_min_keys:
             for sym, widget_key in sync_min_keys.items():
-                if sym in values:
-                    st.session_state[widget_key] = float(values[sym][0])
+                st.session_state[widget_key] = _optional_percent(
+                    (values.get(sym) or (None, None))[0]
+                )
         if sync_max_keys:
             for sym, widget_key in sync_max_keys.items():
-                if sym in values:
-                    st.session_state[widget_key] = float(values[sym][1])
+                st.session_state[widget_key] = _optional_percent(
+                    (values.get(sym) or (None, None))[1]
+                )
         st.rerun()
     if cancel:
         st.rerun()
@@ -559,20 +561,18 @@ elif PAGE == "Raw Material Logging":
                     key=f"rm_line_name_{line_token}_{idx}",
                 )
         with n2:
-            cost = st.number_input(
+            cost = empty_percent_input(
                 "Cost per kg",
-                min_value=0.0,
-                value=0.0,
-                step=0.01,
                 key=f"rm_line_cost_{line_token}_{idx}",
+                max_value=None,
+                step=0.01,
             )
         with n3:
-            weight = st.number_input(
+            weight = empty_percent_input(
                 "Received weight (kg) *",
-                min_value=0.0,
-                value=0.0,
-                step=1.0,
                 key=f"rm_line_weight_{line_token}_{idx}",
+                max_value=None,
+                step=1.0,
             )
         collected_lines.append(
             {
@@ -1937,20 +1937,29 @@ elif PAGE == "Alloys":
     specs: dict[str, tuple[float | None, float | None]] = {}
     for el in entry_elements:
         sym = el["Element_Symbol"]
-        prev = full_specs.get(sym) or (0.0, 0.0)
+        prev = full_specs.get(sym) or (None, None)
         try:
-            dmin, dmax = float(prev[0] or 0.0), float(prev[1] or 0.0)
+            dmin, dmax = prev[0], prev[1]
         except (TypeError, IndexError, ValueError):
-            dmin, dmax = 0.0, 0.0
+            dmin, dmax = None, None
         sc1, sc2, sc3 = st.columns([1, 2, 2])
         sc1.markdown(f"**{sym}**")
-        mn = sc2.number_input(
-            f"{sym} min", 0.0, 100.0, dmin, 0.01, key=f"amin_{sym}"
+        with sc2:
+            mn = empty_percent_input(
+                f"{sym} min",
+                key=f"amin_{sym}",
+                default=dmin,
+            )
+        with sc3:
+            mx = empty_percent_input(
+                f"{sym} max",
+                key=f"amax_{sym}",
+                default=dmax,
+            )
+        specs[sym] = (
+            mn if mn and mn > 0 else None,
+            mx if mx and mx > 0 else None,
         )
-        mx = sc3.number_input(
-            f"{sym} max", 0.0, 100.0, dmax, 0.01, key=f"amax_{sym}"
-        )
-        specs[sym] = (mn if mn > 0 else None, mx if mx > 0 else None)
 
     ab1, ab2 = st.columns([2, 3])
     with ab1:
