@@ -137,6 +137,10 @@ def _optional_percent(value: object) -> float | None:
     return num if num > 0 else None
 
 
+CHEM_PERCENT_STEP = 0.0001
+CHEM_PERCENT_FORMAT = "%.4f"
+
+
 def empty_percent_input(
     label: str,
     *,
@@ -147,6 +151,7 @@ def empty_percent_input(
     step: float = 0.01,
     help: str | None = None,
     disabled: bool = False,
+    format: str | None = None,
 ) -> float | None:
     """Number input that starts blank instead of 0.00."""
     if key in st.session_state:
@@ -165,6 +170,8 @@ def empty_percent_input(
     }
     if max_value is not None:
         kwargs["max_value"] = max_value
+    if format:
+        kwargs["format"] = format
     return st.number_input(label, **kwargs)
 
 
@@ -173,14 +180,19 @@ def dialog_all_element_percentages(
     state_key: str,
     defaults: dict[str, float] | None = None,
     sync_keys: dict[str, str] | None = None,
+    elements: list[dict] | None = None,
+    caption: str | None = None,
 ) -> None:
-    """Popup to enter percentages for every Element_Master row."""
+    """Popup to enter percentages for Element_Master rows."""
     defaults = defaults or {}
     stored = st.session_state.get(state_key) or {}
-    elements = db.list_elements()
+    elements = elements if elements is not None else db.list_elements()
     st.caption(
-        f"Enter assay / chemistry % for all **{len(elements)}** elements "
-        "in Element_Master (Serial_no order). Click **Apply & close** to use these values."
+        caption
+        or (
+            f"Enter assay / chemistry % for all **{len(elements)}** elements "
+            "in Element_Master (Serial_no order). Click **Apply & close** to use these values."
+        )
     )
     values: dict[str, float | None] = {}
     cols = st.columns(4)
@@ -191,7 +203,8 @@ def dialog_all_element_percentages(
                 f"{sym} %",
                 key=f"{state_key}_dlg_{sym}",
                 default=stored.get(sym, defaults.get(sym)),
-                step=0.001,
+                step=CHEM_PERCENT_STEP,
+                format=CHEM_PERCENT_FORMAT,
                 help=el["Element_Name"],
             )
     b1, b2 = st.columns(2)
@@ -274,6 +287,27 @@ def dialog_all_element_specs(
         st.rerun()
     if cancel:
         st.rerun()
+
+
+def _parse_master_date(value: object) -> date:
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    text = str(value or "")[:10]
+    try:
+        return date.fromisoformat(text)
+    except ValueError:
+        return date.today()
+
+
+def _option_label(options: dict, value: object) -> str:
+    if value in (None, ""):
+        return ""
+    for label, stored in options.items():
+        if stored == value or str(stored) == str(value):
+            return label
+    return ""
 
 
 def merge_percent_composition(
@@ -648,19 +682,20 @@ elif PAGE == "Raw Material Logging":
                 doc_type = getattr(invoice_doc, "type", None) if invoice_doc else None
                 lot_ids: list[int] = []
                 for ln in complete:
-                    if ln["name"] not in existing_materials:
-                        db.add_raw_material_master(
+                    material_name = db.find_raw_material_name(ln["name"])
+                    if not material_name:
+                        material_name = db.add_raw_material_master(
                             name=ln["name"],
                             effective_date=invoice_date.isoformat(),
                             vendor_code=vendor_code,
-                            alloy_family="",
                             availability_class=db.RAW_MATERIAL_AVAILABILITY[0],
                             recovery=None,
                             status="Active",
                             cost_per_kg=ln["cost"],
+                            create_new=True,
                         )
                     lot_id = db.add_inventory_lot(
-                        material=ln["name"],
+                        material=material_name,
                         vendor_code=vendor_code,
                         invoice=invoice_no,
                         received_date=received.isoformat(),
@@ -698,7 +733,7 @@ elif PAGE == "Raw Material Logging":
 elif PAGE == "Raw Material Inventory":
     st.title("Raw Material Inventory")
     st.caption(
-        "Review recent lots and lot chemistry. "
+        "Review recent lots and the grade specification from **Raw Material Spec**. "
         "New receipts are entered on **Raw Material Logging**."
     )
 
@@ -735,13 +770,14 @@ elif PAGE == "Raw Material Inventory":
     if lot_pick > 0:
         chem = db.get_lot_chemistry(int(lot_pick))
         if chem:
+            st.caption("Specification from **Raw Material Spec** for this lot's grade.")
             st.dataframe(
                 pd.DataFrame([{"Element": k, "Percentage": v} for k, v in chem.items()]),
                 use_container_width=True,
                 hide_index=True,
             )
         else:
-            st.warning("No chemistry recorded for that lot.")
+            st.warning("No specification recorded for this lot's raw material grade.")
         vehicle_photo = db.get_inventory_vehicle_photo(int(lot_pick))
         if vehicle_photo:
             st.markdown("**Vehicle photo**")
@@ -1262,6 +1298,8 @@ elif PAGE == "Production Batch & Chemistry":
                         f"{sym} %",
                         key=f"bchem_{sym}",
                         default=full_batch.get(sym),
+                        step=CHEM_PERCENT_STEP,
+                        format=CHEM_PERCENT_FORMAT,
                         help=el["Element_Name"],
                     )
                 entered = float(batch_chem[sym] or 0.0)
@@ -1828,9 +1866,9 @@ elif PAGE == "Vendors":
 elif PAGE == "Raw Material Master":
     st.title("Raw Material Master")
     st.caption(
-        "Enter material grades used when logging inventory lots. "
-        "The same **name + effective date** updates the existing row. "
-        "Receive lots under **Raw Material Logging**."
+        "Modify an existing raw material or add a new name. "
+        "New names are checked for duplicates without regard to letter case. "
+        "A new grade also needs a specification stored in **Raw_Material_Spec**."
     )
 
     vendors = db.list_vendors()
@@ -1841,81 +1879,241 @@ elif PAGE == "Raw Material Master":
         f"{c['ISRI_CODE']} — {c['Description']}": c["ISRI_CODE"]
         for c in db.list_isri_codes()
     }
+    existing_names = db.list_raw_materials(active_only=False)
+    entry_elements = db.list_raw_material_spec_elements(entry_only=True)
     if not vendors:
         st.warning("Add at least one vendor under **Vendors** before saving a grade.")
 
-    c1, c2 = st.columns(2)
-    with c1:
+    action = st.radio(
+        "What do you want to do?",
+        ["Modify existing raw material", "Add new raw material"],
+        horizontal=True,
+        key="rmm_action",
+    )
+    is_modify = action.startswith("Modify")
+    prefix = "rmm_mod" if is_modify else "rmm_add"
+    full_spec_key = f"{prefix}_full_spec"
+    spec_defaults = db.omit_raw_material_spec_hidden(
+        st.session_state.get(full_spec_key) or {}
+    )
+
+    if is_modify:
+        if not existing_names:
+            st.info("No raw materials in the database yet. Choose **Add new raw material**.")
+            rm_name = ""
+        else:
+            rm_name = st.selectbox(
+                "Raw material name *",
+                options=existing_names,
+                key="rmm_existing_name",
+                help="Only names already stored in the database can be modified.",
+            )
+            row = db.get_raw_material_master(rm_name) or {}
+            stored_availability = row.get("Availability_class")
+            stale_availability = bool(
+                stored_availability
+                and st.session_state.get("rmm_mod_availability") != stored_availability
+                and stored_availability not in db.RAW_MATERIAL_AVAILABILITY
+            )
+            if rm_name and (
+                rm_name != st.session_state.get("rmm_loaded_name") or stale_availability
+            ):
+                loaded_spec = db.get_raw_material_master_spec(
+                    rm_name, row.get("Effective_date")
+                )
+                st.session_state["rmm_loaded_name"] = rm_name
+                st.session_state["rmm_mod_isri"] = _option_label(
+                    isri_opts, row.get("ISRI_CODE")
+                )
+                availability = row.get("Availability_class")
+                st.session_state["rmm_mod_availability"] = availability or db.RAW_MATERIAL_AVAILABILITY[0]
+                st.session_state["rmm_mod_vendor"] = _option_label(
+                    vendor_opts, row.get("Vendor_code")
+                )
+                st.session_state["rmm_mod_effective"] = _parse_master_date(
+                    row.get("Effective_date")
+                )
+                st.session_state["rmm_mod_recovery"] = _optional_percent(
+                    row.get("Recovery")
+                )
+                st.session_state["rmm_mod_cost"] = _optional_percent(
+                    row.get("Cost_per_kg")
+                )
+                status = row.get("Status")
+                st.session_state["rmm_mod_status"] = (
+                    status if status in db.ACTIVE_STATUS else db.ACTIVE_STATUS[0]
+                )
+                st.session_state[full_spec_key] = loaded_spec
+                for el in entry_elements:
+                    sym = el["Element_Symbol"]
+                    st.session_state[f"{prefix}_spec_{sym}"] = _optional_percent(
+                        loaded_spec.get(sym)
+                    )
+                st.rerun()
+    else:
         rm_name = st.text_input(
             "Raw material name *",
             placeholder="e.g. Tense, Taint/Tabor, UBC, Pure Al",
-            key="rmm_name",
-        )
-        isri_label = st.selectbox(
-            "ISRI code", options=[""] + list(isri_opts.keys()), key="rmm_isri"
-        )
-        alloy_family = st.text_input(
-            "Alloy family", placeholder="e.g. Al-Si", key="rmm_alloy_family"
-        )
-        availability = st.selectbox(
-            "Availability class",
-            db.RAW_MATERIAL_AVAILABILITY,
-            key="rmm_availability",
-        )
-        fe_level = st.selectbox("Fe", [""] + db.ELEMENT_LEVEL, key="rmm_fe")
-        cu_level = st.selectbox("Cu", [""] + db.ELEMENT_LEVEL, key="rmm_cu")
-        mg_level = st.selectbox("Mg", [""] + db.ELEMENT_LEVEL, key="rmm_mg")
-    with c2:
-        vendor_label = st.selectbox(
-            "Vendor", options=[""] + list(vendor_opts.keys()), key="rmm_vendor"
-        )
-        effective = st.date_input(
-            "Effective date *", value=date.today(), key="rmm_effective"
-        )
-        recovery = st.number_input(
-            "Expected recovery %", 0.0, 100.0, 95.0, 0.1, key="rmm_recovery"
-        )
-        cost = st.number_input(
-            "Cost per kg", min_value=0.0, value=0.0, step=0.01, key="rmm_cost"
-        )
-        rm_status = st.selectbox("Status", db.ACTIVE_STATUS, key="rmm_status")
-        photo = st.file_uploader(
-            "Photo", type=["png", "jpg", "jpeg", "webp"], key="rmm_photo"
+            key="rmm_add_name",
         )
 
-    if st.button("Save raw material", type="primary", key="rmm_save"):
-        name_clean = (rm_name or "").strip()
-        if not name_clean:
-            st.error("Raw material name is required.")
+    show_form = bool(rm_name) if is_modify else True
+    if show_form:
+        availability_opts = list(db.RAW_MATERIAL_AVAILABILITY)
+        current_availability = st.session_state.get(f"{prefix}_availability")
+        if current_availability and current_availability not in availability_opts:
+            availability_opts = [current_availability] + availability_opts
+        c1, c2 = st.columns(2)
+        with c1:
+            isri_label = st.selectbox(
+                "ISRI code",
+                options=[""] + list(isri_opts.keys()),
+                key=f"{prefix}_isri",
+            )
+            availability = st.selectbox(
+                "Availability class",
+                availability_opts,
+                key=f"{prefix}_availability",
+            )
+        with c2:
+            vendor_label = st.selectbox(
+                "Vendor",
+                options=[""] + list(vendor_opts.keys()),
+                key=f"{prefix}_vendor",
+            )
+            effective = st.date_input(
+                "Effective date *",
+                key=f"{prefix}_effective",
+            )
+            recovery = empty_percent_input(
+                "Expected recovery %",
+                key=f"{prefix}_recovery",
+                step=0.1,
+            )
+            cost = empty_percent_input(
+                "Cost per kg",
+                key=f"{prefix}_cost",
+                max_value=None,
+                step=0.01,
+            )
+            rm_status = st.selectbox(
+                "Status", db.ACTIVE_STATUS, key=f"{prefix}_status"
+            )
+            photo = st.file_uploader(
+                "Photo",
+                type=["png", "jpg", "jpeg", "webp"],
+                key=f"{prefix}_photo",
+            )
+
+        st.markdown("#### Raw material specification (%)")
+        if is_modify:
+            st.caption(
+                "Master-grade chemistry stored in **Raw_Material_Spec** "
+                "(name + effective date). Update the percentages below if needed."
+            )
         else:
-            try:
-                db.add_raw_material_master(
-                    name=name_clean,
-                    effective_date=effective.isoformat(),
-                    vendor_code=vendor_opts[vendor_label] if vendor_label else None,
-                    alloy_family=alloy_family.strip(),
-                    availability_class=availability,
-                    recovery=recovery,
-                    status=rm_status,
-                    cost_per_kg=cost,
-                    photo=photo_bytes(photo),
-                    isri_code=isri_opts[isri_label] if isri_label else None,
-                    fe=fe_level or None,
-                    cu=cu_level or None,
-                    mg=mg_level or None,
+            st.caption(
+                "Required for a new raw material. Values are stored in "
+                "**Raw_Material_Spec** as the grade specification."
+            )
+
+        spec_values: dict[str, float | None] = {}
+        spec_cols = st.columns(6)
+        for i, el in enumerate(entry_elements):
+            sym = el["Element_Symbol"]
+            with spec_cols[i % 6]:
+                spec_values[sym] = empty_percent_input(
+                    f"{sym} %",
+                    key=f"{prefix}_spec_{sym}",
+                    default=spec_defaults.get(sym),
+                    step=CHEM_PERCENT_STEP,
+                    format=CHEM_PERCENT_FORMAT,
+                    help=el["Element_Name"],
                 )
-                st.success(
-                    f"Saved raw material **{name_clean}** "
-                    f"(effective {effective.isoformat()})."
+
+        sync_spec = {
+            el["Element_Symbol"]: f"{prefix}_spec_{el['Element_Symbol']}"
+            for el in entry_elements
+        }
+        all_spec_elements = db.list_raw_material_spec_elements()
+        sb1, sb2 = st.columns([2, 3])
+        with sb1:
+            if st.button(
+                "Open all elements",
+                key=f"{prefix}_open_spec",
+                use_container_width=True,
+            ):
+                dialog_all_element_percentages(
+                    full_spec_key,
+                    defaults=spec_defaults,
+                    sync_keys=sync_spec,
+                    elements=all_spec_elements,
+                    caption=(
+                        f"Enter specification % for **{len(all_spec_elements)}** "
+                        "elements. **OE**, **OT**, and **SF** are not used on raw material specs. "
+                        "Click **Apply & close** to use these values."
+                    ),
                 )
-                st.cache_data.clear()
-            except Exception as exc:
-                st.error(f"Could not save: {exc}")
+        with sb2:
+            extra_n = len(
+                [
+                    1
+                    for sym, val in spec_defaults.items()
+                    if _optional_percent(val)
+                    and sym not in spec_values
+                ]
+            )
+            if extra_n:
+                st.caption(f"Other element percentages applied ({extra_n}).")
+
+        save_label = "Update raw material" if is_modify else "Add raw material"
+        if st.button(save_label, type="primary", key=f"{prefix}_save"):
+            name_clean = (rm_name or "").strip()
+            composition = merge_percent_composition(spec_values, full_spec_key)
+            if not name_clean:
+                st.error("Raw material name is required.")
+            elif not is_modify and (existing := db.find_raw_material_name(name_clean)):
+                st.error(
+                    f"A raw material named **{existing}** already exists. "
+                    "Names are not case-sensitive."
+                )
+            elif not is_modify and not composition:
+                st.error(
+                    "Enter at least one specification percentage for the new raw material."
+                )
+            else:
+                try:
+                    saved_name = db.add_raw_material_master(
+                        name=name_clean,
+                        effective_date=effective.isoformat(),
+                        vendor_code=vendor_opts[vendor_label] if vendor_label else None,
+                        availability_class=availability,
+                        recovery=recovery,
+                        status=rm_status,
+                        cost_per_kg=cost if cost is not None else 0.0,
+                        photo=photo_bytes(photo),
+                        isri_code=isri_opts[isri_label] if isri_label else None,
+                        create_new=not is_modify,
+                    )
+                    db.set_raw_material_master_spec(
+                        saved_name, composition, effective.isoformat()
+                    )
+                    verb = "Updated" if is_modify else "Added"
+                    st.success(
+                        f"{verb} raw material **{saved_name}** "
+                        f"(effective {effective.isoformat()})."
+                    )
+                    st.session_state.pop(full_spec_key, None)
+                    if is_modify:
+                        st.session_state["rmm_loaded_name"] = None
+                    st.cache_data.clear()
+                except Exception as exc:
+                    st.error(f"Could not save: {exc}")
 
     rows = db.list_raw_material_master()
     st.subheader(f"Raw material grades ({len(rows)})")
     if not rows:
-        st.info("No raw material grades yet. Save one using the form above.")
+        st.info("No raw material grades yet. Add one using the form above.")
     else:
         st.dataframe(
             df_from_rows(rows),
@@ -2839,6 +3037,18 @@ elif PAGE == "Data Browser":
 
     rows = db.load_editable_table(table_key, order_by=meta["order_by"])
     full_df = df_from_rows(rows)
+    if table_key == "raw_material_spec" and not full_df.empty:
+        sym_col = next(
+            (c for c in full_df.columns if c.lower() == "element_symbol"),
+            None,
+        )
+        if sym_col:
+            full_df = full_df[
+                ~full_df[sym_col]
+                .astype(str)
+                .str.upper()
+                .isin(db.RAW_MATERIAL_SPEC_HIDDEN_SYMBOLS)
+            ].copy()
 
     with t2:
         search = st.text_input(
@@ -2915,7 +3125,14 @@ elif PAGE == "Data Browser":
         disabled = [c for c in pk_cols if c in filter_df.columns]
         column_config = {}
         for c in filter_df.columns:
-            if filter_df[c].dtype == object:
+            if (
+                c.lower() == "percentage"
+                and table_key in {"raw_material_spec", "batch_chemical_composition"}
+            ):
+                column_config[c] = st.column_config.NumberColumn(
+                    c, format="%.4f", step=CHEM_PERCENT_STEP
+                )
+            elif filter_df[c].dtype == object:
                 # Keep text columns as text (avoid Streamlit guessing badly)
                 column_config[c] = st.column_config.TextColumn(c)
 
@@ -3031,17 +3248,25 @@ elif PAGE == "Masters Overview":
             hide_index=True,
         )
     with tab3:
+        st.caption(
+            "Each specification row belongs to a **Raw Material Master** grade "
+            "(name + effective date)."
+        )
         st.dataframe(
             df_from_rows(
                 db.fetch_all(
                     """
                     SELECT s.Raw_Material_Name AS "Raw_Material_Name",
-                           s.Lot_id AS "Lot_id",
+                           s.Effective_date AS "Effective_date",
                            s.Element_symbol AS "Element_symbol",
                            s.Percentage AS "Percentage"
                     FROM Raw_Material_Spec s
                     LEFT JOIN Element_Master _el ON _el.Element_Symbol = s.Element_symbol
-                    ORDER BY s.Lot_id DESC, COALESCE(_el.Serial_no, 9999), s.Element_symbol
+                    WHERE LOWER(s.Element_symbol) NOT IN ('oe', 'ot', 'sf')
+                    ORDER BY s.Raw_Material_Name,
+                             s.Effective_date DESC,
+                             COALESCE(_el.Serial_no, 9999),
+                             s.Element_symbol
                     LIMIT 200
                     """
                 )
@@ -3060,7 +3285,7 @@ elif PAGE == "Masters Overview":
             | 2 | Vendor_Master | Vendors (auto-serial Vendor_code PK) |
             | 3 | Element_Master | 36 chemistry elements (seeded) |
             | 4 | Raw_Material_Master | Material grades |
-            | 5 | Raw_Material_Spec | Lot chemistry |
+            | 5 | Raw_Material_Spec | Grade chemistry (child of Raw_Material_Master) |
             | 6 | Raw_Material_Inventory | Lots / stock (includes Vehicle_photo) |
             | 7 | Alloy_Master | Alloys |
             | 8 | Alloy_Master_spec | Alloy min/max % |
