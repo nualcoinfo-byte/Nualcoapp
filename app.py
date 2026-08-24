@@ -539,6 +539,7 @@ PAGE = st.sidebar.radio(
         "Production Batch & Chemistry",
         "Production Batches",
         "Furnace Oil Consumption",
+        "Electricity Consumption",
         "Production Workflow Tracker",
         "Material Recovery & Yield",
         "Finished Goods Inventory",
@@ -609,17 +610,20 @@ if PAGE == "Dashboard":
         lots = db.list_inventory_lots()
         alloys = db.list_alloys()
         oil_stock = db.get_furnace_oil_stock()
+        elec_month = db.electricity_month_totals(date.today().year, date.today().month)
     except Exception as exc:
         _show_db_connection_error(exc)
         batches, materials, lots, alloys = [], [], [], []
         oil_stock = 0.0
+        elec_month = {"consumed": 0.0}
 
-    c1, c2, c3, c4, c5 = st.columns(5)
+    c1, c2, c3, c4, c5, c6 = st.columns(6)
     c1.metric("Batches", len(batches))
     c2.metric("Raw materials", len(materials))
     c3.metric("Active lots", len(lots))
     c4.metric("Alloys", len(alloys))
     c5.metric("Furnace oil (L)", f"{oil_stock:,.1f}")
+    c6.metric("Electricity this month", f"{elec_month['consumed']:,.1f}")
 
     st.subheader("Recent production batches")
     bdf = df_from_rows(batches)
@@ -1801,6 +1805,126 @@ elif PAGE == "Furnace Oil Consumption":
         st.info("No consumption entries yet.")
     else:
         show_dataframe(used)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Electricity Consumption
+# ═══════════════════════════════════════════════════════════════════════════════
+elif PAGE == "Electricity Consumption":
+    st.title("Electricity Consumption")
+    st.caption(
+        "Enter the day's **opening** and **closing** power readings. "
+        "Units consumed = closing reading − opening reading. "
+        "Today's opening reading is filled from the previous day's closing reading. "
+        "Saving the same date updates that day's row."
+    )
+
+    month_tot = db.electricity_month_totals(date.today().year, date.today().month)
+    latest = db.list_electricity_consumption(limit=1)
+    last_close = latest[0]["Closing_reading"] if latest else None
+    m1, m2, m3 = st.columns(3)
+    m1.metric("This month (units)", f"{month_tot['consumed']:,.1f}")
+    m2.metric(
+        "Last closing reading",
+        f"{float(last_close):,.1f}" if last_close is not None else "—",
+    )
+    m3.metric("Unit", "kWh / meter units")
+
+    cons_date = ui_date_input(
+        "Consumption date *", value=date.today(), key="elec_date"
+    )
+    day = cons_date.isoformat()
+    existing = db.get_electricity_consumption(day)
+    prev_close = db.get_previous_electricity_closing(day)
+    if st.session_state.get("elec_loaded_day") != day:
+        st.session_state["elec_loaded_day"] = day
+        if existing:
+            st.session_state["elec_open"] = float(existing["Opening_reading"])
+            st.session_state["elec_close"] = float(existing["Closing_reading"])
+            st.session_state["elec_notes"] = existing.get("Notes") or ""
+        else:
+            st.session_state["elec_open"] = (
+                float(prev_close) if prev_close is not None else None
+            )
+            st.session_state["elec_close"] = None
+            st.session_state["elec_notes"] = ""
+
+    r1, r2 = st.columns(2)
+    with r1:
+        opening = empty_percent_input(
+            "Opening power reading *",
+            key="elec_open",
+            max_value=None,
+            step=0.1,
+            format="%.1f",
+            help=(
+                f"Filled from previous closing ({float(prev_close):,.1f})."
+                if prev_close is not None and not existing
+                else "Meter reading at the start of the day."
+            ),
+        )
+    with r2:
+        closing = empty_percent_input(
+            "Closing power reading *",
+            key="elec_close",
+            max_value=None,
+            step=0.1,
+            format="%.1f",
+            help="Meter reading at the end of the day.",
+        )
+    notes = st.text_input("Notes", key="elec_notes")
+
+    try:
+        open_val = float(opening) if opening is not None else None
+        close_val = float(closing) if closing is not None else None
+    except (TypeError, ValueError):
+        open_val = close_val = None
+    units = (
+        close_val - open_val
+        if open_val is not None and close_val is not None
+        else None
+    )
+    u1, u2, u3 = st.columns(3)
+    u1.metric("Opening", f"{open_val:,.1f}" if open_val is not None else "—")
+    u2.metric("Closing", f"{close_val:,.1f}" if close_val is not None else "—")
+    if units is None:
+        u3.metric("Units consumed", "—")
+    elif units < 0:
+        u3.metric("Units consumed", f"{units:,.1f}")
+        st.error("Closing reading must be greater than or equal to the opening reading.")
+    else:
+        u3.metric("Units consumed", f"{units:,.1f}")
+
+    if st.button("Save electricity reading", type="primary", key="elec_save"):
+        if open_val is None:
+            st.error("Enter the opening power reading.")
+        elif close_val is None:
+            st.error("Enter the closing power reading.")
+        else:
+            try:
+                saved_units = db.add_electricity_consumption(
+                    consumption_date=day,
+                    opening_reading=open_val,
+                    closing_reading=close_val,
+                    notes=notes.strip() or None,
+                )
+                st.success(
+                    f"Saved **{saved_units:,.1f} units** for {format_ui_date(cons_date)} "
+                    f"(opening {open_val:,.1f} → closing {close_val:,.1f})."
+                )
+                st.rerun()
+            except Exception as exc:
+                st.error(f"Could not save: {exc}")
+
+    st.subheader("Daily readings")
+    rows = df_from_rows(db.list_electricity_consumption())
+    if rows.empty:
+        st.info("No electricity readings yet.")
+    else:
+        for col in ("Opening_reading", "Closing_reading", "Units_consumed"):
+            if col in rows.columns:
+                rows[col] = pd.to_numeric(rows[col], errors="coerce").round(1)
+        show_dataframe(rows)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -3669,6 +3793,7 @@ elif PAGE == "Masters Overview":
             | 21 | Furnace_Oil_Purchase | Furnace oil receipts and opening stock |
             | 22 | Furnace_Oil_Consumption | Daily furnace oil use (one row per day) |
             | 23 | Furnace_Oil_Inventory | Daily opening / purchase / consumption / closing ledger |
+            | 24 | Electricity_Consumption | Daily opening/closing power readings and units consumed |
 
             Extra production columns: `Workflow_stage`, sample fields, `Production_supervisor`.
             """

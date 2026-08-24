@@ -713,6 +713,15 @@ CREATE TABLE IF NOT EXISTS Furnace_Oil_Inventory (
     Last_updated_by TEXT,
     Last_updated_datetime TEXT
 );
+CREATE TABLE IF NOT EXISTS Electricity_Consumption (
+    Consumption_date TEXT PRIMARY KEY,
+    Opening_reading {float} NOT NULL,
+    Closing_reading {float} NOT NULL,
+    Units_consumed {float} NOT NULL,
+    Notes TEXT,
+    Last_updated_by TEXT,
+    Last_updated_datetime TEXT
+);
 CREATE TABLE IF NOT EXISTS Alloy_Data_Checker (
     Customer_Name TEXT,
     alloy_family TEXT,
@@ -1389,6 +1398,7 @@ _TEXT_PK_CI: list[tuple[str, list[tuple[str, bool]]]] = [
     ("Alloy_Master_spec", [("Alloy_id", False), ("Element_symbol", True)]),
     ("Furnace_Oil_Consumption", [("Consumption_date", True)]),
     ("Furnace_Oil_Inventory", [("Inventory_date", True)]),
+    ("Electricity_Consumption", [("Consumption_date", True)]),
 ]
 
 
@@ -1988,6 +1998,14 @@ EDITABLE_TABLES: list[dict[str, Any]] = [
         "order_by": "inventory_date",
         "identity": [],
         "allow_add": False,
+    },
+    {
+        "key": "electricity_consumption",
+        "label": "Electricity consumption",
+        "pk": ["consumption_date"],
+        "order_by": "consumption_date",
+        "identity": [],
+        "allow_add": True,
     },
 ]
 
@@ -4099,6 +4117,119 @@ def furnace_oil_month_totals(year: int, month: int) -> dict[str, float]:
         "purchased": float((purchased or {}).get("qty") or 0),
         "consumed": float((used or {}).get("qty") or 0),
     }
+
+
+# ---------- Electricity ----------
+
+def get_electricity_consumption(consumption_date: str) -> Optional[dict[str, Any]]:
+    day = _as_effective_date(consumption_date)
+    if not day:
+        return None
+    return fetch_one(
+        """
+        SELECT Consumption_date AS "Consumption_date",
+               Opening_reading AS "Opening_reading",
+               Closing_reading AS "Closing_reading",
+               Units_consumed AS "Units_consumed",
+               Notes AS "Notes"
+        FROM Electricity_Consumption
+        WHERE Consumption_date = ?
+        """,
+        (day,),
+    )
+
+
+def get_previous_electricity_closing(consumption_date: str) -> Optional[float]:
+    """Latest closing reading before this date, used as today's opening."""
+    day = _as_effective_date(consumption_date)
+    if not day:
+        return None
+    row = fetch_one(
+        """
+        SELECT Closing_reading AS "Closing_reading"
+        FROM Electricity_Consumption
+        WHERE Consumption_date < ?
+        ORDER BY Consumption_date DESC
+        LIMIT 1
+        """,
+        (day,),
+    )
+    if not row:
+        return None
+    try:
+        return float(row.get("Closing_reading"))
+    except (TypeError, ValueError):
+        return None
+
+
+def list_electricity_consumption(limit: int = 60) -> list[dict[str, Any]]:
+    return fetch_all(
+        """
+        SELECT Consumption_date AS "Consumption_date",
+               Opening_reading AS "Opening_reading",
+               Closing_reading AS "Closing_reading",
+               Units_consumed AS "Units_consumed",
+               Notes AS "Notes"
+        FROM Electricity_Consumption
+        ORDER BY Consumption_date DESC
+        LIMIT ?
+        """,
+        (limit,),
+    )
+
+
+def electricity_month_totals(year: int, month: int) -> dict[str, float]:
+    prefix = f"{year:04d}-{month:02d}"
+    row = fetch_one(
+        """
+        SELECT COALESCE(SUM(Units_consumed), 0) AS "qty"
+        FROM Electricity_Consumption
+        WHERE Consumption_date LIKE ?
+        """,
+        (f"{prefix}%",),
+    )
+    return {"consumed": float((row or {}).get("qty") or 0)}
+
+
+def add_electricity_consumption(
+    consumption_date: str,
+    opening_reading: float,
+    closing_reading: float,
+    notes: Optional[str] = None,
+) -> float:
+    day = _as_effective_date(consumption_date)
+    if not day:
+        raise ValueError("Consumption date is required.")
+    try:
+        opening = round(float(opening_reading), 1)
+        closing = round(float(closing_reading), 1)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Opening and closing power readings are required.") from exc
+    if opening < 0 or closing < 0:
+        raise ValueError("Power readings cannot be negative.")
+    units = round(closing - opening, 1)
+    if units < 0:
+        raise ValueError(
+            "Closing reading must be greater than or equal to the opening reading."
+        )
+    by_val, dt_val = audit_stamp()
+    execute(
+        """
+        INSERT INTO Electricity_Consumption
+            (Consumption_date, Opening_reading, Closing_reading, Units_consumed,
+             Notes, Last_updated_by, Last_updated_datetime)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(Consumption_date) DO UPDATE SET
+            Opening_reading=excluded.Opening_reading,
+            Closing_reading=excluded.Closing_reading,
+            Units_consumed=excluded.Units_consumed,
+            Notes=excluded.Notes,
+            Last_updated_by=excluded.Last_updated_by,
+            Last_updated_datetime=excluded.Last_updated_datetime
+        """,
+        (day, opening, closing, units, (notes or "").strip() or None, by_val, dt_val),
+    )
+    return units
 
 
 # ---------- BOM ----------
