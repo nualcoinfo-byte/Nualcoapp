@@ -389,6 +389,10 @@ MELT_NOS = [1, 2, 3, 4, 5, 6, 7, 9]
 HEAT_NOS = list(range(1, 13))
 YIELD_TARGET_PCT = 70.0
 
+ELECTRICITY_LINE_1 = "EB Line 1"
+ELECTRICITY_LINE_2 = "EB Line 2"
+ELECTRICITY_LINES = (ELECTRICITY_LINE_1, ELECTRICITY_LINE_2)
+
 # Tables that track who/when last changed a row.
 AUDIT_TABLES = {
     "alloy_master",
@@ -401,6 +405,7 @@ AUDIT_TABLES = {
     "vendor_master",
     "raw_material_master",
     "raw_material_spec",
+    "raw_material_purchase",
 }
 _ACTING_USER: str = "system"
 
@@ -477,23 +482,29 @@ CREATE TABLE IF NOT EXISTS Raw_Material_Master (
     Last_updated_datetime TEXT,
     PRIMARY KEY (Raw_Material_Name, Effective_date)
 );
-CREATE TABLE IF NOT EXISTS Raw_Material_Inventory (
-    Lot_id {autopk},
-    Raw_Material_Name TEXT NOT NULL,
+CREATE TABLE IF NOT EXISTS Raw_Material_Purchase (
+    Purchase_id {autopk},
     Vendor_code INTEGER REFERENCES Vendor_Master(Vendor_code),
     Supplier_Invoice TEXT,
     Supplier_invoice_date TEXT,
     Received_date TEXT,
+    Invoice_Document {blob},
+    Invoice_Document_name TEXT,
+    Invoice_Document_type TEXT,
+    Vehicle_photo {blob},
+    Last_updated_by TEXT,
+    Last_updated_datetime TEXT
+);
+CREATE TABLE IF NOT EXISTS Raw_Material_Inventory (
+    Lot_id {autopk},
+    Purchase_id INTEGER NOT NULL REFERENCES Raw_Material_Purchase(Purchase_id),
+    Raw_Material_Name TEXT NOT NULL,
     Received_weight {float},
     Remaining_Weight {float},
     Storage_bay TEXT,
     Raw_Material_Status TEXT DEFAULT 'Awaiting Assay',
     Photo {blob},
-    Vehicle_photo {blob},
-    Cost_per_kg {float},
-    Invoice_Document {blob},
-    Invoice_Document_name TEXT,
-    Invoice_Document_type TEXT
+    Cost_per_kg {float}
 );
 CREATE TABLE IF NOT EXISTS Raw_Material_Spec (
     Raw_Material_Name TEXT NOT NULL,
@@ -714,13 +725,15 @@ CREATE TABLE IF NOT EXISTS Furnace_Oil_Inventory (
     Last_updated_datetime TEXT
 );
 CREATE TABLE IF NOT EXISTS Electricity_Consumption (
-    Consumption_date TEXT PRIMARY KEY,
+    Consumption_date TEXT NOT NULL,
+    Line TEXT NOT NULL,
     Opening_reading {float} NOT NULL,
     Closing_reading {float} NOT NULL,
     Units_consumed {float} NOT NULL,
     Notes TEXT,
     Last_updated_by TEXT,
-    Last_updated_datetime TEXT
+    Last_updated_datetime TEXT,
+    PRIMARY KEY (Consumption_date, Line)
 );
 CREATE TABLE IF NOT EXISTS Alloy_Data_Checker (
     Customer_Name TEXT,
@@ -844,10 +857,7 @@ def init_db() -> None:
             conn,
             "Raw_Material_Inventory",
             [
-                ("Invoice_Document", "BYTEA" if IS_POSTGRES else "BLOB"),
-                ("Invoice_Document_name", "TEXT"),
-                ("Invoice_Document_type", "TEXT"),
-                ("Vehicle_photo", "BYTEA" if IS_POSTGRES else "BLOB"),
+                ("Cost_per_kg", "DOUBLE PRECISION" if IS_POSTGRES else "REAL"),
             ],
         )
         _drop_columns(
@@ -870,6 +880,7 @@ def init_db() -> None:
             "Vendor_Master",
             "Raw_Material_Master",
             "Raw_Material_Spec",
+            "Raw_Material_Purchase",
         ):
             _ensure_columns(conn, table, _audit_cols)
         if not IS_POSTGRES:
@@ -885,7 +896,6 @@ def init_db() -> None:
                 conn,
                 "Raw_Material_Inventory",
                 [
-                    ("Supplier_invoice_date", "TEXT"),
                     ("Cost_per_kg", "REAL"),
                 ],
             )
@@ -937,7 +947,9 @@ def init_db() -> None:
             ],
         )
         _ensure_furnace_oil_consumption_daily(conn)
+        _ensure_electricity_consumption_lines(conn)
         _ensure_raw_material_spec_as_master_child(conn)
+        _ensure_raw_material_purchase_header(conn)
         _ensure_case_insensitive_text_pks(conn)
         _ensure_percentage_4dp(conn)
 
@@ -1118,6 +1130,183 @@ def _ensure_raw_material_spec_as_master_child(conn: Connection) -> None:
         _exec(conn, "ALTER TABLE Raw_Material_Spec__new RENAME TO Raw_Material_Spec")
 
 
+def _table_column_names(conn: Connection, table: str) -> set[str]:
+    """Lowercase column names for a table, or empty if it does not exist."""
+    if IS_POSTGRES:
+        rows = list(
+            _exec(
+                conn,
+                """
+                SELECT column_name
+                FROM information_schema.columns
+                WHERE table_schema = current_schema()
+                  AND table_name = ?
+                """,
+                (table.lower(),),
+            ).mappings()
+        )
+        return {str(row["column_name"]).lower() for row in rows}
+    rows = list(_exec(conn, f"PRAGMA table_info({table})").mappings())
+    return {str(row["name"]).lower() for row in rows}
+
+
+_INVENTORY_INVOICE_COLUMNS = (
+    "Vendor_code",
+    "Supplier_Invoice",
+    "Supplier_invoice_date",
+    "Received_date",
+    "Vehicle_photo",
+    "Invoice_Document",
+    "Invoice_Document_name",
+    "Invoice_Document_type",
+)
+
+
+def _ensure_raw_material_purchase_header(conn: Connection) -> None:
+    """Move invoice documents off inventory lots onto Raw_Material_Purchase."""
+    inv_cols = _table_column_names(conn, "Raw_Material_Inventory")
+    if not inv_cols:
+        return
+    if "purchase_id" not in inv_cols:
+        fk_type = (
+            "INTEGER REFERENCES Raw_Material_Purchase(Purchase_id)"
+            if not IS_POSTGRES
+            else "INTEGER"
+        )
+        _exec(conn, f"ALTER TABLE Raw_Material_Inventory ADD COLUMN Purchase_id {fk_type}")
+        inv_cols = _table_column_names(conn, "Raw_Material_Inventory")
+
+    has_legacy = any(col.lower() in inv_cols for col in _INVENTORY_INVOICE_COLUMNS)
+    if has_legacy:
+        select_cols = [
+            'Lot_id AS "Lot_id"',
+            'Raw_Material_Name AS "Raw_Material_Name"',
+        ]
+        for col, alias in (
+            ("vendor_code", "Vendor_code"),
+            ("supplier_invoice", "Supplier_Invoice"),
+            ("supplier_invoice_date", "Supplier_invoice_date"),
+            ("received_date", "Received_date"),
+            ("invoice_document", "Invoice_Document"),
+            ("invoice_document_name", "Invoice_Document_name"),
+            ("invoice_document_type", "Invoice_Document_type"),
+            ("vehicle_photo", "Vehicle_photo"),
+        ):
+            if col.lower() in inv_cols:
+                select_cols.append(f'{alias} AS "{alias}"')
+        lots = list(
+            _exec(
+                conn,
+                f"""
+                SELECT {", ".join(select_cols)}
+                FROM Raw_Material_Inventory
+                WHERE Purchase_id IS NULL
+                ORDER BY Lot_id
+                """,
+            ).mappings()
+        )
+        groups: dict[tuple[Any, ...], list[dict[str, Any]]] = {}
+        for lot in lots:
+            invoice = str(lot.get("Supplier_Invoice") or "").strip()
+            vendor = lot.get("Vendor_code")
+            if invoice:
+                key: tuple[Any, ...] = ("invoice", vendor, invoice.lower())
+            else:
+                key = ("lot", lot["Lot_id"])
+            groups.setdefault(key, []).append(dict(lot))
+
+        def _first(rows: list[dict[str, Any]], field: str) -> Any:
+            for row in rows:
+                value = row.get(field)
+                if value not in (None, ""):
+                    return value
+            return None
+
+        by_val, dt_val = audit_stamp()
+        for grouped in groups.values():
+            result = _exec(
+                conn,
+                """
+                INSERT INTO Raw_Material_Purchase
+                    (Vendor_code, Supplier_Invoice, Supplier_invoice_date,
+                     Received_date, Invoice_Document, Invoice_Document_name,
+                     Invoice_Document_type, Vehicle_photo,
+                     Last_updated_by, Last_updated_datetime)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                RETURNING Purchase_id
+                """,
+                (
+                    _first(grouped, "Vendor_code"),
+                    _first(grouped, "Supplier_Invoice"),
+                    _first(grouped, "Supplier_invoice_date"),
+                    _first(grouped, "Received_date"),
+                    _first(grouped, "Invoice_Document"),
+                    _first(grouped, "Invoice_Document_name"),
+                    _first(grouped, "Invoice_Document_type"),
+                    _first(grouped, "Vehicle_photo"),
+                    by_val,
+                    dt_val,
+                ),
+            )
+            purchase_id = int(result.scalar_one())
+            lot_ids = [int(row["Lot_id"]) for row in grouped]
+            placeholders = ", ".join("?" for _ in lot_ids)
+            _exec(
+                conn,
+                f"""
+                UPDATE Raw_Material_Inventory
+                SET Purchase_id = ?
+                WHERE Lot_id IN ({placeholders})
+                """,
+                tuple([purchase_id, *lot_ids]),
+            )
+
+        _drop_columns(conn, "Raw_Material_Inventory", list(_INVENTORY_INVOICE_COLUMNS))
+
+    if IS_POSTGRES:
+        leftover = _exec(
+            conn,
+            "SELECT COUNT(*) FROM raw_material_inventory WHERE purchase_id IS NULL",
+        ).scalar_one()
+        if int(leftover or 0) == 0:
+            def _try_ddl(sql: str) -> None:
+                _exec(conn, "SAVEPOINT rm_purchase_ddl")
+                try:
+                    _exec(conn, sql)
+                    _exec(conn, "RELEASE SAVEPOINT rm_purchase_ddl")
+                except Exception:
+                    _exec(conn, "ROLLBACK TO SAVEPOINT rm_purchase_ddl")
+
+            _try_ddl(
+                "ALTER TABLE raw_material_inventory ALTER COLUMN purchase_id SET NOT NULL"
+            )
+            has_fk = None
+            try:
+                has_fk = _exec(
+                    conn,
+                    """
+                    SELECT 1
+                    FROM pg_constraint c
+                    JOIN pg_attribute a
+                      ON a.attrelid = c.conrelid AND a.attnum = ANY (c.conkey)
+                    WHERE c.conrelid = 'raw_material_inventory'::regclass
+                      AND c.contype = 'f'
+                      AND a.attname = 'purchase_id'
+                    """,
+                ).first()
+            except Exception:
+                has_fk = True
+            if not has_fk:
+                _try_ddl(
+                    """
+                    ALTER TABLE raw_material_inventory
+                    ADD CONSTRAINT raw_material_inventory_purchase_fkey
+                    FOREIGN KEY (purchase_id)
+                    REFERENCES raw_material_purchase (purchase_id)
+                    """
+                )
+
+
 PERCENT_SCALE = 4
 PERCENT_4DP_TABLES = frozenset(
     {"raw_material_spec", "batch_chemical_composition", "alloy_master_spec"}
@@ -1243,6 +1432,112 @@ def _ensure_furnace_oil_consumption_daily(conn: Connection) -> None:
     _exec(
         conn,
         "ALTER TABLE Furnace_Oil_Consumption__daily RENAME TO Furnace_Oil_Consumption",
+    )
+
+
+def _electricity_consumption_pk_columns(conn: Connection) -> list[str]:
+    if IS_POSTGRES:
+        rows = list(
+            _exec(
+                conn,
+                """
+                SELECT a.attname AS name
+                FROM pg_index i
+                JOIN pg_attribute a
+                  ON a.attrelid = i.indrelid AND a.attnum = ANY (i.indkey)
+                WHERE i.indrelid = 'electricity_consumption'::regclass
+                  AND i.indisprimary
+                ORDER BY array_position(i.indkey, a.attnum)
+                """,
+            ).mappings()
+        )
+        return [str(row["name"]) for row in rows]
+    rows = list(_exec(conn, "PRAGMA table_info(Electricity_Consumption)").mappings())
+    return [str(row["name"]) for row in rows if row.get("pk")]
+
+
+def _ensure_electricity_consumption_lines(conn: Connection) -> None:
+    """Key daily readings on Consumption_date + Line (EB Line 1 / EB Line 2)."""
+    try:
+        pk_cols = _electricity_consumption_pk_columns(conn)
+    except Exception:
+        return
+    if not pk_cols:
+        return
+    normalized = [str(col).lower() for col in pk_cols]
+    if normalized == ["consumption_date", "line"]:
+        _exec(conn, "DROP INDEX IF EXISTS electricity_consumption_text_pk_ci")
+        return
+    line_default = ELECTRICITY_LINE_1
+    if IS_POSTGRES:
+        _exec(conn, "DROP INDEX IF EXISTS electricity_consumption_text_pk_ci")
+        _exec(
+            conn,
+            """
+            CREATE TABLE IF NOT EXISTS electricity_consumption__lines (
+                consumption_date TEXT NOT NULL,
+                line TEXT NOT NULL,
+                opening_reading DOUBLE PRECISION NOT NULL,
+                closing_reading DOUBLE PRECISION NOT NULL,
+                units_consumed DOUBLE PRECISION NOT NULL,
+                notes TEXT,
+                last_updated_by TEXT,
+                last_updated_datetime TEXT,
+                PRIMARY KEY (consumption_date, line)
+            )
+            """,
+        )
+        _exec(conn, "DELETE FROM electricity_consumption__lines")
+        _exec(
+            conn,
+            f"""
+            INSERT INTO electricity_consumption__lines
+                (consumption_date, line, opening_reading, closing_reading,
+                 units_consumed, notes, last_updated_by, last_updated_datetime)
+            SELECT consumption_date, '{line_default}', opening_reading, closing_reading,
+                   units_consumed, notes, last_updated_by, last_updated_datetime
+            FROM electricity_consumption
+            """,
+        )
+        _exec(conn, "DROP TABLE electricity_consumption")
+        _exec(
+            conn,
+            "ALTER TABLE electricity_consumption__lines RENAME TO electricity_consumption",
+        )
+        return
+    _exec(conn, "DROP INDEX IF EXISTS electricity_consumption_text_pk_ci")
+    _exec(
+        conn,
+        """
+        CREATE TABLE IF NOT EXISTS Electricity_Consumption__lines (
+            Consumption_date TEXT NOT NULL,
+            Line TEXT NOT NULL,
+            Opening_reading REAL NOT NULL,
+            Closing_reading REAL NOT NULL,
+            Units_consumed REAL NOT NULL,
+            Notes TEXT,
+            Last_updated_by TEXT,
+            Last_updated_datetime TEXT,
+            PRIMARY KEY (Consumption_date, Line)
+        )
+        """,
+    )
+    _exec(conn, "DELETE FROM Electricity_Consumption__lines")
+    _exec(
+        conn,
+        f"""
+        INSERT INTO Electricity_Consumption__lines
+            (Consumption_date, Line, Opening_reading, Closing_reading,
+             Units_consumed, Notes, Last_updated_by, Last_updated_datetime)
+        SELECT Consumption_date, '{line_default}', Opening_reading, Closing_reading,
+               Units_consumed, Notes, Last_updated_by, Last_updated_datetime
+        FROM Electricity_Consumption
+        """,
+    )
+    _exec(conn, "DROP TABLE Electricity_Consumption")
+    _exec(
+        conn,
+        "ALTER TABLE Electricity_Consumption__lines RENAME TO Electricity_Consumption",
     )
 
 
@@ -1398,7 +1693,7 @@ _TEXT_PK_CI: list[tuple[str, list[tuple[str, bool]]]] = [
     ("Alloy_Master_spec", [("Alloy_id", False), ("Element_symbol", True)]),
     ("Furnace_Oil_Consumption", [("Consumption_date", True)]),
     ("Furnace_Oil_Inventory", [("Inventory_date", True)]),
-    ("Electricity_Consumption", [("Consumption_date", True)]),
+    ("Electricity_Consumption", [("Consumption_date", True), ("Line", True)]),
 ]
 
 
@@ -1864,6 +2159,14 @@ EDITABLE_TABLES: list[dict[str, Any]] = [
         "allow_add": True,
     },
     {
+        "key": "raw_material_purchase",
+        "label": "Raw material purchases",
+        "pk": ["purchase_id"],
+        "order_by": "purchase_id",
+        "identity": ["purchase_id"],
+        "allow_add": False,
+    },
+    {
         "key": "raw_material_inventory",
         "label": "Raw material inventory",
         "pk": ["lot_id"],
@@ -2002,7 +2305,7 @@ EDITABLE_TABLES: list[dict[str, Any]] = [
     {
         "key": "electricity_consumption",
         "label": "Electricity consumption",
-        "pk": ["consumption_date"],
+        "pk": ["consumption_date", "line"],
         "order_by": "consumption_date",
         "identity": [],
         "allow_add": True,
@@ -2622,14 +2925,15 @@ def list_lots_for_material(material: str) -> list[dict[str, Any]]:
     return fetch_all(
         """
         SELECT i.Lot_id AS "Lot_id",
-               i.Received_date AS "Received_date",
+               p.Received_date AS "Received_date",
                i.Received_weight AS "Received_weight",
-               i.Supplier_Invoice AS "Supplier_Invoice",
+               p.Supplier_Invoice AS "Supplier_Invoice",
                (
                    SELECT COUNT(*) FROM Raw_Material_Spec s
                    WHERE LOWER(s.Raw_Material_Name) = LOWER(i.Raw_Material_Name)
                ) AS "Chem_count"
         FROM Raw_Material_Inventory i
+        LEFT JOIN Raw_Material_Purchase p ON p.Purchase_id = i.Purchase_id
         WHERE i.Raw_Material_Name = ?
         ORDER BY i.Lot_id DESC
         """,
@@ -2675,12 +2979,14 @@ def list_inventory_lots(
 ) -> list[dict[str, Any]]:
     sql = """
         SELECT i.Lot_id AS "Lot_id", i.Raw_Material_Name AS "Raw_Material_Name",
-               i.Vendor_code AS "Vendor_code", v.Vendor_name AS "Vendor_name",
+               i.Purchase_id AS "Purchase_id",
+               p.Vendor_code AS "Vendor_code", v.Vendor_name AS "Vendor_name",
                i.Remaining_Weight AS "Remaining_Weight",
                i.Raw_Material_Status AS "Raw_Material_Status",
-               i.Received_date AS "Received_date"
+               p.Received_date AS "Received_date"
         FROM Raw_Material_Inventory i
-        LEFT JOIN Vendor_Master v ON v.Vendor_code = i.Vendor_code
+        LEFT JOIN Raw_Material_Purchase p ON p.Purchase_id = i.Purchase_id
+        LEFT JOIN Vendor_Master v ON v.Vendor_code = p.Vendor_code
         WHERE i.Remaining_Weight > 0
     """
     params: list[Any] = []
@@ -2869,55 +3175,149 @@ def add_raw_material_master(
     return name
 
 
-def add_inventory_lot(
-    material: str,
+def add_raw_material_purchase(
     vendor_code: Optional[int],
     invoice: str,
     received_date: str,
-    weight: float,
-    storage_bay: str,
-    status: str,
-    photo: Optional[bytes] = None,
     supplier_invoice_date: Optional[str] = None,
-    cost_per_kg: Optional[float] = None,
     invoice_document: Optional[bytes] = None,
     invoice_document_name: Optional[str] = None,
     invoice_document_type: Optional[str] = None,
     vehicle_photo: Optional[bytes] = None,
 ) -> int:
+    """Create a vendor-invoice header that inventory lots can attach to."""
     if invoice_document and invoice_document_name:
         _validate_invoice_document_name(invoice_document_name)
+    by_val, dt_val = audit_stamp()
+    with get_connection() as conn:
+        result = _exec(
+            conn,
+            """
+            INSERT INTO Raw_Material_Purchase
+                (Vendor_code, Supplier_Invoice, Supplier_invoice_date, Received_date,
+                 Invoice_Document, Invoice_Document_name, Invoice_Document_type,
+                 Vehicle_photo, Last_updated_by, Last_updated_datetime)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            RETURNING Purchase_id
+            """,
+            (
+                vendor_code,
+                invoice,
+                supplier_invoice_date,
+                received_date,
+                invoice_document,
+                invoice_document_name,
+                invoice_document_type,
+                vehicle_photo,
+                by_val,
+                dt_val,
+            ),
+        )
+        return int(result.scalar_one())
+
+
+def add_inventory_lot(
+    material: str,
+    purchase_id: int,
+    weight: float,
+    storage_bay: str,
+    status: str,
+    photo: Optional[bytes] = None,
+    cost_per_kg: Optional[float] = None,
+) -> int:
     with get_connection() as conn:
         result = _exec(
             conn,
             """
             INSERT INTO Raw_Material_Inventory
-                (Raw_Material_Name, Vendor_code, Supplier_Invoice, Supplier_invoice_date,
-                 Received_date, Received_weight, Remaining_Weight, Storage_bay,
-                 Raw_Material_Status, Photo, Vehicle_photo, Cost_per_kg,
-                 Invoice_Document, Invoice_Document_name, Invoice_Document_type)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                (Purchase_id, Raw_Material_Name, Received_weight, Remaining_Weight,
+                 Storage_bay, Raw_Material_Status, Photo, Cost_per_kg)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             RETURNING Lot_id
             """,
             (
+                int(purchase_id),
                 material,
-                vendor_code,
-                invoice,
-                supplier_invoice_date,
-                received_date,
                 weight,
                 weight,
                 storage_bay,
                 status,
                 photo,
-                vehicle_photo,
                 cost_per_kg,
-                invoice_document,
-                invoice_document_name,
-                invoice_document_type,
             ),
         )
         return int(result.scalar_one())
+
+
+def save_raw_material_invoice(
+    vendor_code: Optional[int],
+    invoice: str,
+    received_date: str,
+    lines: list[dict[str, Any]],
+    storage_bay: str,
+    status: str,
+    supplier_invoice_date: Optional[str] = None,
+    invoice_document: Optional[bytes] = None,
+    invoice_document_name: Optional[str] = None,
+    invoice_document_type: Optional[str] = None,
+    vehicle_photo: Optional[bytes] = None,
+) -> tuple[int, list[int]]:
+    """Save one vendor invoice and its lots in a single transaction."""
+    if not lines:
+        raise ValueError("Add at least one raw material line.")
+    if invoice_document and invoice_document_name:
+        _validate_invoice_document_name(invoice_document_name)
+    by_val, dt_val = audit_stamp()
+    with get_connection() as conn:
+        result = _exec(
+            conn,
+            """
+            INSERT INTO Raw_Material_Purchase
+                (Vendor_code, Supplier_Invoice, Supplier_invoice_date, Received_date,
+                 Invoice_Document, Invoice_Document_name, Invoice_Document_type,
+                 Vehicle_photo, Last_updated_by, Last_updated_datetime)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            RETURNING Purchase_id
+            """,
+            (
+                vendor_code,
+                invoice,
+                supplier_invoice_date,
+                received_date,
+                invoice_document,
+                invoice_document_name,
+                invoice_document_type,
+                vehicle_photo,
+                by_val,
+                dt_val,
+            ),
+        )
+        purchase_id = int(result.scalar_one())
+        lot_ids: list[int] = []
+        for line in lines:
+            weight = float(line["weight"])
+            lot = _exec(
+                conn,
+                """
+                INSERT INTO Raw_Material_Inventory
+                    (Purchase_id, Raw_Material_Name, Received_weight, Remaining_Weight,
+                     Storage_bay, Raw_Material_Status, Photo, Cost_per_kg)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                RETURNING Lot_id
+                """,
+                (
+                    purchase_id,
+                    line["material"],
+                    weight,
+                    weight,
+                    storage_bay,
+                    status,
+                    line.get("photo"),
+                    line.get("cost"),
+                ),
+            )
+            lot_ids.append(int(lot.scalar_one()))
+        return purchase_id, lot_ids
 
 
 INVOICE_DOCUMENT_EXTENSIONS = (
@@ -2950,28 +3350,35 @@ def save_inventory_invoice_document(
     if not file_bytes:
         raise ValueError("Invoice file is empty.")
     _validate_invoice_document_name(filename)
-    existing = fetch_one(
-        'SELECT Lot_id AS "Lot_id" FROM Raw_Material_Inventory WHERE Lot_id = ?',
-        (lot_id,),
-    )
-    if not existing:
-        raise ValueError(f"Lot {lot_id} not found.")
-    execute(
+    row = fetch_one(
         """
-        UPDATE Raw_Material_Inventory
-        SET Invoice_Document = ?, Invoice_Document_name = ?, Invoice_Document_type = ?
+        SELECT Purchase_id AS "Purchase_id"
+        FROM Raw_Material_Inventory
         WHERE Lot_id = ?
         """,
-        (file_bytes, filename.strip(), content_type or "", lot_id),
+        (lot_id,),
+    )
+    if not row or not row.get("Purchase_id"):
+        raise ValueError(f"Lot {lot_id} not found.")
+    by_val, dt_val = audit_stamp()
+    execute(
+        """
+        UPDATE Raw_Material_Purchase
+        SET Invoice_Document = ?, Invoice_Document_name = ?, Invoice_Document_type = ?,
+            Last_updated_by = ?, Last_updated_datetime = ?
+        WHERE Purchase_id = ?
+        """,
+        (file_bytes, filename.strip(), content_type or "", by_val, dt_val, row["Purchase_id"]),
     )
 
 
 def get_inventory_vehicle_photo(lot_id: int) -> Optional[bytes]:
     row = fetch_one(
         """
-        SELECT Vehicle_photo AS "Vehicle_photo"
-        FROM Raw_Material_Inventory
-        WHERE Lot_id = ?
+        SELECT p.Vehicle_photo AS "Vehicle_photo"
+        FROM Raw_Material_Inventory i
+        JOIN Raw_Material_Purchase p ON p.Purchase_id = i.Purchase_id
+        WHERE i.Lot_id = ?
         """,
         (lot_id,),
     )
@@ -2982,12 +3389,14 @@ def get_inventory_vehicle_photo(lot_id: int) -> Optional[bytes]:
 def get_inventory_invoice_document(lot_id: int) -> Optional[dict[str, Any]]:
     return fetch_one(
         """
-        SELECT Lot_id AS "Lot_id",
-               Invoice_Document AS "Invoice_Document",
-               Invoice_Document_name AS "Invoice_Document_name",
-               Invoice_Document_type AS "Invoice_Document_type"
-        FROM Raw_Material_Inventory
-        WHERE Lot_id = ?
+        SELECT i.Lot_id AS "Lot_id",
+               i.Purchase_id AS "Purchase_id",
+               p.Invoice_Document AS "Invoice_Document",
+               p.Invoice_Document_name AS "Invoice_Document_name",
+               p.Invoice_Document_type AS "Invoice_Document_type"
+        FROM Raw_Material_Inventory i
+        JOIN Raw_Material_Purchase p ON p.Purchase_id = i.Purchase_id
+        WHERE i.Lot_id = ?
         """,
         (lot_id,),
     )
@@ -4121,38 +4530,66 @@ def furnace_oil_month_totals(year: int, month: int) -> dict[str, float]:
 
 # ---------- Electricity ----------
 
-def get_electricity_consumption(consumption_date: str) -> Optional[dict[str, Any]]:
+def normalize_electricity_line(line: Optional[str]) -> str:
+    text = ("" if line is None else str(line)).strip()
+    folded = " ".join(text.lower().split())
+    aliases = {
+        "eb line 1": ELECTRICITY_LINE_1,
+        "eb lin1": ELECTRICITY_LINE_1,
+        "eb line1": ELECTRICITY_LINE_1,
+        "line 1": ELECTRICITY_LINE_1,
+        "line1": ELECTRICITY_LINE_1,
+        "1": ELECTRICITY_LINE_1,
+        "eb line 2": ELECTRICITY_LINE_2,
+        "eb line2": ELECTRICITY_LINE_2,
+        "line 2": ELECTRICITY_LINE_2,
+        "line2": ELECTRICITY_LINE_2,
+        "2": ELECTRICITY_LINE_2,
+    }
+    if folded in aliases:
+        return aliases[folded]
+    raise ValueError("Select EB Line 1 or EB Line 2.")
+
+
+def get_electricity_consumption(
+    consumption_date: str, line: str
+) -> Optional[dict[str, Any]]:
     day = _as_effective_date(consumption_date)
     if not day:
         return None
+    line_name = normalize_electricity_line(line)
     return fetch_one(
         """
         SELECT Consumption_date AS "Consumption_date",
+               Line AS "Line",
                Opening_reading AS "Opening_reading",
                Closing_reading AS "Closing_reading",
                Units_consumed AS "Units_consumed",
                Notes AS "Notes"
         FROM Electricity_Consumption
-        WHERE Consumption_date = ?
+        WHERE Consumption_date = ? AND Line = ?
         """,
-        (day,),
+        (day, line_name),
     )
 
 
-def get_previous_electricity_closing(consumption_date: str) -> Optional[float]:
-    """Latest closing reading before this date, used as today's opening."""
+def get_previous_electricity_closing(
+    consumption_date: str, line: str
+) -> Optional[float]:
+    """Latest closing reading for this line before this date."""
     day = _as_effective_date(consumption_date)
     if not day:
         return None
+    line_name = normalize_electricity_line(line)
     row = fetch_one(
         """
         SELECT Closing_reading AS "Closing_reading"
         FROM Electricity_Consumption
-        WHERE Consumption_date < ?
+        WHERE Consumption_date < ? AND Line = ?
         ORDER BY Consumption_date DESC
         LIMIT 1
         """,
-        (day,),
+        (day, line_name),
     )
     if not row:
         return None
@@ -4162,33 +4599,64 @@ def get_previous_electricity_closing(consumption_date: str) -> Optional[float]:
         return None
 
 
-def list_electricity_consumption(limit: int = 60) -> list[dict[str, Any]]:
-    return fetch_all(
-        """
+def list_electricity_consumption(
+    limit: int = 60, line: Optional[str] = None
+) -> list[dict[str, Any]]:
+    sql = """
         SELECT Consumption_date AS "Consumption_date",
+               Line AS "Line",
                Opening_reading AS "Opening_reading",
                Closing_reading AS "Closing_reading",
                Units_consumed AS "Units_consumed",
                Notes AS "Notes"
         FROM Electricity_Consumption
-        ORDER BY Consumption_date DESC
-        LIMIT ?
-        """,
-        (limit,),
-    )
+    """
+    params: list[Any] = []
+    if line:
+        sql += " WHERE Line = ?"
+        params.append(normalize_electricity_line(line))
+    sql += " ORDER BY Consumption_date DESC, Line LIMIT ?"
+    params.append(limit)
+    return fetch_all(sql, tuple(params))
 
 
-def electricity_month_totals(year: int, month: int) -> dict[str, float]:
+def electricity_month_totals(
+    year: int, month: int, line: Optional[str] = None
+) -> dict[str, Any]:
     prefix = f"{year:04d}-{month:02d}"
-    row = fetch_one(
+    by_line = {name: 0.0 for name in ELECTRICITY_LINES}
+    if line:
+        line_name = normalize_electricity_line(line)
+        row = fetch_one(
+            """
+            SELECT COALESCE(SUM(Units_consumed), 0) AS "qty"
+            FROM Electricity_Consumption
+            WHERE Consumption_date LIKE ? AND Line = ?
+            """,
+            (f"{prefix}%", line_name),
+        )
+        qty = float((row or {}).get("qty") or 0)
+        by_line[line_name] = qty
+        return {"consumed": qty, "by_line": by_line}
+    rows = fetch_all(
         """
-        SELECT COALESCE(SUM(Units_consumed), 0) AS "qty"
+        SELECT Line AS "Line", COALESCE(SUM(Units_consumed), 0) AS "qty"
         FROM Electricity_Consumption
         WHERE Consumption_date LIKE ?
+        GROUP BY Line
         """,
         (f"{prefix}%",),
     )
-    return {"consumed": float((row or {}).get("qty") or 0)}
+    total = 0.0
+    for row in rows:
+        qty = float((row or {}).get("qty") or 0)
+        total += qty
+        try:
+            name = normalize_electricity_line(row.get("Line"))
+        except ValueError:
+            continue
+        by_line[name] = qty
+    return {"consumed": total, "by_line": by_line}
 
 
 def add_electricity_consumption(
@@ -4196,10 +4664,12 @@ def add_electricity_consumption(
     opening_reading: float,
     closing_reading: float,
     notes: Optional[str] = None,
+    line: str = ELECTRICITY_LINE_1,
 ) -> float:
     day = _as_effective_date(consumption_date)
     if not day:
         raise ValueError("Consumption date is required.")
+    line_name = normalize_electricity_line(line)
     try:
         opening = round(float(opening_reading), 1)
         closing = round(float(closing_reading), 1)
@@ -4216,10 +4686,10 @@ def add_electricity_consumption(
     execute(
         """
         INSERT INTO Electricity_Consumption
-            (Consumption_date, Opening_reading, Closing_reading, Units_consumed,
+            (Consumption_date, Line, Opening_reading, Closing_reading, Units_consumed,
              Notes, Last_updated_by, Last_updated_datetime)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(Consumption_date) DO UPDATE SET
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(Consumption_date, Line) DO UPDATE SET
             Opening_reading=excluded.Opening_reading,
             Closing_reading=excluded.Closing_reading,
             Units_consumed=excluded.Units_consumed,
@@ -4227,7 +4697,16 @@ def add_electricity_consumption(
             Last_updated_by=excluded.Last_updated_by,
             Last_updated_datetime=excluded.Last_updated_datetime
         """,
-        (day, opening, closing, units, (notes or "").strip() or None, by_val, dt_val),
+        (
+            day,
+            line_name,
+            opening,
+            closing,
+            units,
+            (notes or "").strip() or None,
+            by_val,
+            dt_val,
+        ),
     )
     return units
 

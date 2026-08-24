@@ -95,7 +95,8 @@ def bootstrap() -> str:
         try:
             db.init_db()
             return "neon"
-        except Exception:
+        except Exception as exc:
+            st.session_state["_neon_init_error"] = str(exc)
             db.switch_to_sqlite()
             db.init_db()
             return "sqlite"
@@ -585,8 +586,12 @@ if st.session_state.get("use_sqlite") or os.environ.get("NUALCO_FORCE_SQLITE"):
         "Offline SQLite mode. Rows you save stay on this PC and are not "
         "written to Neon."
     )
+    neon_err = st.session_state.get("_neon_init_error")
+    if neon_err:
+        st.sidebar.caption(f"Neon init error: {neon_err}")
     if st.sidebar.button("Reconnect to Neon"):
         st.session_state.pop("use_sqlite", None)
+        st.session_state.pop("_neon_init_error", None)
         os.environ.pop("NUALCO_FORCE_SQLITE", None)
         st.cache_resource.clear()
         st.rerun()
@@ -615,7 +620,7 @@ if PAGE == "Dashboard":
         _show_db_connection_error(exc)
         batches, materials, lots, alloys = [], [], [], []
         oil_stock = 0.0
-        elec_month = {"consumed": 0.0}
+        elec_month = {"consumed": 0.0, "by_line": {}}
 
     c1, c2, c3, c4, c5, c6 = st.columns(6)
     c1.metric("Batches", len(batches))
@@ -648,6 +653,7 @@ elif PAGE == "Raw Material Logging":
     st.title("Raw Material Logging")
     st.caption(
         "Start with the vendor and invoice, then add every raw material on that invoice. "
+        "The invoice is stored once; each material becomes a stock lot. "
         "Define grades under **Raw Material Master**. "
         "Browse lots under **Raw Material Inventory**."
     )
@@ -695,7 +701,7 @@ elif PAGE == "Raw Material Logging":
         invoice_doc = st.file_uploader(
             "Invoice document",
             type=["png", "jpg", "jpeg", "pdf", "doc", "docx", "xls", "xlsx"],
-            help="Optional. Attached to every lot on this invoice.",
+            help="Optional. Stored once on the vendor invoice, not on each lot.",
             key="rm_log_invoice_doc",
         )
 
@@ -703,7 +709,7 @@ elif PAGE == "Raw Material Logging":
     if st.button(
         "📷 Vehicle photo",
         key="rm_log_vphoto_btn",
-        help="Photo of the delivery vehicle. Saved on every lot on this invoice.",
+        help="Photo of the delivery vehicle. Saved once on this invoice.",
     ):
         st.session_state[vp_open_key] = not bool(st.session_state.get(vp_open_key))
         st.rerun()
@@ -829,7 +835,7 @@ elif PAGE == "Raw Material Logging":
                 doc_bytes = photo_bytes(invoice_doc)
                 doc_name = invoice_doc.name if invoice_doc else None
                 doc_type = getattr(invoice_doc, "type", None) if invoice_doc else None
-                lot_ids: list[int] = []
+                lines: list[dict] = []
                 for ln in complete:
                     material_name = db.find_raw_material_name(ln["name"])
                     if not material_name:
@@ -843,26 +849,31 @@ elif PAGE == "Raw Material Logging":
                             cost_per_kg=ln["cost"],
                             create_new=True,
                         )
-                    lot_id = db.add_inventory_lot(
-                        material=material_name,
-                        vendor_code=vendor_code,
-                        invoice=invoice_no,
-                        received_date=received.isoformat(),
-                        weight=ln["weight"],
-                        storage_bay=storage.strip(),
-                        status=inv_status,
-                        supplier_invoice_date=invoice_date.isoformat(),
-                        cost_per_kg=ln["cost"],
-                        invoice_document=doc_bytes,
-                        invoice_document_name=doc_name,
-                        invoice_document_type=doc_type,
-                        vehicle_photo=vehicle_photo_bytes,
+                    lines.append(
+                        {
+                            "material": material_name,
+                            "cost": ln["cost"],
+                            "weight": ln["weight"],
+                        }
                     )
-                    lot_ids.append(lot_id)
+                purchase_id, lot_ids = db.save_raw_material_invoice(
+                    vendor_code=vendor_code,
+                    invoice=invoice_no,
+                    received_date=received.isoformat(),
+                    lines=lines,
+                    storage_bay=storage.strip(),
+                    status=inv_status,
+                    supplier_invoice_date=invoice_date.isoformat(),
+                    invoice_document=doc_bytes,
+                    invoice_document_name=doc_name,
+                    invoice_document_type=doc_type,
+                    vehicle_photo=vehicle_photo_bytes,
+                )
                 names = ", ".join(ln["name"] for ln in complete)
                 st.success(
-                    f"Saved invoice **{invoice_no}** with {len(lot_ids)} lot(s) "
-                    f"({names}). Lot IDs: {', '.join(str(i) for i in lot_ids)}."
+                    f"Saved invoice **{invoice_no}** (purchase #{purchase_id}) "
+                    f"with {len(lot_ids)} lot(s) ({names}). "
+                    f"Lot IDs: {', '.join(str(i) for i in lot_ids)}."
                 )
                 st.session_state.rm_invoice_lines = [
                     {"name": "", "cost": 0.0, "weight": 0.0}
@@ -882,28 +893,31 @@ elif PAGE == "Raw Material Logging":
 elif PAGE == "Raw Material Inventory":
     st.title("Raw Material Inventory")
     st.caption(
-        "Review recent lots and the grade specification from **Raw Material Spec**. "
+        "Review lots and remaining stock. Invoice documents live on "
+        "**Raw Material Purchase**; grade chemistry comes from **Raw Material Spec**. "
         "New receipts are entered on **Raw Material Logging**."
     )
 
     recent = df_from_rows(
         db.fetch_all(
             """
-            SELECT i.Lot_id AS "Lot_id", i.Raw_Material_Name AS "Raw_Material_Name",
+            SELECT i.Lot_id AS "Lot_id", i.Purchase_id AS "Purchase_id",
+                   i.Raw_Material_Name AS "Raw_Material_Name",
                    v.Vendor_name AS "Vendor_name",
-                   i.Supplier_Invoice AS "Supplier_Invoice",
-                   i.Supplier_invoice_date AS "Supplier_invoice_date",
-                   i.Received_date AS "Received_date",
+                   p.Supplier_Invoice AS "Supplier_Invoice",
+                   p.Supplier_invoice_date AS "Supplier_invoice_date",
+                   p.Received_date AS "Received_date",
                    i.Received_weight AS "Received_weight",
                    i.Remaining_Weight AS "Remaining_Weight",
                    i.Cost_per_kg AS "Cost_per_kg",
                    i.Storage_bay AS "Storage_bay",
                    i.Raw_Material_Status AS "Raw_Material_Status",
-                   i.Invoice_Document_name AS "Invoice_Document_name",
-                   CASE WHEN i.Vehicle_photo IS NULL THEN NULL ELSE 'Yes' END
+                   p.Invoice_Document_name AS "Invoice_Document_name",
+                   CASE WHEN p.Vehicle_photo IS NULL THEN NULL ELSE 'Yes' END
                        AS "Vehicle_photo"
             FROM Raw_Material_Inventory i
-            LEFT JOIN Vendor_Master v ON v.Vendor_code = i.Vendor_code
+            LEFT JOIN Raw_Material_Purchase p ON p.Purchase_id = i.Purchase_id
+            LEFT JOIN Vendor_Master v ON v.Vendor_code = p.Vendor_code
             ORDER BY i.Lot_id DESC
             LIMIT 50
             """
@@ -1813,31 +1827,48 @@ elif PAGE == "Furnace Oil Consumption":
 elif PAGE == "Electricity Consumption":
     st.title("Electricity Consumption")
     st.caption(
-        "Enter the day's **opening** and **closing** power readings. "
-        "Units consumed = closing reading − opening reading. "
-        "Today's opening reading is filled from the previous day's closing reading. "
-        "Saving the same date updates that day's row."
+        "Select **EB Line 1** or **EB Line 2**, then enter that line's opening and "
+        "closing power readings. Units consumed = closing reading − opening reading. "
+        "Each line's opening reading is filled from that line's previous closing reading. "
+        "Saving the same date and line updates that row."
+    )
+
+    line = st.radio(
+        "Electricity line *",
+        db.ELECTRICITY_LINES,
+        horizontal=True,
+        key="elec_line",
+        help="The plant has two EB connections. Readings are stored separately for each line.",
     )
 
     month_tot = db.electricity_month_totals(date.today().year, date.today().month)
-    latest = db.list_electricity_consumption(limit=1)
+    by_line = month_tot.get("by_line") or {}
+    latest = db.list_electricity_consumption(limit=1, line=line)
     last_close = latest[0]["Closing_reading"] if latest else None
-    m1, m2, m3 = st.columns(3)
-    m1.metric("This month (units)", f"{month_tot['consumed']:,.1f}")
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric(
+        f"{db.ELECTRICITY_LINE_1} this month",
+        f"{float(by_line.get(db.ELECTRICITY_LINE_1) or 0):,.1f}",
+    )
     m2.metric(
-        "Last closing reading",
+        f"{db.ELECTRICITY_LINE_2} this month",
+        f"{float(by_line.get(db.ELECTRICITY_LINE_2) or 0):,.1f}",
+    )
+    m3.metric("Both lines this month", f"{month_tot['consumed']:,.1f}")
+    m4.metric(
+        f"Last closing ({line})",
         f"{float(last_close):,.1f}" if last_close is not None else "—",
     )
-    m3.metric("Unit", "kWh / meter units")
 
     cons_date = ui_date_input(
         "Consumption date *", value=date.today(), key="elec_date"
     )
     day = cons_date.isoformat()
-    existing = db.get_electricity_consumption(day)
-    prev_close = db.get_previous_electricity_closing(day)
-    if st.session_state.get("elec_loaded_day") != day:
-        st.session_state["elec_loaded_day"] = day
+    existing = db.get_electricity_consumption(day, line)
+    prev_close = db.get_previous_electricity_closing(day, line)
+    loaded_key = f"{day}|{line}"
+    if st.session_state.get("elec_loaded_key") != loaded_key:
+        st.session_state["elec_loaded_key"] = loaded_key
         if existing:
             st.session_state["elec_open"] = float(existing["Opening_reading"])
             st.session_state["elec_close"] = float(existing["Closing_reading"])
@@ -1858,9 +1889,9 @@ elif PAGE == "Electricity Consumption":
             step=0.1,
             format="%.1f",
             help=(
-                f"Filled from previous closing ({float(prev_close):,.1f})."
+                f"Filled from {line} previous closing ({float(prev_close):,.1f})."
                 if prev_close is not None and not existing
-                else "Meter reading at the start of the day."
+                else f"Meter reading for {line} at the start of the day."
             ),
         )
     with r2:
@@ -1870,7 +1901,7 @@ elif PAGE == "Electricity Consumption":
             max_value=None,
             step=0.1,
             format="%.1f",
-            help="Meter reading at the end of the day.",
+            help=f"Meter reading for {line} at the end of the day.",
         )
     notes = st.text_input("Notes", key="elec_notes")
 
@@ -1907,9 +1938,11 @@ elif PAGE == "Electricity Consumption":
                     opening_reading=open_val,
                     closing_reading=close_val,
                     notes=notes.strip() or None,
+                    line=line,
                 )
                 st.success(
-                    f"Saved **{saved_units:,.1f} units** for {format_ui_date(cons_date)} "
+                    f"Saved **{saved_units:,.1f} units** on **{line}** "
+                    f"for {format_ui_date(cons_date)} "
                     f"(opening {open_val:,.1f} → closing {close_val:,.1f})."
                 )
                 st.rerun()
@@ -1919,7 +1952,7 @@ elif PAGE == "Electricity Consumption":
     st.subheader("Daily readings")
     rows = df_from_rows(db.list_electricity_consumption())
     if rows.empty:
-        st.info("No electricity readings yet.")
+        st.info("No electricity readings yet. Select a line and save the day's readings.")
     else:
         for col in ("Opening_reading", "Closing_reading", "Units_consumed"):
             if col in rows.columns:
@@ -3775,25 +3808,26 @@ elif PAGE == "Masters Overview":
             | 3 | Element_Master | 36 chemistry elements (seeded) |
             | 4 | Raw_Material_Master | Material grades |
             | 5 | Raw_Material_Spec | Grade chemistry (child of Raw_Material_Master) |
-            | 6 | Raw_Material_Inventory | Lots / stock (includes Vehicle_photo) |
-            | 7 | Alloy_Master | Alloys |
-            | 8 | Alloy_Master_spec | Alloy min/max % |
-            | 9 | Furnace_Master | Furnaces (1–4 seeded) |
-            | 10 | Crucible_Master | Crucibles (Crucible_no PK; furnace and Vendor_name FKs) |
-            | 11 | Melter_Master | Melter operators |
-            | 12 | Trolley_Master | Trolleys (name, colour, weight) |
-            | 13 | State_City_Master | States and cities |
-            | 14 | Production_batch | Melts / heats |
-            | 15 | batch_input | Charge sheets |
-            | 16 | Batch_Chemical_Composition | Ladle chemistry |
-            | 17 | Build_of_Material | BOM |
-            | 18 | Purchase_Order | Customer POs + attached PO document (PDF/Word/Excel); key is Customer_PO_No + Alloy_Id |
-            | 19 | ISRI_CODE_TABLE | ISRI scrap specification codes |
-            | 20 | Finished_Goods_Inventory | Bundles (Under_Testing → Available → Assigned / Dispatched / Rejected) |
-            | 21 | Furnace_Oil_Purchase | Furnace oil receipts and opening stock |
-            | 22 | Furnace_Oil_Consumption | Daily furnace oil use (one row per day) |
-            | 23 | Furnace_Oil_Inventory | Daily opening / purchase / consumption / closing ledger |
-            | 24 | Electricity_Consumption | Daily opening/closing power readings and units consumed |
+            | 6 | Raw_Material_Purchase | Vendor invoices / receipts (document + vehicle photo) |
+            | 7 | Raw_Material_Inventory | Lots / remaining stock (child of purchase) |
+            | 8 | Alloy_Master | Alloys |
+            | 9 | Alloy_Master_spec | Alloy min/max % |
+            | 10 | Furnace_Master | Furnaces (1–4 seeded) |
+            | 11 | Crucible_Master | Crucibles (Crucible_no PK; furnace and Vendor_name FKs) |
+            | 12 | Melter_Master | Melter operators |
+            | 13 | Trolley_Master | Trolleys (name, colour, weight) |
+            | 14 | State_City_Master | States and cities |
+            | 15 | Production_batch | Melts / heats |
+            | 16 | batch_input | Charge sheets |
+            | 17 | Batch_Chemical_Composition | Ladle chemistry |
+            | 18 | Build_of_Material | BOM |
+            | 19 | Purchase_Order | Customer POs + attached PO document (PDF/Word/Excel); key is Customer_PO_No + Alloy_Id |
+            | 20 | ISRI_CODE_TABLE | ISRI scrap specification codes |
+            | 21 | Finished_Goods_Inventory | Bundles (Under_Testing → Available → Assigned / Dispatched / Rejected) |
+            | 22 | Furnace_Oil_Purchase | Furnace oil receipts and opening stock |
+            | 23 | Furnace_Oil_Consumption | Daily furnace oil use (one row per day) |
+            | 24 | Furnace_Oil_Inventory | Daily opening / purchase / consumption / closing ledger |
+            | 25 | Electricity_Consumption | Daily opening/closing power readings per EB Line 1 / EB Line 2 |
 
             Extra production columns: `Workflow_stage`, sample fields, `Production_supervisor`.
             """
