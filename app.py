@@ -535,8 +535,10 @@ PAGE = st.sidebar.radio(
         "Dashboard",
         "Raw Material Logging",
         "Raw Material Inventory",
+        "Furnace Oil Purchase",
         "Production Batch & Chemistry",
         "Production Batches",
+        "Furnace Oil Consumption",
         "Production Workflow Tracker",
         "Material Recovery & Yield",
         "Finished Goods Inventory",
@@ -606,15 +608,18 @@ if PAGE == "Dashboard":
         materials = db.list_raw_materials()
         lots = db.list_inventory_lots()
         alloys = db.list_alloys()
+        oil_stock = db.get_furnace_oil_stock()
     except Exception as exc:
         _show_db_connection_error(exc)
         batches, materials, lots, alloys = [], [], [], []
+        oil_stock = 0.0
 
-    c1, c2, c3, c4 = st.columns(4)
+    c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("Batches", len(batches))
     c2.metric("Raw materials", len(materials))
     c3.metric("Active lots", len(lots))
     c4.metric("Alloys", len(alloys))
+    c5.metric("Furnace oil (L)", f"{oil_stock:,.1f}")
 
     st.subheader("Recent production batches")
     bdf = df_from_rows(batches)
@@ -920,6 +925,155 @@ elif PAGE == "Raw Material Inventory":
         if vehicle_photo:
             st.markdown("**Vehicle photo**")
             st.image(vehicle_photo)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Furnace Oil Purchase
+# ═══════════════════════════════════════════════════════════════════════════════
+elif PAGE == "Furnace Oil Purchase":
+    st.title("Furnace Oil Purchase")
+    st.caption(
+        "Purchase team: log furnace oil receipts against a vendor invoice. "
+        "Stock is added to **Furnace Oil Inventory**. "
+        "Production records daily use on **Furnace Oil Consumption**."
+    )
+
+    vendors = db.list_vendors()
+    vendor_opts = {f"{v['Vendor_name']} (#{v['Vendor_code']})": v["Vendor_code"] for v in vendors}
+    if not vendors:
+        st.warning("Add at least one vendor under **Vendors** before logging a purchase.")
+
+    stock = db.get_furnace_oil_stock()
+    s1, s2 = st.columns(2)
+    s1.metric("Current stock (L)", f"{stock:,.1f}")
+    s2.metric("Unit", "Litre")
+
+    st.markdown("#### Purchase details")
+    vendor_label = st.selectbox(
+        "Vendor name *",
+        options=[""] + list(vendor_opts.keys()),
+        key="fo_pur_vendor",
+    )
+    p1, p2, p3 = st.columns(3)
+    with p1:
+        invoice_date = ui_date_input(
+            "Supplier invoice date *", value=date.today(), key="fo_pur_invoice_date"
+        )
+    with p2:
+        invoice = st.text_input(
+            "Vendor invoice *",
+            placeholder="e.g. FO-INV-2026-001",
+            key="fo_pur_invoice",
+        )
+    with p3:
+        received = ui_date_input(
+            "Received date *", value=date.today(), key="fo_pur_received"
+        )
+    q1, q2, q3, q4 = st.columns(4)
+    with q1:
+        qty = empty_percent_input(
+            "Quantity (litres) *",
+            key="fo_pur_qty",
+            max_value=None,
+            step=1.0,
+        )
+    with q2:
+        weight_kg = empty_percent_input(
+            "Weight in kgs",
+            key="fo_pur_weight_kg",
+            max_value=None,
+            step=0.1,
+        )
+    with q3:
+        rate = empty_percent_input(
+            "Rate per litre",
+            key="fo_pur_rate",
+            max_value=None,
+            step=0.01,
+        )
+    with q4:
+        tank = st.text_input(
+            "Storage tank",
+            placeholder="e.g. Tank-1",
+            key="fo_pur_tank",
+        )
+    notes = st.text_input("Notes", key="fo_pur_notes")
+    d1, d2 = st.columns(2)
+    with d1:
+        invoice_doc = st.file_uploader(
+            "Invoice document",
+            type=["png", "jpg", "jpeg", "pdf", "doc", "docx", "xls", "xlsx"],
+            key="fo_pur_doc",
+        )
+    with d2:
+        weighment_slip = st.file_uploader(
+            "Weighment slip",
+            type=["png", "jpg", "jpeg", "pdf", "doc", "docx", "xls", "xlsx"],
+            key="fo_pur_weighment",
+        )
+
+    qty_val = float(qty or 0)
+    weight_val = float(weight_kg or 0)
+    rate_val = float(rate or 0)
+    invoice_value = qty_val * rate_val
+    gst_value = invoice_value * 0.18
+    t1, t2, t3, t4, t5 = st.columns(5)
+    t1.metric("Quantity (L)", f"{qty_val:,.1f}")
+    t2.metric("Weight (kg)", f"{weight_val:,.1f}" if weight_val > 0 else "—")
+    t3.metric("Invoice value", f"{invoice_value:,.2f}")
+    t4.metric("GST value (18%)", f"{gst_value:,.2f}")
+    t5.metric("Total value", f"{invoice_value + gst_value:,.2f}")
+
+    if st.button("Save furnace oil purchase", type="primary", key="fo_pur_save"):
+        vendor_code = vendor_opts[vendor_label] if vendor_label else None
+        if not vendors:
+            st.error("Create a vendor first.")
+        elif not vendor_code:
+            st.error("Select a vendor name.")
+        elif not (invoice or "").strip():
+            st.error("Vendor invoice is required.")
+        elif qty_val <= 0:
+            st.error("Quantity (litres) must be greater than zero.")
+        else:
+            try:
+                pid = db.add_furnace_oil_purchase(
+                    vendor_code=vendor_code,
+                    invoice=invoice.strip(),
+                    invoice_date=invoice_date.isoformat(),
+                    received_date=received.isoformat(),
+                    quantity=qty_val,
+                    weight_in_kgs=weight_val if weight_val > 0 else None,
+                    rate_per_litre=rate_val if rate_val > 0 else None,
+                    storage_tank=tank.strip() or None,
+                    notes=notes.strip() or None,
+                    invoice_document=photo_bytes(invoice_doc),
+                    invoice_document_name=invoice_doc.name if invoice_doc else None,
+                    invoice_document_type=getattr(invoice_doc, "type", None) if invoice_doc else None,
+                    weighment_slip=photo_bytes(weighment_slip),
+                    weighment_slip_name=weighment_slip.name if weighment_slip else None,
+                    weighment_slip_type=(
+                        getattr(weighment_slip, "type", None) if weighment_slip else None
+                    ),
+                )
+                st.success(
+                    f"Saved furnace oil purchase **#{pid}** "
+                    f"({qty_val:,.1f} L, invoice {invoice.strip()}). "
+                    f"Stock is now **{db.get_furnace_oil_stock():,.1f} L**."
+                )
+                st.session_state["fo_pur_qty"] = None
+                st.session_state["fo_pur_weight_kg"] = None
+                st.session_state["fo_pur_rate"] = None
+                st.cache_data.clear()
+                st.rerun()
+            except Exception as exc:
+                st.error(f"Could not save: {exc}")
+
+    st.subheader("Recent purchases")
+    purchases = df_from_rows(db.list_furnace_oil_purchases())
+    if purchases.empty:
+        st.info("No furnace oil purchases yet.")
+    else:
+        show_dataframe(purchases)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1538,6 +1692,115 @@ elif PAGE == "Production Batches":
         st.info("No batches yet. Create one under **Production Batch & Chemistry**.")
     else:
         show_dataframe(batches_df)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Furnace Oil Consumption
+# ═══════════════════════════════════════════════════════════════════════════════
+elif PAGE == "Furnace Oil Consumption":
+    st.title("Furnace Oil Consumption")
+    st.caption(
+        "Production team: enter the overall furnace oil used for the day. "
+        "Saving the same date updates that day's row. "
+        "Inventory is rebuilt from purchases minus consumption."
+    )
+
+    stock = db.get_furnace_oil_stock()
+    month_tot = db.furnace_oil_month_totals(date.today().year, date.today().month)
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Current stock (L)", f"{stock:,.1f}")
+    m2.metric("Purchased this month (L)", f"{month_tot['purchased']:,.1f}")
+    m3.metric("Consumed this month (L)", f"{month_tot['consumed']:,.1f}")
+    m4.metric("Unit", "Litre")
+
+    with st.expander("Set opening stock", expanded=stock <= 0 and not db.list_furnace_oil_inventory(limit=1)):
+        st.caption(
+            "Use this once to load the tank balance before the first purchase. "
+            "It is stored as an **Opening** receipt, not a vendor invoice."
+        )
+        o1, o2 = st.columns(2)
+        with o1:
+            open_date = ui_date_input(
+                "Opening date", value=date.today(), key="fo_open_date"
+            )
+        with o2:
+            open_qty = empty_percent_input(
+                "Opening stock (litres) *",
+                key="fo_open_qty",
+                max_value=None,
+                step=1.0,
+            )
+        if st.button("Save opening stock", key="fo_open_save"):
+            if float(open_qty or 0) <= 0:
+                st.error("Opening stock (litres) must be greater than zero.")
+            else:
+                try:
+                    db.add_furnace_oil_purchase(
+                        vendor_code=None,
+                        invoice="OPENING",
+                        invoice_date=open_date.isoformat(),
+                        received_date=open_date.isoformat(),
+                        quantity=float(open_qty),
+                        purchase_type="Opening",
+                        notes="Opening stock",
+                    )
+                    st.success(
+                        f"Opening stock set to **{float(open_qty):,.1f} L** "
+                        f"on {format_ui_date(open_date)}."
+                    )
+                    st.session_state["fo_open_qty"] = None
+                    st.rerun()
+                except Exception as exc:
+                    st.error(f"Could not save opening stock: {exc}")
+
+    st.markdown("#### Daily consumption")
+    c1, c2 = st.columns(2)
+    with c1:
+        cons_date = ui_date_input(
+            "Consumption date *", value=date.today(), key="fo_cons_date"
+        )
+    with c2:
+        cons_qty = empty_percent_input(
+            "Quantity consumed (litres) *",
+            key="fo_cons_qty",
+            max_value=None,
+            step=1.0,
+        )
+    cons_notes = st.text_input("Notes", key="fo_cons_notes")
+
+    if st.button("Save consumption", type="primary", key="fo_cons_save"):
+        qty_val = float(cons_qty or 0)
+        if qty_val <= 0:
+            st.error("Quantity consumed (litres) must be greater than zero.")
+        else:
+            try:
+                db.add_furnace_oil_consumption(
+                    consumption_date=cons_date.isoformat(),
+                    quantity=qty_val,
+                    notes=cons_notes.strip() or None,
+                )
+                st.success(
+                    f"Saved **{qty_val:,.1f} L** for {format_ui_date(cons_date)}. "
+                    f"Stock is now **{db.get_furnace_oil_stock():,.1f} L**."
+                )
+                st.session_state["fo_cons_qty"] = None
+                st.rerun()
+            except Exception as exc:
+                st.error(f"Could not save: {exc}")
+
+    st.subheader("Inventory ledger")
+    ledger = df_from_rows(db.list_furnace_oil_inventory())
+    if ledger.empty:
+        st.info("No furnace oil inventory yet. Add an opening stock or a purchase.")
+    else:
+        show_dataframe(ledger)
+
+    st.subheader("Recent consumption")
+    used = df_from_rows(db.list_furnace_oil_consumption())
+    if used.empty:
+        st.info("No consumption entries yet.")
+    else:
+        show_dataframe(used)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -3403,6 +3666,9 @@ elif PAGE == "Masters Overview":
             | 18 | Purchase_Order | Customer POs + attached PO document (PDF/Word/Excel); key is Customer_PO_No + Alloy_Id |
             | 19 | ISRI_CODE_TABLE | ISRI scrap specification codes |
             | 20 | Finished_Goods_Inventory | Bundles (Under_Testing → Available → Assigned / Dispatched / Rejected) |
+            | 21 | Furnace_Oil_Purchase | Furnace oil receipts and opening stock |
+            | 22 | Furnace_Oil_Consumption | Daily furnace oil use (one row per day) |
+            | 23 | Furnace_Oil_Inventory | Daily opening / purchase / consumption / closing ledger |
 
             Extra production columns: `Workflow_stage`, sample fields, `Production_supervisor`.
             """

@@ -672,6 +672,47 @@ CREATE TABLE IF NOT EXISTS Purchase_Order (
         CHECK(Purchase_Order_Status IN ('Open', 'Closed', 'Cancelled')),
     PRIMARY KEY (Customer_PO_No, Alloy_Id)
 );
+CREATE TABLE IF NOT EXISTS Furnace_Oil_Purchase (
+    Purchase_id {autopk},
+    Vendor_code INTEGER REFERENCES Vendor_Master(Vendor_code),
+    Supplier_Invoice TEXT,
+    Supplier_invoice_date TEXT,
+    Received_date TEXT NOT NULL,
+    Quantity {float} NOT NULL,
+    Weight_in_kgs {float},
+    Rate_per_litre {float},
+    Storage_tank TEXT,
+    Purchase_type TEXT DEFAULT 'Purchase'
+        CHECK(Purchase_type IN ('Purchase', 'Opening')),
+    Invoice_Document {blob},
+    Invoice_Document_name TEXT,
+    Invoice_Document_type TEXT,
+    Weighment_slip {blob},
+    Weighment_slip_name TEXT,
+    Weighment_slip_type TEXT,
+    Notes TEXT,
+    Last_updated_by TEXT,
+    Last_updated_datetime TEXT
+);
+CREATE TABLE IF NOT EXISTS Furnace_Oil_Consumption (
+    Consumption_date TEXT PRIMARY KEY,
+    Furnace TEXT REFERENCES Furnace_Master(Furnace),
+    Shift TEXT CHECK(Shift IS NULL OR Shift IN ('A', 'B')),
+    Quantity {float} NOT NULL,
+    Batch_ID TEXT,
+    Notes TEXT,
+    Last_updated_by TEXT,
+    Last_updated_datetime TEXT
+);
+CREATE TABLE IF NOT EXISTS Furnace_Oil_Inventory (
+    Inventory_date TEXT PRIMARY KEY,
+    Opening_qty {float} NOT NULL DEFAULT 0,
+    Purchase_qty {float} NOT NULL DEFAULT 0,
+    Consumption_qty {float} NOT NULL DEFAULT 0,
+    Closing_qty {float} NOT NULL DEFAULT 0,
+    Last_updated_by TEXT,
+    Last_updated_datetime TEXT
+);
 CREATE TABLE IF NOT EXISTS Alloy_Data_Checker (
     Customer_Name TEXT,
     alloy_family TEXT,
@@ -873,6 +914,20 @@ def init_db() -> None:
         _ensure_vacum_sample_check(conn)
         _ensure_crucible_status(conn)
         _ensure_one_available_crucible(conn)
+        _ensure_columns(
+            conn,
+            "Furnace_Oil_Purchase",
+            [
+                ("Weight_in_kgs", "DOUBLE PRECISION" if IS_POSTGRES else "REAL"),
+                (
+                    "Weighment_slip",
+                    "BYTEA" if IS_POSTGRES else "BLOB",
+                ),
+                ("Weighment_slip_name", "TEXT"),
+                ("Weighment_slip_type", "TEXT"),
+            ],
+        )
+        _ensure_furnace_oil_consumption_daily(conn)
         _ensure_raw_material_spec_as_master_child(conn)
         _ensure_case_insensitive_text_pks(conn)
         _ensure_percentage_4dp(conn)
@@ -1071,6 +1126,117 @@ def round_percent_4(value: Any) -> Optional[float]:
         return None
 
 
+def _furnace_oil_consumption_pk_columns(conn: Connection) -> list[str]:
+    if IS_POSTGRES:
+        rows = list(
+            _exec(
+                conn,
+                """
+                SELECT a.attname AS name
+                FROM pg_index i
+                JOIN pg_attribute a
+                  ON a.attrelid = i.indrelid AND a.attnum = ANY (i.indkey)
+                WHERE i.indrelid = 'furnace_oil_consumption'::regclass
+                  AND i.indisprimary
+                ORDER BY array_position(i.indkey, a.attnum)
+                """,
+            ).mappings()
+        )
+        return [str(row["name"]) for row in rows]
+    rows = list(_exec(conn, "PRAGMA table_info(Furnace_Oil_Consumption)").mappings())
+    return [str(row["name"]) for row in rows if row.get("pk")]
+
+
+def _ensure_furnace_oil_consumption_daily(conn: Connection) -> None:
+    """Key daily consumption on Consumption_date only."""
+    try:
+        pk_cols = _furnace_oil_consumption_pk_columns(conn)
+    except Exception:
+        return
+    if not pk_cols:
+        return
+    if pk_cols == ["consumption_date"] or pk_cols == ["Consumption_date"]:
+        if IS_POSTGRES:
+            _exec(
+                conn,
+                "ALTER TABLE furnace_oil_consumption ALTER COLUMN furnace DROP NOT NULL",
+            )
+            _exec(
+                conn,
+                "ALTER TABLE furnace_oil_consumption ALTER COLUMN shift DROP NOT NULL",
+            )
+        return
+    if IS_POSTGRES:
+        _exec(
+            conn,
+            """
+            CREATE TABLE IF NOT EXISTS furnace_oil_consumption__daily (
+                consumption_date TEXT PRIMARY KEY,
+                furnace TEXT,
+                shift TEXT,
+                quantity DOUBLE PRECISION NOT NULL,
+                batch_id TEXT,
+                notes TEXT,
+                last_updated_by TEXT,
+                last_updated_datetime TEXT
+            )
+            """,
+        )
+        _exec(conn, "DELETE FROM furnace_oil_consumption__daily")
+        _exec(
+            conn,
+            """
+            INSERT INTO furnace_oil_consumption__daily
+                (consumption_date, quantity, notes, last_updated_by, last_updated_datetime)
+            SELECT consumption_date,
+                   SUM(quantity),
+                   MAX(notes),
+                   MAX(last_updated_by),
+                   MAX(last_updated_datetime)
+            FROM furnace_oil_consumption
+            GROUP BY consumption_date
+            """,
+        )
+        _exec(conn, "DROP TABLE furnace_oil_consumption")
+        _exec(
+            conn,
+            "ALTER TABLE furnace_oil_consumption__daily RENAME TO furnace_oil_consumption",
+        )
+        return
+    _exec(
+        conn,
+        """
+        CREATE TABLE IF NOT EXISTS Furnace_Oil_Consumption__daily (
+            Consumption_date TEXT PRIMARY KEY,
+            Furnace TEXT,
+            Shift TEXT,
+            Quantity REAL NOT NULL,
+            Batch_ID TEXT,
+            Notes TEXT,
+            Last_updated_by TEXT,
+            Last_updated_datetime TEXT
+        )
+        """,
+    )
+    _exec(conn, "DELETE FROM Furnace_Oil_Consumption__daily")
+    _exec(
+        conn,
+        """
+        INSERT INTO Furnace_Oil_Consumption__daily
+            (Consumption_date, Quantity, Notes, Last_updated_by, Last_updated_datetime)
+        SELECT Consumption_date, SUM(Quantity), MAX(Notes),
+               MAX(Last_updated_by), MAX(Last_updated_datetime)
+        FROM Furnace_Oil_Consumption
+        GROUP BY Consumption_date
+        """,
+    )
+    _exec(conn, "DROP TABLE Furnace_Oil_Consumption")
+    _exec(
+        conn,
+        "ALTER TABLE Furnace_Oil_Consumption__daily RENAME TO Furnace_Oil_Consumption",
+    )
+
+
 def _ensure_percentage_4dp(conn: Connection) -> None:
     """Store chemistry % columns as NUMERIC(10,4)."""
     if not IS_POSTGRES:
@@ -1221,6 +1387,8 @@ _TEXT_PK_CI: list[tuple[str, list[tuple[str, bool]]]] = [
     ("Build_of_Material", [("BOMID", False), ("Effective_date", True)]),
     ("Purchase_Order", [("Customer_PO_No", True), ("Alloy_Id", False)]),
     ("Alloy_Master_spec", [("Alloy_id", False), ("Element_symbol", True)]),
+    ("Furnace_Oil_Consumption", [("Consumption_date", True)]),
+    ("Furnace_Oil_Inventory", [("Inventory_date", True)]),
 ]
 
 
@@ -1797,6 +1965,30 @@ EDITABLE_TABLES: list[dict[str, Any]] = [
         "identity": [],
         "allow_add": False,
     },
+    {
+        "key": "furnace_oil_purchase",
+        "label": "Furnace oil purchases",
+        "pk": ["purchase_id"],
+        "order_by": "purchase_id",
+        "identity": ["purchase_id"],
+        "allow_add": False,
+    },
+    {
+        "key": "furnace_oil_consumption",
+        "label": "Furnace oil consumption",
+        "pk": ["consumption_date"],
+        "order_by": "consumption_date",
+        "identity": [],
+        "allow_add": True,
+    },
+    {
+        "key": "furnace_oil_inventory",
+        "label": "Furnace oil inventory",
+        "pk": ["inventory_date"],
+        "order_by": "inventory_date",
+        "identity": [],
+        "allow_add": False,
+    },
 ]
 
 
@@ -1948,6 +2140,12 @@ def save_table_edits(
             else:
                 inserted += 1
 
+    if resolved.lower() in {
+        "furnace_oil_purchase",
+        "furnace_oil_consumption",
+        "furnace_oil_inventory",
+    }:
+        rebuild_furnace_oil_inventory()
     return {"inserted": inserted, "updated": updated}
 
 
@@ -3615,6 +3813,292 @@ def clear_po_document(customer_po_no: str, alloy_id: int) -> None:
         """,
         (customer_po_no, alloy),
     )
+
+
+# ---------- Furnace oil ----------
+
+FURNACE_OIL_PURCHASE_TYPES = ("Purchase", "Opening")
+
+
+def _oil_qty(value: Any) -> float:
+    try:
+        qty = float(value or 0)
+    except (TypeError, ValueError):
+        return 0.0
+    return qty if qty > 0 else 0.0
+
+
+def rebuild_furnace_oil_inventory() -> None:
+    """Rebuild the daily inventory ledger from purchases and consumption."""
+    by_val, dt_val = audit_stamp()
+    purchases = fetch_all(
+        """
+        SELECT Received_date AS "Received_date", Quantity AS "Quantity",
+               Purchase_type AS "Purchase_type"
+        FROM Furnace_Oil_Purchase
+        """
+    )
+    consumed = fetch_all(
+        """
+        SELECT Consumption_date AS "Consumption_date", Quantity AS "Quantity"
+        FROM Furnace_Oil_Consumption
+        """
+    )
+    days: dict[str, dict[str, float]] = {}
+
+    def _day(key: str) -> dict[str, float]:
+        return days.setdefault(key, {"opening": 0.0, "purchase": 0.0, "consumption": 0.0})
+
+    for row in purchases:
+        key = _as_effective_date(row.get("Received_date"))
+        if not key:
+            continue
+        qty = _oil_qty(row.get("Quantity"))
+        if (row.get("Purchase_type") or "Purchase") == "Opening":
+            _day(key)["opening"] += qty
+        else:
+            _day(key)["purchase"] += qty
+    for row in consumed:
+        key = _as_effective_date(row.get("Consumption_date"))
+        if not key:
+            continue
+        _day(key)["consumption"] += _oil_qty(row.get("Quantity"))
+
+    ledger: list[tuple[str, float, float, float, float]] = []
+    carried = 0.0
+    for key in sorted(days):
+        rec = days[key]
+        opening = rec["opening"] if rec["opening"] > 0 else carried
+        closing = opening + rec["purchase"] - rec["consumption"]
+        ledger.append((key, opening, rec["purchase"], rec["consumption"], closing))
+        carried = closing
+
+    with get_connection() as conn:
+        _exec(conn, "DELETE FROM Furnace_Oil_Inventory")
+        for key, opening, purchase, consumption, closing in ledger:
+            _exec(
+                conn,
+                """
+                INSERT INTO Furnace_Oil_Inventory
+                    (Inventory_date, Opening_qty, Purchase_qty, Consumption_qty,
+                     Closing_qty, Last_updated_by, Last_updated_datetime)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (key, opening, purchase, consumption, closing, by_val, dt_val),
+            )
+
+
+def get_furnace_oil_stock() -> float:
+    row = fetch_one(
+        """
+        SELECT Closing_qty AS "Closing_qty"
+        FROM Furnace_Oil_Inventory
+        ORDER BY Inventory_date DESC
+        LIMIT 1
+        """
+    )
+    if not row:
+        return 0.0
+    try:
+        return float(row.get("Closing_qty") or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def list_furnace_oil_purchases(limit: int = 50) -> list[dict[str, Any]]:
+    return fetch_all(
+        """
+        SELECT p.Purchase_id AS "Purchase_id",
+               p.Purchase_type AS "Purchase_type",
+               v.Vendor_name AS "Vendor_name",
+               p.Vendor_code AS "Vendor_code",
+               p.Supplier_Invoice AS "Supplier_Invoice",
+               p.Supplier_invoice_date AS "Supplier_invoice_date",
+               p.Received_date AS "Received_date",
+               p.Quantity AS "Quantity",
+               p.Weight_in_kgs AS "Weight_in_kgs",
+               p.Rate_per_litre AS "Rate_per_litre",
+               p.Storage_tank AS "Storage_tank",
+               p.Invoice_Document_name AS "Invoice_Document_name",
+               p.Weighment_slip_name AS "Weighment_slip_name",
+               p.Notes AS "Notes"
+        FROM Furnace_Oil_Purchase p
+        LEFT JOIN Vendor_Master v ON v.Vendor_code = p.Vendor_code
+        ORDER BY p.Received_date DESC, p.Purchase_id DESC
+        LIMIT ?
+        """,
+        (limit,),
+    )
+
+
+def list_furnace_oil_consumption(limit: int = 50) -> list[dict[str, Any]]:
+    return fetch_all(
+        """
+        SELECT Consumption_date AS "Consumption_date",
+               Quantity AS "Quantity",
+               Notes AS "Notes"
+        FROM Furnace_Oil_Consumption
+        ORDER BY Consumption_date DESC
+        LIMIT ?
+        """,
+        (limit,),
+    )
+
+
+def list_furnace_oil_inventory(limit: int = 90) -> list[dict[str, Any]]:
+    return fetch_all(
+        """
+        SELECT Inventory_date AS "Inventory_date",
+               Opening_qty AS "Opening_qty",
+               Purchase_qty AS "Purchase_qty",
+               Consumption_qty AS "Consumption_qty",
+               Closing_qty AS "Closing_qty"
+        FROM Furnace_Oil_Inventory
+        ORDER BY Inventory_date DESC
+        LIMIT ?
+        """,
+        (limit,),
+    )
+
+
+def add_furnace_oil_purchase(
+    vendor_code: Optional[int],
+    invoice: str,
+    invoice_date: str,
+    received_date: str,
+    quantity: float,
+    rate_per_litre: Optional[float] = None,
+    weight_in_kgs: Optional[float] = None,
+    storage_tank: Optional[str] = None,
+    notes: Optional[str] = None,
+    invoice_document: Optional[bytes] = None,
+    invoice_document_name: Optional[str] = None,
+    invoice_document_type: Optional[str] = None,
+    weighment_slip: Optional[bytes] = None,
+    weighment_slip_name: Optional[str] = None,
+    weighment_slip_type: Optional[str] = None,
+    purchase_type: str = "Purchase",
+) -> int:
+    qty = _oil_qty(quantity)
+    if qty <= 0:
+        raise ValueError("Quantity (litres) must be greater than zero.")
+    kind = (purchase_type or "Purchase").strip()
+    if kind not in FURNACE_OIL_PURCHASE_TYPES:
+        raise ValueError("Purchase type must be Purchase or Opening.")
+    if kind == "Purchase" and not (invoice or "").strip():
+        raise ValueError("Vendor invoice is required.")
+    if invoice_document and invoice_document_name:
+        _validate_invoice_document_name(invoice_document_name)
+    if weighment_slip and weighment_slip_name:
+        _validate_invoice_document_name(weighment_slip_name)
+    weight = _oil_qty(weight_in_kgs) or None
+    by_val, dt_val = audit_stamp()
+    with get_connection() as conn:
+        result = _exec(
+            conn,
+            """
+            INSERT INTO Furnace_Oil_Purchase
+                (Vendor_code, Supplier_Invoice, Supplier_invoice_date, Received_date,
+                 Quantity, Weight_in_kgs, Rate_per_litre, Storage_tank, Purchase_type,
+                 Invoice_Document, Invoice_Document_name, Invoice_Document_type,
+                 Weighment_slip, Weighment_slip_name, Weighment_slip_type,
+                 Notes, Last_updated_by, Last_updated_datetime)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            RETURNING Purchase_id
+            """,
+            (
+                vendor_code,
+                (invoice or "").strip() or ("OPENING" if kind == "Opening" else ""),
+                invoice_date,
+                received_date,
+                qty,
+                weight,
+                rate_per_litre,
+                (storage_tank or "").strip() or None,
+                kind,
+                invoice_document,
+                invoice_document_name,
+                invoice_document_type,
+                weighment_slip,
+                weighment_slip_name,
+                weighment_slip_type,
+                (notes or "").strip() or None,
+                by_val,
+                dt_val,
+            ),
+        )
+        purchase_id = int(result.scalar_one())
+    rebuild_furnace_oil_inventory()
+    return purchase_id
+
+
+def get_furnace_oil_consumption_row(consumption_date: str) -> Optional[dict[str, Any]]:
+    return fetch_one(
+        """
+        SELECT Consumption_date AS "Consumption_date", Quantity AS "Quantity"
+        FROM Furnace_Oil_Consumption
+        WHERE Consumption_date = ?
+        """,
+        (consumption_date,),
+    )
+
+
+def add_furnace_oil_consumption(
+    consumption_date: str,
+    quantity: float,
+    notes: Optional[str] = None,
+) -> None:
+    qty = _oil_qty(quantity)
+    if qty <= 0:
+        raise ValueError("Consumption (litres) must be greater than zero.")
+    day = _as_effective_date(consumption_date)
+    if not day:
+        raise ValueError("Consumption date is required.")
+    existing = get_furnace_oil_consumption_row(day)
+    available = get_furnace_oil_stock() + _oil_qty(existing.get("Quantity") if existing else 0)
+    if qty > available + 1e-9:
+        raise ValueError(
+            f"Consumption {qty:g} L exceeds available stock {available:g} L."
+        )
+    by_val, dt_val = audit_stamp()
+    execute(
+        """
+        INSERT INTO Furnace_Oil_Consumption
+            (Consumption_date, Quantity, Notes, Last_updated_by, Last_updated_datetime)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(Consumption_date) DO UPDATE SET
+            Quantity=excluded.Quantity,
+            Notes=excluded.Notes,
+            Last_updated_by=excluded.Last_updated_by,
+            Last_updated_datetime=excluded.Last_updated_datetime
+        """,
+        (day, qty, (notes or "").strip() or None, by_val, dt_val),
+    )
+    rebuild_furnace_oil_inventory()
+
+
+def furnace_oil_month_totals(year: int, month: int) -> dict[str, float]:
+    prefix = f"{year:04d}-{month:02d}"
+    purchased = fetch_one(
+        """
+        SELECT COALESCE(SUM(Quantity), 0) AS "qty"
+        FROM Furnace_Oil_Purchase
+        WHERE Purchase_type = 'Purchase' AND Received_date LIKE ?
+        """,
+        (f"{prefix}%",),
+    )
+    used = fetch_one(
+        """
+        SELECT COALESCE(SUM(Quantity), 0) AS "qty"
+        FROM Furnace_Oil_Consumption
+        WHERE Consumption_date LIKE ?
+        """,
+        (f"{prefix}%",),
+    )
+    return {
+        "purchased": float((purchased or {}).get("qty") or 0),
+        "consumed": float((used or {}).get("qty") or 0),
+    }
 
 
 # ---------- BOM ----------
