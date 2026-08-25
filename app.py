@@ -433,6 +433,48 @@ def ui_datetime_input(label: str, **kwargs):
     return st.datetime_input(label, **kwargs)
 
 
+def _furnace_form_key(furnace: str, name: str) -> str:
+    """Session/widget key scoped to one furnace so drafts never mix."""
+    safe = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in str(furnace))
+    return f"pb_{safe}_{name}"
+
+
+def _furnace_key_prefix(furnace: str) -> str:
+    return _furnace_form_key(furnace, "")
+
+
+def _snapshot_furnace_widgets(furnace: str) -> None:
+    """Keep a durable copy of one furnace's widgets.
+
+    Streamlit deletes unused widget keys at the end of a run, so switching
+    furnace would otherwise drop an in-progress draft.
+    """
+    if not furnace or furnace == "— select furnace —":
+        return
+    prefix = _furnace_key_prefix(furnace)
+    store = st.session_state.setdefault("batch_drafts", {})
+    store[str(furnace)] = {
+        k: st.session_state[k]
+        for k in list(st.session_state.keys())
+        if isinstance(k, str) and k.startswith(prefix)
+    }
+
+
+def _restore_furnace_widgets(furnace: str) -> None:
+    saved = (st.session_state.get("batch_drafts") or {}).get(str(furnace)) or {}
+    for k, v in saved.items():
+        if k not in st.session_state:
+            st.session_state[k] = v
+
+
+def _on_working_furnace_change() -> None:
+    prev = st.session_state.get("_pb_prev_furnace")
+    current = st.session_state.get("batch_working_furnace")
+    if prev and prev != current:
+        _snapshot_furnace_widgets(prev)
+    st.session_state["_pb_prev_furnace"] = current
+
+
 def _parse_master_date(value: object) -> date:
     parsed = parse_any_date(value)
     if isinstance(parsed, datetime):
@@ -1100,8 +1142,10 @@ elif PAGE == "Furnace Oil Purchase":
 elif PAGE == "Production Batch & Chemistry":
     st.title("Production Batch & Chemistry Input")
     st.caption(
-        "Optimized for shop-floor capture: batch ID is built as **F{Furnace}-H{Heat}** "
-        "(e.g. Furnace 3 + Heat 7 → `F3-H07`). "
+        "Choose a furnace first, then enter alloy, samples, charge lines, and chemistry "
+        "for that furnace only. Switching furnace keeps this draft and opens a separate "
+        "form — it does not remap entries to the other furnace. "
+        "Batch ID is **F{Furnace}-H{Heat}** (e.g. Furnace 3 + Heat 7 → `F3-H07`). "
         "Browse existing batches under **Production Batches**."
     )
 
@@ -1123,9 +1167,38 @@ elif PAGE == "Production Batch & Chemistry":
     elif not supervisors:
         st.error("Define at least one production supervisor (Data Browser → Production supervisors).")
     else:
+        furnace_choice = st.selectbox(
+            "Working furnace *",
+            options=["— select furnace —"] + furnaces,
+            key="batch_working_furnace",
+            on_change=_on_working_furnace_change,
+            help=(
+                "Select the furnace this heat is running in. All fields below "
+                "stay with this furnace only."
+            ),
+        )
+        if furnace_choice == "— select furnace —":
+            st.info(
+                "Select a furnace to enter production data. Alloy, samples, "
+                "charge lines, and batch chemistry are stored per furnace, so "
+                "changing furnace later will not move this entry to another furnace."
+            )
+            st.stop()
+
+        furnace = furnace_choice
+        _restore_furnace_widgets(furnace)
+        st.session_state["_pb_prev_furnace"] = furnace
+
+        def _pk(name: str) -> str:
+            return _furnace_form_key(furnace, name)
+
+        st.info(
+            f"Entering data for furnace **{furnace}** only. "
+            "Crucible, heat, alloy, samples, charges, and chemistry apply to this furnace."
+        )
+
         col1, col2, col3 = st.columns(3)
         with col1:
-            furnace = st.selectbox("Furnace *", furnaces, key="batch_furnace")
             available_crucible = (
                 db.get_available_crucible(furnace) if furnace else None
             )
@@ -1138,22 +1211,28 @@ elif PAGE == "Production Batch & Chemistry":
                 st.error(
                     "No crucible available for the respective furnace."
                 )
-            heat_no = st.selectbox("Heat no *", db.HEAT_NOS)
-            melt_no = st.selectbox("Melt no", db.MELT_NOS)
+            heat_no = st.selectbox("Heat no *", db.HEAT_NOS, key=_pk("heat_no"))
+            melt_no = st.selectbox("Melt no", db.MELT_NOS, key=_pk("melt_no"))
         with col2:
-            prod_date = ui_date_input("Production date", value=date.today())
-            shift = st.selectbox("Shift", db.SHIFTS)
-            melting_team = st.selectbox("Melter name *", melters)
+            prod_date = ui_date_input(
+                "Production date",
+                value=date.today(),
+                key=_pk("prod_date"),
+            )
+            shift = st.selectbox("Shift", db.SHIFTS, key=_pk("shift"))
+            melting_team = st.selectbox("Melter name *", melters, key=_pk("melter"))
         with col3:
             alloy_label = st.selectbox(
                 "Alloy",
                 options=["— none —"] + list(alloy_labels.keys()),
+                key=_pk("alloy"),
             )
             production_supervisor = st.selectbox(
                 "Production supervisor *",
                 supervisors,
+                key=_pk("supervisor"),
             )
-            notes = st.text_area("Notes", height=68)
+            notes = st.text_area("Notes", height=68, key=_pk("notes"))
             preview_id = db.make_batch_id(furnace, heat_no)
             st.markdown(f"**Batch ID preview:** `{preview_id}`")
 
@@ -1165,18 +1244,19 @@ elif PAGE == "Production Batch & Chemistry":
             degassing_time = st.text_input(
                 "Degassing time",
                 placeholder="e.g. 14:30 or 12 min",
+                key=_pk("degassing_time"),
             )
         with d2:
             sampled_pcs = empty_percent_input(
                 "Sampled pcs",
-                key="sampled_pcs",
+                key=_pk("sampled_pcs"),
                 max_value=None,
                 step=1.0,
             )
         with d3:
             defect_pcs = empty_percent_input(
                 "Defect pcs",
-                key="defect_pcs",
+                key=_pk("defect_pcs"),
                 max_value=None,
                 step=1.0,
             )
@@ -1200,21 +1280,31 @@ elif PAGE == "Production Batch & Chemistry":
         sample_opts = [sample_blank] + db.SAMPLE_OK_STATUS
         s1, s2, s3, s4 = st.columns(4)
         with s1:
-            top_sample = st.selectbox("Top sample", sample_opts)
+            top_sample = st.selectbox("Top sample", sample_opts, key=_pk("top_sample"))
         with s2:
-            middle_sample = st.selectbox("Middle sample", sample_opts)
+            middle_sample = st.selectbox(
+                "Middle sample", sample_opts, key=_pk("middle_sample")
+            )
         with s3:
-            bottom_sample = st.selectbox("Bottom sample", sample_opts)
+            bottom_sample = st.selectbox(
+                "Bottom sample", sample_opts, key=_pk("bottom_sample")
+            )
         with s4:
-            vacum_sample = st.selectbox("Vacum sample", sample_opts)
+            vacum_sample = st.selectbox(
+                "Vacum sample", sample_opts, key=_pk("vacum_sample")
+            )
 
         r1, r2, r3, r4 = st.columns(4)
         with r1:
-            top_sample_remarks = st.text_input("Remarks", key="top_sample_remarks")
+            top_sample_remarks = st.text_input("Remarks", key=_pk("top_sample_remarks"))
         with r2:
-            middle_sample_remarks = st.text_input("Remarks", key="middle_sample_remarks")
+            middle_sample_remarks = st.text_input(
+                "Remarks", key=_pk("middle_sample_remarks")
+            )
         with r3:
-            bottom_sample_remarks = st.text_input("Remarks", key="bottom_sample_remarks")
+            bottom_sample_remarks = st.text_input(
+                "Remarks", key=_pk("bottom_sample_remarks")
+            )
         with r4:
             st.empty()
 
@@ -1224,7 +1314,7 @@ elif PAGE == "Production Batch & Chemistry":
                 "Datetime",
                 value=None,
                 step=60,
-                key="top_sample_dt",
+                key=_pk("top_sample_dt"),
                 help="Open the calendar icon to pick date and time.",
             )
         with d2:
@@ -1232,7 +1322,7 @@ elif PAGE == "Production Batch & Chemistry":
                 "Datetime",
                 value=None,
                 step=60,
-                key="middle_sample_dt",
+                key=_pk("middle_sample_dt"),
                 help="Open the calendar icon to pick date and time.",
             )
         with d3:
@@ -1240,7 +1330,7 @@ elif PAGE == "Production Batch & Chemistry":
                 "Datetime",
                 value=None,
                 step=60,
-                key="bottom_sample_dt",
+                key=_pk("bottom_sample_dt"),
                 help="Open the calendar icon to pick date and time.",
             )
         with d4:
@@ -1272,23 +1362,27 @@ elif PAGE == "Production Batch & Chemistry":
             for t in trolleys
         }
 
-        if "charge_lines" not in st.session_state:
-            st.session_state.charge_lines = [
+        if "charge_lines_by_furnace" not in st.session_state:
+            st.session_state.charge_lines_by_furnace = {}
+        drafts = st.session_state.charge_lines_by_furnace
+        if furnace not in drafts:
+            drafts[furnace] = [
                 {"material": "", "lot_id": None, "weight": 0.0, "notes": ""}
             ]
+        furnace_charge_lines = drafts[furnace]
 
         if not trolleys:
             st.error("Define at least one active trolley under **Trolleys**.")
 
         charge_inputs: list[dict] = []
-        for idx, line in enumerate(st.session_state.charge_lines):
+        for idx, line in enumerate(furnace_charge_lines):
             st.markdown(f"**Charge line {idx + 1}**")
             r1c1, r1c2, r1c3 = st.columns([2, 2, 2])
             with r1c1:
                 mat = st.selectbox(
                     "Raw material",
                     options=[""] + materials,
-                    key=f"mat_{idx}",
+                    key=_pk(f"mat_{idx}"),
                 )
             lots = db.list_inventory_lots(material=mat or None) if mat else []
             lot_opts = {
@@ -1299,11 +1393,11 @@ elif PAGE == "Production Batch & Chemistry":
                 lot_label = st.selectbox(
                     "Lot",
                     options=[""] + list(lot_opts.keys()),
-                    key=f"lot_{idx}",
+                    key=_pk(f"lot_{idx}"),
                 )
             with r1c3:
                 # Style from current selection (session) so highlight updates on rerun
-                _pending_label = st.session_state.get(f"trolley_{idx}", "") or ""
+                _pending_label = st.session_state.get(_pk(f"trolley_{idx}"), "") or ""
                 _pending_name = trolley_label_to_name.get(_pending_label)
                 _pending_colour = (
                     trolley_colour_by_name.get(_pending_name) if _pending_name else None
@@ -1360,7 +1454,7 @@ elif PAGE == "Production Batch & Chemistry":
                     trolley_label = st.selectbox(
                         "Trolley *",
                         options=[""] + trolley_labels,
-                        key=f"trolley_{idx}",
+                        key=_pk(f"trolley_{idx}"),
                         disabled=not bool(trolleys),
                     )
 
@@ -1369,8 +1463,8 @@ elif PAGE == "Production Batch & Chemistry":
 
             # Streamlit number_input ignores `value` after first render when `key` is set.
             # Sync tare whenever the selected trolley changes.
-            tare_key = f"trolley_w_{idx}"
-            prev_trolley_key = f"_prev_trolley_label_{idx}"
+            tare_key = _pk(f"trolley_w_{idx}")
+            prev_trolley_key = _pk(f"_prev_trolley_label_{idx}")
             if st.session_state.get(prev_trolley_key) != trolley_label:
                 st.session_state[tare_key] = float(trolley_w)
                 st.session_state[prev_trolley_key] = trolley_label
@@ -1390,14 +1484,14 @@ elif PAGE == "Production Batch & Chemistry":
             with r2c2:
                 scale_w = empty_percent_input(
                     "Weighment scale weight (kg) *",
-                    key=f"scale_w_{idx}",
+                    key=_pk(f"scale_w_{idx}"),
                     max_value=None,
                     step=1.0,
                 )
-                wsp_open_key = f"wsp_open_{idx}"
+                wsp_open_key = _pk(f"wsp_open_{idx}")
                 if st.button(
                     "📷 Weighment scale photo",
-                    key=f"wsp_btn_{idx}",
+                    key=_pk(f"wsp_btn_{idx}"),
                     help="Open camera or choose a photo from the phone gallery",
                     use_container_width=True,
                 ):
@@ -1411,21 +1505,21 @@ elif PAGE == "Production Batch & Chemistry":
                     st.caption("Capture with camera or pick from gallery")
                     wsp_cam = st.camera_input(
                         "Camera",
-                        key=f"wsp_cam_{idx}",
+                        key=_pk(f"wsp_cam_{idx}"),
                         help="Uses the phone camera when available.",
                     )
                     wsp_file = st.file_uploader(
                         "Gallery / files",
                         type=["png", "jpg", "jpeg", "webp"],
-                        key=f"wsp_file_{idx}",
+                        key=_pk(f"wsp_file_{idx}"),
                         help="Choose an existing photo from the device gallery.",
                     )
                     scale_photo_bytes = photo_bytes(wsp_cam) or photo_bytes(wsp_file)
                     if scale_photo_bytes:
-                        st.session_state[f"wsp_bytes_{idx}"] = scale_photo_bytes
+                        st.session_state[_pk(f"wsp_bytes_{idx}")] = scale_photo_bytes
                         st.success("Weighment scale photo ready to save with this charge line.")
                 else:
-                    scale_photo_bytes = st.session_state.get(f"wsp_bytes_{idx}")
+                    scale_photo_bytes = st.session_state.get(_pk(f"wsp_bytes_{idx}"))
                     if scale_photo_bytes:
                         st.caption("Weighment scale photo attached.")
 
@@ -1433,7 +1527,7 @@ elif PAGE == "Production Batch & Chemistry":
             tare_w = float(st.session_state.get(tare_key, trolley_w) or 0.0)
             scale_val = float(scale_w or 0)
             net_w = max(scale_val - tare_w, 0.0) if trolley_name and scale_val > 0 else 0.0
-            net_key = f"wt_{idx}"
+            net_key = _pk(f"wt_{idx}")
             st.session_state[net_key] = float(net_w)
             with r2c3:
                 st.number_input(
@@ -1445,11 +1539,11 @@ elif PAGE == "Production Batch & Chemistry":
                     help="Auto: weighment scale weight − trolley weight.",
                 )
             with r2c4:
-                n = st.text_input("Line notes", key=f"ln_{idx}")
-                inp_open_key = f"inp_open_{idx}"
+                n = st.text_input("Line notes", key=_pk(f"ln_{idx}"))
+                inp_open_key = _pk(f"inp_open_{idx}")
                 if st.button(
                     "📷 Material Photo",
-                    key=f"inp_btn_{idx}",
+                    key=_pk(f"inp_btn_{idx}"),
                     help="Open camera or choose a photo from the phone gallery for Material Photo",
                     use_container_width=True,
                 ):
@@ -1463,21 +1557,21 @@ elif PAGE == "Production Batch & Chemistry":
                 st.caption(f"Charge line {idx + 1} — Material Photo (camera or gallery)")
                 inp_cam = st.camera_input(
                     "Input camera",
-                    key=f"inp_cam_{idx}",
+                    key=_pk(f"inp_cam_{idx}"),
                     help="Uses the phone camera when available.",
                 )
                 inp_file = st.file_uploader(
                     "Input gallery / files",
                     type=["png", "jpg", "jpeg", "webp"],
-                    key=f"inp_file_{idx}",
+                    key=_pk(f"inp_file_{idx}"),
                     help="Choose an existing photo from the device gallery.",
                 )
                 input_photo_bytes = photo_bytes(inp_cam) or photo_bytes(inp_file)
                 if input_photo_bytes:
-                    st.session_state[f"inp_bytes_{idx}"] = input_photo_bytes
+                    st.session_state[_pk(f"inp_bytes_{idx}")] = input_photo_bytes
                     st.success("Material Photo ready to save with this charge line.")
             else:
-                input_photo_bytes = st.session_state.get(f"inp_bytes_{idx}")
+                input_photo_bytes = st.session_state.get(_pk(f"inp_bytes_{idx}"))
                 if input_photo_bytes:
                     st.caption(f"Charge line {idx + 1}: Material Photo attached.")
 
@@ -1498,13 +1592,15 @@ elif PAGE == "Production Batch & Chemistry":
                 )
 
         add_col, rem_col, _ = st.columns([1, 1, 4])
-        if add_col.button("Add charge line"):
-            st.session_state.charge_lines.append(
+        if add_col.button("Add charge line", key=_pk("add_charge")):
+            drafts[furnace].append(
                 {"material": "", "lot_id": None, "weight": 0.0, "notes": ""}
             )
             st.rerun()
-        if rem_col.button("Remove last line") and len(st.session_state.charge_lines) > 1:
-            st.session_state.charge_lines.pop()
+        if rem_col.button("Remove last line", key=_pk("rem_charge")) and len(
+            drafts[furnace]
+        ) > 1:
+            drafts[furnace].pop()
             st.rerun()
 
         total_in = sum(c["Weight"] for c in charge_inputs)
@@ -1523,20 +1619,22 @@ elif PAGE == "Production Batch & Chemistry":
             st.info("Select an alloy above to display spec ranges and validate ladle chemistry.")
         alloy_specs = db.get_alloy_specs(alloy_id) if alloy_id else {}
         entry_elements = db.list_batch_chem_elements()
+        full_chem_key = _pk("full_chem")
         sync_batch_keys = {
-            el["Element_Symbol"]: f"bchem_{el['Element_Symbol']}" for el in entry_elements
+            el["Element_Symbol"]: _pk(f"bchem_{el['Element_Symbol']}")
+            for el in entry_elements
         }
-        full_batch = st.session_state.get("batch_full_chem") or {}
+        full_batch = st.session_state.get(full_chem_key) or {}
         bbtn1, bbtn2 = st.columns([2, 3])
         with bbtn1:
             if st.button(
                 "Open all elements…",
-                key="batch_open_all_elements",
+                key=_pk("open_all_elements"),
                 help="Enter chemistry for every row in Element_Master",
                 use_container_width=True,
             ):
                 dialog_all_element_percentages(
-                    "batch_full_chem",
+                    full_chem_key,
                     defaults=full_batch,
                     sync_keys=sync_batch_keys,
                 )
@@ -1570,7 +1668,7 @@ elif PAGE == "Production Batch & Chemistry":
                 except (TypeError, ValueError):
                     return 0.0
             try:
-                return float(st.session_state.get(f"bchem_{sym}") or 0.0)
+                return float(st.session_state.get(_pk(f"bchem_{sym}")) or 0.0)
             except (TypeError, ValueError):
                 return 0.0
 
@@ -1588,14 +1686,14 @@ elif PAGE == "Production Batch & Chemistry":
                         + 3.0 * _entered_chem("Cr")
                     )
                     sf_val = round(sludge, 1)
-                    st.session_state["bchem_SF"] = sf_val if sf_val > 0 else None
+                    st.session_state[_pk("bchem_SF")] = sf_val if sf_val > 0 else None
                     batch_chem[sym] = st.number_input(
                         "SF %",
                         min_value=0.0,
                         max_value=600.0,
                         value=None,
                         step=0.1,
-                        key="bchem_SF",
+                        key=_pk("bchem_SF"),
                         disabled=True,
                         placeholder="",
                         help="Auto: Sludge Factor = Fe + 2×Mn + 3×Cr, rounded to 0.1%.",
@@ -1603,7 +1701,7 @@ elif PAGE == "Production Batch & Chemistry":
                 else:
                     batch_chem[sym] = empty_percent_input(
                         f"{sym} %",
-                        key=f"bchem_{sym}",
+                        key=_pk(f"bchem_{sym}"),
                         default=full_batch.get(sym),
                         step=CHEM_PERCENT_STEP,
                         format=CHEM_PERCENT_FORMAT,
@@ -1623,7 +1721,7 @@ elif PAGE == "Production Batch & Chemistry":
                 css = "chem-spec-bad" if bad else "chem-spec"
                 st.markdown(f'<p class="{css}">{spec_line}</p>', unsafe_allow_html=True)
                 if bad:
-                    out_of_spec_keys.append(f"bchem_{sym}")
+                    out_of_spec_keys.append(_pk(f"bchem_{sym}"))
 
         if out_of_spec_keys:
             rules = "\n".join(
@@ -1639,6 +1737,7 @@ elif PAGE == "Production Batch & Chemistry":
             "Create production batch",
             type="primary",
             disabled=available_crucible is None,
+            key=_pk("create_batch"),
         ):
             if available_crucible is None:
                 st.error("No crucible available for the respective furnace.")
@@ -1646,7 +1745,7 @@ elif PAGE == "Production Batch & Chemistry":
                 st.error("Add at least one charge line with weight > 0.")
             else:
                 try:
-                    merged_chem = merge_percent_composition(batch_chem, "batch_full_chem")
+                    merged_chem = merge_percent_composition(batch_chem, full_chem_key)
                     bid = db.create_batch(
                         furnace=furnace,
                         heat_no=heat_no,
@@ -1686,13 +1785,15 @@ elif PAGE == "Production Batch & Chemistry":
                         production_supervisor=production_supervisor,
                     )
                     st.success(f"Created batch **{bid}** — Heat {heat_no}, Furnace {furnace}.")
-                    st.session_state.charge_lines = [
+                    drafts[furnace] = [
                         {"material": "", "lot_id": None, "weight": 0.0, "notes": ""}
                     ]
-                    st.session_state.pop("batch_full_chem", None)
+                    st.session_state.pop(full_chem_key, None)
                     st.balloons()
                 except Exception as exc:
                     st.error(str(exc))
+
+        _snapshot_furnace_widgets(furnace)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
