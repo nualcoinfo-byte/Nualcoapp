@@ -145,12 +145,35 @@ class NeonHttpClient:
         self._ctx = ssl.create_default_context()
 
     def execute(self, sql: str, params: Any = None) -> HttpResult:
+        if self._is_txn_control(sql):
+            # Each HTTPS request is auto-commit. SAVEPOINT / BEGIN / COMMIT
+            # are session commands and return 400 outside a real txn.
+            return HttpResult({"rows": [], "rowCount": 0, "fields": []})
         if self._is_executemany(params):
             last = HttpResult({"rows": [], "rowCount": 0, "fields": []})
             for item in params:
                 last = self._one(sql, item)
             return last
         return self._one(sql, params)
+
+    @staticmethod
+    def _is_txn_control(sql: str) -> bool:
+        text = " ".join(sql.strip().rstrip(";").split()).upper()
+        if text in {
+            "BEGIN",
+            "BEGIN TRANSACTION",
+            "START TRANSACTION",
+            "COMMIT",
+            "ROLLBACK",
+            "END",
+        }:
+            return True
+        return (
+            text.startswith("SAVEPOINT ")
+            or text.startswith("RELEASE SAVEPOINT ")
+            or text.startswith("RELEASE ")
+            or text.startswith("ROLLBACK TO")
+        )
 
     @staticmethod
     def _is_executemany(params: Any) -> bool:

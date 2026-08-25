@@ -1270,6 +1270,12 @@ def _ensure_raw_material_purchase_header(conn: Connection) -> None:
         ).scalar_one()
         if int(leftover or 0) == 0:
             def _try_ddl(sql: str) -> None:
+                if _USE_NEON_HTTP:
+                    try:
+                        _exec(conn, sql)
+                    except Exception:
+                        pass
+                    return
                 _exec(conn, "SAVEPOINT rm_purchase_ddl")
                 try:
                     _exec(conn, sql)
