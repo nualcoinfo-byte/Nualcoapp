@@ -176,6 +176,117 @@ def empty_percent_input(
     return st.number_input(label, **kwargs)
 
 
+def _alloy_output_label(alloy: dict) -> str:
+    aid = int(alloy["Alloy_id"])
+    name = alloy.get("Alloy_name") or f"Alloy {aid}"
+    if db.is_sidestream_alloy(aid):
+        return f"{aid} — {name} (non-spec)"
+    return f"{aid} — {name}"
+
+
+def render_batch_output_editor(batch: dict, *, key_prefix: str) -> None:
+    """Enter output lines for one batch: product alloy plus 78/79/80."""
+    bid = batch["Batch_ID"]
+    product_id = batch.get("Alloy_id")
+    alloys = db.list_batch_output_alloys(product_id)
+    if not alloys:
+        st.error(
+            "Define the batch alloy and non-spec outputs 78 (Broken Ingot), "
+            "79 (Furnace Empty), and 80 (Not Ok Ingot) under **Alloys**."
+        )
+        return
+
+    label_to_id = {_alloy_output_label(a): int(a["Alloy_id"]) for a in alloys}
+    id_to_label = {v: k for k, v in label_to_id.items()}
+    labels = list(label_to_id.keys())
+    default_label = labels[0]
+    if product_id:
+        default_label = id_to_label.get(int(product_id), default_label)
+
+    state_key = f"{key_prefix}_n_{bid}"
+    loaded_key = f"{key_prefix}_loaded_{bid}"
+    if not st.session_state.get(loaded_key):
+        existing = db.get_batch_outputs(bid)
+        st.session_state[state_key] = max(len(existing), 1)
+        for idx, row in enumerate(existing):
+            st.session_state[f"{key_prefix}_{bid}_alloy_{idx}"] = id_to_label.get(
+                int(row["Alloy_id"]), default_label
+            )
+            st.session_state[f"{key_prefix}_{bid}_wt_{idx}"] = float(row["Weight"] or 0)
+            pcs = row.get("Pieces")
+            st.session_state[f"{key_prefix}_{bid}_pcs_{idx}"] = (
+                float(pcs) if pcs not in (None, "") else None
+            )
+            st.session_state[f"{key_prefix}_{bid}_notes_{idx}"] = row.get("Notes") or ""
+        if not existing and default_label:
+            st.session_state[f"{key_prefix}_{bid}_alloy_0"] = default_label
+        st.session_state[loaded_key] = True
+
+    n_lines = int(st.session_state.get(state_key) or 1)
+    st.markdown("#### Batch outputs")
+    st.caption(
+        "Record metal that left this heat. The product alloy is the one selected on the "
+        "batch. **Broken Ingot**, **Furnace Empty**, and **Not Ok Ingot** (alloy IDs 78–80) "
+        "are for samples and portions taken out so they do not spoil the chemistry. "
+        "They have no spec."
+    )
+
+    collected: list[dict] = []
+    for idx in range(n_lines):
+        st.markdown(f"**Output line {idx + 1}**")
+        c1, c2, c3, c4 = st.columns([2.2, 1.2, 1.2, 2])
+        with c1:
+            alloy_label = st.selectbox(
+                "Output alloy *",
+                options=labels,
+                key=f"{key_prefix}_{bid}_alloy_{idx}",
+            )
+        with c2:
+            weight = empty_percent_input(
+                "Weight (kg) *",
+                key=f"{key_prefix}_{bid}_wt_{idx}",
+                max_value=None,
+                step=1.0,
+            )
+        with c3:
+            pieces = empty_percent_input(
+                "Pieces",
+                key=f"{key_prefix}_{bid}_pcs_{idx}",
+                max_value=None,
+                step=1.0,
+            )
+        with c4:
+            notes = st.text_input("Notes", key=f"{key_prefix}_{bid}_notes_{idx}")
+        collected.append(
+            {
+                "Alloy_id": label_to_id[alloy_label],
+                "Weight": weight,
+                "Pieces": pieces,
+                "Notes": notes,
+            }
+        )
+
+    add_c, rem_c, save_c = st.columns([1, 1, 3])
+    if add_c.button("Add output line", key=f"{key_prefix}_{bid}_add"):
+        st.session_state[state_key] = n_lines + 1
+        st.rerun()
+    if rem_c.button("Remove last line", key=f"{key_prefix}_{bid}_rem") and n_lines > 1:
+        st.session_state[state_key] = n_lines - 1
+        st.rerun()
+    if save_c.button("Save outputs", type="primary", key=f"{key_prefix}_{bid}_save"):
+        try:
+            db.save_batch_outputs(bid, collected)
+            st.session_state.pop(loaded_key, None)
+            st.success(f"Saved outputs for **{bid}**.")
+            st.rerun()
+        except Exception as exc:
+            st.error(str(exc))
+
+    saved = db.get_batch_outputs(bid)
+    if saved:
+        show_dataframe(df_from_rows(saved))
+
+
 @st.dialog("All elements — chemical composition (%)", width="large")
 def dialog_all_element_percentages(
     state_key: str,
@@ -580,6 +691,7 @@ PAGE = st.sidebar.radio(
         "Raw Material Inventory",
         "Furnace Oil Purchase",
         "Production Batch & Chemistry",
+        "Batch Output",
         "Production Batches",
         "Furnace Oil Consumption",
         "Electricity Consumption",
@@ -1146,13 +1258,14 @@ elif PAGE == "Production Batch & Chemistry":
         "for that furnace only. Switching furnace keeps this draft and opens a separate "
         "form — it does not remap entries to the other furnace. "
         "Batch ID is **F{Furnace}-H{Heat}** (e.g. Furnace 3 + Heat 7 → `F3-H07`). "
+        "Record metal that left the furnace on **Batch Output**. "
         "Browse existing batches under **Production Batches**."
     )
 
     furnaces = db.list_furnaces()
     melters = db.list_melters()
     supervisors = db.list_production_supervisors()
-    alloys = db.list_alloys()
+    alloys = db.list_alloys(include_sidestream=False)
     alloy_labels = {
         f"{a['Alloy_id']} — {a['Alloy_name']}"
         + (f" ({a['Customer_name']})" if a["Customer_name"] else ""): a["Alloy_id"]
@@ -1784,7 +1897,10 @@ elif PAGE == "Production Batch & Chemistry":
                         ),
                         production_supervisor=production_supervisor,
                     )
-                    st.success(f"Created batch **{bid}** — Heat {heat_no}, Furnace {furnace}.")
+                    st.success(
+                        f"Created batch **{bid}** — Heat {heat_no}, Furnace {furnace}. "
+                        "Record product and non-spec output on **Batch Output**."
+                    )
                     drafts[furnace] = [
                         {"material": "", "lot_id": None, "weight": 0.0, "notes": ""}
                     ]
@@ -1797,13 +1913,91 @@ elif PAGE == "Production Batch & Chemistry":
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# 2a. Batch Output
+# ═══════════════════════════════════════════════════════════════════════════════
+elif PAGE == "Batch Output":
+    st.title("Batch Output")
+    st.caption(
+        "Enter metal that left a heat into **batch_output**. "
+        "Each batch can have more than one output line: the product alloy selected "
+        "on the batch, plus **Broken Ingot (78)**, **Furnace Empty (79)**, and "
+        "**Not Ok Ingot (80)** for samples and portions taken out so they do not "
+        "spoil the chemistry. Those three have no spec. "
+        "Create the batch first on **Production Batch & Chemistry**."
+    )
+
+    batches = db.list_batches()
+    if not batches:
+        st.info("No batches yet. Create one under **Production Batch & Chemistry**.")
+    else:
+        furnace_opts = ["All furnaces"] + sorted(
+            {str(b["Furnace"]) for b in batches if b.get("Furnace")}
+        )
+        furnace_filter = st.selectbox("Furnace", furnace_opts, key="bo_furnace")
+        filtered = [
+            b
+            for b in batches
+            if furnace_filter == "All furnaces" or str(b.get("Furnace")) == furnace_filter
+        ]
+        if not filtered:
+            st.info("No batches for this furnace.")
+        else:
+            labels = {
+                f"{b['Batch_ID']}  |  {b.get('Alloy_name') or '—'}  |  "
+                f"in={float(b.get('Input_Weight') or 0):.0f} kg  |  "
+                f"out={float(b.get('Output_Weight') or 0):.0f} kg": b["Batch_ID"]
+                for b in filtered
+            }
+            pick = st.selectbox("Batch *", list(labels.keys()), key="bo_batch")
+            bid = labels[pick]
+            batch = db.get_batch(bid)
+            if not batch:
+                st.error(f"Batch {bid} was not found.")
+            else:
+                alloy_name = next(
+                    (b.get("Alloy_name") for b in filtered if b["Batch_ID"] == bid),
+                    None,
+                )
+                m1, m2, m3, m4, m5 = st.columns(5)
+                m1.metric("Batch ID", batch["Batch_ID"])
+                m2.metric("Furnace", batch.get("Furnace") or "—")
+                m3.metric("Heat No", batch.get("Heat_no") or "—")
+                m4.metric(
+                    "Product alloy",
+                    f"{batch.get('Alloy_id')} — {alloy_name or '—'}",
+                )
+                m5.metric(
+                    "Charge input (kg)",
+                    f"{float(batch.get('Input_Weight') or 0):,.2f}",
+                )
+
+                with st.expander("Charge input lines"):
+                    charges = db.get_batch_inputs(bid)
+                    if charges:
+                        show_dataframe(df_from_rows(charges))
+                    else:
+                        st.caption("No charge lines on this batch.")
+
+                render_batch_output_editor(batch, key_prefix="bo_page")
+
+    st.subheader("Saved outputs")
+    saved_all = df_from_rows(db.list_all_batch_outputs())
+    if saved_all.empty:
+        st.info("No output rows yet. Select a batch above and save output lines.")
+    else:
+        show_dataframe(saved_all)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # 2b. Production Batches (browse — kept separate for efficient batch capture)
 # ═══════════════════════════════════════════════════════════════════════════════
 elif PAGE == "Production Batches":
     st.title("Production Batches")
     st.caption(
         "Review existing production batches. "
-        "New batches are created on **Production Batch & Chemistry**."
+        "New batches are created on **Production Batch & Chemistry**. "
+        "Input is charge weight; output is entered on **Batch Output** "
+        "(product alloy plus Broken Ingot / Furnace Empty / Not Ok Ingot)."
     )
     st.subheader("Existing batches")
     batches_df = df_from_rows(db.list_batches())
@@ -2085,6 +2279,10 @@ elif PAGE == "Production Workflow Tracker":
             m3.metric("Crucible", batch.get("Crucible_no") or "—")
             m4.metric("Heat No", batch["Heat_no"])
             m5.metric("Output kg", f"{batch['Output_Weight'] or 0:,.1f}")
+            st.caption(
+                f"Input **{float(batch.get('Input_Weight') or 0):,.1f} kg** from charges. "
+                "Output is the sum of recorded batch outputs (not charge weight)."
+            )
 
             st.markdown(
                 f"**Current stage:** `{batch['Workflow_stage']}` &nbsp;|&nbsp; "
@@ -2140,26 +2338,25 @@ elif PAGE == "Production Workflow Tracker":
                 st.caption("No chemistry recorded.")
             else:
                 show_dataframe(chem_df)
+            render_batch_output_editor(batch, key_prefix="wf_out")
 
         st.divider()
         st.subheader("All batches by stage")
         overview = df_from_rows(batches)
         if not overview.empty:
-            show_dataframe(
-                overview[
-                    [
-                        "Batch_ID",
-                        "Production_Date",
-                        "Furnace",
-                        "Heat_no",
-                        "Workflow_stage",
-                        "Production_status",
-                        "Output_Weight",
-                        "Output_pieces",
-                        "Alloy_name",
-                    ]
-                ]
-            )
+            cols = [
+                "Batch_ID",
+                "Production_Date",
+                "Furnace",
+                "Heat_no",
+                "Workflow_stage",
+                "Production_status",
+                "Input_Weight",
+                "Output_Weight",
+                "Output_pieces",
+                "Alloy_name",
+            ]
+            show_dataframe(overview[[c for c in cols if c in overview.columns]])
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -2168,53 +2365,62 @@ elif PAGE == "Production Workflow Tracker":
 elif PAGE == "Material Recovery & Yield":
     st.title("Material Recovery & Yield Calculator")
     st.caption(
-        f"Recovery % = (Output Weight / Input Weight) × 100. "
+        f"Recovery % = (total recorded output / charge input) × 100. "
+        f"Enter outputs on **Batch Output** (product alloy plus Broken Ingot, "
+        f"Furnace Empty, and Not Ok Ingot). "
         f"Below **{db.YIELD_TARGET_PCT:.0f}%** is highlighted in red."
     )
 
     batches = db.list_batches()
-    # Prefer batches at casting / finished goods, but allow any
-    eligible = [
-        b
-        for b in batches
-        if b["Workflow_stage"] in ("Casting", "Quality Inspection", "Finished Goods")
-        or True
-    ]
-    if not eligible:
+    if not batches:
         st.info("No batches available.")
     else:
         labels = {
-            f"{b['Batch_ID']}  |  stage={b['Workflow_stage']}  |  out={b['Output_Weight'] or 0:.0f} kg": b[
-                "Batch_ID"
-            ]
-            for b in eligible
+            f"{b['Batch_ID']}  |  stage={b['Workflow_stage']}  |  "
+            f"in={b.get('Input_Weight') or 0:.0f} kg  |  "
+            f"out={b.get('Output_Weight') or 0:.0f} kg": b["Batch_ID"]
+            for b in batches
         }
         pick = st.selectbox("Batch", list(labels.keys()))
         bid = labels[pick]
         batch = db.get_batch(bid)
         assert batch is not None
 
-        charge_rows = db.get_batch_inputs(bid)
-        input_w = sum(float(r["Weight"] or 0) for r in charge_rows)
-        current_out = float(batch["Output_Weight"] or 0)
+        render_batch_output_editor(batch, key_prefix="yield_out")
+        batch = db.get_batch(bid)
+        assert batch is not None
 
-        c1, c2 = st.columns(2)
-        with c1:
-            st.metric("Total input weight (kg)", f"{input_w:,.2f}")
-            st.caption("Sum of all charge weights for this batch.")
-        with c2:
-            output_w = st.number_input(
-                "Final output weight (kg)",
-                min_value=0.0,
-                value=current_out if current_out > 0 else 0.0,
-                step=1.0,
-            )
+        input_w = float(batch.get("Input_Weight") or 0)
+        output_rows = db.get_batch_outputs(bid)
+        output_w = sum(float(r["Weight"] or 0) for r in output_rows)
+        product_id = batch.get("Alloy_id")
+        product_w = sum(
+            float(r["Weight"] or 0)
+            for r in output_rows
+            if product_id is not None and int(r["Alloy_id"]) == int(product_id)
+        )
+        sidestream_w = sum(
+            float(r["Weight"] or 0)
+            for r in output_rows
+            if db.is_sidestream_alloy(r["Alloy_id"])
+        )
 
-        if st.button("Calculate yield", type="primary"):
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Charge input (kg)", f"{input_w:,.2f}")
+        c2.metric("Product alloy (kg)", f"{product_w:,.2f}")
+        c3.metric("Non-spec output (kg)", f"{sidestream_w:,.2f}")
+        c4.metric("Total output (kg)", f"{output_w:,.2f}")
+
+        if st.button("Advance to Casting if output recorded", key="yield_advance"):
             stage = batch["Workflow_stage"]
             if output_w > 0 and stage in ("Raw Material", "Melting/Furnace"):
                 db.update_batch_workflow(bid, workflow_stage="Casting")
                 st.info("Batch stage advanced to **Casting**.")
+                st.rerun()
+            elif output_w <= 0:
+                st.warning("Save at least one output line with weight > 0 first.")
+            else:
+                st.info(f"Batch is already at **{stage}**.")
 
         if output_w > 0 and input_w > 0:
             result = db.calc_yield(input_w, output_w)
@@ -2240,8 +2446,10 @@ elif PAGE == "Material Recovery & Yield":
 
             bar = min(pct / 100.0, 1.0)
             st.progress(bar, text=f"Recovery {pct:.1f}% (target {db.YIELD_TARGET_PCT:.0f}%)")
-
-        st.caption("Output weight is calculated here only and is not stored on the batch.")
+        elif input_w <= 0:
+            st.info("This batch has no charge input yet.")
+        else:
+            st.info("Save batch outputs above to calculate recovery.")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -2268,18 +2476,27 @@ elif PAGE == "Finished Goods Inventory":
             with fc1:
                 fg_batch = st.selectbox("Batch ID *", batch_ids)
             linked = batch_map.get(fg_batch, {})
+            product_id = linked.get("Alloy_id")
+            product_out = 0.0
+            product_pcs = 0.0
+            for r in db.get_batch_outputs(fg_batch):
+                if product_id is None or int(r["Alloy_id"]) != int(product_id):
+                    continue
+                product_out += float(r["Weight"] or 0)
+                product_pcs += float(r.get("Pieces") or 0)
             with fc2:
                 fg_w = st.number_input(
                     "Output weight (kg)",
                     min_value=0.0,
-                    value=float(linked.get("Output_Weight") or 0),
+                    value=float(product_out or 0),
                     step=1.0,
+                    help="Defaults to this batch’s product-alloy output (excludes 78/79/80).",
                 )
             with fc3:
                 fg_pcs = st.number_input(
                     "Output pieces",
                     min_value=0.0,
-                    value=float(linked.get("Output_pieces") or 0),
+                    value=float(product_pcs or 0),
                     step=1.0,
                 )
             st.caption(

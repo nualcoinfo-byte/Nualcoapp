@@ -383,6 +383,9 @@ ACTIVE_STATUS = ["Active", "Inactive"]
 CRUCIBLE_STATUS = ["Available", "Damaged"]
 PURCHASE_ORDER_STATUS = ["Open", "Closed", "Cancelled"]
 SAMPLE_OK_STATUS = ["OK", "NOT OK"]
+# Non-spec metal taken off a heat: samples, furnace heel, and off-chemistry ingot.
+# These IDs live in Alloy_Master but have no Alloy_Master_spec rows.
+SIDESTREAM_ALLOY_IDS = (78, 79, 80)
 RAW_MATERIAL_AVAILABILITY = ["Standard", "Spot", "Contract", "Internal"]
 SHIFTS = ["A", "B"]
 MELT_NOS = [1, 2, 3, 4, 5, 6, 7, 9]
@@ -639,6 +642,15 @@ CREATE TABLE IF NOT EXISTS batch_input (
     Notes TEXT,
     Weighment_scale_photo {blob}, Input_photo {blob},
     PRIMARY KEY (Batch_ID, Raw_Material_Name, Lot_id, Charge_time)
+);
+CREATE TABLE IF NOT EXISTS batch_output (
+    Output_id {autopk},
+    Batch_ID TEXT NOT NULL REFERENCES Production_batch(Batch_ID),
+    Alloy_id INTEGER NOT NULL REFERENCES Alloy_Master(Alloy_id),
+    Weight {float} NOT NULL,
+    Pieces {float},
+    Notes TEXT,
+    Output_time TEXT DEFAULT {now}
 );
 CREATE TABLE IF NOT EXISTS Batch_Chemical_Composition (
     Batch_ID TEXT NOT NULL REFERENCES Production_batch(Batch_ID),
@@ -931,6 +943,7 @@ def init_db() -> None:
         _ensure_finished_goods_status(conn)
         _ensure_finished_goods_release_trigger(conn)
         _ensure_vacum_sample_check(conn)
+        _clear_copied_input_as_output(conn)
         _ensure_crucible_status(conn)
         _ensure_one_available_crucible(conn)
         _ensure_columns(
@@ -1792,6 +1805,36 @@ def _ensure_vacum_sample_check(conn: Connection) -> None:
     )
 
 
+def _clear_copied_input_as_output(conn: Connection) -> None:
+    """Undo Output_Weight that was stored as the sum of charge inputs."""
+    try:
+        _exec(
+            conn,
+            """
+            UPDATE Production_batch
+            SET Output_Weight = 0
+            WHERE COALESCE(Output_Weight, 0) > 0
+              AND ABS(
+                    COALESCE(Output_Weight, 0)
+                    - COALESCE(
+                        (
+                            SELECT SUM(Weight)
+                            FROM batch_input
+                            WHERE batch_input.Batch_ID = Production_batch.Batch_ID
+                        ),
+                        0
+                    )
+                  ) < 0.0001
+              AND NOT EXISTS (
+                    SELECT 1 FROM batch_output
+                    WHERE batch_output.Batch_ID = Production_batch.Batch_ID
+              )
+            """,
+        )
+    except Exception:
+        pass
+
+
 def _purchase_order_pk_columns(conn: Connection) -> list[str]:
     if IS_POSTGRES:
         rows = list(
@@ -2275,6 +2318,14 @@ EDITABLE_TABLES: list[dict[str, Any]] = [
         "order_by": "production_supervisor",
         "identity": [],
         "allow_add": True,
+    },
+    {
+        "key": "batch_output",
+        "label": "Batch outputs",
+        "pk": ["output_id"],
+        "order_by": "output_id",
+        "identity": ["output_id"],
+        "allow_add": False,
     },
     {
         "key": "element_master",
@@ -2947,9 +2998,8 @@ def list_lots_for_material(material: str) -> list[dict[str, Any]]:
     )
 
 
-def list_alloys() -> list[dict[str, Any]]:
-    return fetch_all(
-        """
+def list_alloys(*, include_sidestream: bool = True) -> list[dict[str, Any]]:
+    sql = """
         SELECT a.Alloy_id AS "Alloy_id", a.Alloy_name AS "Alloy_name",
                a.Cust_code AS "Cust_code", c.Customer_name AS "Customer_name",
                a.Alloy_Family AS "Alloy_Family", a.Colour_code AS "Colour_code",
@@ -2958,9 +3008,14 @@ def list_alloys() -> list[dict[str, Any]]:
                a.Remarks AS "Remarks", a.Status AS "Status"
         FROM Alloy_Master a
         LEFT JOIN Customer_Master c ON c.Cust_code = a.Cust_code
-        ORDER BY a.Alloy_name
-        """
-    )
+    """
+    params: tuple[Any, ...] = ()
+    if not include_sidestream:
+        placeholders = ", ".join("?" for _ in SIDESTREAM_ALLOY_IDS)
+        sql += f" WHERE a.Alloy_id NOT IN ({placeholders})"
+        params = SIDESTREAM_ALLOY_IDS
+    sql += " ORDER BY a.Alloy_name"
+    return fetch_all(sql, params)
 
 
 def get_alloy_specs(alloy_id: int) -> dict[str, dict[str, Any]]:
@@ -3670,7 +3725,6 @@ def create_batch(
             )
 
     crucible_no = require_available_crucible(furnace)
-    total_weight = sum(float(i["Weight"]) for i in inputs)
 
     with get_connection() as conn:
         _exec(
@@ -3678,13 +3732,13 @@ def create_batch(
             """
             INSERT INTO Production_batch
                 (Batch_ID, Alloy_id, Production_Date, Shift, Furnace, Crucible_no, Melt_No,
-                 Heat_no, Melting_team, Output_Weight, Notes, Production_status, Workflow_stage,
+                 Heat_no, Melting_team, Output_Weight, Output_pieces, Notes, Production_status, Workflow_stage,
                  Degassing_time, Sampled_pcs, Defect_pcs,
                  Top_Sample, Middle_Sample, Bottom_Sample, Vacum_Sample,
                  Top_Sample_Remarks, Middle_Sample_Remarks, Bottom_Sample_Remarks,
                  Top_Sample_datetime, Middle_Sample_datetime, Bottom_Sample_datetime,
                  Production_supervisor)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'Pending QA', 'Raw Material',
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, 'Pending QA', 'Raw Material',
                     ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
@@ -3697,7 +3751,6 @@ def create_batch(
                 melt_no,
                 str(heat_no),
                 melting_team,
-                total_weight,
                 notes,
                 degassing_time,
                 sampled_pcs,
@@ -3902,8 +3955,19 @@ _BATCH_COLUMNS = """
     Production_Date AS "Production_Date", Shift AS "Shift",
     Furnace AS "Furnace", Crucible_no AS "Crucible_no",
     Melt_No AS "Melt_No", Heat_no AS "Heat_no",
-    Melting_team AS "Melting_team", Output_Weight AS "Output_Weight",
-    Output_pieces AS "Output_pieces",
+    Melting_team AS "Melting_team",
+    COALESCE(
+        (SELECT SUM(Weight) FROM batch_input i WHERE i.Batch_ID = Production_batch.Batch_ID),
+        0
+    ) AS "Input_Weight",
+    COALESCE(
+        (SELECT SUM(Weight) FROM batch_output o WHERE o.Batch_ID = Production_batch.Batch_ID),
+        0
+    ) AS "Output_Weight",
+    COALESCE(
+        (SELECT SUM(Pieces) FROM batch_output o WHERE o.Batch_ID = Production_batch.Batch_ID),
+        0
+    ) AS "Output_pieces",
     Notes AS "Notes", Production_status AS "Production_status",
     Workflow_stage AS "Workflow_stage",
     Degassing_time AS "Degassing_time",
@@ -3943,6 +4007,141 @@ def get_batch_inputs(batch_id: str) -> list[dict[str, Any]]:
     )
 
 
+def is_sidestream_alloy(alloy_id: object) -> bool:
+    try:
+        return int(alloy_id) in SIDESTREAM_ALLOY_IDS
+    except (TypeError, ValueError):
+        return False
+
+
+def allowed_batch_output_alloy_ids(batch_alloy_id: Optional[int]) -> set[int]:
+    allowed = set(SIDESTREAM_ALLOY_IDS)
+    if batch_alloy_id:
+        allowed.add(int(batch_alloy_id))
+    return allowed
+
+
+def list_batch_output_alloys(batch_alloy_id: Optional[int]) -> list[dict[str, Any]]:
+    """Product alloy (if any) plus Broken Ingot / Furnace Empty / Not Ok Ingot."""
+    ids: list[int] = []
+    if batch_alloy_id:
+        ids.append(int(batch_alloy_id))
+    for sid in SIDESTREAM_ALLOY_IDS:
+        if sid not in ids:
+            ids.append(sid)
+    if not ids:
+        return []
+    placeholders = ", ".join("?" for _ in ids)
+    rows = fetch_all(
+        f"""
+        SELECT Alloy_id AS "Alloy_id", Alloy_name AS "Alloy_name"
+        FROM Alloy_Master
+        WHERE Alloy_id IN ({placeholders})
+        """,
+        tuple(ids),
+    )
+    by_id = {int(r["Alloy_id"]): r for r in rows}
+    return [by_id[i] for i in ids if i in by_id]
+
+
+def get_batch_outputs(batch_id: str) -> list[dict[str, Any]]:
+    return fetch_all(
+        """
+        SELECT o.Output_id AS "Output_id", o.Batch_ID AS "Batch_ID",
+               o.Alloy_id AS "Alloy_id", a.Alloy_name AS "Alloy_name",
+               o.Weight AS "Weight", o.Pieces AS "Pieces",
+               o.Notes AS "Notes", o.Output_time AS "Output_time"
+        FROM batch_output o
+        LEFT JOIN Alloy_Master a ON a.Alloy_id = o.Alloy_id
+        WHERE o.Batch_ID = ?
+        ORDER BY o.Output_id
+        """,
+        (batch_id,),
+    )
+
+
+def list_all_batch_outputs(limit: int = 200) -> list[dict[str, Any]]:
+    return fetch_all(
+        """
+        SELECT o.Output_id AS "Output_id", o.Batch_ID AS "Batch_ID",
+               b.Furnace AS "Furnace", b.Heat_no AS "Heat_no",
+               o.Alloy_id AS "Alloy_id", a.Alloy_name AS "Alloy_name",
+               o.Weight AS "Weight", o.Pieces AS "Pieces",
+               o.Notes AS "Notes", o.Output_time AS "Output_time"
+        FROM batch_output o
+        LEFT JOIN Alloy_Master a ON a.Alloy_id = o.Alloy_id
+        LEFT JOIN Production_batch b ON b.Batch_ID = o.Batch_ID
+        ORDER BY o.Output_id DESC
+        LIMIT ?
+        """,
+        (limit,),
+    )
+
+
+def save_batch_outputs(batch_id: str, lines: list[dict[str, Any]]) -> None:
+    """Replace all output rows for a batch. Weight > 0 lines are kept."""
+    batch = get_batch(batch_id)
+    if not batch:
+        raise ValueError(f"Batch {batch_id} not found.")
+    allowed = allowed_batch_output_alloy_ids(batch.get("Alloy_id"))
+    cleaned: list[dict[str, Any]] = []
+    for line in lines:
+        try:
+            alloy_id = int(line["Alloy_id"])
+        except (TypeError, ValueError, KeyError):
+            continue
+        weight = float(line.get("Weight") or 0)
+        if weight <= 0:
+            continue
+        if alloy_id not in allowed:
+            raise ValueError(
+                f"Alloy {alloy_id} is not an allowed output for batch {batch_id}. "
+                "Use the batch alloy or Broken Ingot / Furnace Empty / Not Ok Ingot."
+            )
+        pieces_raw = line.get("Pieces")
+        pieces = float(pieces_raw) if pieces_raw not in (None, "") else None
+        cleaned.append(
+            {
+                "Alloy_id": alloy_id,
+                "Weight": weight,
+                "Pieces": pieces if pieces and pieces > 0 else None,
+                "Notes": (str(line.get("Notes") or "")).strip() or None,
+            }
+        )
+
+    total_w = sum(row["Weight"] for row in cleaned)
+    total_pcs = sum(float(row["Pieces"] or 0) for row in cleaned)
+    stamp = datetime.now().isoformat(timespec="seconds")
+    with get_connection() as conn:
+        _exec(conn, "DELETE FROM batch_output WHERE Batch_ID = ?", (batch_id,))
+        for row in cleaned:
+            _exec(
+                conn,
+                """
+                INSERT INTO batch_output
+                    (Batch_ID, Alloy_id, Weight, Pieces, Notes, Output_time)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    batch_id,
+                    row["Alloy_id"],
+                    row["Weight"],
+                    row["Pieces"],
+                    row["Notes"],
+                    stamp,
+                ),
+            )
+        _exec(
+            conn,
+            """
+            UPDATE Production_batch
+            SET Output_Weight = ?, Output_pieces = ?
+            WHERE Batch_ID = ?
+            """,
+            (total_w, total_pcs, batch_id),
+        )
+
+
 def get_batch_chemistry(batch_id: str) -> list[dict[str, Any]]:
     return fetch_all(
         """
@@ -3962,8 +4161,19 @@ def list_batches() -> list[dict[str, Any]]:
         SELECT b.Batch_ID AS "Batch_ID", b.Production_Date AS "Production_Date",
                b.Furnace AS "Furnace", b.Crucible_no AS "Crucible_no",
                b.Heat_no AS "Heat_no", b.Melt_No AS "Melt_No",
-               b.Shift AS "Shift", b.Output_Weight AS "Output_Weight",
-               b.Output_pieces AS "Output_pieces",
+               b.Shift AS "Shift", b.Alloy_id AS "Alloy_id",
+               COALESCE(
+                   (SELECT SUM(i.Weight) FROM batch_input i WHERE i.Batch_ID = b.Batch_ID),
+                   0
+               ) AS "Input_Weight",
+               COALESCE(
+                   (SELECT SUM(o.Weight) FROM batch_output o WHERE o.Batch_ID = b.Batch_ID),
+                   0
+               ) AS "Output_Weight",
+               COALESCE(
+                   (SELECT SUM(o.Pieces) FROM batch_output o WHERE o.Batch_ID = b.Batch_ID),
+                   0
+               ) AS "Output_pieces",
                b.Production_status AS "Production_status",
                b.Workflow_stage AS "Workflow_stage", a.Alloy_name AS "Alloy_name",
                b.Production_supervisor AS "Production_supervisor",
