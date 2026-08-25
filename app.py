@@ -127,12 +127,39 @@ def photo_bytes(uploaded) -> bytes | None:
     return uploaded.getvalue()
 
 
+def _as_photo_bytes(value: object) -> bytes | None:
+    if value is None or value == "":
+        return None
+    if isinstance(value, memoryview):
+        value = value.tobytes()
+    elif isinstance(value, bytearray):
+        value = bytes(value)
+    if isinstance(value, bytes) and value:
+        return value
+    return None
+
+
+def _output_rows_for_table(rows: list[dict]) -> list[dict]:
+    skip = {"Weighment_scale_photo", "Output_photo"}
+    return [{k: v for k, v in row.items() if k not in skip} for row in rows]
+
+
 def _optional_percent(value: object) -> float | None:
     """Treat blank / 0 as empty so percentage fields can start without 0.00."""
     if value is None or value == "":
         return None
     try:
         num = float(value)
+    except (TypeError, ValueError):
+        return None
+    return num if num > 0 else None
+
+
+def _optional_int(value: object) -> int | None:
+    if value is None or value == "":
+        return None
+    try:
+        num = int(round(float(value)))
     except (TypeError, ValueError):
         return None
     return num if num > 0 else None
@@ -176,6 +203,37 @@ def empty_percent_input(
     return st.number_input(label, **kwargs)
 
 
+def empty_int_input(
+    label: str,
+    *,
+    key: str,
+    default: object = None,
+    help: str | None = None,
+) -> int | None:
+    """Whole-number input that starts blank instead of 0."""
+    if key in st.session_state:
+        raw = st.session_state[key]
+        if raw in (0, 0.0):
+            st.session_state[key] = None
+        elif raw is not None:
+            try:
+                st.session_state[key] = int(raw)
+            except (TypeError, ValueError):
+                st.session_state[key] = None
+    else:
+        st.session_state[key] = _optional_int(default)
+    return st.number_input(
+        label,
+        min_value=0,
+        value=None,
+        step=1,
+        format="%d",
+        key=key,
+        help=help,
+        placeholder="",
+    )
+
+
 def _alloy_output_label(alloy: dict) -> str:
     aid = int(alloy["Alloy_id"])
     name = alloy.get("Alloy_name") or f"Alloy {aid}"
@@ -203,30 +261,45 @@ def render_batch_output_editor(batch: dict, *, key_prefix: str) -> None:
     if product_id:
         default_label = id_to_label.get(int(product_id), default_label)
 
+    def _k(name: str, idx: int) -> str:
+        return f"{key_prefix}_{bid}_{name}_{idx}"
+
     state_key = f"{key_prefix}_n_{bid}"
     loaded_key = f"{key_prefix}_loaded_{bid}"
     if not st.session_state.get(loaded_key):
-        existing = db.get_batch_outputs(bid)
+        existing = db.get_batch_outputs(bid, include_photos=True)
         st.session_state[state_key] = max(len(existing), 1)
         for idx, row in enumerate(existing):
-            st.session_state[f"{key_prefix}_{bid}_alloy_{idx}"] = id_to_label.get(
+            st.session_state[_k("alloy", idx)] = id_to_label.get(
                 int(row["Alloy_id"]), default_label
             )
-            st.session_state[f"{key_prefix}_{bid}_wt_{idx}"] = float(row["Weight"] or 0)
-            pcs = row.get("Pieces")
-            st.session_state[f"{key_prefix}_{bid}_pcs_{idx}"] = (
-                float(pcs) if pcs not in (None, "") else None
+            scale = row.get("Weighment_scale_weight")
+            st.session_state[_k("scale", idx)] = (
+                float(scale) if scale not in (None, "") else None
             )
-            st.session_state[f"{key_prefix}_{bid}_notes_{idx}"] = row.get("Notes") or ""
+            stand = row.get("Stand_weight")
+            st.session_state[_k("stand", idx)] = (
+                float(stand) if stand not in (None, "") else None
+            )
+            st.session_state[_k("wt", idx)] = float(row["Weight"] or 0)
+            st.session_state[_k("pcs", idx)] = _optional_int(row.get("Pieces"))
+            st.session_state[_k("notes", idx)] = row.get("Notes") or ""
+            scale_photo = _as_photo_bytes(row.get("Weighment_scale_photo"))
+            if scale_photo:
+                st.session_state[_k("wsp_bytes", idx)] = scale_photo
+            out_photo = _as_photo_bytes(row.get("Output_photo"))
+            if out_photo:
+                st.session_state[_k("out_bytes", idx)] = out_photo
         if not existing and default_label:
-            st.session_state[f"{key_prefix}_{bid}_alloy_0"] = default_label
+            st.session_state[_k("alloy", 0)] = default_label
         st.session_state[loaded_key] = True
 
     n_lines = int(st.session_state.get(state_key) or 1)
     st.markdown("#### Batch outputs")
     st.caption(
-        "Record metal that left this heat. The product alloy is the one selected on the "
-        "batch. **Broken Ingot**, **Furnace Empty**, and **Not Ok Ingot** (alloy IDs 78–80) "
+        "Record metal that left this heat. Net weight is **weighment scale − stand**. "
+        "The product alloy is the one selected on the batch. "
+        "**Broken Ingot**, **Furnace Empty**, and **Not Ok Ingot** (alloy IDs 78–80) "
         "are for samples and portions taken out so they do not spoil the chemistry. "
         "They have no spec."
     )
@@ -234,35 +307,133 @@ def render_batch_output_editor(batch: dict, *, key_prefix: str) -> None:
     collected: list[dict] = []
     for idx in range(n_lines):
         st.markdown(f"**Output line {idx + 1}**")
-        c1, c2, c3, c4 = st.columns([2.2, 1.2, 1.2, 2])
+        c1, c2, c3 = st.columns([2.4, 1.2, 2.4])
         with c1:
             alloy_label = st.selectbox(
                 "Output alloy *",
                 options=labels,
-                key=f"{key_prefix}_{bid}_alloy_{idx}",
+                key=_k("alloy", idx),
             )
         with c2:
-            weight = empty_percent_input(
-                "Weight (kg) *",
-                key=f"{key_prefix}_{bid}_wt_{idx}",
-                max_value=None,
-                step=1.0,
+            pieces = empty_int_input(
+                "Pieces",
+                key=_k("pcs", idx),
+                help="Whole number of pieces. No decimals.",
             )
         with c3:
-            pieces = empty_percent_input(
-                "Pieces",
-                key=f"{key_prefix}_{bid}_pcs_{idx}",
+            notes = st.text_input("Notes", key=_k("notes", idx))
+
+        w1, w2, w3 = st.columns(3)
+        with w1:
+            scale_w = empty_percent_input(
+                "Weighment scale weight (kg) *",
+                key=_k("scale", idx),
                 max_value=None,
                 step=1.0,
             )
-        with c4:
-            notes = st.text_input("Notes", key=f"{key_prefix}_{bid}_notes_{idx}")
+            wsp_open_key = _k("wsp_open", idx)
+            if st.button(
+                "📷 Weighment scale photo",
+                key=_k("wsp_btn", idx),
+                help="Open camera or choose a photo from the phone gallery",
+                use_container_width=True,
+            ):
+                st.session_state[wsp_open_key] = not bool(
+                    st.session_state.get(wsp_open_key)
+                )
+                st.rerun()
+            scale_photo_bytes: bytes | None = None
+            if st.session_state.get(wsp_open_key):
+                st.caption("Capture with camera or pick from gallery")
+                wsp_cam = st.camera_input(
+                    "Scale camera",
+                    key=_k("wsp_cam", idx),
+                    help="Uses the phone camera when available.",
+                )
+                wsp_file = st.file_uploader(
+                    "Scale gallery / files",
+                    type=["png", "jpg", "jpeg", "webp"],
+                    key=_k("wsp_file", idx),
+                    help="Choose an existing photo from the device gallery.",
+                )
+                scale_photo_bytes = photo_bytes(wsp_cam) or photo_bytes(wsp_file)
+                if scale_photo_bytes:
+                    st.session_state[_k("wsp_bytes", idx)] = scale_photo_bytes
+                    st.success("Weighment scale photo ready to save with this line.")
+            else:
+                scale_photo_bytes = _as_photo_bytes(
+                    st.session_state.get(_k("wsp_bytes", idx))
+                )
+                if scale_photo_bytes:
+                    st.caption("Weighment scale photo attached.")
+        with w2:
+            stand_w = empty_percent_input(
+                "Stand weight (kg)",
+                key=_k("stand", idx),
+                max_value=None,
+                step=1.0,
+            )
+        scale_val = float(scale_w or 0)
+        stand_val = float(stand_w or 0)
+        net_w = max(scale_val - stand_val, 0.0) if scale_val > 0 else 0.0
+        net_key = _k("wt", idx)
+        st.session_state[net_key] = float(net_w)
+        with w3:
+            st.number_input(
+                "Net weight (kg)",
+                min_value=0.0,
+                step=0.1,
+                disabled=True,
+                key=net_key,
+                help="Auto: weighment scale weight − stand weight.",
+            )
+            out_open_key = _k("out_open", idx)
+            if st.button(
+                "📷 Output photo",
+                key=_k("out_btn", idx),
+                help="Open camera or choose a photo of the output",
+                use_container_width=True,
+            ):
+                st.session_state[out_open_key] = not bool(
+                    st.session_state.get(out_open_key)
+                )
+                st.rerun()
+
+        output_photo_bytes: bytes | None = None
+        if st.session_state.get(out_open_key):
+            st.caption(f"Output line {idx + 1} — output photo (camera or gallery)")
+            out_cam = st.camera_input(
+                "Output camera",
+                key=_k("out_cam", idx),
+                help="Uses the phone camera when available.",
+            )
+            out_file = st.file_uploader(
+                "Output gallery / files",
+                type=["png", "jpg", "jpeg", "webp"],
+                key=_k("out_file", idx),
+                help="Choose an existing photo from the device gallery.",
+            )
+            output_photo_bytes = photo_bytes(out_cam) or photo_bytes(out_file)
+            if output_photo_bytes:
+                st.session_state[_k("out_bytes", idx)] = output_photo_bytes
+                st.success("Output photo ready to save with this line.")
+        else:
+            output_photo_bytes = _as_photo_bytes(
+                st.session_state.get(_k("out_bytes", idx))
+            )
+            if output_photo_bytes:
+                st.caption(f"Output line {idx + 1}: output photo attached.")
+
         collected.append(
             {
                 "Alloy_id": label_to_id[alloy_label],
-                "Weight": weight,
+                "Weight": net_w,
+                "Weighment_scale_weight": scale_val,
+                "Stand_weight": stand_val,
                 "Pieces": pieces,
                 "Notes": notes,
+                "Weighment_scale_photo": scale_photo_bytes,
+                "Output_photo": output_photo_bytes,
             }
         )
 
@@ -284,7 +455,7 @@ def render_batch_output_editor(batch: dict, *, key_prefix: str) -> None:
 
     saved = db.get_batch_outputs(bid)
     if saved:
-        show_dataframe(df_from_rows(saved))
+        show_dataframe(df_from_rows(_output_rows_for_table(saved)))
 
 
 @st.dialog("All elements — chemical composition (%)", width="large")
@@ -2478,12 +2649,12 @@ elif PAGE == "Finished Goods Inventory":
             linked = batch_map.get(fg_batch, {})
             product_id = linked.get("Alloy_id")
             product_out = 0.0
-            product_pcs = 0.0
+            product_pcs = 0
             for r in db.get_batch_outputs(fg_batch):
                 if product_id is None or int(r["Alloy_id"]) != int(product_id):
                     continue
                 product_out += float(r["Weight"] or 0)
-                product_pcs += float(r.get("Pieces") or 0)
+                product_pcs += int(r.get("Pieces") or 0)
             with fc2:
                 fg_w = st.number_input(
                     "Output weight (kg)",
@@ -2495,9 +2666,11 @@ elif PAGE == "Finished Goods Inventory":
             with fc3:
                 fg_pcs = st.number_input(
                     "Output pieces",
-                    min_value=0.0,
-                    value=float(product_pcs or 0),
-                    step=1.0,
+                    min_value=0,
+                    value=int(product_pcs or 0),
+                    step=1,
+                    format="%d",
+                    help="Whole number of pieces. No decimals.",
                 )
             st.caption(
                 f"Status will be locked to **{db.FG_STATUS_UNDER_TESTING}** "
@@ -2508,7 +2681,7 @@ elif PAGE == "Finished Goods Inventory":
                     bid = db.add_finished_goods_bundle(
                         batch_id=fg_batch,
                         output_weight=fg_w if fg_w > 0 else None,
-                        output_pieces=fg_pcs if fg_pcs > 0 else None,
+                        output_pieces=int(fg_pcs) if fg_pcs > 0 else None,
                     )
                     st.success(
                         f"Created bundle **{bid}** for batch {fg_batch} "
