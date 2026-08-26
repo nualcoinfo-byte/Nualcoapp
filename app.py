@@ -67,6 +67,11 @@ st.markdown(
     div[data-testid="stMetricValue"] {{ font-size: 1.6rem; }}
     .yield-ok {{ color: #1b7a3d; font-weight: 700; font-size: 1.4rem; }}
     .yield-bad {{ color: #c62828; font-weight: 700; font-size: 1.4rem; }}
+    .avg-piece-label {{
+        font-size: 0.875rem; margin: 0 0 0.2rem 0; color: {_BRAND_INK};
+    }}
+    .avg-piece {{ font-size: 1.35rem; font-weight: 600; margin: 0; color: {_BRAND_INK}; }}
+    .avg-piece-bad {{ font-size: 1.35rem; font-weight: 700; margin: 0; color: #c62828; }}
     .chem-spec {{ font-size: 0.8rem; color: {_BRAND_INK}; opacity: 0.75; margin: 0 0 0.35rem 0; }}
     .chem-spec-bad {{ font-size: 0.8rem; color: #c62828; font-weight: 700; margin: 0 0 0.35rem 0; }}
     .batch-id {{ font-family: ui-monospace, monospace; font-weight: 700; }}
@@ -104,10 +109,10 @@ st.markdown(
 
 @st.cache_resource
 def bootstrap() -> str:
-    """Create tables. If Neon cannot be reached, continue on local SQLite."""
+    """Open the database. Full init_db() is skipped on Neon (it can hang)."""
     if db.IS_POSTGRES:
         try:
-            db.init_db()
+            db._ensure_packing_list_ready()
             return "neon"
         except Exception as exc:
             st.session_state["_neon_init_error"] = str(exc)
@@ -155,10 +160,114 @@ def _as_photo_bytes(value: object) -> bytes | None:
 
 def _output_rows_for_table(rows: list[dict]) -> list[dict]:
     skip = {"Weighment_scale_photo", "Output_photo"}
-    return [{k: v for k, v in row.items() if k not in skip} for row in rows]
+    out: list[dict] = []
+    for row in rows:
+        item = {k: v for k, v in row.items() if k not in skip}
+        avg = db.alloy_piece_avg_kg(item.get("Weight"), item.get("Pieces"))
+        ordered: dict = {}
+        for key, value in item.items():
+            ordered[key] = value
+            if key == "Pieces":
+                ordered["Avg_piece_kg"] = avg
+        if "Avg_piece_kg" not in ordered:
+            ordered["Avg_piece_kg"] = avg
+        out.append(ordered)
+    return out
 
 
-def _optional_percent(value: object) -> float | None:
+def _add_avg_piece_column(data: pd.DataFrame) -> pd.DataFrame:
+    """Add Avg_piece_kg from Weight/Pieces or Output_Weight/Output_pieces."""
+    if data is None or data.empty:
+        return data
+    out = data.copy()
+    if "Avg_piece_kg" in out.columns:
+        return out
+    weight_col = next(
+        (c for c in ("Weight", "Output_Weight") if c in out.columns),
+        None,
+    )
+    pieces_col = next(
+        (c for c in ("Pieces", "Output_pieces") if c in out.columns),
+        None,
+    )
+    if not weight_col or not pieces_col:
+        return out
+    avgs = [
+        db.alloy_piece_avg_kg(w, p)
+        for w, p in zip(out[weight_col], out[pieces_col])
+    ]
+    insert_at = list(out.columns).index(pieces_col) + 1
+    out.insert(insert_at, "Avg_piece_kg", avgs)
+    return out
+
+
+def _style_avg_piece_column(data: pd.DataFrame):
+    """Highlight product-alloy piece averages outside 5.6–6.1 kg in red."""
+    if data is None or data.empty or "Avg_piece_kg" not in data.columns:
+        return data
+    alloy_ids = data["Alloy_id"] if "Alloy_id" in data.columns else None
+
+    def _color(col: pd.Series) -> list[str]:
+        if col.name != "Avg_piece_kg":
+            return [""] * len(col)
+        styles: list[str] = []
+        for i, val in enumerate(col):
+            aid = alloy_ids.iloc[i] if alloy_ids is not None else None
+            if db.alloy_piece_avg_out_of_range(val, aid):
+                styles.append("color: #c62828; font-weight: 700")
+            else:
+                styles.append("")
+        return styles
+
+    def _fmt_avg(val: object) -> str:
+        if val is None or (isinstance(val, float) and pd.isna(val)):
+            return "—"
+        try:
+            return f"{float(val):.2f}"
+        except (TypeError, ValueError):
+            return "—"
+
+    return data.style.apply(_color, axis=0).format(
+        {"Avg_piece_kg": _fmt_avg},
+        na_rep="—",
+    )
+
+
+def render_avg_piece_weight(
+    net_weight: object,
+    pieces: object,
+    *,
+    alloy_id: object = None,
+) -> None:
+    """Show net weight ÷ pieces; red when a product alloy is outside 5.6–6.1 kg."""
+    avg = db.alloy_piece_avg_kg(net_weight, pieces)
+    lo, hi = db.ALLOY_PIECE_KG_MIN, db.ALLOY_PIECE_KG_MAX
+    sidestream = db.is_sidestream_alloy(alloy_id) if alloy_id is not None else False
+    if avg is None:
+        st.markdown(
+            '<p class="avg-piece-label">Avg piece (kg)</p>'
+            '<p class="avg-piece">—</p>',
+            unsafe_allow_html=True,
+        )
+        if not sidestream:
+            st.caption(f"Net weight ÷ pieces. Typical range {lo:g}–{hi:g} kg.")
+        return
+    out_of_range = db.alloy_piece_avg_out_of_range(avg, alloy_id)
+    css = "avg-piece-bad" if out_of_range else "avg-piece"
+    st.markdown(
+        f'<p class="avg-piece-label">Avg piece (kg)</p>'
+        f'<p class="{css}">{avg:.2f}</p>',
+        unsafe_allow_html=True,
+    )
+    if out_of_range:
+        st.caption(
+            f"Outside {lo:g}–{hi:g} kg. Check the pieces count."
+        )
+    elif not sidestream:
+        st.caption(f"Typical range {lo:g}–{hi:g} kg.")
+
+
+def _optional_percent(value: object, *, allow_zero: bool = False) -> float | None:
     """Treat blank / 0 as empty so percentage fields can start without 0.00."""
     if value is None or value == "":
         return None
@@ -166,6 +275,8 @@ def _optional_percent(value: object) -> float | None:
         num = float(value)
     except (TypeError, ValueError):
         return None
+    if allow_zero:
+        return num if num >= 0 else None
     return num if num > 0 else None
 
 
@@ -194,13 +305,14 @@ def empty_percent_input(
     help: str | None = None,
     disabled: bool = False,
     format: str | None = None,
+    allow_zero: bool = False,
 ) -> float | None:
     """Number input that starts blank instead of 0.00."""
     if key in st.session_state:
-        if st.session_state[key] in (0, 0.0):
+        if st.session_state[key] in (0, 0.0) and not allow_zero:
             st.session_state[key] = None
     else:
-        st.session_state[key] = _optional_percent(default)
+        st.session_state[key] = _optional_percent(default, allow_zero=allow_zero)
     kwargs: dict[str, object] = {
         "min_value": min_value,
         "value": None,
@@ -223,6 +335,7 @@ def empty_int_input(
     key: str,
     default: object = None,
     help: str | None = None,
+    disabled: bool = False,
 ) -> int | None:
     """Whole-number input that starts blank instead of 0."""
     if key in st.session_state:
@@ -245,6 +358,7 @@ def empty_int_input(
         key=key,
         help=help,
         placeholder="",
+        disabled=disabled,
     )
 
 
@@ -259,6 +373,19 @@ def _alloy_output_label(alloy: dict) -> str:
 def render_batch_output_editor(batch: dict, *, key_prefix: str) -> None:
     """Enter output lines for one batch: product alloy plus 78/79/80."""
     bid = batch["Batch_ID"]
+    if (batch.get("Production_status") or "") != db.BATCH_STATUS_COMPLETED:
+        st.warning(
+            "Batch output can be entered only after this heat is marked "
+            "**Completed** on **Production Batch & Chemistry**."
+        )
+        saved = db.get_batch_outputs(bid)
+        if saved:
+            st.caption("Saved outputs (read-only until Completed).")
+            show_dataframe(
+                df_from_rows(_output_rows_for_table(saved)),
+                highlight_avg_piece=True,
+            )
+        return
     product_id = batch.get("Alloy_id")
     alloys = db.list_batch_output_alloys(product_id)
     if not alloys:
@@ -312,6 +439,9 @@ def render_batch_output_editor(batch: dict, *, key_prefix: str) -> None:
     st.markdown("#### Batch outputs")
     st.caption(
         "Record metal that left this heat. Net weight is **weighment scale − stand**. "
+        "Avg piece is **net weight ÷ pieces**. Product alloy pieces are typically "
+        f"**{db.ALLOY_PIECE_KG_MIN:g}–{db.ALLOY_PIECE_KG_MAX:g} kg**; outside that "
+        "range the average is shown in red so you can check the piece count. "
         "The product alloy is the one selected on the batch. "
         "**Broken Ingot**, **Furnace Empty**, and **Not Ok Ingot** (alloy IDs 78–80) "
         "are for samples and portions taken out so they do not spoil the chemistry. "
@@ -337,7 +467,7 @@ def render_batch_output_editor(batch: dict, *, key_prefix: str) -> None:
         with c3:
             notes = st.text_input("Notes", key=_k("notes", idx))
 
-        w1, w2, w3 = st.columns(3)
+        w1, w2, w3, w4 = st.columns(4)
         with w1:
             scale_w = empty_percent_input(
                 "Weighment scale weight (kg) *",
@@ -412,6 +542,12 @@ def render_batch_output_editor(batch: dict, *, key_prefix: str) -> None:
                     st.session_state.get(out_open_key)
                 )
                 st.rerun()
+        with w4:
+            render_avg_piece_weight(
+                net_w,
+                pieces,
+                alloy_id=label_to_id[alloy_label],
+            )
 
         output_photo_bytes: bytes | None = None
         if st.session_state.get(out_open_key):
@@ -469,7 +605,10 @@ def render_batch_output_editor(batch: dict, *, key_prefix: str) -> None:
 
     saved = db.get_batch_outputs(bid)
     if saved:
-        show_dataframe(df_from_rows(_output_rows_for_table(saved)))
+        show_dataframe(
+            df_from_rows(_output_rows_for_table(saved)),
+            highlight_avg_piece=True,
+        )
         cost = db.compute_batch_production_cost(bid)
         first = saved[0]
         material_kg = first.get("cost_of_production_per_kg")
@@ -775,8 +914,13 @@ def format_df_dates(data: pd.DataFrame) -> pd.DataFrame:
 
 def show_dataframe(data, **kwargs):
     """Display a table with date columns as DD-MON-YYYY."""
+    highlight_avg = kwargs.pop("highlight_avg_piece", False)
     if isinstance(data, pd.DataFrame):
+        if highlight_avg:
+            data = _add_avg_piece_column(data)
         data = format_df_dates(data)
+        if highlight_avg:
+            data = _style_avg_piece_column(data)
     kwargs.setdefault("use_container_width", True)
     kwargs.setdefault("hide_index", True)
     return st.dataframe(data, **kwargs)
@@ -868,6 +1012,131 @@ def merge_percent_composition(
     return merged
 
 
+def _as_widget_datetime(value: object) -> datetime | None:
+    parsed = parse_any_date(value)
+    if parsed is None:
+        return None
+    if isinstance(parsed, datetime):
+        return parsed
+    if isinstance(parsed, date):
+        return datetime.combine(parsed, datetime.min.time())
+    return None
+
+
+def _hydrate_production_batch_form(
+    furnace: str,
+    batch: dict | None,
+    *,
+    heat_no: object,
+    alloy_labels: dict[str, object],
+    sample_blank: str,
+) -> None:
+    """Load a saved batch into furnace-scoped widgets when the heat changes."""
+    pk = lambda name: _furnace_form_key(furnace, name)
+    loaded_key = pk("_hydrated_batch_id")
+    token = (
+        str(batch["Batch_ID"])
+        if batch
+        else f"new:{furnace}:{heat_no}"
+    )
+    if st.session_state.get(loaded_key) == token:
+        return
+    st.session_state[loaded_key] = token
+    if not batch:
+        return
+
+    melt = batch.get("Melt_No")
+    try:
+        melt_i = int(melt)
+    except (TypeError, ValueError):
+        melt_i = None
+    if melt_i in db.MELT_NOS:
+        st.session_state[pk("melt_no")] = melt_i
+
+    parsed_date = parse_any_date(batch.get("Production_Date"))
+    if isinstance(parsed_date, datetime):
+        st.session_state[pk("prod_date")] = parsed_date.date()
+    elif isinstance(parsed_date, date):
+        st.session_state[pk("prod_date")] = parsed_date
+
+    shift = batch.get("Shift")
+    if shift in db.SHIFTS:
+        st.session_state[pk("shift")] = shift
+
+    if batch.get("Melting_team"):
+        st.session_state[pk("melter")] = batch["Melting_team"]
+    if batch.get("Production_supervisor"):
+        st.session_state[pk("supervisor")] = batch["Production_supervisor"]
+    st.session_state[pk("notes")] = batch.get("Notes") or ""
+
+    alloy_id = batch.get("Alloy_id")
+    alloy_label = "— none —"
+    if alloy_id not in (None, ""):
+        for label, stored in alloy_labels.items():
+            if stored == alloy_id or str(stored) == str(alloy_id):
+                alloy_label = label
+                break
+    st.session_state[pk("alloy")] = alloy_label
+
+    st.session_state[pk("degassing_time")] = batch.get("Degassing_time") or ""
+    sampled = batch.get("Sampled_pcs")
+    try:
+        st.session_state[pk("sampled_pcs")] = (
+            float(sampled) if sampled not in (None, "") else None
+        )
+    except (TypeError, ValueError):
+        st.session_state[pk("sampled_pcs")] = None
+    defect = batch.get("Defect_pcs")
+    try:
+        st.session_state[pk("defect_pcs")] = (
+            float(defect) if defect not in (None, "") else None
+        )
+    except (TypeError, ValueError):
+        st.session_state[pk("defect_pcs")] = None
+
+    def _sample_choice(value: object) -> str:
+        text = str(value or "").strip()
+        return text if text in db.SAMPLE_OK_STATUS else sample_blank
+
+    st.session_state[pk("top_sample")] = _sample_choice(batch.get("Top_Sample"))
+    st.session_state[pk("middle_sample")] = _sample_choice(batch.get("Middle_Sample"))
+    st.session_state[pk("bottom_sample")] = _sample_choice(batch.get("Bottom_Sample"))
+    st.session_state[pk("vacum_sample")] = _sample_choice(batch.get("Vacum_Sample"))
+    st.session_state[pk("top_sample_remarks")] = batch.get("Top_Sample_Remarks") or ""
+    st.session_state[pk("middle_sample_remarks")] = (
+        batch.get("Middle_Sample_Remarks") or ""
+    )
+    st.session_state[pk("bottom_sample_remarks")] = (
+        batch.get("Bottom_Sample_Remarks") or ""
+    )
+    st.session_state[pk("top_sample_dt")] = _as_widget_datetime(
+        batch.get("Top_Sample_datetime")
+    )
+    st.session_state[pk("middle_sample_dt")] = _as_widget_datetime(
+        batch.get("Middle_Sample_datetime")
+    )
+    st.session_state[pk("bottom_sample_dt")] = _as_widget_datetime(
+        batch.get("Bottom_Sample_datetime")
+    )
+
+    full: dict[str, float] = {}
+    for row in db.get_batch_chemistry(batch["Batch_ID"]):
+        sym = row.get("Element_symbol")
+        if not sym:
+            continue
+        try:
+            val = float(row.get("Percentage"))
+        except (TypeError, ValueError):
+            continue
+        full[str(sym)] = val
+        if str(sym) != "SF":
+            st.session_state[pk(f"bchem_{sym}")] = val if val > 0 else None
+    st.session_state[pk("full_chem")] = full
+
+    drafts = st.session_state.setdefault("charge_lines_by_furnace", {})
+    drafts[furnace] = [{"material": "", "lot_id": None, "weight": 0.0, "notes": ""}]
+
+
 def merge_spec_ranges(
     page_specs: dict[str, tuple[float | None, float | None]],
     full_state_key: str,
@@ -941,6 +1210,7 @@ NAV_SECTIONS: list[tuple[str, list[str]]] = [
             "Purchase Orders",
             "All Purchase Orders",
             "Finished Goods Inventory",
+            "Packing List",
             "Bill of Materials",
         ],
     ),
@@ -950,7 +1220,6 @@ NAV_SECTIONS: list[tuple[str, list[str]]] = [
             "Production Batch & Chemistry",
             "Batch Output",
             "Production Batches",
-            "Production Workflow Tracker",
             "Material Recovery & Yield",
         ],
     ),
@@ -1567,7 +1836,9 @@ elif PAGE == "Production Batch & Chemistry":
         "for that furnace only. Switching furnace keeps this draft and opens a separate "
         "form — it does not remap entries to the other furnace. "
         "Batch ID is **F{Furnace}-H{Heat}** (e.g. Furnace 3 + Heat 7 → `F3-H07`). "
-        "Record metal that left the furnace on **Batch Output**. "
+        "Mark the heat **Completed** here after degassing, samples, K Mold, chemistry, "
+        "and at least one charge line. **Batch Output** can be entered only after that. "
+        "A Completed heat is locked; only Admin can unlock it to correct history. "
         "Browse existing batches under **Production Batches**."
     )
 
@@ -1614,49 +1885,114 @@ elif PAGE == "Production Batch & Chemistry":
         def _pk(name: str) -> str:
             return _furnace_form_key(furnace, name)
 
+        flash = st.session_state.pop("_pb_flash", None)
+        if flash:
+            st.success(flash)
+
         st.info(
             f"Entering data for furnace **{furnace}** only. "
             "Crucible, heat, alloy, samples, charges, and chemistry apply to this furnace."
         )
 
+        sample_blank = "— not set —"
+        heat_no = st.selectbox("Heat no *", db.HEAT_NOS, key=_pk("heat_no"))
+        preview_id = db.make_batch_id(furnace, heat_no)
+        existing_batch = db.get_batch(preview_id)
+        _hydrate_production_batch_form(
+            furnace,
+            existing_batch,
+            heat_no=heat_no,
+            alloy_labels=alloy_labels,
+            sample_blank=sample_blank,
+        )
+
+        is_completed = (
+            existing_batch is not None
+            and existing_batch.get("Production_status") == db.BATCH_STATUS_COMPLETED
+        )
+        is_admin = db.is_admin_user()
+        unlock_key = f"pb_unlock_{preview_id}"
+        status_col, unlock_col = st.columns([2, 2])
+        with status_col:
+            if existing_batch:
+                st.markdown(
+                    f"**Batch ID:** `{preview_id}` &nbsp;|&nbsp; "
+                    f"**Status:** `{existing_batch.get('Production_status')}`"
+                )
+            else:
+                st.markdown(
+                    f"**Batch ID:** `{preview_id}` &nbsp;|&nbsp; "
+                    "**Status:** new (will save as In-Progress)"
+                )
+        with unlock_col:
+            if is_completed and is_admin:
+                st.checkbox(
+                    "Correct history (unlock this completed batch)",
+                    key=unlock_key,
+                    help=(
+                        "Admin only. Check this to edit a Completed heat. "
+                        "Save writes a history correction; status stays Completed."
+                    ),
+                )
+            elif is_completed:
+                st.info(
+                    "This heat is Completed and locked. Ask an Admin to unlock "
+                    "it if history needs correction."
+                )
+        locked = bool(is_completed) and not (
+            is_admin and st.session_state.get(unlock_key)
+        )
+
         col1, col2, col3 = st.columns(3)
         with col1:
-            available_crucible = (
-                db.get_available_crucible(furnace) if furnace else None
-            )
-            if available_crucible:
-                crucible_no = str(available_crucible["Crucible_no"])
+            if existing_batch and existing_batch.get("Crucible_no"):
+                available_crucible = {"Crucible_no": existing_batch["Crucible_no"]}
                 st.markdown("**Crucible no**")
-                st.info(crucible_no)
+                st.info(str(existing_batch["Crucible_no"]))
             else:
-                st.markdown("**Crucible no**")
-                st.error(
-                    "No crucible available for the respective furnace."
+                available_crucible = (
+                    db.get_available_crucible(furnace) if furnace else None
                 )
-            heat_no = st.selectbox("Heat no *", db.HEAT_NOS, key=_pk("heat_no"))
-            melt_no = st.selectbox("Melt no", db.MELT_NOS, key=_pk("melt_no"))
+                if available_crucible:
+                    st.markdown("**Crucible no**")
+                    st.info(str(available_crucible["Crucible_no"]))
+                else:
+                    st.markdown("**Crucible no**")
+                    st.error(
+                        "No crucible available for the respective furnace."
+                    )
+            melt_no = st.selectbox(
+                "Melt no", db.MELT_NOS, key=_pk("melt_no"), disabled=locked
+            )
         with col2:
             prod_date = ui_date_input(
                 "Production date",
                 value=date.today(),
                 key=_pk("prod_date"),
+                disabled=locked,
             )
-            shift = st.selectbox("Shift", db.SHIFTS, key=_pk("shift"))
-            melting_team = st.selectbox("Melter name *", melters, key=_pk("melter"))
+            shift = st.selectbox(
+                "Shift", db.SHIFTS, key=_pk("shift"), disabled=locked
+            )
+            melting_team = st.selectbox(
+                "Melter name *", melters, key=_pk("melter"), disabled=locked
+            )
         with col3:
             alloy_label = st.selectbox(
                 "Alloy",
                 options=["— none —"] + list(alloy_labels.keys()),
                 key=_pk("alloy"),
+                disabled=locked,
             )
             production_supervisor = st.selectbox(
                 "Production supervisor *",
                 supervisors,
                 key=_pk("supervisor"),
+                disabled=locked,
             )
-            notes = st.text_area("Notes", height=68, key=_pk("notes"))
-            preview_id = db.make_batch_id(furnace, heat_no)
-            st.markdown(f"**Batch ID preview:** `{preview_id}`")
+            notes = st.text_area(
+                "Notes", height=68, key=_pk("notes"), disabled=locked
+            )
 
         alloy_id = None if alloy_label == "— none —" else alloy_labels[alloy_label]
 
@@ -1667,6 +2003,7 @@ elif PAGE == "Production Batch & Chemistry":
                 "Degassing time",
                 placeholder="e.g. 14:30 or 12 min",
                 key=_pk("degassing_time"),
+                disabled=locked,
             )
         with d2:
             sampled_pcs = empty_percent_input(
@@ -1674,6 +2011,7 @@ elif PAGE == "Production Batch & Chemistry":
                 key=_pk("sampled_pcs"),
                 max_value=None,
                 step=1.0,
+                disabled=locked,
             )
         with d3:
             defect_pcs = empty_percent_input(
@@ -1681,12 +2019,14 @@ elif PAGE == "Production Batch & Chemistry":
                 key=_pk("defect_pcs"),
                 max_value=None,
                 step=1.0,
+                allow_zero=True,
+                disabled=locked,
             )
         with d4:
             st.caption("K Mold Value = Defect pcs / Sampled pcs")
-            if sampled_pcs and sampled_pcs > 0:
-                k_mold = float(defect_pcs or 0) / float(sampled_pcs)
-                css = "yield-bad" if k_mold > 0.5 else "yield-ok"
+            if sampled_pcs and sampled_pcs > 0 and defect_pcs is not None:
+                k_mold = float(defect_pcs) / float(sampled_pcs)
+                css = "yield-bad" if k_mold > db.K_MOLD_MAX else "yield-ok"
                 st.markdown(
                     f'<p class="{css}">K Mold Value<br>{k_mold:.3f}</p>',
                     unsafe_allow_html=True,
@@ -1698,34 +2038,46 @@ elif PAGE == "Production Batch & Chemistry":
                 )
 
         st.markdown("#### Sample results")
-        sample_blank = "— not set —"
         sample_opts = [sample_blank] + db.SAMPLE_OK_STATUS
         s1, s2, s3, s4 = st.columns(4)
         with s1:
-            top_sample = st.selectbox("Top sample", sample_opts, key=_pk("top_sample"))
+            top_sample = st.selectbox(
+                "Top sample", sample_opts, key=_pk("top_sample"), disabled=locked
+            )
         with s2:
             middle_sample = st.selectbox(
-                "Middle sample", sample_opts, key=_pk("middle_sample")
+                "Middle sample",
+                sample_opts,
+                key=_pk("middle_sample"),
+                disabled=locked,
             )
         with s3:
             bottom_sample = st.selectbox(
-                "Bottom sample", sample_opts, key=_pk("bottom_sample")
+                "Bottom sample",
+                sample_opts,
+                key=_pk("bottom_sample"),
+                disabled=locked,
             )
         with s4:
             vacum_sample = st.selectbox(
-                "Vacum sample", sample_opts, key=_pk("vacum_sample")
+                "Vacum sample",
+                sample_opts,
+                key=_pk("vacum_sample"),
+                disabled=locked,
             )
 
         r1, r2, r3, r4 = st.columns(4)
         with r1:
-            top_sample_remarks = st.text_input("Remarks", key=_pk("top_sample_remarks"))
+            top_sample_remarks = st.text_input(
+                "Remarks", key=_pk("top_sample_remarks"), disabled=locked
+            )
         with r2:
             middle_sample_remarks = st.text_input(
-                "Remarks", key=_pk("middle_sample_remarks")
+                "Remarks", key=_pk("middle_sample_remarks"), disabled=locked
             )
         with r3:
             bottom_sample_remarks = st.text_input(
-                "Remarks", key=_pk("bottom_sample_remarks")
+                "Remarks", key=_pk("bottom_sample_remarks"), disabled=locked
             )
         with r4:
             st.empty()
@@ -1738,6 +2090,7 @@ elif PAGE == "Production Batch & Chemistry":
                 step=60,
                 key=_pk("top_sample_dt"),
                 help="Open the calendar icon to pick date and time.",
+                disabled=locked,
             )
         with d2:
             middle_sample_dt = ui_datetime_input(
@@ -1746,6 +2099,7 @@ elif PAGE == "Production Batch & Chemistry":
                 step=60,
                 key=_pk("middle_sample_dt"),
                 help="Open the calendar icon to pick date and time.",
+                disabled=locked,
             )
         with d3:
             bottom_sample_dt = ui_datetime_input(
@@ -1754,6 +2108,7 @@ elif PAGE == "Production Batch & Chemistry":
                 step=60,
                 key=_pk("bottom_sample_dt"),
                 help="Open the calendar icon to pick date and time.",
+                disabled=locked,
             )
         with d4:
             st.empty()
@@ -1763,6 +2118,11 @@ elif PAGE == "Production Batch & Chemistry":
             "Select trolley (tare), enter weighment scale reading. "
             "**Net Weight = Weighment scale − Trolley weight.**"
         )
+
+        saved_charges = db.get_batch_inputs(preview_id) if existing_batch else []
+        if saved_charges:
+            st.caption("Saved charge lines")
+            show_dataframe(df_from_rows(saved_charges))
 
         trolleys = db.list_trolleys(active_only=True)
         trolley_by_name = {t["Trolley_name"]: float(t["Weight"] or 0) for t in trolleys}
@@ -1792,6 +2152,12 @@ elif PAGE == "Production Batch & Chemistry":
                 {"material": "", "lot_id": None, "weight": 0.0, "notes": ""}
             ]
         furnace_charge_lines = drafts[furnace]
+        if locked:
+            furnace_charge_lines = []
+            st.caption("Charge lines cannot be edited on a Completed heat.")
+        elif existing_batch:
+            st.markdown("##### Additional charge lines")
+            st.caption("Saved lines above stay as-is. Use this to charge more metal.")
 
         if not trolleys:
             st.error("Define at least one active trolley under **Trolleys**.")
@@ -2025,19 +2391,26 @@ elif PAGE == "Production Batch & Chemistry":
                 )
 
         add_col, rem_col, _ = st.columns([1, 1, 4])
-        if add_col.button("Add charge line", key=_pk("add_charge")):
+        if add_col.button(
+            "Add charge line", key=_pk("add_charge"), disabled=locked
+        ):
             drafts[furnace].append(
                 {"material": "", "lot_id": None, "weight": 0.0, "notes": ""}
             )
             st.rerun()
-        if rem_col.button("Remove last line", key=_pk("rem_charge")) and len(
-            drafts[furnace]
-        ) > 1:
+        if rem_col.button(
+            "Remove last line", key=_pk("rem_charge"), disabled=locked
+        ) and len(drafts[furnace]) > 1:
             drafts[furnace].pop()
             st.rerun()
 
-        total_in = sum(c["Weight"] for c in charge_inputs)
-        st.info(f"Total net input weight: **{total_in:,.2f} kg** across {len(charge_inputs)} charge line(s).")
+        saved_in = sum(float(c.get("Weight") or 0) for c in saved_charges)
+        extra_in = sum(c["Weight"] for c in charge_inputs)
+        total_in = saved_in + extra_in
+        total_lines = len(saved_charges) + len(charge_inputs)
+        st.info(
+            f"Total net input weight: **{total_in:,.2f} kg** across {total_lines} charge line(s)."
+        )
 
         st.markdown("#### Batch chemistry (ladle / spectrometer)")
         st.caption(
@@ -2065,6 +2438,7 @@ elif PAGE == "Production Batch & Chemistry":
                 key=_pk("open_all_elements"),
                 help="Enter chemistry for every row in Element_Master",
                 use_container_width=True,
+                disabled=locked,
             ):
                 dialog_all_element_percentages(
                     full_chem_key,
@@ -2139,6 +2513,7 @@ elif PAGE == "Production Batch & Chemistry":
                         step=CHEM_PERCENT_STEP,
                         format=CHEM_PERCENT_FORMAT,
                         help=el["Element_Name"],
+                        disabled=locked,
                     )
                 entered = float(batch_chem[sym] or 0.0)
                 bad = _spec_out_of_range(entered, spec)
@@ -2166,66 +2541,168 @@ elif PAGE == "Production Batch & Chemistry":
         def _sample_or_none(v: str) -> str | None:
             return None if v == sample_blank else v
 
-        if st.button(
-            "Create production batch",
+        merged_chem = merge_percent_composition(batch_chem, full_chem_key)
+        composition = {k: v for k, v in merged_chem.items() if v and v > 0}
+        completion_gaps = db.production_batch_completion_gaps(
+            degassing_time=degassing_time,
+            sampled_pcs=sampled_pcs,
+            defect_pcs=defect_pcs,
+            top_sample=_sample_or_none(top_sample),
+            middle_sample=_sample_or_none(middle_sample),
+            bottom_sample=_sample_or_none(bottom_sample),
+            vacum_sample=_sample_or_none(vacum_sample),
+            top_sample_datetime=(
+                top_sample_dt.isoformat(timespec="seconds") if top_sample_dt else None
+            ),
+            middle_sample_datetime=(
+                middle_sample_dt.isoformat(timespec="seconds")
+                if middle_sample_dt
+                else None
+            ),
+            bottom_sample_datetime=(
+                bottom_sample_dt.isoformat(timespec="seconds")
+                if bottom_sample_dt
+                else None
+            ),
+            chemistry_count=len(composition),
+            charge_line_count=len(saved_charges) + len(charge_inputs),
+        )
+        if not is_completed:
+            if completion_gaps:
+                st.warning(
+                    "Required before **Completed**: " + "; ".join(completion_gaps)
+                )
+            else:
+                st.success(
+                    "Required fields are filled. You can mark this heat **Completed**."
+                )
+
+        def _batch_kwargs() -> dict:
+            return dict(
+                alloy_id=alloy_id,
+                production_date=prod_date.isoformat(),
+                shift=shift,
+                melt_no=melt_no,
+                melting_team=melting_team,
+                notes=notes.strip(),
+                composition=composition,
+                degassing_time=degassing_time.strip() or None,
+                sampled_pcs=(
+                    sampled_pcs if sampled_pcs and sampled_pcs > 0 else None
+                ),
+                defect_pcs=None if defect_pcs is None else float(defect_pcs),
+                top_sample=_sample_or_none(top_sample),
+                middle_sample=_sample_or_none(middle_sample),
+                bottom_sample=_sample_or_none(bottom_sample),
+                vacum_sample=_sample_or_none(vacum_sample),
+                top_sample_remarks=top_sample_remarks.strip() or None,
+                middle_sample_remarks=middle_sample_remarks.strip() or None,
+                bottom_sample_remarks=bottom_sample_remarks.strip() or None,
+                top_sample_datetime=(
+                    top_sample_dt.isoformat(timespec="seconds")
+                    if top_sample_dt
+                    else None
+                ),
+                middle_sample_datetime=(
+                    middle_sample_dt.isoformat(timespec="seconds")
+                    if middle_sample_dt
+                    else None
+                ),
+                bottom_sample_datetime=(
+                    bottom_sample_dt.isoformat(timespec="seconds")
+                    if bottom_sample_dt
+                    else None
+                ),
+                production_supervisor=production_supervisor,
+            )
+
+        def _save_chemistry_page(*, mark_completed: bool) -> str:
+            if existing_batch:
+                db.update_production_batch_input(
+                    preview_id,
+                    extra_inputs=charge_inputs,
+                    allow_completed=bool(
+                        is_completed and is_admin and st.session_state.get(unlock_key)
+                    ),
+                    **_batch_kwargs(),
+                )
+                bid = preview_id
+            else:
+                if available_crucible is None:
+                    raise ValueError("No crucible available for the respective furnace.")
+                if not charge_inputs:
+                    raise ValueError("Add at least one charge line with weight > 0.")
+                bid = db.create_batch(
+                    furnace=furnace,
+                    heat_no=heat_no,
+                    inputs=charge_inputs,
+                    **_batch_kwargs(),
+                )
+            if mark_completed:
+                db.complete_production_batch(bid)
+            drafts[furnace] = [
+                {"material": "", "lot_id": None, "weight": 0.0, "notes": ""}
+            ]
+            st.session_state.pop(full_chem_key, None)
+            st.session_state.pop(_pk("_hydrated_batch_id"), None)
+            return bid
+
+        b1, b2, _ = st.columns([1.4, 1.4, 2])
+        save_clicked = b1.button(
+            (
+                "Save history correction"
+                if is_completed
+                else ("Save changes" if existing_batch else "Create production batch")
+            ),
+            type="primary" if is_completed or not existing_batch else "secondary",
+            disabled=locked or (available_crucible is None and not existing_batch),
+            key=_pk("save_batch"),
+        )
+        complete_clicked = b2.button(
+            "Mark as Completed",
             type="primary",
-            disabled=available_crucible is None,
-            key=_pk("create_batch"),
-        ):
-            if available_crucible is None:
-                st.error("No crucible available for the respective furnace.")
-            elif not charge_inputs:
-                st.error("Add at least one charge line with weight > 0.")
+            disabled=locked or is_completed or bool(completion_gaps),
+            key=_pk("complete_batch"),
+            help=(
+                "Requires degassing time, sampled/defect pcs, K Mold ≤ "
+                f"{db.K_MOLD_MAX:g}, top/middle/bottom samples and datetimes, "
+                "vacum sample, batch chemistry, and at least one charge line."
+            ),
+        )
+        if save_clicked:
+            try:
+                bid = _save_chemistry_page(mark_completed=False)
+                if is_completed:
+                    st.session_state["_pb_flash"] = (
+                        f"Saved history correction for **{bid}**."
+                    )
+                elif existing_batch:
+                    st.session_state["_pb_flash"] = (
+                        f"Saved **{bid}**. Mark Completed when the checklist is done, "
+                        "then enter **Batch Output**."
+                    )
+                else:
+                    st.session_state["_pb_flash"] = (
+                        f"Created batch **{bid}** — Heat {heat_no}, Furnace {furnace}. "
+                        "Mark Completed when the checklist is done, then enter **Batch Output**."
+                    )
+                st.rerun()
+            except Exception as exc:
+                st.error(str(exc))
+        if complete_clicked:
+            if completion_gaps:
+                st.error(
+                    "Cannot mark Completed until these are entered: "
+                    + "; ".join(completion_gaps)
+                )
             else:
                 try:
-                    merged_chem = merge_percent_composition(batch_chem, full_chem_key)
-                    bid = db.create_batch(
-                        furnace=furnace,
-                        heat_no=heat_no,
-                        alloy_id=alloy_id,
-                        production_date=prod_date.isoformat(),
-                        shift=shift,
-                        melt_no=melt_no,
-                        melting_team=melting_team,
-                        notes=notes.strip(),
-                        inputs=charge_inputs,
-                        composition={k: v for k, v in merged_chem.items() if v and v > 0},
-                        degassing_time=degassing_time.strip() or None,
-                        sampled_pcs=sampled_pcs if sampled_pcs and sampled_pcs > 0 else None,
-                        defect_pcs=defect_pcs if defect_pcs and defect_pcs > 0 else None,
-                        top_sample=_sample_or_none(top_sample),
-                        middle_sample=_sample_or_none(middle_sample),
-                        bottom_sample=_sample_or_none(bottom_sample),
-                        vacum_sample=_sample_or_none(vacum_sample),
-                        top_sample_remarks=top_sample_remarks.strip() or None,
-                        middle_sample_remarks=middle_sample_remarks.strip() or None,
-                        bottom_sample_remarks=bottom_sample_remarks.strip() or None,
-                        top_sample_datetime=(
-                            top_sample_dt.isoformat(timespec="seconds")
-                            if top_sample_dt
-                            else None
-                        ),
-                        middle_sample_datetime=(
-                            middle_sample_dt.isoformat(timespec="seconds")
-                            if middle_sample_dt
-                            else None
-                        ),
-                        bottom_sample_datetime=(
-                            bottom_sample_dt.isoformat(timespec="seconds")
-                            if bottom_sample_dt
-                            else None
-                        ),
-                        production_supervisor=production_supervisor,
+                    bid = _save_chemistry_page(mark_completed=True)
+                    st.session_state["_pb_flash"] = (
+                        f"Batch **{bid}** is **Completed** and locked. "
+                        "Enter product and non-spec output on **Batch Output**."
                     )
-                    st.success(
-                        f"Created batch **{bid}** — Heat {heat_no}, Furnace {furnace}. "
-                        "Record product and non-spec output on **Batch Output**."
-                    )
-                    drafts[furnace] = [
-                        {"material": "", "lot_id": None, "weight": 0.0, "notes": ""}
-                    ]
-                    st.session_state.pop(full_chem_key, None)
-                    st.balloons()
+                    st.rerun()
                 except Exception as exc:
                     st.error(str(exc))
 
@@ -2243,7 +2720,11 @@ elif PAGE == "Batch Output":
         "on the batch, plus **Broken Ingot (78)**, **Furnace Empty (79)**, and "
         "**Not Ok Ingot (80)** for samples and portions taken out so they do not "
         "spoil the chemistry. Those three have no spec. "
-        "Create the batch first on **Production Batch & Chemistry**. "
+        "Create and mark the batch **Completed** first on **Production Batch & Chemistry**. "
+        "Saving product-alloy output posts that heat into **Finished Goods Inventory**. "
+        "Dispatch those bundles on **Packing List**. "
+        "Avg piece weight is net output ÷ pieces; product alloy pieces are typically "
+        f"{db.ALLOY_PIECE_KG_MIN:g}–{db.ALLOY_PIECE_KG_MAX:g} kg and show in red if outside that range. "
         "On save, each output line stores material ₹/kg (charge lot cost ÷ total output kg) "
         "and overall ₹/kg (material + Cost of Conversion for the production month, "
         "or the previous available month if that month's rates are not in yet). "
@@ -2310,7 +2791,7 @@ elif PAGE == "Batch Output":
     if saved_all.empty:
         st.info("No output rows yet. Select a batch above and save output lines.")
     else:
-        show_dataframe(saved_all)
+        show_dataframe(saved_all, highlight_avg_piece=True)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -2321,7 +2802,8 @@ elif PAGE == "Production Batches":
     st.caption(
         "Review existing production batches. "
         "New batches are created on **Production Batch & Chemistry**. "
-        "Input is charge weight; output is entered on **Batch Output** "
+        "Input is charge weight; output is entered on **Batch Output** after the heat "
+        "is marked **Completed** "
         "(product alloy plus Broken Ingot / Furnace Empty / Not Ok Ingot)."
     )
     st.subheader("Existing batches")
@@ -2669,118 +3151,14 @@ elif PAGE == "Cost of Conversion":
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 3. Production Workflow Tracker
-# ═══════════════════════════════════════════════════════════════════════════════
-elif PAGE == "Production Workflow Tracker":
-    st.title("Production Workflow Tracker")
-    st.caption(
-        "Move each batch through: Raw Material → Melting/Furnace → Casting → "
-        "Quality Inspection → Finished Goods."
-    )
-
-    batches = db.list_batches()
-    if not batches:
-        st.info("No batches to track yet.")
-    else:
-        batch_ids = [b["Batch_ID"] for b in batches]
-        selected = st.selectbox("Select Batch ID", batch_ids)
-        batch = db.get_batch(selected)
-        if batch:
-            m1, m2, m3, m4, m5 = st.columns(5)
-            m1.metric("Batch ID", batch["Batch_ID"])
-            m2.metric("Furnace", batch["Furnace"])
-            m3.metric("Crucible", batch.get("Crucible_no") or "—")
-            m4.metric("Heat No", batch["Heat_no"])
-            m5.metric("Output kg", f"{batch['Output_Weight'] or 0:,.1f}")
-            st.caption(
-                f"Input **{float(batch.get('Input_Weight') or 0):,.1f} kg** from charges. "
-                "Output is the sum of recorded batch outputs (not charge weight)."
-            )
-
-            st.markdown(
-                f"**Current stage:** `{batch['Workflow_stage']}` &nbsp;|&nbsp; "
-                f"**QA status:** `{batch['Production_status']}`"
-            )
-
-            # Stage progress
-            try:
-                stage_idx = db.WORKFLOW_STAGES.index(batch["Workflow_stage"])
-            except ValueError:
-                stage_idx = 0
-            prog = (stage_idx + 1) / len(db.WORKFLOW_STAGES)
-            st.progress(prog, text=" → ".join(db.WORKFLOW_STAGES))
-
-            with st.form("workflow_form"):
-                wc1, wc2 = st.columns(2)
-                with wc1:
-                    new_stage = st.selectbox(
-                        "Workflow stage",
-                        db.WORKFLOW_STAGES,
-                        index=stage_idx,
-                    )
-                with wc2:
-                    qa = st.selectbox(
-                        "QA / batch status",
-                        db.BATCH_QA_STATUS,
-                        index=db.BATCH_QA_STATUS.index(batch["Production_status"])
-                        if batch["Production_status"] in db.BATCH_QA_STATUS
-                        else 0,
-                    )
-                save = st.form_submit_button("Update workflow", type="primary")
-
-            if save:
-                db.update_batch_workflow(
-                    selected,
-                    workflow_stage=new_stage,
-                    qa_status=qa,
-                )
-                if qa == "Approved":
-                    st.success(
-                        f"Batch {selected} → **{new_stage}** (Approved). "
-                        "Under_Testing finished-goods bundles for this batch are now **Available**."
-                    )
-                else:
-                    st.success(f"Batch {selected} → **{new_stage}** ({qa}).")
-                st.rerun()
-
-            st.subheader("Charge details")
-            show_dataframe(df_from_rows(db.get_batch_inputs(selected)))
-            st.subheader("Chemistry")
-            chem_df = df_from_rows(db.get_batch_chemistry(selected))
-            if chem_df.empty:
-                st.caption("No chemistry recorded.")
-            else:
-                show_dataframe(chem_df)
-            render_batch_output_editor(batch, key_prefix="wf_out")
-
-        st.divider()
-        st.subheader("All batches by stage")
-        overview = df_from_rows(batches)
-        if not overview.empty:
-            cols = [
-                "Batch_ID",
-                "Production_Date",
-                "Furnace",
-                "Heat_no",
-                "Workflow_stage",
-                "Production_status",
-                "Input_Weight",
-                "Output_Weight",
-                "Output_pieces",
-                "Alloy_name",
-            ]
-            show_dataframe(overview[[c for c in cols if c in overview.columns]])
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
 # 4. Material Recovery & Yield
 # ═══════════════════════════════════════════════════════════════════════════════
 elif PAGE == "Material Recovery & Yield":
     st.title("Material Recovery & Yield Calculator")
     st.caption(
         f"Recovery % = (total recorded output / charge input) × 100. "
-        f"Enter outputs on **Batch Output** (product alloy plus Broken Ingot, "
-        f"Furnace Empty, and Not Ok Ingot). "
+        f"Enter outputs on **Batch Output** after the heat is **Completed** "
+        f"(product alloy plus Broken Ingot, Furnace Empty, and Not Ok Ingot). "
         f"Below **{db.YIELD_TARGET_PCT:.0f}%** is highlighted in red."
     )
 
@@ -2789,7 +3167,7 @@ elif PAGE == "Material Recovery & Yield":
         st.info("No batches available.")
     else:
         labels = {
-            f"{b['Batch_ID']}  |  stage={b['Workflow_stage']}  |  "
+            f"{b['Batch_ID']}  |  {b.get('Alloy_name') or '—'}  |  "
             f"in={b.get('Input_Weight') or 0:.0f} kg  |  "
             f"out={b.get('Output_Weight') or 0:.0f} kg": b["Batch_ID"]
             for b in batches
@@ -2823,17 +3201,6 @@ elif PAGE == "Material Recovery & Yield":
         c2.metric("Product alloy (kg)", f"{product_w:,.2f}")
         c3.metric("Non-spec output (kg)", f"{sidestream_w:,.2f}")
         c4.metric("Total output (kg)", f"{output_w:,.2f}")
-
-        if st.button("Advance to Casting if output recorded", key="yield_advance"):
-            stage = batch["Workflow_stage"]
-            if output_w > 0 and stage in ("Raw Material", "Melting/Furnace"):
-                db.update_batch_workflow(bid, workflow_stage="Casting")
-                st.info("Batch stage advanced to **Casting**.")
-                st.rerun()
-            elif output_w <= 0:
-                st.warning("Save at least one output line with weight > 0 first.")
-            else:
-                st.info(f"Batch is already at **{stage}**.")
 
         if output_w > 0 and input_w > 0:
             result = db.calc_yield(input_w, output_w)
@@ -2871,98 +3238,371 @@ elif PAGE == "Material Recovery & Yield":
 elif PAGE == "Finished Goods Inventory":
     st.title("Finished Goods Inventory")
     st.caption(
-        "New bundles are created as **Under_Testing** and cannot be assigned. "
-        "When the linked production batch is set to **Approved**, those bundles "
-        "automatically become **Available**."
+        "Product-alloy output saved on **Batch Output** posts here as **Available**. "
+        "Dispatch stock by entering a **Packing List**. "
+        "Avg piece is output weight ÷ pieces; typical product alloy pieces are "
+        f"**{db.ALLOY_PIECE_KG_MIN:g}–{db.ALLOY_PIECE_KG_MAX:g} kg** and show in red "
+        "if outside that range so you can check the piece count."
     )
+    try:
+        db.backfill_finished_goods_from_output()
+    except Exception as exc:
+        st.warning(f"Could not refresh finished goods from batch output: {exc}")
 
-    batches = db.list_batches()
-    batch_ids = [b["Batch_ID"] for b in batches]
-    batch_map = {b["Batch_ID"]: b for b in batches}
-
-    st.markdown("#### Add bundle")
-    if not batch_ids:
-        st.info("Create a production batch first.")
-    else:
-        with st.form("fg_add_form", clear_on_submit=True):
-            fc1, fc2, fc3 = st.columns(3)
-            with fc1:
-                fg_batch = st.selectbox("Batch ID *", batch_ids)
-            linked = batch_map.get(fg_batch, {})
-            product_id = linked.get("Alloy_id")
-            product_out = 0.0
-            product_pcs = 0
-            for r in db.get_batch_outputs(fg_batch):
-                if product_id is None or int(r["Alloy_id"]) != int(product_id):
-                    continue
-                product_out += float(r["Weight"] or 0)
-                product_pcs += int(r.get("Pieces") or 0)
-            with fc2:
-                fg_w = st.number_input(
-                    "Output weight (kg)",
-                    min_value=0.0,
-                    value=float(product_out or 0),
-                    step=1.0,
-                    help="Defaults to this batch’s product-alloy output (excludes 78/79/80).",
-                )
-            with fc3:
-                fg_pcs = st.number_input(
-                    "Output pieces",
-                    min_value=0,
-                    value=int(product_pcs or 0),
-                    step=1,
-                    format="%d",
-                    help="Whole number of pieces. No decimals.",
-                )
-            st.caption(
-                f"Status will be locked to **{db.FG_STATUS_UNDER_TESTING}** "
-                f"(batch QA: `{linked.get('Production_status', '—')}`)."
-            )
-            if st.form_submit_button("Create bundle", type="primary"):
-                try:
-                    bid = db.add_finished_goods_bundle(
-                        batch_id=fg_batch,
-                        output_weight=fg_w if fg_w > 0 else None,
-                        output_pieces=int(fg_pcs) if fg_pcs > 0 else None,
-                    )
-                    st.success(
-                        f"Created bundle **{bid}** for batch {fg_batch} "
-                        f"(status {db.FG_STATUS_UNDER_TESTING})."
-                    )
-                    st.rerun()
-                except Exception as exc:
-                    st.error(str(exc))
-
-    st.divider()
-    st.markdown("#### All bundles")
     all_fg = db.list_finished_goods()
-    show_dataframe(df_from_rows(all_fg))
-
-    locked = [r for r in all_fg if r["Finished_Goods_Status"] == db.FG_STATUS_UNDER_TESTING]
-    if locked:
-        st.warning(
-            f"{len(locked)} bundle(s) locked as **Under_Testing** — "
-            "approve the production batch to release them."
+    available_n = sum(
+        1 for r in all_fg if r.get("Finished_Goods_Status") == db.FG_STATUS_AVAILABLE
+    )
+    dispatched_n = sum(
+        1 for r in all_fg if r.get("Finished_Goods_Status") == db.FG_STATUS_DISPATCHED
+    )
+    m1, m2, m3 = st.columns(3)
+    m1.metric("Bundles", len(all_fg))
+    m2.metric("Available", available_n)
+    m3.metric("Dispatched", dispatched_n)
+    if all_fg:
+        show_dataframe(df_from_rows(all_fg), highlight_avg_piece=True)
+    else:
+        st.info(
+            "No finished goods yet. Mark a heat **Completed**, then save product-alloy "
+            "output on **Batch Output**."
         )
 
-    st.markdown("#### Assignable stock (Available only)")
-    available = db.list_finished_goods(assignable_only=True)
-    if not available:
-        st.info("No Available bundles. Under_Testing stock stays locked until batch approval.")
-    else:
-        assign_opts = {
-            f"Bundle {r['Bundle_id']} | batch {r['Batch_ID']} | "
-            f"{r['Output_Weight'] or 0:.1f} kg / {r['Output_pieces'] or 0:.0f} pcs": r["Bundle_id"]
-            for r in available
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Packing List
+# ═══════════════════════════════════════════════════════════════════════════════
+elif PAGE == "Packing List":
+    st.title("Packing List")
+    st.caption(
+        "Enter invoice details, then select **batch_id**s from Available finished goods. "
+        "A heat made for one customer can be dispatched on another PO when the "
+        "alloy name or alloy group matches the alloy on this packing list. "
+        "Saving as **Verified** marks those bundles **Dispatched**."
+    )
+    try:
+        db.backfill_finished_goods_from_output()
+    except Exception as exc:
+        st.warning(f"Could not refresh finished goods from batch output: {exc}")
+
+    def _clear_packing_form() -> None:
+        keep = {"pl_load_pick"}
+        for key in list(st.session_state.keys()):
+            if str(key).startswith("pl_") and key not in keep:
+                st.session_state.pop(key, None)
+
+    def _cust_label(row: dict) -> str:
+        return f"{row.get('Customer_name') or '—'} ({row.get('Cust_code') or '—'})"
+
+    def _alloy_label(row: dict) -> str:
+        return f"{row.get('Alloy_name') or '—'} (#{row.get('Alloy_id')})"
+
+    existing_lists = db.list_packing_lists()
+    po_numbers = db.list_packing_po_numbers()
+    editing_id = st.session_state.get("pl_edit_id")
+
+    top1, top2 = st.columns([3, 1])
+    with top1:
+        if editing_id:
+            st.info(
+                f"Editing packing list **#{editing_id}**. "
+                "Save to update, or start a new list."
+            )
+        else:
+            st.markdown("#### New packing list")
+    with top2:
+        if st.button("New packing list", key="pl_new"):
+            _clear_packing_form()
+            st.rerun()
+
+    h1, h2, h3 = st.columns(3)
+    with h1:
+        invoice_date = ui_date_input(
+            "Invoice date *",
+            value=date.today(),
+            key="pl_invoice_date",
+        )
+        invoice_number = st.text_input("Invoice number *", key="pl_invoice")
+        po_no = st.selectbox(
+            "P.O. Number *",
+            options=[""] + po_numbers,
+            key="pl_po",
+            help="Customer PO numbers from purchase_order.customer_po_no (not Cancelled).",
+        )
+
+    if st.session_state.get("pl_po_seen") != po_no:
+        previous_po = st.session_state.get("pl_po_seen")
+        st.session_state["pl_po_seen"] = po_no
+        if previous_po is not None:
+            for key in (
+                "pl_cust",
+                "pl_alloy",
+                "pl_batches",
+                "pl_batches_labels",
+                "pl_cust_seen",
+                "pl_alloy_seen",
+            ):
+                st.session_state.pop(key, None)
+
+    customers = db.list_packing_po_customers(po_no) if po_no else []
+    cust_opts = {_cust_label(c): c for c in customers}
+    valid_cust = set(cust_opts) | {""}
+    if st.session_state.get("pl_cust") not in valid_cust:
+        wanted = st.session_state.get("pl_cust_code")
+        match = next(
+            (
+                label
+                for label, row in cust_opts.items()
+                if str(row.get("Cust_code")) == str(wanted)
+            ),
+            "",
+        )
+        st.session_state["pl_cust"] = match
+    if len(cust_opts) == 1 and not st.session_state.get("pl_cust"):
+        st.session_state["pl_cust"] = next(iter(cust_opts))
+
+    with h2:
+        cust_label = st.selectbox(
+            "Customer name *",
+            options=[""] + list(cust_opts.keys()),
+            key="pl_cust",
+            help="Customers on this P.O., names from customer_master.",
+        )
+        cust_row = cust_opts.get(cust_label) or {}
+        cust_code = cust_row.get("Cust_code")
+        customer_name = cust_row.get("Customer_name")
+        st.session_state["pl_cust_code"] = cust_code
+
+        if st.session_state.get("pl_cust_seen") != cust_code:
+            previous_cust = st.session_state.get("pl_cust_seen")
+            st.session_state["pl_cust_seen"] = cust_code
+            if previous_cust is not None:
+                for key in ("pl_alloy", "pl_batches", "pl_batches_labels", "pl_alloy_seen"):
+                    st.session_state.pop(key, None)
+
+        alloys = (
+            db.list_packing_po_alloys(po_no, cust_code)
+            if po_no and cust_code
+            else []
+        )
+        alloy_opts = {
+            _alloy_label(a): a
+            for a in alloys
+            if a.get("Alloy_id") not in (None, "")
         }
-        pick = st.selectbox("Select Available bundle to assign", list(assign_opts.keys()))
-        if st.button("Mark as Assigned", type="primary"):
+        valid_alloy = set(alloy_opts) | {""}
+        if st.session_state.get("pl_alloy") not in valid_alloy:
+            wanted_aid = st.session_state.get("pl_alloy_id")
+            match = next(
+                (
+                    label
+                    for label, row in alloy_opts.items()
+                    if str(row.get("Alloy_id")) == str(wanted_aid)
+                ),
+                "",
+            )
+            st.session_state["pl_alloy"] = match
+        if len(alloy_opts) == 1 and not st.session_state.get("pl_alloy"):
+            st.session_state["pl_alloy"] = next(iter(alloy_opts))
+
+        alloy_label = st.selectbox(
+            "Alloy Name *",
+            options=[""] + list(alloy_opts.keys()),
+            key="pl_alloy",
+            help="Alloys on this P.O. for the selected customer.",
+        )
+        alloy_row = alloy_opts.get(alloy_label) or {}
+        alloy_id = alloy_row.get("Alloy_id")
+        st.session_state["pl_alloy_id"] = alloy_id
+        if alloy_id not in (None, ""):
+            master = db.get_alloy(alloy_id) or alloy_row
+            colour_code = master.get("Colour_code") or ""
+        else:
+            colour_code = ""
+        st.text_input(
+            "Colour code",
+            value=colour_code,
+            disabled=True,
+            help="Filled from alloy_master for the selected alloy.",
+        )
+    with h3:
+        vehicle_no = st.text_input("Vehicle No", key="pl_vehicle")
+        status = st.selectbox(
+            "Packing list status *",
+            options=db.PACKING_LIST_STATUS,
+            key="pl_status",
+            help="In-Progress keeps stock Available. Verified dispatches the selected batches.",
+        )
+
+    if st.session_state.get("pl_alloy_seen") != alloy_id:
+        previous_alloy = st.session_state.get("pl_alloy_seen")
+        st.session_state["pl_alloy_seen"] = alloy_id
+        if previous_alloy is not None:
+            st.session_state.pop("pl_batches", None)
+            st.session_state.pop("pl_batches_labels", None)
+
+    st.markdown("#### Batch IDs")
+    f1, f2 = st.columns(2)
+    match_name = f1.checkbox(
+        "Filter by alloy name",
+        value=True,
+        key="pl_match_name",
+        help="Include heats whose alloy_name matches the packing-list alloy (or its group).",
+    )
+    match_group = f2.checkbox(
+        "Filter by alloy group",
+        value=True,
+        key="pl_match_group",
+        help="Include heats whose alloy_group matches the packing-list alloy.",
+    )
+
+    include_ids = [
+        str(b) for b in (st.session_state.get("pl_batches") or []) if b
+    ]
+    dispatchable = []
+    if alloy_id not in (None, ""):
+        try:
+            dispatchable = db.list_dispatchable_batches(
+                int(alloy_id),
+                match_name=bool(match_name),
+                match_group=bool(match_group),
+                include_batch_ids=include_ids,
+            )
+        except Exception as exc:
+            st.error(str(exc))
+    batch_opts = {
+        (
+            f"{r['Batch_ID']}  |  {r.get('Alloy_name') or '—'} / "
+            f"{r.get('Alloy_group') or '—'}  |  "
+            f"{float(r.get('Output_Weight') or 0):,.1f} kg / "
+            f"{int(r.get('Output_pieces') or 0)} pcs"
+        ): r["Batch_ID"]
+        for r in dispatchable
+    }
+    restore_labels = [
+        label for label, bid in batch_opts.items() if bid in set(include_ids)
+    ]
+    current_labels = [
+        label
+        for label in (st.session_state.get("pl_batches_labels") or [])
+        if label in batch_opts
+    ]
+    next_labels = restore_labels if restore_labels and not current_labels else current_labels
+    if st.session_state.get("pl_batches_labels") != next_labels:
+        st.session_state["pl_batches_labels"] = next_labels
+
+    if not po_no:
+        st.info("Select a P.O. Number to load customers and alloys.")
+    elif not cust_code:
+        st.info("Select the customer on this purchase order.")
+    elif alloy_id in (None, ""):
+        st.info("Select the alloy on this purchase order, then pick batch IDs.")
+    elif not batch_opts:
+        st.warning(
+            "No Available finished-goods batches match this alloy name or group. "
+            "Save product-alloy output on **Batch Output** first."
+        )
+    selected_batch_labels = st.multiselect(
+        "Batch ID",
+        options=list(batch_opts.keys()),
+        key="pl_batches_labels",
+        help="Stock produced for another customer is allowed when alloy name or group match.",
+    )
+    selected_batch_ids = [batch_opts[label] for label in selected_batch_labels]
+    st.session_state["pl_batches"] = selected_batch_ids
+
+    if st.button("Save packing list", type="primary", key="pl_save"):
+        if not invoice_number.strip():
+            st.error("Invoice number is required.")
+        elif not po_no:
+            st.error("P.O. Number is required.")
+        elif not cust_code:
+            st.error("Customer name is required.")
+        elif alloy_id in (None, ""):
+            st.error("Alloy Name is required.")
+        else:
             try:
-                db.assign_finished_goods_bundle(assign_opts[pick])
-                st.success(f"Bundle {assign_opts[pick]} marked **Assigned**.")
+                pid = db.save_packing_list(
+                    packing_list_id=int(editing_id) if editing_id else None,
+                    invoice_date=to_storage_date(invoice_date),
+                    invoice_number=invoice_number,
+                    customer_po_no=po_no,
+                    cust_code=cust_code,
+                    customer_name=customer_name,
+                    alloy_id=int(alloy_id),
+                    colour_code=colour_code or None,
+                    vehicle_no=vehicle_no,
+                    packing_list_status=status,
+                    batch_ids=selected_batch_ids,
+                )
+                st.session_state["pl_edit_id"] = pid
+                st.success(
+                    f"Saved packing list **#{pid}** as **{status}** "
+                    f"({len(selected_batch_ids)} batch"
+                    f"{'' if len(selected_batch_ids) == 1 else 'es'})."
+                )
                 st.rerun()
             except Exception as exc:
                 st.error(str(exc))
+
+    st.divider()
+    st.markdown("#### Existing packing lists")
+    if not existing_lists:
+        st.info("No packing lists yet.")
+    else:
+        show_dataframe(df_from_rows(existing_lists))
+        load_opts = {
+            (
+                f"#{r['Packing_list_id']}  |  {r.get('Invoice_number') or '—'}  |  "
+                f"{r.get('Customer_name') or '—'}  |  {r.get('Packing_list_status')}"
+            ): int(r["Packing_list_id"])
+            for r in existing_lists
+        }
+        load_label = st.selectbox(
+            "Load packing list",
+            options=[""] + list(load_opts.keys()),
+            key="pl_load_pick",
+        )
+        if st.button("Load selected", key="pl_load") and load_label:
+            header = db.get_packing_list(load_opts[load_label])
+            if not header:
+                st.error("That packing list was not found.")
+            else:
+                _clear_packing_form()
+                st.session_state["pl_edit_id"] = int(header["Packing_list_id"])
+                st.session_state["pl_invoice_date"] = _parse_master_date(
+                    header.get("Invoice_date")
+                )
+                st.session_state["pl_invoice"] = header.get("Invoice_number") or ""
+                po_loaded = header.get("Customer_PO_No") or ""
+                st.session_state["pl_po"] = po_loaded
+                st.session_state["pl_po_seen"] = po_loaded
+                st.session_state["pl_cust_code"] = header.get("Cust_code")
+                st.session_state["pl_cust"] = _cust_label(
+                    {
+                        "Customer_name": header.get("Customer_name"),
+                        "Cust_code": header.get("Cust_code"),
+                    }
+                )
+                st.session_state["pl_cust_seen"] = header.get("Cust_code")
+                aid = header.get("Alloy_id")
+                st.session_state["pl_alloy_id"] = aid
+                st.session_state["pl_alloy"] = (
+                    _alloy_label(
+                        {"Alloy_name": header.get("Alloy_name"), "Alloy_id": aid}
+                    )
+                    if aid not in (None, "")
+                    else ""
+                )
+                st.session_state["pl_alloy_seen"] = aid
+                st.session_state["pl_vehicle"] = header.get("Vehicle_no") or ""
+                st.session_state["pl_status"] = (
+                    header.get("Packing_list_status") or db.PACKING_STATUS_IN_PROGRESS
+                )
+                st.session_state["pl_batches"] = [
+                    str(r["Batch_ID"]) for r in header.get("batches") or []
+                ]
+                st.rerun()
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -3415,6 +4055,9 @@ elif PAGE == "Alloys":
         family = st.text_input(
             "Alloy family", placeholder="e.g. Al-Si-Cu", key="alloy_family"
         )
+        alloy_group = st.text_input(
+            "Alloy group", placeholder="e.g. ADC, LM", key="alloy_group"
+        )
         created_by = st.text_input("Created by", value="operator", key="alloy_created_by")
     with a2:
         customer = st.selectbox(
@@ -3509,6 +4152,7 @@ elif PAGE == "Alloys":
                 cust_code=cust_opts[customer] if customer else None,
                 alloy_name=aname.strip(),
                 family=family.strip(),
+                alloy_group=alloy_group.strip() or None,
                 created_by=created_by.strip(),
                 specs=merge_spec_ranges(specs, "alloy_full_specs"),
                 colour_code=colour.strip() or None,
@@ -4556,13 +5200,15 @@ elif PAGE == "Masters Overview":
             | 18 | Build_of_Material | BOM |
             | 19 | Purchase_Order | Customer POs + attached PO document (PDF/Word/Excel); key is Customer_PO_No + Alloy_Id |
             | 20 | ISRI_CODE_TABLE | ISRI scrap specification codes |
-            | 21 | Finished_Goods_Inventory | Bundles (Under_Testing → Available → Assigned / Dispatched / Rejected) |
+            | 21 | Finished_Goods_Inventory | Product-alloy output from batch_output (Available → Dispatched via Packing List) |
             | 22 | Furnace_Oil_Purchase | Furnace oil receipts and opening stock |
             | 23 | Furnace_Oil_Consumption | Daily furnace oil use (one row per day) |
             | 24 | Furnace_Oil_Inventory | Daily opening / purchase / consumption / closing ledger |
             | 25 | Electricity_Consumption | Daily opening/closing power readings per EB Line 1 / EB Line 2 |
             | 26 | Cost_of_conversion | Monthly conversion rates per kg (oil, electricity, labour, salaries, consumables, overheads) |
+            | 27 | Packing_list | Dispatch header (invoice, PO, customer, alloy, vehicle; status In-Progress / Verified) |
+            | 28 | Packing_list_batch | Batch IDs on a packing list; Verified lists mark FG **Dispatched** |
 
-            Extra production columns: `Workflow_stage`, sample fields, `Production_supervisor`.
+            Extra production columns: sample fields, `Production_supervisor`.
             """
         )

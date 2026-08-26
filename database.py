@@ -365,7 +365,11 @@ WORKFLOW_STAGES = [
     "Finished Goods",
 ]
 
-BATCH_QA_STATUS = ["Pending QA", "In-Progress", "Approved", "Rejected"]
+BATCH_STATUS_IN_PROGRESS = "In-Progress"
+BATCH_STATUS_COMPLETED = "Completed"
+BATCH_PRODUCTION_STATUS = [BATCH_STATUS_IN_PROGRESS, BATCH_STATUS_COMPLETED]
+BATCH_QA_STATUS = BATCH_PRODUCTION_STATUS
+K_MOLD_MAX = 0.5
 FG_STATUS_UNDER_TESTING = "Under_Testing"
 FG_STATUS_AVAILABLE = "Available"
 FG_STATUS_ASSIGNED = "Assigned"
@@ -378,11 +382,16 @@ FG_STATUSES = [
     FG_STATUS_DISPATCHED,
     FG_STATUS_REJECTED,
 ]
+# Assigned is leftover from the old assign step; packing list can still dispatch it.
+FG_DISPATCHABLE_STATUSES = {FG_STATUS_AVAILABLE, FG_STATUS_ASSIGNED}
 INVENTORY_STATUS = ["Awaiting Assay", "Ready For Melt", "Not Ready for Melt"]
 ACTIVE_STATUS = ["Active", "Inactive"]
 CRUCIBLE_STATUS = ["Available", "Damaged"]
 PURCHASE_ORDER_STATUS = ["Open", "Closed", "Cancelled"]
 SAMPLE_OK_STATUS = ["OK", "NOT OK"]
+PACKING_STATUS_IN_PROGRESS = "In-Progress"
+PACKING_STATUS_VERIFIED = "Verified"
+PACKING_LIST_STATUS = [PACKING_STATUS_IN_PROGRESS, PACKING_STATUS_VERIFIED]
 # Non-spec metal taken off a heat: samples, furnace heel, and off-chemistry ingot.
 # These IDs live in Alloy_Master but have no Alloy_Master_spec rows.
 SIDESTREAM_ALLOY_IDS = (78, 79, 80)
@@ -398,6 +407,10 @@ SHIFTS = ["A", "B"]
 MELT_NOS = [1, 2, 3, 4, 5, 6, 7, 9]
 HEAT_NOS = list(range(1, 13))
 YIELD_TARGET_PCT = 70.0
+# Typical finished-alloy ingot piece weight. Used to flag a likely
+# wrong piece count when supervisors enter batch output.
+ALLOY_PIECE_KG_MIN = 5.6
+ALLOY_PIECE_KG_MAX = 6.1
 
 ELECTRICITY_LINE_1 = "EB Line 1"
 ELECTRICITY_LINE_2 = "EB Line 2"
@@ -416,6 +429,7 @@ AUDIT_TABLES = {
     "raw_material_master",
     "raw_material_spec",
     "raw_material_purchase",
+    "packing_list",
 }
 _ACTING_USER: str = "system"
 
@@ -534,6 +548,7 @@ CREATE TABLE IF NOT EXISTS Alloy_Master (
     Cust_code TEXT REFERENCES Customer_Master(Cust_code),
     Alloy_name TEXT NOT NULL,
     Alloy_Family TEXT,
+    Alloy_group TEXT,
     Created_by TEXT,
     Created_at TEXT DEFAULT {now},
     Colour_code TEXT,
@@ -610,7 +625,8 @@ CREATE TABLE IF NOT EXISTS Production_batch (
     Melting_team TEXT,
     Notes TEXT,
     Photo1 {blob}, Photo2 {blob}, Photo3 {blob},
-    Production_status TEXT DEFAULT 'Pending QA',
+    Production_status TEXT NOT NULL DEFAULT 'In-Progress'
+        CHECK(Production_status IN ('In-Progress', 'Completed')),
     Workflow_stage TEXT DEFAULT 'Raw Material',
     Degassing_time TEXT,
     Sampled_pcs {float},
@@ -636,6 +652,26 @@ CREATE TABLE IF NOT EXISTS Finished_Goods_Inventory (
         CHECK(Finished_Goods_Status IN (
             'Under_Testing', 'Available', 'Assigned', 'Dispatched', 'Rejected'
         ))
+);
+CREATE TABLE IF NOT EXISTS Packing_list (
+    Packing_list_id {autopk},
+    Invoice_date TEXT,
+    Invoice_number TEXT NOT NULL,
+    Customer_PO_No TEXT NOT NULL,
+    Cust_code TEXT REFERENCES Customer_Master(Cust_code),
+    Customer_name TEXT,
+    Alloy_id INTEGER NOT NULL REFERENCES Alloy_Master(Alloy_id),
+    Colour_code TEXT,
+    Vehicle_no TEXT,
+    Packing_list_status TEXT NOT NULL DEFAULT 'In-Progress'
+        CHECK (Packing_list_status IN ('In-Progress', 'Verified')),
+    Last_updated_by TEXT,
+    Last_updated_datetime TEXT
+);
+CREATE TABLE IF NOT EXISTS Packing_list_batch (
+    Packing_list_id INTEGER NOT NULL REFERENCES Packing_list(Packing_list_id),
+    Batch_ID TEXT NOT NULL REFERENCES Production_batch(Batch_ID),
+    PRIMARY KEY (Packing_list_id, Batch_ID)
 );
 CREATE TABLE IF NOT EXISTS batch_input (
     Batch_ID TEXT NOT NULL REFERENCES Production_batch(Batch_ID),
@@ -947,6 +983,7 @@ def init_db() -> None:
                     ("Revision_datetime", "TEXT"),
                     ("Remarks", "TEXT"),
                     ("Status", "TEXT DEFAULT 'Active'"),
+                    ("Alloy_group", "TEXT"),
                 ],
             )
             _drop_columns(
@@ -967,6 +1004,7 @@ def init_db() -> None:
         _ensure_purchase_order_status(conn)
         _ensure_purchase_order_composite_pk(conn)
         _ensure_finished_goods_status(conn)
+        _ensure_production_batch_status(conn)
         _ensure_finished_goods_release_trigger(conn)
         _ensure_vacum_sample_check(conn)
         _drop_columns(
@@ -1015,6 +1053,12 @@ def init_db() -> None:
         _ensure_raw_material_spec_as_master_child(conn)
         _ensure_raw_material_purchase_header(conn)
         _ensure_sidestream_remelt_inventory(conn)
+        _ensure_packing_list(conn)
+        _ensure_columns(
+            conn,
+            "Alloy_Master",
+            [("Alloy_group", "TEXT")],
+        )
         _ensure_case_insensitive_text_pks(conn)
         _ensure_percentage_4dp(conn)
         _ensure_integer_piece_columns(conn)
@@ -1881,6 +1925,61 @@ def _ensure_one_available_crucible(conn: Connection) -> None:
     )
 
 
+def _ensure_packing_list(conn: Connection) -> None:
+    """Create packing-list tables used to dispatch finished goods."""
+    if IS_POSTGRES:
+        id_sql = "INTEGER PRIMARY KEY GENERATED BY DEFAULT AS IDENTITY"
+    else:
+        id_sql = "INTEGER PRIMARY KEY AUTOINCREMENT"
+    _exec(
+        conn,
+        f"""
+        CREATE TABLE IF NOT EXISTS Packing_list (
+            Packing_list_id {id_sql},
+            Invoice_date TEXT,
+            Invoice_number TEXT NOT NULL,
+            Customer_PO_No TEXT NOT NULL,
+            Cust_code TEXT REFERENCES Customer_Master(Cust_code),
+            Customer_name TEXT,
+            Alloy_id INTEGER NOT NULL REFERENCES Alloy_Master(Alloy_id),
+            Colour_code TEXT,
+            Vehicle_no TEXT,
+            Packing_list_status TEXT NOT NULL DEFAULT 'In-Progress'
+                CHECK (Packing_list_status IN ('In-Progress', 'Verified')),
+            Last_updated_by TEXT,
+            Last_updated_datetime TEXT
+        )
+        """,
+    )
+    _exec(
+        conn,
+        """
+        CREATE TABLE IF NOT EXISTS Packing_list_batch (
+            Packing_list_id INTEGER NOT NULL REFERENCES Packing_list(Packing_list_id),
+            Batch_ID TEXT NOT NULL REFERENCES Production_batch(Batch_ID),
+            PRIMARY KEY (Packing_list_id, Batch_ID)
+        )
+        """,
+    )
+    _ensure_columns(
+        conn,
+        "Packing_list",
+        [
+            ("Invoice_date", "TEXT"),
+            ("Invoice_number", "TEXT"),
+            ("Customer_PO_No", "TEXT"),
+            ("Cust_code", "TEXT"),
+            ("Customer_name", "TEXT"),
+            ("Alloy_id", "INTEGER"),
+            ("Colour_code", "TEXT"),
+            ("Vehicle_no", "TEXT"),
+            ("Packing_list_status", "TEXT"),
+            ("Last_updated_by", "TEXT"),
+            ("Last_updated_datetime", "TEXT"),
+        ],
+    )
+
+
 # TEXT columns that participate in a PRIMARY KEY. True = fold case with LOWER().
 _TEXT_PK_CI: list[tuple[str, list[tuple[str, bool]]]] = [
     ("Customer_Master", [("Cust_code", True)]),
@@ -1919,6 +2018,10 @@ _TEXT_PK_CI: list[tuple[str, list[tuple[str, bool]]]] = [
     ("Furnace_Oil_Consumption", [("Consumption_date", True)]),
     ("Furnace_Oil_Inventory", [("Inventory_date", True)]),
     ("Electricity_Consumption", [("Consumption_date", True), ("Line", True)]),
+    (
+        "Packing_list_batch",
+        [("Packing_list_id", False), ("Batch_ID", True)],
+    ),
 ]
 
 
@@ -2168,8 +2271,69 @@ def _ensure_finished_goods_status(conn: Connection) -> None:
     )
 
 
+def _ensure_production_batch_status(conn: Connection) -> None:
+    """Restrict Production_status to In-Progress and Completed."""
+    _exec(
+        conn,
+        """
+        UPDATE Production_batch
+        SET Production_status = 'Completed'
+        WHERE Production_status IN ('Approved', 'Completed')
+        """,
+    )
+    _exec(
+        conn,
+        """
+        UPDATE Production_batch
+        SET Production_status = 'In-Progress'
+        WHERE Production_status IS NULL
+           OR Production_status NOT IN ('In-Progress', 'Completed')
+        """,
+    )
+    if not IS_POSTGRES:
+        return
+    _exec(
+        conn,
+        """
+        ALTER TABLE Production_batch
+        ALTER COLUMN Production_status SET DEFAULT 'In-Progress'
+        """,
+    )
+    _exec(
+        conn,
+        "ALTER TABLE Production_batch ALTER COLUMN Production_status SET NOT NULL",
+    )
+    rows = list(
+        _exec(
+            conn,
+            """
+            SELECT conname
+            FROM pg_constraint
+            WHERE conrelid = 'production_batch'::regclass
+              AND contype = 'c'
+              AND position(
+                    'production_status' IN lower(pg_get_constraintdef(oid))
+                  ) > 0
+            """,
+        ).mappings()
+    )
+    for row in rows:
+        _exec(
+            conn,
+            f'ALTER TABLE Production_batch DROP CONSTRAINT "{row["conname"]}"',
+        )
+    _exec(
+        conn,
+        """
+        ALTER TABLE Production_batch
+        ADD CONSTRAINT production_batch_production_status_check
+        CHECK (Production_status IN ('In-Progress', 'Completed'))
+        """,
+    )
+
+
 def _ensure_finished_goods_release_trigger(conn: Connection) -> None:
-    """When a batch is Approved, release its Under_Testing finished-goods bundles."""
+    """When a batch is Completed, release its Under_Testing finished-goods bundles."""
     if not IS_POSTGRES:
         return
     _exec(
@@ -2178,8 +2342,8 @@ def _ensure_finished_goods_release_trigger(conn: Connection) -> None:
         CREATE OR REPLACE FUNCTION release_finished_goods_on_batch_approved()
         RETURNS TRIGGER AS $fn$
         BEGIN
-            IF NEW.production_status = 'Approved'
-               AND (OLD.production_status IS DISTINCT FROM 'Approved') THEN
+            IF NEW.production_status = 'Completed'
+               AND (OLD.production_status IS DISTINCT FROM 'Completed') THEN
                 UPDATE finished_goods_inventory
                 SET finished_goods_status = 'Available'
                 WHERE batch_id = NEW.batch_id
@@ -2646,6 +2810,11 @@ def save_table_edits(
                     row[col] = existing_text_key(resolved, col, row[col])
             key = _row_key(row, pk_cols)
             is_new = key not in original_map or any(v is None for v in key)
+
+            if resolved.lower() == "batch_output":
+                lower_row = {str(k).lower(): v for k, v in row.items()}
+                bid = lower_row.get("batch_id")
+                require_completed_batch_for_output(str(bid) if bid not in (None, "") else "")
 
             write_cols = [
                 c for c in cols
@@ -3186,7 +3355,8 @@ def list_alloys(*, include_sidestream: bool = True) -> list[dict[str, Any]]:
     sql = """
         SELECT a.Alloy_id AS "Alloy_id", a.Alloy_name AS "Alloy_name",
                a.Cust_code AS "Cust_code", c.Customer_name AS "Customer_name",
-               a.Alloy_Family AS "Alloy_Family", a.Colour_code AS "Colour_code",
+               a.Alloy_Family AS "Alloy_Family", a.Alloy_group AS "Alloy_group",
+               a.Colour_code AS "Colour_code",
                a.Bis_Designation AS "Bis_Designation",
                a.Revision_datetime AS "Revision_datetime",
                a.Remarks AS "Remarks", a.Status AS "Status"
@@ -3200,6 +3370,24 @@ def list_alloys(*, include_sidestream: bool = True) -> list[dict[str, Any]]:
         params = SIDESTREAM_ALLOY_IDS
     sql += " ORDER BY a.Alloy_name"
     return fetch_all(sql, params)
+
+
+def get_alloy(alloy_id: object) -> Optional[dict[str, Any]]:
+    try:
+        aid = int(alloy_id)
+    except (TypeError, ValueError):
+        return None
+    return fetch_one(
+        """
+        SELECT a.Alloy_id AS "Alloy_id", a.Alloy_name AS "Alloy_name",
+               a.Alloy_group AS "Alloy_group", a.Colour_code AS "Colour_code",
+               a.Cust_code AS "Cust_code", c.Customer_name AS "Customer_name"
+        FROM Alloy_Master a
+        LEFT JOIN Customer_Master c ON c.Cust_code = a.Cust_code
+        WHERE a.Alloy_id = ?
+        """,
+        (aid,),
+    )
 
 
 def get_alloy_specs(alloy_id: int) -> dict[str, dict[str, Any]]:
@@ -3689,6 +3877,7 @@ def add_alloy(
     revision_datetime: Optional[str] = None,
     remarks: Optional[str] = None,
     status: str = "Active",
+    alloy_group: Optional[str] = None,
 ) -> int:
     by_val, dt_val = audit_stamp()
     with get_connection() as conn:
@@ -3696,17 +3885,18 @@ def add_alloy(
             conn,
             """
             INSERT INTO Alloy_Master
-                (Cust_code, Alloy_name, Alloy_Family, Created_by, Created_at,
+                (Cust_code, Alloy_name, Alloy_Family, Alloy_group, Created_by, Created_at,
                  Colour_code, Bis_Designation,
                  Revision_datetime, Remarks, Status,
                  Last_updated_by, Last_updated_datetime)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             RETURNING Alloy_id
             """,
             (
                 cust_code,
                 alloy_name,
                 family,
+                alloy_group,
                 created_by,
                 datetime.now().isoformat(timespec="seconds"),
                 colour_code,
@@ -3859,11 +4049,262 @@ def list_access_users() -> list[str]:
         return []
 
 
+def is_admin_user(name: str | None = None) -> bool:
+    """True when the acting user is Admin (Name or Access_matrix.Access)."""
+    user = (name or get_acting_user() or "").strip()
+    if not user:
+        return False
+    if user.lower() == "admin":
+        return True
+    try:
+        row = fetch_one(
+            """
+            SELECT Name AS "Name", Access AS "Access"
+            FROM Access_matrix
+            WHERE LOWER(Name) = LOWER(?)
+            """,
+            (user,),
+        )
+    except Exception:
+        return False
+    if not row:
+        return False
+    access = str(row.get("Access") or "").strip().lower()
+    return access in {"admin", "administrator"}
+
+
+def k_mold_value(sampled_pcs: object, defect_pcs: object) -> float | None:
+    """Defect pcs / sampled pcs. None when sampled pcs is missing or zero."""
+    try:
+        sampled = float(sampled_pcs)
+        defect = float(defect_pcs)
+    except (TypeError, ValueError):
+        return None
+    if sampled <= 0:
+        return None
+    return defect / sampled
+
+
+def _is_missing_value(value: object) -> bool:
+    if value is None:
+        return True
+    if isinstance(value, str) and not value.strip():
+        return True
+    return False
+
+
+def production_batch_completion_gaps(
+    *,
+    degassing_time: object = None,
+    sampled_pcs: object = None,
+    defect_pcs: object = None,
+    top_sample: object = None,
+    middle_sample: object = None,
+    bottom_sample: object = None,
+    vacum_sample: object = None,
+    top_sample_datetime: object = None,
+    middle_sample_datetime: object = None,
+    bottom_sample_datetime: object = None,
+    chemistry_count: int = 0,
+    charge_line_count: int = 0,
+) -> list[str]:
+    """Return labels of fields that must be filled before Completed."""
+    gaps: list[str] = []
+    if _is_missing_value(degassing_time):
+        gaps.append("Degassing time")
+    try:
+        sampled = float(sampled_pcs) if sampled_pcs not in (None, "") else None
+    except (TypeError, ValueError):
+        sampled = None
+    if sampled is None or sampled <= 0:
+        gaps.append("Sampled pcs")
+        sampled = None
+    if defect_pcs in (None, ""):
+        gaps.append("Defect pcs")
+        k_mold = None
+    else:
+        try:
+            defect = float(defect_pcs)
+        except (TypeError, ValueError):
+            gaps.append("Defect pcs")
+            k_mold = None
+        else:
+            k_mold = (defect / sampled) if sampled else None
+    if k_mold is None:
+        if sampled:
+            gaps.append(f"K Mold Value (must be {K_MOLD_MAX:g} or below)")
+    elif k_mold > K_MOLD_MAX:
+        gaps.append(
+            f"K Mold Value must be {K_MOLD_MAX:g} or below (currently {k_mold:.3f})"
+        )
+    if _is_missing_value(top_sample) or str(top_sample) not in SAMPLE_OK_STATUS:
+        gaps.append("Top sample")
+    if _is_missing_value(middle_sample) or str(middle_sample) not in SAMPLE_OK_STATUS:
+        gaps.append("Middle sample")
+    if _is_missing_value(bottom_sample) or str(bottom_sample) not in SAMPLE_OK_STATUS:
+        gaps.append("Bottom sample")
+    if _is_missing_value(top_sample_datetime):
+        gaps.append("Top sample datetime")
+    if _is_missing_value(middle_sample_datetime):
+        gaps.append("Middle sample datetime")
+    if _is_missing_value(bottom_sample_datetime):
+        gaps.append("Bottom sample datetime")
+    if _is_missing_value(vacum_sample) or str(vacum_sample) not in SAMPLE_OK_STATUS:
+        gaps.append("Vacum sample")
+    if int(chemistry_count or 0) < 1:
+        gaps.append("Batch chemistry")
+    if int(charge_line_count or 0) < 1:
+        gaps.append("At least one charge line")
+    return gaps
+
+
+def production_batch_completion_gaps_for_id(batch_id: str) -> list[str]:
+    batch = get_batch(batch_id)
+    if not batch:
+        raise ValueError(f"Batch {batch_id} not found.")
+    chem = get_batch_chemistry(batch_id)
+    inputs = get_batch_inputs(batch_id)
+    chem_n = 0
+    for row in chem:
+        try:
+            if float(row.get("Percentage") or 0) > 0:
+                chem_n += 1
+        except (TypeError, ValueError):
+            continue
+    charge_n = 0
+    for row in inputs:
+        try:
+            if float(row.get("Weight") or 0) > 0:
+                charge_n += 1
+        except (TypeError, ValueError):
+            continue
+    return production_batch_completion_gaps(
+        degassing_time=batch.get("Degassing_time"),
+        sampled_pcs=batch.get("Sampled_pcs"),
+        defect_pcs=batch.get("Defect_pcs"),
+        top_sample=batch.get("Top_Sample"),
+        middle_sample=batch.get("Middle_Sample"),
+        bottom_sample=batch.get("Bottom_Sample"),
+        vacum_sample=batch.get("Vacum_Sample"),
+        top_sample_datetime=batch.get("Top_Sample_datetime"),
+        middle_sample_datetime=batch.get("Middle_Sample_datetime"),
+        bottom_sample_datetime=batch.get("Bottom_Sample_datetime"),
+        chemistry_count=chem_n,
+        charge_line_count=charge_n,
+    )
+
+
+def require_completed_batch_for_output(batch_id: str) -> None:
+    batch = get_batch(batch_id)
+    if not batch:
+        raise ValueError(f"Batch {batch_id} not found.")
+    if batch.get("Production_status") != BATCH_STATUS_COMPLETED:
+        raise ValueError(
+            f"Batch output can be entered only after {batch_id} is marked "
+            "Completed on Production Batch & Chemistry."
+        )
+
+
 # ---------- Production batches ----------
 
 def make_batch_id(furnace: str, heat_no: str | int) -> str:
     """Unique Batch ID = Furnace + Heat number (e.g. F3-H07)."""
     return f"F{furnace}-H{int(heat_no):02d}"
+
+
+def _insert_charge_lines(conn: Connection, batch_id: str, inputs: list[dict[str, Any]]) -> None:
+    for item in inputs:
+        lot = _exec(
+            conn,
+            'SELECT Remaining_Weight AS "Remaining_Weight" '
+            "FROM Raw_Material_Inventory WHERE Lot_id = ?",
+            (item["Lot_id"],),
+        ).mappings().first()
+        if not lot:
+            raise ValueError(f"Lot {item['Lot_id']} not found.")
+        remaining = float(lot["Remaining_Weight"] or 0)
+        w = float(item["Weight"])
+        if w > remaining + 1e-9:
+            raise ValueError(
+                f"Insufficient stock on Lot {item['Lot_id']}: need {w}, have {remaining}."
+            )
+        _exec(
+            conn,
+            """
+            UPDATE Raw_Material_Inventory
+            SET Remaining_Weight = Remaining_Weight - ?
+            WHERE Lot_id = ?
+            """,
+            (w, item["Lot_id"]),
+        )
+        _exec(
+            conn,
+            """
+            INSERT INTO batch_input
+                (Batch_ID, Raw_Material_Name, Lot_id, Weight,
+                 Weighment_scale_weight, Trolley_weight, Trolley_name,
+                 Charge_time, Notes, Weighment_scale_photo, Input_photo)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                batch_id,
+                item["Raw_Material_Name"],
+                item["Lot_id"],
+                w,
+                item.get("Weighment_scale_weight"),
+                item.get("Trolley_weight"),
+                item.get("Trolley_name"),
+                item.get("Charge_time") or datetime.now().isoformat(timespec="seconds"),
+                item.get("Notes", ""),
+                item.get("Weighment_scale_photo"),
+                item.get("Input_photo"),
+            ),
+        )
+
+
+def _replace_batch_chemistry(
+    conn: Connection, batch_id: str, composition: dict[str, float]
+) -> None:
+    _exec(
+        conn,
+        "DELETE FROM Batch_Chemical_Composition WHERE Batch_ID = ?",
+        (batch_id,),
+    )
+    for sym, pct in composition.items():
+        rounded = round_percent_4(pct)
+        if rounded is None:
+            continue
+        _exec(
+            conn,
+            """
+            INSERT INTO Batch_Chemical_Composition (Batch_ID, Element_symbol, Percentage)
+            VALUES (?, ?, ?)
+            """,
+            (batch_id, sym, rounded),
+        )
+
+
+def _validate_batch_samples_and_supervisor(
+    top_sample: Optional[str],
+    middle_sample: Optional[str],
+    bottom_sample: Optional[str],
+    vacum_sample: Optional[str],
+    production_supervisor: Optional[str],
+) -> None:
+    for label, value in (
+        ("Top_Sample", top_sample),
+        ("Middle_Sample", middle_sample),
+        ("Bottom_Sample", bottom_sample),
+        ("Vacum_Sample", vacum_sample),
+    ):
+        if value and value not in SAMPLE_OK_STATUS:
+            raise ValueError(f"{label} must be one of {SAMPLE_OK_STATUS}.")
+    if production_supervisor:
+        supervisors = list_production_supervisors(active_only=False)
+        if production_supervisor not in supervisors:
+            raise ValueError(
+                f"Production supervisor '{production_supervisor}' is not in Production_supervisor."
+            )
 
 
 def create_batch(
@@ -3900,21 +4341,13 @@ def create_batch(
     if existing:
         raise ValueError(f"Batch ID {batch_id} already exists. Choose another Heat No.")
 
-    for label, value in (
-        ("Top_Sample", top_sample),
-        ("Middle_Sample", middle_sample),
-        ("Bottom_Sample", bottom_sample),
-        ("Vacum_Sample", vacum_sample),
-    ):
-        if value and value not in SAMPLE_OK_STATUS:
-            raise ValueError(f"{label} must be one of {SAMPLE_OK_STATUS}.")
-
-    if production_supervisor:
-        supervisors = list_production_supervisors(active_only=False)
-        if production_supervisor not in supervisors:
-            raise ValueError(
-                f"Production supervisor '{production_supervisor}' is not in Production_supervisor."
-            )
+    _validate_batch_samples_and_supervisor(
+        top_sample,
+        middle_sample,
+        bottom_sample,
+        vacum_sample,
+        production_supervisor,
+    )
 
     crucible_no = require_available_crucible(furnace)
 
@@ -3930,7 +4363,7 @@ def create_batch(
                  Top_Sample_Remarks, Middle_Sample_Remarks, Bottom_Sample_Remarks,
                  Top_Sample_datetime, Middle_Sample_datetime, Bottom_Sample_datetime,
                  Production_supervisor)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'Pending QA', 'Raw Material',
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'In-Progress', 'Raw Material',
                     ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
@@ -3960,70 +4393,120 @@ def create_batch(
                 production_supervisor,
             ),
         )
-
-        for item in inputs:
-            # Deduct inventory
-            lot = _exec(
-                conn,
-                'SELECT Remaining_Weight AS "Remaining_Weight" '
-                "FROM Raw_Material_Inventory WHERE Lot_id = ?",
-                (item["Lot_id"],),
-            ).mappings().first()
-            if not lot:
-                raise ValueError(f"Lot {item['Lot_id']} not found.")
-            remaining = float(lot["Remaining_Weight"] or 0)
-            w = float(item["Weight"])
-            if w > remaining + 1e-9:
-                raise ValueError(
-                    f"Insufficient stock on Lot {item['Lot_id']}: need {w}, have {remaining}."
-                )
-            _exec(
-                conn,
-                """
-                UPDATE Raw_Material_Inventory
-                SET Remaining_Weight = Remaining_Weight - ?
-                WHERE Lot_id = ?
-                """,
-                (w, item["Lot_id"]),
-            )
-            _exec(
-                conn,
-                """
-                INSERT INTO batch_input
-                    (Batch_ID, Raw_Material_Name, Lot_id, Weight,
-                     Weighment_scale_weight, Trolley_weight, Trolley_name,
-                     Charge_time, Notes, Weighment_scale_photo, Input_photo)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    batch_id,
-                    item["Raw_Material_Name"],
-                    item["Lot_id"],
-                    w,
-                    item.get("Weighment_scale_weight"),
-                    item.get("Trolley_weight"),
-                    item.get("Trolley_name"),
-                    item.get("Charge_time") or datetime.now().isoformat(timespec="seconds"),
-                    item.get("Notes", ""),
-                    item.get("Weighment_scale_photo"),
-                    item.get("Input_photo"),
-                ),
-            )
-
-        for sym, pct in composition.items():
-            rounded = round_percent_4(pct)
-            if rounded is None:
-                continue
-            _exec(
-                conn,
-                """
-                INSERT INTO Batch_Chemical_Composition (Batch_ID, Element_symbol, Percentage)
-                VALUES (?, ?, ?)
-                """,
-                (batch_id, sym, rounded),
-            )
+        _insert_charge_lines(conn, batch_id, inputs)
+        _replace_batch_chemistry(conn, batch_id, composition)
 
     return batch_id
+
+
+def update_production_batch_input(
+    batch_id: str,
+    *,
+    alloy_id: Optional[int],
+    production_date: str,
+    shift: str,
+    melt_no: int,
+    melting_team: str,
+    notes: str,
+    extra_inputs: list[dict[str, Any]],
+    composition: dict[str, float],
+    degassing_time: Optional[str] = None,
+    sampled_pcs: Optional[float] = None,
+    defect_pcs: Optional[float] = None,
+    top_sample: Optional[str] = None,
+    middle_sample: Optional[str] = None,
+    bottom_sample: Optional[str] = None,
+    vacum_sample: Optional[str] = None,
+    top_sample_remarks: Optional[str] = None,
+    middle_sample_remarks: Optional[str] = None,
+    bottom_sample_remarks: Optional[str] = None,
+    top_sample_datetime: Optional[str] = None,
+    middle_sample_datetime: Optional[str] = None,
+    bottom_sample_datetime: Optional[str] = None,
+    production_supervisor: Optional[str] = None,
+    allow_completed: bool = False,
+) -> None:
+    """Update header, samples, chemistry, and append extra charge lines."""
+    batch = get_batch(batch_id)
+    if not batch:
+        raise ValueError(f"Batch {batch_id} not found.")
+    status = batch.get("Production_status")
+    if status == BATCH_STATUS_COMPLETED and not allow_completed:
+        raise ValueError(
+            f"Batch {batch_id} is Completed and cannot be edited. "
+            "An Admin can unlock it on Production Batch & Chemistry to correct history."
+        )
+    if status == BATCH_STATUS_COMPLETED and allow_completed and not is_admin_user():
+        raise ValueError("Only Admin can correct a Completed batch.")
+
+    _validate_batch_samples_and_supervisor(
+        top_sample,
+        middle_sample,
+        bottom_sample,
+        vacum_sample,
+        production_supervisor,
+    )
+
+    with get_connection() as conn:
+        _exec(
+            conn,
+            """
+            UPDATE Production_batch SET
+                Alloy_id = ?, Production_Date = ?, Shift = ?, Melt_No = ?,
+                Melting_team = ?, Notes = ?,
+                Degassing_time = ?, Sampled_pcs = ?, Defect_pcs = ?,
+                Top_Sample = ?, Middle_Sample = ?, Bottom_Sample = ?, Vacum_Sample = ?,
+                Top_Sample_Remarks = ?, Middle_Sample_Remarks = ?, Bottom_Sample_Remarks = ?,
+                Top_Sample_datetime = ?, Middle_Sample_datetime = ?, Bottom_Sample_datetime = ?,
+                Production_supervisor = ?
+            WHERE Batch_ID = ?
+            """,
+            (
+                alloy_id,
+                production_date,
+                shift,
+                melt_no,
+                melting_team,
+                notes,
+                degassing_time,
+                sampled_pcs,
+                defect_pcs,
+                top_sample,
+                middle_sample,
+                bottom_sample,
+                vacum_sample,
+                top_sample_remarks,
+                middle_sample_remarks,
+                bottom_sample_remarks,
+                top_sample_datetime,
+                middle_sample_datetime,
+                bottom_sample_datetime,
+                production_supervisor,
+                batch_id,
+            ),
+        )
+        if extra_inputs:
+            _insert_charge_lines(conn, batch_id, extra_inputs)
+        _replace_batch_chemistry(conn, batch_id, composition)
+
+
+def complete_production_batch(batch_id: str) -> None:
+    """Set production_status to Completed after required fields are present."""
+    batch = get_batch(batch_id)
+    if not batch:
+        raise ValueError(f"Batch {batch_id} not found.")
+    if batch.get("Production_status") == BATCH_STATUS_COMPLETED:
+        return
+    gaps = production_batch_completion_gaps_for_id(batch_id)
+    if gaps:
+        raise ValueError(
+            "Cannot mark Completed until these are entered: " + "; ".join(gaps)
+        )
+    execute(
+        "UPDATE Production_batch SET Production_status = ? WHERE Batch_ID = ?",
+        (BATCH_STATUS_COMPLETED, batch_id),
+    )
+    release_finished_goods_for_batch(batch_id)
 
 
 def update_batch_workflow(
@@ -4031,19 +4514,12 @@ def update_batch_workflow(
     workflow_stage: str,
     qa_status: Optional[str] = None,
 ) -> None:
-    fields = ["Workflow_stage = ?"]
-    params: list[Any] = [workflow_stage]
-    if qa_status:
-        fields.append("Production_status = ?")
-        params.append(qa_status)
-    params.append(batch_id)
+    """Update workflow stage only. Production_status is set on the chemistry page."""
+    del qa_status
     execute(
-        f"UPDATE Production_batch SET {', '.join(fields)} WHERE Batch_ID = ?",
-        params,
+        "UPDATE Production_batch SET Workflow_stage = ? WHERE Batch_ID = ?",
+        (workflow_stage, batch_id),
     )
-    # App-level hook (also covered by Postgres trigger): release locked FG stock.
-    if qa_status == "Approved":
-        release_finished_goods_for_batch(batch_id)
 
 
 def release_finished_goods_for_batch(batch_id: str) -> int:
@@ -4063,7 +4539,7 @@ def add_finished_goods_bundle(
     output_weight: Optional[float] = None,
     output_pieces: Optional[int] = None,
 ) -> int:
-    """Create a finished-goods bundle locked as Under_Testing until the batch is Approved."""
+    """Create a finished-goods bundle locked as Under_Testing until the batch is Completed."""
     batch = get_batch(batch_id)
     if not batch:
         raise ValueError(f"Batch {batch_id} not found.")
@@ -4096,23 +4572,27 @@ def list_finished_goods(
 ) -> list[dict[str, Any]]:
     """List finished-goods bundles. assignable_only=True returns Available only."""
     sql = """
-        SELECT Bundle_id AS "Bundle_id", Batch_ID AS "Batch_ID",
-               Output_Weight AS "Output_Weight", Output_pieces AS "Output_pieces",
-               Finished_Goods_Status AS "Finished_Goods_Status"
-        FROM Finished_Goods_Inventory
+        SELECT fg.Bundle_id AS "Bundle_id", fg.Batch_ID AS "Batch_ID",
+               fg.Output_Weight AS "Output_Weight", fg.Output_pieces AS "Output_pieces",
+               fg.Finished_Goods_Status AS "Finished_Goods_Status",
+               a.Alloy_id AS "Alloy_id", a.Alloy_name AS "Alloy_name",
+               a.Alloy_group AS "Alloy_group"
+        FROM Finished_Goods_Inventory fg
+        LEFT JOIN Production_batch b ON b.Batch_ID = fg.Batch_ID
+        LEFT JOIN Alloy_Master a ON a.Alloy_id = b.Alloy_id
         WHERE 1=1
     """
     params: list[Any] = []
     if batch_id:
-        sql += " AND Batch_ID = ?"
+        sql += " AND fg.Batch_ID = ?"
         params.append(batch_id)
     if assignable_only:
-        sql += " AND Finished_Goods_Status = ?"
+        sql += " AND fg.Finished_Goods_Status = ?"
         params.append(FG_STATUS_AVAILABLE)
     elif status:
-        sql += " AND Finished_Goods_Status = ?"
+        sql += " AND fg.Finished_Goods_Status = ?"
         params.append(status)
-    sql += " ORDER BY Bundle_id DESC"
+    sql += " ORDER BY fg.Bundle_id DESC"
     return fetch_all(sql, params)
 
 
@@ -4132,7 +4612,7 @@ def assign_finished_goods_bundle(bundle_id: int) -> None:
         raise ValueError(
             f"Bundle {bundle_id} cannot be assigned — status is "
             f"'{row['Finished_Goods_Status']}' (must be Available). "
-            "Approve the production batch to release Under_Testing stock."
+            "Mark the production batch Completed to release Under_Testing stock."
         )
     execute(
         """
@@ -4141,6 +4621,550 @@ def assign_finished_goods_bundle(bundle_id: int) -> None:
         """,
         (FG_STATUS_ASSIGNED, bundle_id),
     )
+
+
+def _norm_match_text(value: object) -> str:
+    return str(value or "").strip().casefold()
+
+
+def _product_output_totals_on_conn(
+    conn: Connection, batch_id: str, product_alloy_id: object
+) -> tuple[float, Optional[int]]:
+    try:
+        aid = int(product_alloy_id)
+    except (TypeError, ValueError):
+        return 0.0, None
+    row = (
+        _exec(
+            conn,
+            """
+            SELECT COALESCE(SUM(Weight), 0) AS "Weight",
+                   COALESCE(SUM(Pieces), 0) AS "Pieces"
+            FROM batch_output
+            WHERE Batch_ID = ? AND Alloy_id = ?
+            """,
+            (batch_id, aid),
+        )
+        .mappings()
+        .first()
+    )
+    if not row:
+        return 0.0, None
+    weight = float(row["Weight"] or 0)
+    try:
+        pieces = int(row["Pieces"] or 0)
+    except (TypeError, ValueError):
+        pieces = 0
+    return weight, (pieces if pieces > 0 else None)
+
+
+def sync_finished_goods_from_output(batch_id: str) -> Optional[int]:
+    """Create or update the product-alloy FG bundle from batch_output."""
+    with get_connection() as conn:
+        return _sync_finished_goods_from_output(conn, batch_id)
+
+
+def _sync_finished_goods_from_output(conn: Connection, batch_id: str) -> Optional[int]:
+    batch = (
+        _exec(
+            conn,
+            """
+            SELECT Batch_ID AS "Batch_ID", Alloy_id AS "Alloy_id",
+                   Production_status AS "Production_status"
+            FROM Production_batch WHERE Batch_ID = ?
+            """,
+            (batch_id,),
+        )
+        .mappings()
+        .first()
+    )
+    if not batch or batch.get("Alloy_id") in (None, ""):
+        return None
+    weight, pieces = _product_output_totals_on_conn(conn, batch_id, batch["Alloy_id"])
+    if weight <= 0:
+        return None
+    status = (
+        FG_STATUS_AVAILABLE
+        if batch.get("Production_status") == BATCH_STATUS_COMPLETED
+        else FG_STATUS_UNDER_TESTING
+    )
+    existing = list(
+        _exec(
+            conn,
+            """
+            SELECT Bundle_id AS "Bundle_id",
+                   Finished_Goods_Status AS "Finished_Goods_Status"
+            FROM Finished_Goods_Inventory
+            WHERE Batch_ID = ?
+            ORDER BY Bundle_id DESC
+            """,
+            (batch_id,),
+        ).mappings()
+    )
+    locked = {
+        FG_STATUS_DISPATCHED,
+        FG_STATUS_REJECTED,
+    }
+    if any((row["Finished_Goods_Status"] or "") in locked for row in existing):
+        return int(existing[0]["Bundle_id"]) if existing else None
+    editable = [
+        row
+        for row in existing
+        if (row["Finished_Goods_Status"] or "")
+        in {FG_STATUS_AVAILABLE, FG_STATUS_UNDER_TESTING, FG_STATUS_ASSIGNED}
+    ]
+    if editable:
+        bundle_id = int(editable[0]["Bundle_id"])
+        _exec(
+            conn,
+            """
+            UPDATE Finished_Goods_Inventory
+            SET Output_Weight = ?, Output_pieces = ?, Finished_Goods_Status = ?
+            WHERE Bundle_id = ?
+            """,
+            (weight, pieces, status, bundle_id),
+        )
+        return bundle_id
+    result = _exec(
+        conn,
+        """
+        INSERT INTO Finished_Goods_Inventory
+            (Batch_ID, Output_Weight, Output_pieces, Finished_Goods_Status)
+        VALUES (?, ?, ?, ?)
+        RETURNING Bundle_id
+        """,
+        (batch_id, weight, pieces, status),
+    )
+    row = result.first()
+    return int(row[0]) if row else None
+
+
+def backfill_finished_goods_from_output() -> int:
+    """Ensure every completed heat with product output has an FG bundle."""
+    batches = fetch_all(
+        """
+        SELECT Batch_ID AS "Batch_ID"
+        FROM Production_batch
+        WHERE Production_status = ?
+        """,
+        (BATCH_STATUS_COMPLETED,),
+    )
+    updated = 0
+    with get_connection() as conn:
+        for row in batches:
+            if _sync_finished_goods_from_output(conn, row["Batch_ID"]):
+                updated += 1
+    return updated
+
+
+def _ensure_packing_list_ready() -> None:
+    with get_connection() as conn:
+        _ensure_packing_list(conn)
+
+
+def list_packing_po_numbers() -> list[str]:
+    rows = fetch_all(
+        """
+        SELECT DISTINCT p.Customer_PO_No AS "Customer_PO_No"
+        FROM Purchase_Order p
+        WHERE COALESCE(p.Purchase_Order_Status, 'Open') <> 'Cancelled'
+        ORDER BY p.Customer_PO_No
+        """
+    )
+    return [str(r["Customer_PO_No"]) for r in rows if r.get("Customer_PO_No")]
+
+
+def list_packing_po_customers(po_no: str) -> list[dict[str, Any]]:
+    """Customers on a PO, names taken from Customer_Master when possible."""
+    return fetch_all(
+        """
+        SELECT DISTINCT
+            COALESCE(c.Cust_code, p.Cust_code) AS "Cust_code",
+            COALESCE(c.Customer_name, p.Customer_name) AS "Customer_name"
+        FROM Purchase_Order p
+        LEFT JOIN Customer_Master c ON LOWER(c.Cust_code) = LOWER(p.Cust_code)
+        WHERE p.Customer_PO_No = ?
+        ORDER BY COALESCE(c.Customer_name, p.Customer_name)
+        """,
+        (po_no,),
+    )
+
+
+def list_packing_po_alloys(
+    po_no: str, cust_code: Optional[str] = None
+) -> list[dict[str, Any]]:
+    sql = """
+        SELECT DISTINCT p.Alloy_Id AS "Alloy_id",
+               a.Alloy_name AS "Alloy_name",
+               a.Alloy_group AS "Alloy_group",
+               a.Colour_code AS "Colour_code"
+        FROM Purchase_Order p
+        LEFT JOIN Alloy_Master a ON a.Alloy_id = p.Alloy_Id
+        WHERE p.Customer_PO_No = ?
+    """
+    params: list[Any] = [po_no]
+    if cust_code:
+        sql += " AND LOWER(p.Cust_code) = LOWER(?)"
+        params.append(cust_code)
+    sql += " ORDER BY a.Alloy_name"
+    return fetch_all(sql, params)
+
+
+def _alloy_matches_target(
+    batch_alloy: dict[str, Any],
+    target: dict[str, Any],
+    *,
+    match_name: bool,
+    match_group: bool,
+) -> bool:
+    if batch_alloy.get("Alloy_id") not in (None, "") and target.get("Alloy_id") not in (
+        None,
+        "",
+    ):
+        try:
+            if int(batch_alloy["Alloy_id"]) == int(target["Alloy_id"]):
+                return True
+        except (TypeError, ValueError):
+            pass
+    batch_name = _norm_match_text(batch_alloy.get("Alloy_name"))
+    batch_group = _norm_match_text(batch_alloy.get("Alloy_group"))
+    target_name = _norm_match_text(target.get("Alloy_name"))
+    target_group = _norm_match_text(target.get("Alloy_group"))
+    if match_name and target_name:
+        if batch_name == target_name:
+            return True
+        if batch_group and batch_group == target_name:
+            return True
+    if match_group and target_group:
+        if batch_group == target_group:
+            return True
+        if batch_name and batch_name == target_group:
+            return True
+    return False
+
+
+def list_dispatchable_batches(
+    alloy_id: int,
+    *,
+    match_name: bool = True,
+    match_group: bool = True,
+    include_batch_ids: Optional[list[str]] = None,
+) -> list[dict[str, Any]]:
+    """Batches whose alloy_name or alloy_group matches the selected PO alloy."""
+    _ensure_packing_list_ready()
+    target = get_alloy(alloy_id)
+    if not target:
+        raise ValueError(f"Alloy {alloy_id} was not found.")
+    include = {str(b) for b in (include_batch_ids or []) if b}
+    verified = fetch_all(
+        """
+        SELECT lb.Batch_ID AS "Batch_ID"
+        FROM Packing_list_batch lb
+        JOIN Packing_list p ON p.Packing_list_id = lb.Packing_list_id
+        WHERE p.Packing_list_status = ?
+        """,
+        (PACKING_STATUS_VERIFIED,),
+    )
+    taken = {str(r["Batch_ID"]) for r in verified} - include
+    rows = fetch_all(
+        """
+        SELECT b.Batch_ID AS "Batch_ID",
+               a.Alloy_id AS "Alloy_id",
+               a.Alloy_name AS "Alloy_name",
+               a.Alloy_group AS "Alloy_group",
+               fg.Bundle_id AS "Bundle_id",
+               fg.Output_Weight AS "Output_Weight",
+               fg.Output_pieces AS "Output_pieces",
+               fg.Finished_Goods_Status AS "Finished_Goods_Status"
+        FROM Production_batch b
+        JOIN Alloy_Master a ON a.Alloy_id = b.Alloy_id
+        JOIN Finished_Goods_Inventory fg ON fg.Batch_ID = b.Batch_ID
+        WHERE b.Production_status = ?
+        ORDER BY b.Batch_ID, fg.Bundle_id DESC
+        """,
+        (BATCH_STATUS_COMPLETED,),
+    )
+    seen: set[str] = set()
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        bid = str(row["Batch_ID"])
+        if bid in seen:
+            continue
+        seen.add(bid)
+        if bid in taken:
+            continue
+        status = row.get("Finished_Goods_Status") or ""
+        if bid not in include and status not in FG_DISPATCHABLE_STATUSES:
+            continue
+        if not _alloy_matches_target(
+            row, target, match_name=match_name, match_group=match_group
+        ):
+            continue
+        out.append(row)
+    return out
+
+
+def list_packing_lists() -> list[dict[str, Any]]:
+    _ensure_packing_list_ready()
+    return fetch_all(
+        """
+        SELECT p.Packing_list_id AS "Packing_list_id",
+               p.Invoice_date AS "Invoice_date",
+               p.Invoice_number AS "Invoice_number",
+               p.Customer_PO_No AS "Customer_PO_No",
+               p.Cust_code AS "Cust_code",
+               p.Customer_name AS "Customer_name",
+               p.Alloy_id AS "Alloy_id",
+               a.Alloy_name AS "Alloy_name",
+               a.Alloy_group AS "Alloy_group",
+               p.Colour_code AS "Colour_code",
+               p.Vehicle_no AS "Vehicle_no",
+               p.Packing_list_status AS "Packing_list_status",
+               (
+                   SELECT COUNT(*) FROM Packing_list_batch lb
+                   WHERE lb.Packing_list_id = p.Packing_list_id
+               ) AS "Batch_count"
+        FROM Packing_list p
+        LEFT JOIN Alloy_Master a ON a.Alloy_id = p.Alloy_id
+        ORDER BY p.Packing_list_id DESC
+        """
+    )
+
+
+def get_packing_list(packing_list_id: int) -> Optional[dict[str, Any]]:
+    _ensure_packing_list_ready()
+    header = fetch_one(
+        """
+        SELECT p.Packing_list_id AS "Packing_list_id",
+               p.Invoice_date AS "Invoice_date",
+               p.Invoice_number AS "Invoice_number",
+               p.Customer_PO_No AS "Customer_PO_No",
+               p.Cust_code AS "Cust_code",
+               p.Customer_name AS "Customer_name",
+               p.Alloy_id AS "Alloy_id",
+               a.Alloy_name AS "Alloy_name",
+               a.Alloy_group AS "Alloy_group",
+               p.Colour_code AS "Colour_code",
+               p.Vehicle_no AS "Vehicle_no",
+               p.Packing_list_status AS "Packing_list_status"
+        FROM Packing_list p
+        LEFT JOIN Alloy_Master a ON a.Alloy_id = p.Alloy_id
+        WHERE p.Packing_list_id = ?
+        """,
+        (packing_list_id,),
+    )
+    if not header:
+        return None
+    header["batches"] = fetch_all(
+        """
+        SELECT Batch_ID AS "Batch_ID"
+        FROM Packing_list_batch
+        WHERE Packing_list_id = ?
+        ORDER BY Batch_ID
+        """,
+        (packing_list_id,),
+    )
+    return header
+
+
+def _dispatch_batches_on_conn(
+    conn: Connection, batch_ids: list[str], *, dispatch: bool
+) -> None:
+    if not batch_ids:
+        return
+    placeholders = ", ".join("?" for _ in batch_ids)
+    if dispatch:
+        _exec(
+            conn,
+            f"""
+            UPDATE Finished_Goods_Inventory
+            SET Finished_Goods_Status = ?
+            WHERE Batch_ID IN ({placeholders})
+              AND Finished_Goods_Status IN (?, ?)
+            """,
+            (
+                FG_STATUS_DISPATCHED,
+                *batch_ids,
+                FG_STATUS_AVAILABLE,
+                FG_STATUS_ASSIGNED,
+            ),
+        )
+        return
+    other_verified = {
+        str(r["Batch_ID"])
+        for r in _exec(
+            conn,
+            """
+            SELECT lb.Batch_ID AS "Batch_ID"
+            FROM Packing_list_batch lb
+            JOIN Packing_list p ON p.Packing_list_id = lb.Packing_list_id
+            WHERE p.Packing_list_status = ?
+            """,
+            (PACKING_STATUS_VERIFIED,),
+        ).mappings()
+    }
+    restore = [b for b in batch_ids if b not in other_verified]
+    if not restore:
+        return
+    rest_ph = ", ".join("?" for _ in restore)
+    _exec(
+        conn,
+        f"""
+        UPDATE Finished_Goods_Inventory
+        SET Finished_Goods_Status = ?
+        WHERE Batch_ID IN ({rest_ph})
+          AND Finished_Goods_Status = ?
+        """,
+        (FG_STATUS_AVAILABLE, *restore, FG_STATUS_DISPATCHED),
+    )
+
+
+def save_packing_list(
+    *,
+    packing_list_id: Optional[int] = None,
+    invoice_date: Optional[str],
+    invoice_number: str,
+    customer_po_no: str,
+    cust_code: Optional[str],
+    customer_name: Optional[str],
+    alloy_id: int,
+    colour_code: Optional[str],
+    vehicle_no: Optional[str],
+    packing_list_status: str,
+    batch_ids: list[str],
+) -> int:
+    """Create or update a packing list. Verified lists dispatch FG stock."""
+    _ensure_packing_list_ready()
+    status = (packing_list_status or "").strip()
+    if status not in PACKING_LIST_STATUS:
+        raise ValueError(
+            f"Packing_list_status must be one of {', '.join(PACKING_LIST_STATUS)}."
+        )
+    invoice = (invoice_number or "").strip()
+    if not invoice:
+        raise ValueError("Invoice number is required.")
+    po_no = (customer_po_no or "").strip()
+    if not po_no:
+        raise ValueError("P.O. Number is required.")
+    aid = int(alloy_id)
+    alloys = list_packing_po_alloys(po_no, cust_code)
+    if not any(int(r["Alloy_id"]) == aid for r in alloys if r.get("Alloy_id") not in (None, "")):
+        raise ValueError(
+            f"Alloy {aid} is not on purchase order {po_no}."
+        )
+    unique_batches = []
+    seen: set[str] = set()
+    for bid in batch_ids:
+        text = str(bid or "").strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        unique_batches.append(text)
+    if status == PACKING_STATUS_VERIFIED and not unique_batches:
+        raise ValueError("Select at least one batch_id before marking Verified.")
+
+    previous = get_packing_list(packing_list_id) if packing_list_id else None
+    if packing_list_id and not previous:
+        raise ValueError(f"Packing list {packing_list_id} was not found.")
+    previous_batches = [
+        str(r["Batch_ID"]) for r in (previous.get("batches") or [])
+    ] if previous else []
+    previous_status = (previous or {}).get("Packing_list_status")
+    if status == PACKING_STATUS_VERIFIED:
+        for bid in unique_batches:
+            if bid in previous_batches and previous_status == PACKING_STATUS_VERIFIED:
+                continue
+            rows = list_finished_goods(batch_id=bid)
+            if not any(
+                (r.get("Finished_Goods_Status") or "") in FG_DISPATCHABLE_STATUSES
+                for r in rows
+            ):
+                raise ValueError(
+                    f"No Available finished goods for {bid}. "
+                    "Save product output on Batch Output first."
+                )
+    by_val, dt_val = audit_stamp()
+
+    with get_connection() as conn:
+        if packing_list_id:
+            result = _exec(
+                conn,
+                """
+                UPDATE Packing_list SET
+                    Invoice_date = ?, Invoice_number = ?, Customer_PO_No = ?,
+                    Cust_code = ?, Customer_name = ?, Alloy_id = ?,
+                    Colour_code = ?, Vehicle_no = ?, Packing_list_status = ?,
+                    Last_updated_by = ?, Last_updated_datetime = ?
+                WHERE Packing_list_id = ?
+                """,
+                (
+                    invoice_date,
+                    invoice,
+                    po_no,
+                    cust_code,
+                    customer_name,
+                    aid,
+                    colour_code,
+                    (vehicle_no or "").strip() or None,
+                    status,
+                    by_val,
+                    dt_val,
+                    packing_list_id,
+                ),
+            )
+            pid = int(packing_list_id)
+            _exec(
+                conn,
+                "DELETE FROM Packing_list_batch WHERE Packing_list_id = ?",
+                (pid,),
+            )
+        else:
+            result = _exec(
+                conn,
+                """
+                INSERT INTO Packing_list (
+                    Invoice_date, Invoice_number, Customer_PO_No, Cust_code,
+                    Customer_name, Alloy_id, Colour_code, Vehicle_no,
+                    Packing_list_status, Last_updated_by, Last_updated_datetime
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                RETURNING Packing_list_id
+                """,
+                (
+                    invoice_date,
+                    invoice,
+                    po_no,
+                    cust_code,
+                    customer_name,
+                    aid,
+                    colour_code,
+                    (vehicle_no or "").strip() or None,
+                    status,
+                    by_val,
+                    dt_val,
+                ),
+            )
+            row = result.first()
+            pid = int(row[0])
+        for bid in unique_batches:
+            _exec(
+                conn,
+                """
+                INSERT INTO Packing_list_batch (Packing_list_id, Batch_ID)
+                VALUES (?, ?)
+                """,
+                (pid, bid),
+            )
+        if previous_status == PACKING_STATUS_VERIFIED:
+            dropped = (
+                previous_batches
+                if status != PACKING_STATUS_VERIFIED
+                else [b for b in previous_batches if b not in unique_batches]
+            )
+            _dispatch_batches_on_conn(conn, dropped, dispatch=False)
+        if status == PACKING_STATUS_VERIFIED:
+            _dispatch_batches_on_conn(conn, unique_batches, dispatch=True)
+    return pid
 
 
 _BATCH_COLUMNS = """
@@ -4198,6 +5222,33 @@ def get_batch_inputs(batch_id: str) -> list[dict[str, Any]]:
         """,
         (batch_id,),
     )
+
+
+def alloy_piece_avg_kg(net_weight: object, pieces: object) -> float | None:
+    """Net output weight divided by piece count, rounded to 0.01 kg."""
+    try:
+        weight = float(net_weight)
+        count = int(round(float(pieces)))
+    except (TypeError, ValueError):
+        return None
+    if weight <= 0 or count <= 0:
+        return None
+    return round(weight / count, 2)
+
+
+def alloy_piece_avg_out_of_range(
+    avg_kg: object, alloy_id: object = None
+) -> bool:
+    """True when a product-alloy piece average is outside 5.6–6.1 kg."""
+    if avg_kg is None:
+        return False
+    try:
+        avg = float(avg_kg)
+    except (TypeError, ValueError):
+        return False
+    if alloy_id is not None and is_sidestream_alloy(alloy_id):
+        return False
+    return avg < ALLOY_PIECE_KG_MIN or avg > ALLOY_PIECE_KG_MAX
 
 
 def is_sidestream_alloy(alloy_id: object) -> bool:
@@ -4577,6 +5628,7 @@ def list_all_batch_outputs(limit: int = 200) -> list[dict[str, Any]]:
 
 def save_batch_outputs(batch_id: str, lines: list[dict[str, Any]]) -> None:
     """Replace all output rows for a batch. Weight > 0 lines are kept."""
+    require_completed_batch_for_output(batch_id)
     batch = get_batch(batch_id)
     if not batch:
         raise ValueError(f"Batch {batch_id} not found.")
@@ -4645,6 +5697,7 @@ def save_batch_outputs(batch_id: str, lines: list[dict[str, Any]]) -> None:
         if cleaned:
             _apply_batch_output_costs(conn, batch_id)
         _sync_sidestream_inventory(conn, batch_id)
+        _sync_finished_goods_from_output(conn, batch_id)
 
 
 def _sqlite_internal_remelt_purchase_id(conn: Connection) -> int:
