@@ -82,11 +82,11 @@ st.markdown(
         border-bottom: 2px solid {_BRAND_ORANGE};
         padding-bottom: 0.35rem;
     }}
-    [data-testid="stSidebar"] .stButton button {{
-        justify-content: flex-start;
-        text-align: left;
-        font-weight: 500;
-        min-height: 2.05rem;
+    [data-testid="stSidebar"] .stRadio {{
+        margin-bottom: 0.15rem;
+    }}
+    [data-testid="stSidebar"] .stRadio [data-testid="stWidgetLabel"] {{
+        display: none;
     }}
     .nav-section {{
         color: {_BRAND_ORANGE};
@@ -981,8 +981,14 @@ NAV_SECTIONS: list[tuple[str, list[str]]] = [
 _NAV_PAGES = [page for _section, pages in NAV_SECTIONS for page in pages]
 
 
-def _goto_page(page: str) -> None:
-    st.session_state.nav_page = page
+def _on_nav_section(section: str) -> None:
+    chosen = st.session_state.get(f"nav_radio_{section}")
+    if not chosen:
+        return
+    st.session_state.nav_page = chosen
+    for other, _pages in NAV_SECTIONS:
+        if other != section:
+            st.session_state[f"nav_radio_{other}"] = None
 
 
 if st.session_state.get("nav_page") not in _NAV_PAGES:
@@ -993,15 +999,21 @@ for section, pages in NAV_SECTIONS:
         f'<div class="nav-section">{html.escape(section)}</div>',
         unsafe_allow_html=True,
     )
-    for page in pages:
-        st.sidebar.button(
-            page,
-            key=f"nav_{page}",
-            type="primary" if st.session_state.nav_page == page else "secondary",
-            use_container_width=True,
-            on_click=_goto_page,
-            args=(page,),
-        )
+    key = f"nav_radio_{section}"
+    current = st.session_state.nav_page
+    if current in pages:
+        index = pages.index(current)
+    else:
+        index = None
+    st.sidebar.radio(
+        section,
+        pages,
+        index=index,
+        key=key,
+        on_change=_on_nav_section,
+        args=(section,),
+        label_visibility="collapsed",
+    )
 
 PAGE = st.session_state.nav_page
 
