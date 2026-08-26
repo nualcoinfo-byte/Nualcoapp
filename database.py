@@ -652,7 +652,11 @@ CREATE TABLE IF NOT EXISTS batch_output (
     Notes TEXT,
     Output_time TEXT DEFAULT {now},
     Weighment_scale_photo {blob},
-    Output_photo {blob}
+    Output_photo {blob},
+    cost_of_production_per_kg {pct4},
+    cost_of_production_overall_per_kg {pct4},
+    conversion_rate_applied {pct4},
+    conversion_expense_month DATE
 );
 CREATE TABLE IF NOT EXISTS Batch_Chemical_Composition (
     Batch_ID TEXT NOT NULL REFERENCES Production_batch(Batch_ID),
@@ -975,8 +979,13 @@ def init_db() -> None:
                     "Output_photo",
                     "BYTEA" if IS_POSTGRES else "BLOB",
                 ),
+                ("cost_of_production_per_kg", "NUMERIC(10, 4)"),
+                ("cost_of_production_overall_per_kg", "NUMERIC(10, 4)"),
+                ("conversion_rate_applied", "NUMERIC(10, 4)"),
+                ("conversion_expense_month", "DATE"),
             ],
         )
+        _backfill_batch_output_production_costs(conn)
         _ensure_crucible_status(conn)
         _ensure_one_available_crucible(conn)
         _ensure_columns(
@@ -4120,6 +4129,274 @@ def _as_sql_photo(value: Any) -> bytes | None:
     return None
 
 
+_BATCH_OUTPUT_COST_SELECT = """
+               o.cost_of_production_per_kg AS "cost_of_production_per_kg",
+               o.cost_of_production_overall_per_kg AS "cost_of_production_overall_per_kg",
+               o.conversion_rate_applied AS "conversion_rate_applied",
+               o.conversion_expense_month AS "conversion_expense_month"
+"""
+
+
+def _as_cost_4(value: Any) -> float:
+    rounded = round_percent_4(value)
+    return 0.0 if rounded is None else rounded
+
+
+def _iso_date_or_none(value: Any) -> Optional[str]:
+    if value is None or value == "":
+        return None
+    if isinstance(value, datetime):
+        return value.date().isoformat()
+    if isinstance(value, date):
+        return value.isoformat()
+    text = str(value).strip()
+    return text[:10] if text else None
+
+
+def _as_month_start(value: Any) -> Optional[date]:
+    """First day of the calendar month for a stored date, or None if missing."""
+    text = _as_effective_date(value)
+    if len(text) < 7:
+        return None
+    try:
+        return date(int(text[:4]), int(text[5:7]), 1)
+    except ValueError:
+        return None
+
+
+def conversion_cutoff_for_batch(batch_id: str) -> date:
+    """Production-month start for conversion lookup (this month if the date is missing)."""
+    row = fetch_one(
+        'SELECT Production_Date AS "Production_Date" FROM Production_batch WHERE Batch_ID = ?',
+        (batch_id,),
+    )
+    month = _as_month_start(row["Production_Date"] if row else None)
+    return month or date.today().replace(day=1)
+
+
+def _conversion_cutoff_on_conn(conn: Connection, batch_id: str) -> date:
+    row = (
+        _exec(
+            conn,
+            'SELECT Production_Date AS "Production_Date" FROM Production_batch WHERE Batch_ID = ?',
+            (batch_id,),
+        )
+        .mappings()
+        .first()
+    )
+    month = _as_month_start(row["Production_Date"] if row else None)
+    return month or date.today().replace(day=1)
+
+
+def get_latest_cost_of_conversion(
+    as_of: date | str | None = None,
+) -> Optional[dict[str, Any]]:
+    """Conversion row for as_of's month, else the latest earlier month.
+
+    Production-month rates are preferred. If that month is not on file yet
+    (typical in the first week), the previous available month is used.
+    """
+    if as_of is None:
+        as_of_iso = date.today().replace(day=1).isoformat()
+    else:
+        month = _as_month_start(as_of)
+        as_of_iso = (month or date.today().replace(day=1)).isoformat()
+    return fetch_one(
+        """
+        SELECT id AS "id",
+               expense_month AS "expense_month",
+               oil_rate_per_kg AS "oil_rate_per_kg",
+               electricity_rate_per_kg AS "electricity_rate_per_kg",
+               labour_rate_per_kg AS "labour_rate_per_kg",
+               salaries_rate_per_kg AS "salaries_rate_per_kg",
+               consumables_rate_per_kg AS "consumables_rate_per_kg",
+               overheads_rate_per_kg AS "overheads_rate_per_kg",
+               total_conversion_rate_per_kg AS "total_conversion_rate_per_kg"
+        FROM Cost_of_conversion
+        WHERE expense_month <= ?
+        ORDER BY expense_month DESC, id DESC
+        LIMIT 1
+        """,
+        (as_of_iso,),
+    )
+
+
+def _latest_conversion_on_conn(
+    conn: Connection, as_of: date
+) -> tuple[float, Optional[str]]:
+    cutoff = _as_month_start(as_of) or date.today().replace(day=1)
+    row = (
+        _exec(
+            conn,
+            """
+            SELECT total_conversion_rate_per_kg AS "total_conversion_rate_per_kg",
+                   expense_month AS "expense_month"
+            FROM Cost_of_conversion
+            WHERE expense_month <= ?
+            ORDER BY expense_month DESC, id DESC
+            LIMIT 1
+            """,
+            (cutoff.isoformat(),),
+        )
+        .mappings()
+        .first()
+    )
+    if not row:
+        return 0.0, None
+    return _as_cost_4(row["total_conversion_rate_per_kg"]), _iso_date_or_none(
+        row["expense_month"]
+    )
+
+
+def _batch_input_material_cost_on_conn(conn: Connection, batch_id: str) -> float:
+    row = (
+        _exec(
+            conn,
+            """
+            SELECT COALESCE(SUM(i.Weight * COALESCE(inv.Cost_per_kg, 0)), 0)
+                   AS "input_cost"
+            FROM batch_input i
+            LEFT JOIN Raw_Material_Inventory inv ON inv.Lot_id = i.Lot_id
+            WHERE i.Batch_ID = ?
+            """,
+            (batch_id,),
+        )
+        .mappings()
+        .first()
+    )
+    return _as_cost_4(row["input_cost"] if row else 0)
+
+
+def _batch_output_weight_on_conn(conn: Connection, batch_id: str) -> float:
+    row = (
+        _exec(
+            conn,
+            """
+            SELECT COALESCE(SUM(Weight), 0) AS "output_kg"
+            FROM batch_output
+            WHERE Batch_ID = ?
+            """,
+            (batch_id,),
+        )
+        .mappings()
+        .first()
+    )
+    return float(row["output_kg"] or 0) if row else 0.0
+
+
+def compute_batch_production_cost(
+    batch_id: str, *, as_of: date | None = None
+) -> dict[str, Any]:
+    """Material + conversion unit costs using the production month, else the previous month."""
+    as_of = as_of or conversion_cutoff_for_batch(batch_id)
+    input_row = fetch_one(
+        """
+        SELECT COALESCE(SUM(i.Weight * COALESCE(inv.Cost_per_kg, 0)), 0)
+               AS "input_cost"
+        FROM batch_input i
+        LEFT JOIN Raw_Material_Inventory inv ON inv.Lot_id = i.Lot_id
+        WHERE i.Batch_ID = ?
+        """,
+        (batch_id,),
+    )
+    output_row = fetch_one(
+        """
+        SELECT COALESCE(SUM(Weight), 0) AS "output_kg"
+        FROM batch_output
+        WHERE Batch_ID = ?
+        """,
+        (batch_id,),
+    )
+    input_cost = _as_cost_4(input_row["input_cost"] if input_row else 0)
+    output_kg = float(output_row["output_kg"] or 0) if output_row else 0.0
+    conversion = get_latest_cost_of_conversion(as_of)
+    conversion_rate = _as_cost_4(
+        conversion["total_conversion_rate_per_kg"] if conversion else 0
+    )
+    conversion_month = _iso_date_or_none(
+        conversion["expense_month"] if conversion else None
+    )
+    material_per_kg = (
+        round(input_cost / output_kg, PERCENT_SCALE) if output_kg > 0 else None
+    )
+    overall_per_kg = (
+        round(material_per_kg + conversion_rate, PERCENT_SCALE)
+        if material_per_kg is not None
+        else None
+    )
+    return {
+        "input_cost_total": input_cost,
+        "output_weight_total": output_kg,
+        "cost_of_production_per_kg": material_per_kg,
+        "conversion_rate_applied": conversion_rate if conversion else 0.0,
+        "conversion_expense_month": conversion_month,
+        "cost_of_production_overall_per_kg": overall_per_kg,
+    }
+
+
+def _apply_batch_output_costs(
+    conn: Connection, batch_id: str, *, as_of: date | None = None
+) -> None:
+    """Write the same batch-level unit costs onto every output line."""
+    cutoff = as_of or _conversion_cutoff_on_conn(conn, batch_id)
+    output_kg = _batch_output_weight_on_conn(conn, batch_id)
+    if output_kg <= 0:
+        return
+    input_cost = _batch_input_material_cost_on_conn(conn, batch_id)
+    material_per_kg = round(input_cost / output_kg, PERCENT_SCALE)
+    conversion_rate, conversion_month = _latest_conversion_on_conn(conn, cutoff)
+    overall_per_kg = round(material_per_kg + conversion_rate, PERCENT_SCALE)
+    _exec(
+        conn,
+        """
+        UPDATE batch_output
+        SET cost_of_production_per_kg = ?,
+            cost_of_production_overall_per_kg = ?,
+            conversion_rate_applied = ?,
+            conversion_expense_month = ?
+        WHERE Batch_ID = ?
+        """,
+        (
+            material_per_kg,
+            overall_per_kg,
+            conversion_rate,
+            conversion_month,
+            batch_id,
+        ),
+    )
+
+
+def _backfill_batch_output_production_costs(conn: Connection) -> None:
+    rows = list(
+        _exec(
+            conn,
+            """
+            SELECT DISTINCT Batch_ID AS "Batch_ID"
+            FROM batch_output
+            WHERE cost_of_production_per_kg IS NULL
+            """,
+        ).mappings()
+    )
+    for row in rows:
+        _apply_batch_output_costs(conn, row["Batch_ID"])
+
+
+def refresh_outputs_missing_conversion_rate() -> int:
+    """Recompute conversion on saved outputs (production month, else previous month)."""
+    rows = fetch_all(
+        """
+        SELECT DISTINCT Batch_ID AS "Batch_ID"
+        FROM batch_output
+        """
+    )
+    if not rows:
+        return 0
+    with get_connection() as conn:
+        for row in rows:
+            _apply_batch_output_costs(conn, row["Batch_ID"])
+    return len(rows)
+
+
 def get_batch_outputs(
     batch_id: str, *, include_photos: bool = False
 ) -> list[dict[str, Any]]:
@@ -4138,6 +4415,7 @@ def get_batch_outputs(
                o.Stand_weight AS "Stand_weight",
                o.Pieces AS "Pieces",
                o.Notes AS "Notes", o.Output_time AS "Output_time",
+               {_BATCH_OUTPUT_COST_SELECT},
                (o.Weighment_scale_photo IS NOT NULL) AS "Has_scale_photo",
                (o.Output_photo IS NOT NULL) AS "Has_output_photo"
                {photo_sql}
@@ -4161,6 +4439,10 @@ def list_all_batch_outputs(limit: int = 200) -> list[dict[str, Any]]:
                o.Stand_weight AS "Stand_weight",
                o.Pieces AS "Pieces",
                o.Notes AS "Notes", o.Output_time AS "Output_time",
+               o.cost_of_production_per_kg AS "cost_of_production_per_kg",
+               o.cost_of_production_overall_per_kg AS "cost_of_production_overall_per_kg",
+               o.conversion_rate_applied AS "conversion_rate_applied",
+               o.conversion_expense_month AS "conversion_expense_month",
                (o.Weighment_scale_photo IS NOT NULL) AS "Has_scale_photo",
                (o.Output_photo IS NOT NULL) AS "Has_output_photo"
         FROM batch_output o
@@ -4240,6 +4522,8 @@ def save_batch_outputs(batch_id: str, lines: list[dict[str, Any]]) -> None:
                     row["Output_photo"],
                 ),
             )
+        if cleaned:
+            _apply_batch_output_costs(conn, batch_id)
 
 
 def get_batch_chemistry(batch_id: str) -> list[dict[str, Any]]:
@@ -5147,6 +5431,7 @@ def save_cost_of_conversion(
             total,
         ),
     )
+    refresh_outputs_missing_conversion_rate()
     return total
 
 

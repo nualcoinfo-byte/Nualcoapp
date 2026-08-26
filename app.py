@@ -456,6 +456,65 @@ def render_batch_output_editor(batch: dict, *, key_prefix: str) -> None:
     saved = db.get_batch_outputs(bid)
     if saved:
         show_dataframe(df_from_rows(_output_rows_for_table(saved)))
+        cost = db.compute_batch_production_cost(bid)
+        first = saved[0]
+        material_kg = first.get("cost_of_production_per_kg")
+        overall_kg = first.get("cost_of_production_overall_per_kg")
+        conv_rate = first.get("conversion_rate_applied")
+        conv_month = first.get("conversion_expense_month")
+        k1, k2, k3, k4 = st.columns(4)
+        k1.metric(
+            "Charge material cost",
+            f"{float(cost['input_cost_total'] or 0):,.2f}",
+        )
+        k2.metric(
+            "Material ₹/kg",
+            f"{float(material_kg):,.4f}" if material_kg is not None else "—",
+        )
+        k3.metric(
+            "Conversion ₹/kg",
+            f"{float(conv_rate):,.4f}" if conv_rate is not None else "—",
+        )
+        k4.metric(
+            "Overall ₹/kg",
+            f"{float(overall_kg):,.4f}" if overall_kg is not None else "—",
+        )
+        if conv_month:
+            prod_date = batch.get("Production_Date")
+            conv_key = (
+                conv_month.isoformat()[:7]
+                if hasattr(conv_month, "isoformat")
+                else str(conv_month)[:7]
+            )
+            prod_key = (
+                prod_date.isoformat()[:7]
+                if hasattr(prod_date, "isoformat")
+                else str(prod_date or "")[:7]
+            )
+            if prod_key and conv_key == prod_key:
+                conv_note = (
+                    f"Overall adds the production-month conversion rate "
+                    f"(**{format_ui_date(conv_month)}**)."
+                )
+            else:
+                conv_note = (
+                    "Production-month conversion was not on file yet, "
+                    f"so the previous available month was used "
+                    f"(**{format_ui_date(conv_month)}**)."
+                )
+            st.caption(
+                "Material ₹/kg is total charge cost ÷ total output kg. "
+                f"{conv_note} "
+                "The same unit costs are stored on every output line of this batch."
+            )
+        else:
+            st.caption(
+                "Material ₹/kg is total charge cost ÷ total output kg. "
+                "No Cost of Conversion row exists for the production month or any "
+                "earlier month, so overall cost is material only. Save conversion "
+                "rates and these rows will pick up the production month, or the "
+                "previous month if that month is not in yet."
+            )
 
 
 @st.dialog("All elements — chemical composition (%)", width="large")
@@ -596,7 +655,11 @@ def _column_is_datetime(name: object) -> bool:
 
 def _column_is_date(name: object) -> bool:
     lowered = str(name).lower()
-    return lowered.endswith("date") or _column_is_datetime(name)
+    return (
+        lowered.endswith("date")
+        or lowered.endswith("expense_month")
+        or _column_is_datetime(name)
+    )
 
 
 def parse_any_date(value: object) -> date | datetime | None:
@@ -2095,7 +2158,10 @@ elif PAGE == "Batch Output":
         "on the batch, plus **Broken Ingot (78)**, **Furnace Empty (79)**, and "
         "**Not Ok Ingot (80)** for samples and portions taken out so they do not "
         "spoil the chemistry. Those three have no spec. "
-        "Create the batch first on **Production Batch & Chemistry**."
+        "Create the batch first on **Production Batch & Chemistry**. "
+        "On save, each output line stores material ₹/kg (charge lot cost ÷ total output kg) "
+        "and overall ₹/kg (material + Cost of Conversion for the production month, "
+        "or the previous available month if that month's rates are not in yet)."
     )
 
     batches = db.list_batches()
@@ -2435,7 +2501,9 @@ elif PAGE == "Cost of Conversion":
     st.caption(
         "Enter the finalized conversion rates for one calendar month. "
         "Saving the same month updates that row. "
-        "**Total conversion rate per kg** is stored as the sum of the six rates."
+        "**Total conversion rate per kg** is stored as the sum of the six rates "
+        "and is added to every batch output's overall ₹/kg when outputs are saved "
+        "(production month if that month is on file, otherwise the previous available month)."
     )
 
     today = date.today()
