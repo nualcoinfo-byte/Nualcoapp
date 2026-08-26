@@ -82,6 +82,20 @@ st.markdown(
         border-bottom: 2px solid {_BRAND_ORANGE};
         padding-bottom: 0.35rem;
     }}
+    [data-testid="stSidebar"] .stButton button {{
+        justify-content: flex-start;
+        text-align: left;
+        font-weight: 500;
+        min-height: 2.05rem;
+    }}
+    .nav-section {{
+        color: {_BRAND_ORANGE};
+        font-weight: 700;
+        font-size: 0.72rem;
+        letter-spacing: 0.06em;
+        text-transform: uppercase;
+        margin: 0.85rem 0 0.25rem 0;
+    }}
     </style>
     """,
     unsafe_allow_html=True,
@@ -917,37 +931,79 @@ else:
     st.sidebar.title("Nualco")
 st.sidebar.caption("Secondary Aluminum Alloy Manufacturing")
 
-PAGE = st.sidebar.radio(
-    "Navigate",
-    [
-        "Dashboard",
-        "Raw Material Logging",
-        "Raw Material Inventory",
-        "Furnace Oil Purchase",
-        "Production Batch & Chemistry",
-        "Batch Output",
-        "Production Batches",
-        "Furnace Oil Consumption",
-        "Electricity Consumption",
-        "Cost of Conversion",
-        "Production Workflow Tracker",
-        "Material Recovery & Yield",
-        "Finished Goods Inventory",
-        "Purchase Orders",
-        "All Purchase Orders",
-        "Customers",
-        "Vendors",
-        "Raw Material Master",
-        "Alloys",
-        "Furnaces",
-        "Crucibles",
-        "Melters",
-        "Trolleys",
-        "Bill of Materials",
-        "Data Browser",
-        "Masters Overview",
-    ],
-)
+NAV_SECTIONS: list[tuple[str, list[str]]] = [
+    ("Overview", ["Dashboard"]),
+    (
+        "Purchasing & inventory",
+        [
+            "Raw Material Logging",
+            "Raw Material Inventory",
+            "Purchase Orders",
+            "All Purchase Orders",
+            "Finished Goods Inventory",
+            "Bill of Materials",
+        ],
+    ),
+    (
+        "Production",
+        [
+            "Production Batch & Chemistry",
+            "Batch Output",
+            "Production Batches",
+            "Production Workflow Tracker",
+            "Material Recovery & Yield",
+        ],
+    ),
+    (
+        "Utilities & conversion",
+        [
+            "Furnace Oil Purchase",
+            "Furnace Oil Consumption",
+            "Electricity Consumption",
+            "Cost of Conversion",
+        ],
+    ),
+    (
+        "Masters",
+        [
+            "Customers",
+            "Vendors",
+            "Raw Material Master",
+            "Alloys",
+            "Furnaces",
+            "Crucibles",
+            "Melters",
+            "Trolleys",
+        ],
+    ),
+    ("Tools", ["Data Browser", "Masters Overview"]),
+]
+_NAV_PAGES = [page for _section, pages in NAV_SECTIONS for page in pages]
+
+
+def _goto_page(page: str) -> None:
+    st.session_state.nav_page = page
+
+
+if st.session_state.get("nav_page") not in _NAV_PAGES:
+    st.session_state.nav_page = "Dashboard"
+
+for section, pages in NAV_SECTIONS:
+    st.sidebar.markdown(
+        f'<div class="nav-section">{html.escape(section)}</div>',
+        unsafe_allow_html=True,
+    )
+    for page in pages:
+        st.sidebar.button(
+            page,
+            key=f"nav_{page}",
+            type="primary" if st.session_state.nav_page == page else "secondary",
+            use_container_width=True,
+            on_click=_goto_page,
+            args=(page,),
+        )
+
+PAGE = st.session_state.nav_page
 
 st.sidebar.divider()
 users = db.list_access_users()
@@ -1284,7 +1340,9 @@ elif PAGE == "Raw Material Inventory":
     st.caption(
         "Review lots and remaining stock. Invoice documents live on "
         "**Raw Material Purchase**; grade chemistry comes from **Raw Material Spec**. "
-        "New receipts are entered on **Raw Material Logging**."
+        "New receipts are entered on **Raw Material Logging**. "
+        "Broken Ingot, Furnace Empty, and Not Ok Ingot from **Batch Output** "
+        "are stored as remelt lots linked to the source heat (`Source_Batch_ID`)."
     )
 
     recent = df_from_rows(
@@ -1292,10 +1350,12 @@ elif PAGE == "Raw Material Inventory":
             """
             SELECT i.Lot_id AS "Lot_id", i.Purchase_id AS "Purchase_id",
                    i.Raw_Material_Name AS "Raw_Material_Name",
+                   i.Source_Batch_ID AS "Source_Batch_ID",
+                   oa.Alloy_name AS "Origin_Alloy_name",
                    v.Vendor_name AS "Vendor_name",
                    p.Supplier_Invoice AS "Supplier_Invoice",
                    p.Supplier_invoice_date AS "Supplier_invoice_date",
-                   p.Received_date AS "Received_date",
+                   COALESCE(p.Received_date, b.Production_Date) AS "Received_date",
                    i.Received_weight AS "Received_weight",
                    i.Remaining_Weight AS "Remaining_Weight",
                    i.Cost_per_kg AS "Cost_per_kg",
@@ -1307,6 +1367,8 @@ elif PAGE == "Raw Material Inventory":
             FROM Raw_Material_Inventory i
             LEFT JOIN Raw_Material_Purchase p ON p.Purchase_id = i.Purchase_id
             LEFT JOIN Vendor_Master v ON v.Vendor_code = p.Vendor_code
+            LEFT JOIN Production_batch b ON b.Batch_ID = i.Source_Batch_ID
+            LEFT JOIN Alloy_Master oa ON oa.Alloy_id = b.Alloy_id
             ORDER BY i.Lot_id DESC
             LIMIT 50
             """
@@ -1733,10 +1795,21 @@ elif PAGE == "Production Batch & Chemistry":
                     key=_pk(f"mat_{idx}"),
                 )
             lots = db.list_inventory_lots(material=mat or None) if mat else []
-            lot_opts = {
-                f"Lot {l['Lot_id']} — rem {l['Remaining_Weight']:.1f} kg ({l['Raw_Material_Status']})": l["Lot_id"]
-                for l in lots
-            }
+            lot_opts = {}
+            for lot in lots:
+                rem = float(lot.get("Remaining_Weight") or 0)
+                status = lot.get("Raw_Material_Status") or ""
+                src = lot.get("Source_Batch_ID")
+                origin = lot.get("Origin_Alloy_name")
+                if src:
+                    origin_bit = f" {origin}" if origin else ""
+                    label = (
+                        f"Lot {lot['Lot_id']} — rem {rem:.1f} kg | "
+                        f"from {src}{origin_bit} ({status})"
+                    )
+                else:
+                    label = f"Lot {lot['Lot_id']} — rem {rem:.1f} kg ({status})"
+                lot_opts[label] = lot["Lot_id"]
             with r1c2:
                 lot_label = st.selectbox(
                     "Lot",
@@ -2161,7 +2234,9 @@ elif PAGE == "Batch Output":
         "Create the batch first on **Production Batch & Chemistry**. "
         "On save, each output line stores material ₹/kg (charge lot cost ÷ total output kg) "
         "and overall ₹/kg (material + Cost of Conversion for the production month, "
-        "or the previous available month if that month's rates are not in yet)."
+        "or the previous available month if that month's rates are not in yet). "
+        "Broken Ingot, Furnace Empty, and Not Ok Ingot are also stored as remelt lots "
+        "in **Raw Material Inventory**, linked to this heat so they can be charged later."
     )
 
     batches = db.list_batches()

@@ -386,6 +386,13 @@ SAMPLE_OK_STATUS = ["OK", "NOT OK"]
 # Non-spec metal taken off a heat: samples, furnace heel, and off-chemistry ingot.
 # These IDs live in Alloy_Master but have no Alloy_Master_spec rows.
 SIDESTREAM_ALLOY_IDS = (78, 79, 80)
+SIDESTREAM_RM_EFFECTIVE_DATE = "2026-08-01"
+SIDESTREAM_RM_RECOVERY = 99.0
+SIDESTREAM_RM_NAMES = {
+    78: "Broken Ingot",
+    79: "Furnace Empty",
+    80: "Not Ok Ingot",
+}
 RAW_MATERIAL_AVAILABILITY = ["Standard", "Spot", "Contract", "Internal"]
 SHIFTS = ["A", "B"]
 MELT_NOS = [1, 2, 3, 4, 5, 6, 7, 9]
@@ -500,14 +507,16 @@ CREATE TABLE IF NOT EXISTS Raw_Material_Purchase (
 );
 CREATE TABLE IF NOT EXISTS Raw_Material_Inventory (
     Lot_id {autopk},
-    Purchase_id INTEGER NOT NULL REFERENCES Raw_Material_Purchase(Purchase_id),
+    Purchase_id INTEGER REFERENCES Raw_Material_Purchase(Purchase_id),
     Raw_Material_Name TEXT NOT NULL,
     Received_weight {float},
     Remaining_Weight {float},
     Storage_bay TEXT,
     Raw_Material_Status TEXT DEFAULT 'Awaiting Assay',
     Photo {blob},
-    Cost_per_kg {float}
+    Cost_per_kg {float},
+    Source_Batch_ID TEXT REFERENCES Production_batch(Batch_ID),
+    Source_Alloy_id INTEGER REFERENCES Alloy_Master(Alloy_id)
 );
 CREATE TABLE IF NOT EXISTS Raw_Material_Spec (
     Raw_Material_Name TEXT NOT NULL,
@@ -1005,6 +1014,7 @@ def init_db() -> None:
         _ensure_electricity_consumption_lines(conn)
         _ensure_raw_material_spec_as_master_child(conn)
         _ensure_raw_material_purchase_header(conn)
+        _ensure_sidestream_remelt_inventory(conn)
         _ensure_case_insensitive_text_pks(conn)
         _ensure_percentage_4dp(conn)
         _ensure_integer_piece_columns(conn)
@@ -1320,53 +1330,155 @@ def _ensure_raw_material_purchase_header(conn: Connection) -> None:
         _drop_columns(conn, "Raw_Material_Inventory", list(_INVENTORY_INVOICE_COLUMNS))
 
     if IS_POSTGRES:
-        leftover = _exec(
-            conn,
-            "SELECT COUNT(*) FROM raw_material_inventory WHERE purchase_id IS NULL",
-        ).scalar_one()
-        if int(leftover or 0) == 0:
-            def _try_ddl(sql: str) -> None:
-                if _USE_NEON_HTTP:
-                    try:
-                        _exec(conn, sql)
-                    except Exception:
-                        pass
-                    return
-                _exec(conn, "SAVEPOINT rm_purchase_ddl")
+        def _try_ddl(sql: str) -> None:
+            if _USE_NEON_HTTP:
                 try:
                     _exec(conn, sql)
-                    _exec(conn, "RELEASE SAVEPOINT rm_purchase_ddl")
                 except Exception:
-                    _exec(conn, "ROLLBACK TO SAVEPOINT rm_purchase_ddl")
-
-            _try_ddl(
-                "ALTER TABLE raw_material_inventory ALTER COLUMN purchase_id SET NOT NULL"
-            )
-            has_fk = None
+                    pass
+                return
+            _exec(conn, "SAVEPOINT rm_purchase_ddl")
             try:
-                has_fk = _exec(
-                    conn,
-                    """
-                    SELECT 1
-                    FROM pg_constraint c
-                    JOIN pg_attribute a
-                      ON a.attrelid = c.conrelid AND a.attnum = ANY (c.conkey)
-                    WHERE c.conrelid = 'raw_material_inventory'::regclass
-                      AND c.contype = 'f'
-                      AND a.attname = 'purchase_id'
-                    """,
-                ).first()
+                _exec(conn, sql)
+                _exec(conn, "RELEASE SAVEPOINT rm_purchase_ddl")
             except Exception:
-                has_fk = True
-            if not has_fk:
-                _try_ddl(
-                    """
-                    ALTER TABLE raw_material_inventory
-                    ADD CONSTRAINT raw_material_inventory_purchase_fkey
-                    FOREIGN KEY (purchase_id)
-                    REFERENCES raw_material_purchase (purchase_id)
-                    """
-                )
+                _exec(conn, "ROLLBACK TO SAVEPOINT rm_purchase_ddl")
+
+        _try_ddl(
+            "ALTER TABLE raw_material_inventory ALTER COLUMN purchase_id DROP NOT NULL"
+        )
+        has_fk = None
+        try:
+            has_fk = _exec(
+                conn,
+                """
+                SELECT 1
+                FROM pg_constraint c
+                JOIN pg_attribute a
+                  ON a.attrelid = c.conrelid AND a.attnum = ANY (c.conkey)
+                WHERE c.conrelid = 'raw_material_inventory'::regclass
+                  AND c.contype = 'f'
+                  AND a.attname = 'purchase_id'
+                """,
+            ).first()
+        except Exception:
+            has_fk = True
+        if not has_fk:
+            _try_ddl(
+                """
+                ALTER TABLE raw_material_inventory
+                ADD CONSTRAINT raw_material_inventory_purchase_fkey
+                FOREIGN KEY (purchase_id)
+                REFERENCES raw_material_purchase (purchase_id)
+                """
+            )
+
+
+def _sidestream_rm_name_on_conn(conn: Connection, alloy_id: int) -> str:
+    row = (
+        _exec(
+            conn,
+            """
+            SELECT Alloy_name AS "Alloy_name"
+            FROM Alloy_Master
+            WHERE Alloy_id = ?
+            """,
+            (int(alloy_id),),
+        )
+        .mappings()
+        .first()
+    )
+    wanted = str((row or {}).get("Alloy_name") or "").strip()
+    if not wanted:
+        wanted = SIDESTREAM_RM_NAMES.get(int(alloy_id), f"Alloy {alloy_id}")
+    stored = (
+        _exec(
+            conn,
+            """
+            SELECT Raw_Material_Name AS "Raw_Material_Name"
+            FROM Raw_Material_Master
+            WHERE LOWER(Raw_Material_Name) = LOWER(?)
+            ORDER BY Effective_date DESC
+            LIMIT 1
+            """,
+            (wanted,),
+        )
+        .mappings()
+        .first()
+    )
+    if stored and stored.get("Raw_Material_Name"):
+        return str(stored["Raw_Material_Name"])
+    return wanted
+
+
+def _ensure_sidestream_remelt_inventory(conn: Connection) -> None:
+    """Allow remelt returns on inventory: nullable purchase, source heat, master grades."""
+    _ensure_columns(
+        conn,
+        "Raw_Material_Inventory",
+        [
+            ("Source_Batch_ID", "TEXT REFERENCES Production_batch(Batch_ID)"),
+            ("Source_Alloy_id", "INTEGER REFERENCES Alloy_Master(Alloy_id)"),
+        ],
+    )
+    if IS_POSTGRES:
+        try:
+            _exec(
+                conn,
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS uq_rm_inventory_source_batch_alloy
+                ON Raw_Material_Inventory (Source_Batch_ID, Source_Alloy_id)
+                """,
+            )
+        except Exception:
+            pass
+    else:
+        _exec(
+            conn,
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS uq_rm_inventory_source_batch_alloy
+            ON Raw_Material_Inventory (Source_Batch_ID, Source_Alloy_id)
+            """,
+        )
+    by_val, dt_val = audit_stamp()
+    for alloy_id in SIDESTREAM_ALLOY_IDS:
+        name = _sidestream_rm_name_on_conn(conn, alloy_id)
+        _exec(
+            conn,
+            """
+            INSERT INTO Raw_Material_Master
+                (Raw_Material_Name, Effective_date, Vendor_code, ISRI_CODE,
+                 Availability_class, Recovery, Photo, Status, Cost_per_kg,
+                 Last_updated_by, Last_updated_datetime)
+            VALUES (?, ?, NULL, NULL, 'Internal', ?, NULL, 'Active', 0, ?, ?)
+            ON CONFLICT(Raw_Material_Name, Effective_date) DO UPDATE SET
+                Availability_class = excluded.Availability_class,
+                Recovery = excluded.Recovery,
+                Status = excluded.Status,
+                Last_updated_by = excluded.Last_updated_by,
+                Last_updated_datetime = excluded.Last_updated_datetime
+            """,
+            (
+                name,
+                SIDESTREAM_RM_EFFECTIVE_DATE,
+                SIDESTREAM_RM_RECOVERY,
+                by_val,
+                dt_val,
+            ),
+        )
+    batches = list(
+        _exec(
+            conn,
+            """
+            SELECT DISTINCT Batch_ID AS "Batch_ID"
+            FROM batch_output
+            WHERE Alloy_id IN (?, ?, ?)
+            """,
+            SIDESTREAM_ALLOY_IDS,
+        ).mappings()
+    )
+    for row in batches:
+        _sync_sidestream_inventory(conn, row["Batch_ID"])
 
 
 PERCENT_SCALE = 4
@@ -3115,11 +3227,19 @@ def list_inventory_lots(
                i.Purchase_id AS "Purchase_id",
                p.Vendor_code AS "Vendor_code", v.Vendor_name AS "Vendor_name",
                i.Remaining_Weight AS "Remaining_Weight",
+               i.Received_weight AS "Received_weight",
+               i.Cost_per_kg AS "Cost_per_kg",
                i.Raw_Material_Status AS "Raw_Material_Status",
-               p.Received_date AS "Received_date"
+               i.Source_Batch_ID AS "Source_Batch_ID",
+               i.Source_Alloy_id AS "Source_Alloy_id",
+               b.Alloy_id AS "Origin_Alloy_id",
+               oa.Alloy_name AS "Origin_Alloy_name",
+               COALESCE(p.Received_date, b.Production_Date) AS "Received_date"
         FROM Raw_Material_Inventory i
         LEFT JOIN Raw_Material_Purchase p ON p.Purchase_id = i.Purchase_id
         LEFT JOIN Vendor_Master v ON v.Vendor_code = p.Vendor_code
+        LEFT JOIN Production_batch b ON b.Batch_ID = i.Source_Batch_ID
+        LEFT JOIN Alloy_Master oa ON oa.Alloy_id = b.Alloy_id
         WHERE i.Remaining_Weight > 0
     """
     params: list[Any] = []
@@ -4524,6 +4644,147 @@ def save_batch_outputs(batch_id: str, lines: list[dict[str, Any]]) -> None:
             )
         if cleaned:
             _apply_batch_output_costs(conn, batch_id)
+        _sync_sidestream_inventory(conn, batch_id)
+
+
+def _sqlite_internal_remelt_purchase_id(conn: Connection) -> int:
+    row = (
+        _exec(
+            conn,
+            """
+            SELECT Purchase_id AS "Purchase_id"
+            FROM Raw_Material_Purchase
+            WHERE Supplier_Invoice = 'INTERNAL-REMELT'
+            """,
+        )
+        .mappings()
+        .first()
+    )
+    if row:
+        return int(row["Purchase_id"])
+    by_val, dt_val = audit_stamp()
+    result = _exec(
+        conn,
+        """
+        INSERT INTO Raw_Material_Purchase
+            (Vendor_code, Supplier_Invoice, Supplier_invoice_date, Received_date,
+             Last_updated_by, Last_updated_datetime)
+        VALUES (NULL, 'INTERNAL-REMELT', NULL, ?, ?, ?)
+        RETURNING Purchase_id
+        """,
+        (date.today().isoformat(), by_val, dt_val),
+    )
+    return int(result.scalar_one())
+
+
+def _sync_sidestream_inventory(conn: Connection, batch_id: str) -> None:
+    """Turn Broken Ingot / Furnace Empty / Not Ok Ingot outputs into remelt lots."""
+    placeholders = ", ".join("?" for _ in SIDESTREAM_ALLOY_IDS)
+    totals = list(
+        _exec(
+            conn,
+            f"""
+            SELECT o.Alloy_id AS "Alloy_id",
+                   COALESCE(SUM(o.Weight), 0) AS "Weight",
+                   MAX(o.cost_of_production_overall_per_kg)
+                       AS "cost_of_production_overall_per_kg"
+            FROM batch_output o
+            WHERE o.Batch_ID = ?
+              AND o.Alloy_id IN ({placeholders})
+            GROUP BY o.Alloy_id
+            """,
+            (batch_id, *SIDESTREAM_ALLOY_IDS),
+        ).mappings()
+    )
+    wanted = {
+        int(row["Alloy_id"]): (
+            float(row["Weight"] or 0),
+            _as_cost_4(row["cost_of_production_overall_per_kg"]),
+        )
+        for row in totals
+        if float(row["Weight"] or 0) > 0
+    }
+    existing = list(
+        _exec(
+            conn,
+            """
+            SELECT Lot_id AS "Lot_id",
+                   Source_Alloy_id AS "Source_Alloy_id",
+                   Received_weight AS "Received_weight",
+                   Remaining_Weight AS "Remaining_Weight"
+            FROM Raw_Material_Inventory
+            WHERE Source_Batch_ID = ?
+            """,
+            (batch_id,),
+        ).mappings()
+    )
+    by_alloy = {int(row["Source_Alloy_id"]): dict(row) for row in existing if row.get("Source_Alloy_id") is not None}
+
+    purchase_id = None if IS_POSTGRES else _sqlite_internal_remelt_purchase_id(conn)
+
+    for alloy_id, (weight, cost_per_kg) in wanted.items():
+        rm_name = _sidestream_rm_name_on_conn(conn, alloy_id)
+        current = by_alloy.get(alloy_id)
+        if current is None:
+            _exec(
+                conn,
+                """
+                INSERT INTO Raw_Material_Inventory
+                    (Purchase_id, Raw_Material_Name, Received_weight, Remaining_Weight,
+                     Storage_bay, Raw_Material_Status, Cost_per_kg,
+                     Source_Batch_ID, Source_Alloy_id)
+                VALUES (?, ?, ?, ?, 'Remelt', 'Ready For Melt', ?, ?, ?)
+                """,
+                (
+                    purchase_id,
+                    rm_name,
+                    weight,
+                    weight,
+                    cost_per_kg,
+                    batch_id,
+                    alloy_id,
+                ),
+            )
+            continue
+        old_received = float(current["Received_weight"] or 0)
+        remaining = float(current["Remaining_Weight"] or 0)
+        consumed = max(old_received - remaining, 0.0)
+        if weight + 1e-9 < consumed:
+            raise ValueError(
+                f"Cannot reduce {rm_name} on {batch_id} to {weight:.2f} kg: "
+                f"{consumed:.2f} kg from this lot has already been charged into another heat."
+            )
+        _exec(
+            conn,
+            """
+            UPDATE Raw_Material_Inventory
+            SET Raw_Material_Name = ?,
+                Received_weight = ?,
+                Remaining_Weight = ?,
+                Cost_per_kg = ?,
+                Raw_Material_Status = 'Ready For Melt',
+                Storage_bay = COALESCE(Storage_bay, 'Remelt')
+            WHERE Lot_id = ?
+            """,
+            (rm_name, weight, weight - consumed, cost_per_kg, current["Lot_id"]),
+        )
+
+    for alloy_id, current in by_alloy.items():
+        if alloy_id in wanted:
+            continue
+        old_received = float(current["Received_weight"] or 0)
+        remaining = float(current["Remaining_Weight"] or 0)
+        consumed = max(old_received - remaining, 0.0)
+        if consumed > 1e-9:
+            raise ValueError(
+                f"Cannot remove remelt lot {current['Lot_id']} for batch {batch_id}: "
+                f"{consumed:.2f} kg has already been charged into another heat."
+            )
+        _exec(
+            conn,
+            "DELETE FROM Raw_Material_Inventory WHERE Lot_id = ?",
+            (current["Lot_id"],),
+        )
 
 
 def get_batch_chemistry(batch_id: str) -> list[dict[str, Any]]:
