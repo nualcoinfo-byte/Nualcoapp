@@ -4843,14 +4843,14 @@ def _alloy_matches_target(
     return False
 
 
-def list_dispatchable_batches(
+def list_packing_batch_candidates(
     alloy_id: int,
     *,
     match_name: bool = True,
     match_group: bool = True,
     include_batch_ids: Optional[list[str]] = None,
-) -> list[dict[str, Any]]:
-    """Batches whose alloy_name or alloy_group matches the selected PO alloy."""
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Return (dispatchable, blocked) heats matching the packing-list alloy."""
     _ensure_packing_list_ready()
     target = get_alloy(alloy_id)
     if not target:
@@ -4869,6 +4869,7 @@ def list_dispatchable_batches(
     rows = fetch_all(
         """
         SELECT b.Batch_ID AS "Batch_ID",
+               b.Production_status AS "Production_status",
                a.Alloy_id AS "Alloy_id",
                a.Alloy_name AS "Alloy_name",
                a.Alloy_group AS "Alloy_group",
@@ -4877,31 +4878,72 @@ def list_dispatchable_batches(
                fg.Output_pieces AS "Output_pieces",
                fg.Finished_Goods_Status AS "Finished_Goods_Status"
         FROM Production_batch b
-        JOIN Alloy_Master a ON a.Alloy_id = b.Alloy_id
-        JOIN Finished_Goods_Inventory fg ON fg.Batch_ID = b.Batch_ID
-        WHERE b.Production_status = ?
+        LEFT JOIN Alloy_Master a ON a.Alloy_id = b.Alloy_id
+        LEFT JOIN Finished_Goods_Inventory fg ON fg.Batch_ID = b.Batch_ID
         ORDER BY b.Batch_ID, fg.Bundle_id DESC
-        """,
-        (BATCH_STATUS_COMPLETED,),
+        """
     )
     seen: set[str] = set()
-    out: list[dict[str, Any]] = []
+    eligible: list[dict[str, Any]] = []
+    blocked: list[dict[str, Any]] = []
     for row in rows:
         bid = str(row["Batch_ID"])
         if bid in seen:
             continue
         seen.add(bid)
-        if bid in taken:
-            continue
-        status = row.get("Finished_Goods_Status") or ""
-        if bid not in include and status not in FG_DISPATCHABLE_STATUSES:
-            continue
         if not _alloy_matches_target(
             row, target, match_name=match_name, match_group=match_group
         ):
             continue
-        out.append(row)
-    return out
+        item = dict(row)
+        status = item.get("Finished_Goods_Status") or ""
+        weight = float(item.get("Output_Weight") or 0)
+        if bid in taken:
+            item["Reason"] = "Already on a Verified packing list"
+            blocked.append(item)
+            continue
+        if (item.get("Production_status") or "") != BATCH_STATUS_COMPLETED:
+            gaps = production_batch_completion_gaps_for_id(bid)
+            if gaps:
+                item["Reason"] = (
+                    "Mark the heat Completed on Production Batch & Chemistry "
+                    f"({'; '.join(gaps)})"
+                )
+            else:
+                item["Reason"] = (
+                    "Mark the heat Completed on Production Batch & Chemistry"
+                )
+            blocked.append(item)
+            continue
+        if item.get("Bundle_id") in (None, "") or weight <= 0:
+            item["Reason"] = "Save product-alloy output on Batch Output"
+            blocked.append(item)
+            continue
+        if bid not in include and status not in FG_DISPATCHABLE_STATUSES:
+            item["Reason"] = (
+                f"Finished goods status is {status or 'missing'}"
+            )
+            blocked.append(item)
+            continue
+        eligible.append(item)
+    return eligible, blocked
+
+
+def list_dispatchable_batches(
+    alloy_id: int,
+    *,
+    match_name: bool = True,
+    match_group: bool = True,
+    include_batch_ids: Optional[list[str]] = None,
+) -> list[dict[str, Any]]:
+    """Batches whose alloy_name or alloy_group matches the selected PO alloy."""
+    eligible, _blocked = list_packing_batch_candidates(
+        alloy_id,
+        match_name=match_name,
+        match_group=match_group,
+        include_batch_ids=include_batch_ids,
+    )
+    return eligible
 
 
 def list_packing_lists() -> list[dict[str, Any]]:

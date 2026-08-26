@@ -374,10 +374,25 @@ def render_batch_output_editor(batch: dict, *, key_prefix: str) -> None:
     """Enter output lines for one batch: product alloy plus 78/79/80."""
     bid = batch["Batch_ID"]
     if (batch.get("Production_status") or "") != db.BATCH_STATUS_COMPLETED:
-        st.warning(
-            "Batch output can be entered only after this heat is marked "
-            "**Completed** on **Production Batch & Chemistry**."
-        )
+        status = batch.get("Production_status") or "In-Progress"
+        gaps = []
+        try:
+            gaps = db.production_batch_completion_gaps_for_id(bid)
+        except Exception:
+            gaps = []
+        if gaps:
+            st.warning(
+                f"**{bid}** is still **{status}** — saving the chemistry form does not "
+                "complete the heat. Open **Production Batch & Chemistry**, fix: "
+                + "; ".join(gaps)
+                + ", then click **Mark as Completed**."
+            )
+        else:
+            st.warning(
+                f"**{bid}** is still **{status}**. Required fields are filled — open "
+                "**Production Batch & Chemistry** and click **Mark as Completed**. "
+                "Save changes alone does not complete the heat."
+            )
         saved = db.get_batch_outputs(bid)
         if saved:
             st.caption("Saved outputs (read-only until Completed).")
@@ -946,6 +961,25 @@ def _furnace_key_prefix(furnace: str) -> str:
     return _furnace_form_key(furnace, "")
 
 
+def _is_ephemeral_widget_key(key: object) -> bool:
+    """True for widgets Streamlit forbids assigning via st.session_state."""
+    if not isinstance(key, str):
+        return False
+    return any(
+        marker in key
+        for marker in (
+            "_btn_",
+            "_cam_",
+            "_file_",
+            "_add_charge",
+            "_rem_charge",
+            "_save_batch",
+            "_complete_batch",
+            "_open_all_elements",
+        )
+    ) or key.endswith(("_btn", "_cam", "_file"))
+
+
 def _snapshot_furnace_widgets(furnace: str) -> None:
     """Keep a durable copy of one furnace's widgets.
 
@@ -959,13 +993,21 @@ def _snapshot_furnace_widgets(furnace: str) -> None:
     store[str(furnace)] = {
         k: st.session_state[k]
         for k in list(st.session_state.keys())
-        if isinstance(k, str) and k.startswith(prefix)
+        if isinstance(k, str)
+        and k.startswith(prefix)
+        and not _is_ephemeral_widget_key(k)
     }
 
 
 def _restore_furnace_widgets(furnace: str) -> None:
+    prefix = _furnace_key_prefix(furnace)
+    for k in list(st.session_state.keys()):
+        if isinstance(k, str) and k.startswith(prefix) and _is_ephemeral_widget_key(k):
+            st.session_state.pop(k, None)
     saved = (st.session_state.get("batch_drafts") or {}).get(str(furnace)) or {}
     for k, v in saved.items():
+        if _is_ephemeral_widget_key(k):
+            continue
         if k not in st.session_state:
             st.session_state[k] = v
 
@@ -2669,6 +2711,11 @@ elif PAGE == "Production Batch & Chemistry":
                 "vacum sample, batch chemistry, and at least one charge line."
             ),
         )
+        if not is_completed and completion_gaps:
+            st.caption(
+                "**Mark as Completed** stays disabled until: "
+                + "; ".join(completion_gaps)
+            )
         if save_clicked:
             try:
                 bid = _save_chemistry_page(mark_completed=False)
@@ -2773,8 +2820,11 @@ elif PAGE == "Batch Output":
                     f"{batch.get('Alloy_id')} — {alloy_name or '—'}",
                 )
                 m5.metric(
-                    "Charge input (kg)",
-                    f"{float(batch.get('Input_Weight') or 0):,.2f}",
+                    "Status",
+                    batch.get("Production_status") or "—",
+                )
+                st.caption(
+                    f"Charge input: {float(batch.get('Input_Weight') or 0):,.2f} kg"
                 )
 
                 with st.expander("Charge input lines"):
@@ -3459,10 +3509,11 @@ elif PAGE == "Packing List":
     include_ids = [
         str(b) for b in (st.session_state.get("pl_batches") or []) if b
     ]
-    dispatchable = []
+    dispatchable: list[dict] = []
+    blocked: list[dict] = []
     if alloy_id not in (None, ""):
         try:
-            dispatchable = db.list_dispatchable_batches(
+            dispatchable, blocked = db.list_packing_batch_candidates(
                 int(alloy_id),
                 match_name=bool(match_name),
                 match_group=bool(match_group),
@@ -3470,26 +3521,11 @@ elif PAGE == "Packing List":
             )
         except Exception as exc:
             st.error(str(exc))
-    batch_opts = {
-        (
-            f"{r['Batch_ID']}  |  {r.get('Alloy_name') or '—'} / "
-            f"{r.get('Alloy_group') or '—'}  |  "
-            f"{float(r.get('Output_Weight') or 0):,.1f} kg / "
-            f"{int(r.get('Output_pieces') or 0)} pcs"
-        ): r["Batch_ID"]
-        for r in dispatchable
+
+    selected_batch_ids: list[str] = []
+    by_id: dict[str, dict] = {
+        str(r["Batch_ID"]): r for r in dispatchable
     }
-    restore_labels = [
-        label for label, bid in batch_opts.items() if bid in set(include_ids)
-    ]
-    current_labels = [
-        label
-        for label in (st.session_state.get("pl_batches_labels") or [])
-        if label in batch_opts
-    ]
-    next_labels = restore_labels if restore_labels and not current_labels else current_labels
-    if st.session_state.get("pl_batches_labels") != next_labels:
-        st.session_state["pl_batches_labels"] = next_labels
 
     if not po_no:
         st.info("Select a P.O. Number to load customers and alloys.")
@@ -3497,18 +3533,101 @@ elif PAGE == "Packing List":
         st.info("Select the customer on this purchase order.")
     elif alloy_id in (None, ""):
         st.info("Select the alloy on this purchase order, then pick batch IDs.")
-    elif not batch_opts:
-        st.warning(
-            "No Available finished-goods batches match this alloy name or group. "
-            "Save product-alloy output on **Batch Output** first."
-        )
-    selected_batch_labels = st.multiselect(
-        "Batch ID",
-        options=list(batch_opts.keys()),
-        key="pl_batches_labels",
-        help="Stock produced for another customer is allowed when alloy name or group match.",
-    )
-    selected_batch_ids = [batch_opts[label] for label in selected_batch_labels]
+    else:
+        if dispatchable:
+            st.caption(
+                "Tick every heat to dispatch. Only **Completed** heats with product-alloy "
+                "output in Finished Goods can be selected."
+            )
+            pick_df = pd.DataFrame(
+                [
+                    {
+                        "Select": str(r["Batch_ID"]) in set(include_ids),
+                        "Batch_ID": str(r["Batch_ID"]),
+                        "Weight (kg)": float(r.get("Output_Weight") or 0),
+                        "Pieces": int(float(r.get("Output_pieces") or 0)),
+                        "Alloy": r.get("Alloy_name") or "—",
+                    }
+                    for r in dispatchable
+                ]
+            )
+            editor_key = (
+                f"pl_batch_editor_{alloy_id}_"
+                f"{int(bool(match_name))}_{int(bool(match_group))}_"
+                f"{int(editing_id or 0)}"
+            )
+            edited = st.data_editor(
+                pick_df,
+                column_config={
+                    "Select": st.column_config.CheckboxColumn(
+                        "Select",
+                        help="Include this heat on the packing list.",
+                    ),
+                    "Weight (kg)": st.column_config.NumberColumn(format="%.2f"),
+                    "Pieces": st.column_config.NumberColumn(format="%d"),
+                },
+                disabled=["Batch_ID", "Weight (kg)", "Pieces", "Alloy"],
+                hide_index=True,
+                use_container_width=True,
+                key=editor_key,
+            )
+            selected_batch_ids = [
+                str(bid)
+                for bid in edited.loc[edited["Select"], "Batch_ID"].tolist()
+            ]
+        else:
+            st.warning(
+                "No Available finished-goods batches match this alloy name or group. "
+                "Mark the heat **Completed**, then save product-alloy output on **Batch Output**."
+            )
+
+        st.markdown("##### Selected batches")
+        selected_rows = [by_id[b] for b in selected_batch_ids if b in by_id]
+        if selected_rows:
+            selected_df = pd.DataFrame(
+                [
+                    {
+                        "Batch_ID": r["Batch_ID"],
+                        "Weight (kg)": float(r.get("Output_Weight") or 0),
+                        "Pieces": int(float(r.get("Output_pieces") or 0)),
+                    }
+                    for r in selected_rows
+                ]
+            )
+            show_dataframe(selected_df)
+            t1, t2, t3 = st.columns(3)
+            t1.metric("Batches", len(selected_rows))
+            t2.metric(
+                "Total weight (kg)",
+                f"{float(selected_df['Weight (kg)'].sum()):,.2f}",
+            )
+            t3.metric(
+                "Total pieces",
+                f"{int(selected_df['Pieces'].sum())}",
+            )
+        else:
+            st.caption("Tick one or more rows above to add them to this packing list.")
+
+        if blocked:
+            with st.expander(
+                f"Matching heats not ready to dispatch ({len(blocked)})",
+                expanded=True,
+            ):
+                show_dataframe(
+                    pd.DataFrame(
+                        [
+                            {
+                                "Batch_ID": r["Batch_ID"],
+                                "Weight (kg)": float(r.get("Output_Weight") or 0),
+                                "Pieces": int(float(r.get("Output_pieces") or 0)),
+                                "Status": r.get("Production_status") or "—",
+                                "Reason": r.get("Reason") or "",
+                            }
+                            for r in blocked
+                        ]
+                    )
+                )
+
     st.session_state["pl_batches"] = selected_batch_ids
 
     if st.button("Save packing list", type="primary", key="pl_save"):
