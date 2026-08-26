@@ -749,6 +749,17 @@ CREATE TABLE IF NOT EXISTS Electricity_Consumption (
     Last_updated_datetime TEXT,
     PRIMARY KEY (Consumption_date, Line)
 );
+CREATE TABLE IF NOT EXISTS Cost_of_conversion (
+    id {autopk},
+    expense_month DATE NOT NULL UNIQUE,
+    oil_rate_per_kg {pct4} NOT NULL,
+    electricity_rate_per_kg {pct4} NOT NULL,
+    labour_rate_per_kg {pct4} NOT NULL,
+    salaries_rate_per_kg {pct4} NOT NULL,
+    consumables_rate_per_kg {pct4} NOT NULL,
+    overheads_rate_per_kg {pct4} NOT NULL,
+    total_conversion_rate_per_kg {pct4} NOT NULL
+);
 CREATE TABLE IF NOT EXISTS Alloy_Data_Checker (
     Customer_Name TEXT,
     alloy_family TEXT,
@@ -2410,6 +2421,14 @@ EDITABLE_TABLES: list[dict[str, Any]] = [
         "order_by": "consumption_date",
         "identity": [],
         "allow_add": True,
+    },
+    {
+        "key": "cost_of_conversion",
+        "label": "Cost of conversion",
+        "pk": ["id"],
+        "order_by": "expense_month",
+        "identity": ["id"],
+        "allow_add": False,
     },
 ]
 
@@ -5006,6 +5025,129 @@ def add_electricity_consumption(
         ),
     )
     return units
+
+
+CONVERSION_RATE_FIELDS: tuple[tuple[str, str], ...] = (
+    ("oil_rate_per_kg", "Oil rate per kg"),
+    ("electricity_rate_per_kg", "Electricity rate per kg"),
+    ("labour_rate_per_kg", "Labour rate per kg"),
+    ("salaries_rate_per_kg", "Salaries rate per kg"),
+    ("consumables_rate_per_kg", "Consumables rate per kg"),
+    ("overheads_rate_per_kg", "Overheads rate per kg"),
+)
+
+
+def _month_start_iso(value: Any) -> str:
+    """Store expense_month as the first day of that month (YYYY-MM-01)."""
+    text = _as_effective_date(value)
+    if len(text) < 7:
+        raise ValueError("Expense month is required.")
+    year = int(text[:4])
+    month = int(text[5:7])
+    return date(year, month, 1).isoformat()
+
+
+def _as_rate_4(value: Any, label: str) -> float:
+    rounded = round_percent_4(value)
+    if rounded is None:
+        raise ValueError(f"{label} is required.")
+    if rounded < 0:
+        raise ValueError(f"{label} cannot be negative.")
+    return rounded
+
+
+def list_cost_of_conversion(limit: int = 120) -> list[dict[str, Any]]:
+    return fetch_all(
+        """
+        SELECT id AS "id",
+               expense_month AS "expense_month",
+               oil_rate_per_kg AS "oil_rate_per_kg",
+               electricity_rate_per_kg AS "electricity_rate_per_kg",
+               labour_rate_per_kg AS "labour_rate_per_kg",
+               salaries_rate_per_kg AS "salaries_rate_per_kg",
+               consumables_rate_per_kg AS "consumables_rate_per_kg",
+               overheads_rate_per_kg AS "overheads_rate_per_kg",
+               total_conversion_rate_per_kg AS "total_conversion_rate_per_kg"
+        FROM Cost_of_conversion
+        ORDER BY expense_month DESC, id DESC
+        LIMIT ?
+        """,
+        (limit,),
+    )
+
+
+def get_cost_of_conversion(expense_month: str | date) -> Optional[dict[str, Any]]:
+    month = _month_start_iso(expense_month)
+    return fetch_one(
+        """
+        SELECT id AS "id",
+               expense_month AS "expense_month",
+               oil_rate_per_kg AS "oil_rate_per_kg",
+               electricity_rate_per_kg AS "electricity_rate_per_kg",
+               labour_rate_per_kg AS "labour_rate_per_kg",
+               salaries_rate_per_kg AS "salaries_rate_per_kg",
+               consumables_rate_per_kg AS "consumables_rate_per_kg",
+               overheads_rate_per_kg AS "overheads_rate_per_kg",
+               total_conversion_rate_per_kg AS "total_conversion_rate_per_kg"
+        FROM Cost_of_conversion
+        WHERE expense_month = ?
+        """,
+        (month,),
+    )
+
+
+def save_cost_of_conversion(
+    expense_month: str | date,
+    oil_rate_per_kg: float,
+    electricity_rate_per_kg: float,
+    labour_rate_per_kg: float,
+    salaries_rate_per_kg: float,
+    consumables_rate_per_kg: float,
+    overheads_rate_per_kg: float,
+) -> float:
+    """Upsert one month's conversion rates. Total is stored as the sum of the six rates."""
+    month = _month_start_iso(expense_month)
+    rates = {
+        "oil_rate_per_kg": _as_rate_4(oil_rate_per_kg, "Oil rate per kg"),
+        "electricity_rate_per_kg": _as_rate_4(
+            electricity_rate_per_kg, "Electricity rate per kg"
+        ),
+        "labour_rate_per_kg": _as_rate_4(labour_rate_per_kg, "Labour rate per kg"),
+        "salaries_rate_per_kg": _as_rate_4(salaries_rate_per_kg, "Salaries rate per kg"),
+        "consumables_rate_per_kg": _as_rate_4(
+            consumables_rate_per_kg, "Consumables rate per kg"
+        ),
+        "overheads_rate_per_kg": _as_rate_4(overheads_rate_per_kg, "Overheads rate per kg"),
+    }
+    total = round(sum(rates.values()), PERCENT_SCALE)
+    execute(
+        """
+        INSERT INTO Cost_of_conversion
+            (expense_month, oil_rate_per_kg, electricity_rate_per_kg,
+             labour_rate_per_kg, salaries_rate_per_kg, consumables_rate_per_kg,
+             overheads_rate_per_kg, total_conversion_rate_per_kg)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT (expense_month) DO UPDATE SET
+            oil_rate_per_kg = excluded.oil_rate_per_kg,
+            electricity_rate_per_kg = excluded.electricity_rate_per_kg,
+            labour_rate_per_kg = excluded.labour_rate_per_kg,
+            salaries_rate_per_kg = excluded.salaries_rate_per_kg,
+            consumables_rate_per_kg = excluded.consumables_rate_per_kg,
+            overheads_rate_per_kg = excluded.overheads_rate_per_kg,
+            total_conversion_rate_per_kg = excluded.total_conversion_rate_per_kg
+        """,
+        (
+            month,
+            rates["oil_rate_per_kg"],
+            rates["electricity_rate_per_kg"],
+            rates["labour_rate_per_kg"],
+            rates["salaries_rate_per_kg"],
+            rates["consumables_rate_per_kg"],
+            rates["overheads_rate_per_kg"],
+            total,
+        ),
+    )
+    return total
 
 
 # ---------- BOM ----------
