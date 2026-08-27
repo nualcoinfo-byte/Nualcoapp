@@ -671,6 +671,8 @@ CREATE TABLE IF NOT EXISTS Packing_list (
 CREATE TABLE IF NOT EXISTS Packing_list_batch (
     Packing_list_id INTEGER NOT NULL REFERENCES Packing_list(Packing_list_id),
     Batch_ID TEXT NOT NULL REFERENCES Production_batch(Batch_ID),
+    Weight {float},
+    Pieces INTEGER,
     PRIMARY KEY (Packing_list_id, Batch_ID)
 );
 CREATE TABLE IF NOT EXISTS batch_input (
@@ -1782,6 +1784,7 @@ def _ensure_percentage_4dp(conn: Connection) -> None:
 INTEGER_PIECE_COLUMNS: tuple[tuple[str, str], ...] = (
     ("batch_output", "pieces"),
     ("finished_goods_inventory", "output_pieces"),
+    ("packing_list_batch", "pieces"),
 )
 
 
@@ -1925,6 +1928,87 @@ def _ensure_one_available_crucible(conn: Connection) -> None:
     )
 
 
+def _backfill_packing_list_line_quantities(conn: Connection) -> None:
+    """Fill missing packing-list kg/pieces and zero leftover Dispatched stock."""
+    _exec(
+        conn,
+        """
+        UPDATE Packing_list_batch
+        SET Weight = (
+                SELECT fg.Output_Weight
+                FROM Finished_Goods_Inventory fg
+                WHERE fg.Batch_ID = Packing_list_batch.Batch_ID
+                ORDER BY fg.Bundle_id DESC
+                LIMIT 1
+            )
+        WHERE Weight IS NULL
+        """,
+    )
+    _exec(
+        conn,
+        """
+        UPDATE Packing_list_batch
+        SET Pieces = (
+                SELECT fg.Output_pieces
+                FROM Finished_Goods_Inventory fg
+                WHERE fg.Batch_ID = Packing_list_batch.Batch_ID
+                ORDER BY fg.Bundle_id DESC
+                LIMIT 1
+            )
+        WHERE Pieces IS NULL
+        """,
+    )
+    dispatched = list(
+        _exec(
+            conn,
+            """
+            SELECT Bundle_id AS "Bundle_id",
+                   Batch_ID AS "Batch_ID",
+                   Output_Weight AS "Output_Weight",
+                   Output_pieces AS "Output_pieces"
+            FROM Finished_Goods_Inventory
+            WHERE Finished_Goods_Status = ?
+            """,
+            (FG_STATUS_DISPATCHED,),
+        ).mappings()
+    )
+    for row in dispatched:
+        weight = float(row.get("Output_Weight") or 0)
+        pieces = int(float(row.get("Output_pieces") or 0))
+        if weight <= 0 and pieces <= 0:
+            continue
+        packed = (
+            _exec(
+                conn,
+                """
+                SELECT COALESCE(SUM(lb.Weight), 0) AS "Weight",
+                       COALESCE(SUM(lb.Pieces), 0) AS "Pieces"
+                FROM Packing_list_batch lb
+                JOIN Packing_list p ON p.Packing_list_id = lb.Packing_list_id
+                WHERE lb.Batch_ID = ? AND p.Packing_list_status = ?
+                """,
+                (row["Batch_ID"], PACKING_STATUS_VERIFIED),
+            )
+            .mappings()
+            .first()
+        ) or {}
+        packed_w = float(packed.get("Weight") or 0)
+        packed_p = int(float(packed.get("Pieces") or 0))
+        if packed_w <= 0 and packed_p <= 0:
+            continue
+        new_w = max(weight - packed_w, 0.0)
+        new_p = max(pieces - packed_p, 0)
+        _exec(
+            conn,
+            """
+            UPDATE Finished_Goods_Inventory
+            SET Output_Weight = ?, Output_pieces = ?
+            WHERE Bundle_id = ?
+            """,
+            (new_w, new_p, row["Bundle_id"]),
+        )
+
+
 def _ensure_packing_list(conn: Connection) -> None:
     """Create packing-list tables used to dispatch finished goods."""
     if IS_POSTGRES:
@@ -1957,6 +2041,8 @@ def _ensure_packing_list(conn: Connection) -> None:
         CREATE TABLE IF NOT EXISTS Packing_list_batch (
             Packing_list_id INTEGER NOT NULL REFERENCES Packing_list(Packing_list_id),
             Batch_ID TEXT NOT NULL REFERENCES Production_batch(Batch_ID),
+            Weight REAL,
+            Pieces INTEGER,
             PRIMARY KEY (Packing_list_id, Batch_ID)
         )
         """,
@@ -1978,6 +2064,15 @@ def _ensure_packing_list(conn: Connection) -> None:
             ("Last_updated_datetime", "TEXT"),
         ],
     )
+    _ensure_columns(
+        conn,
+        "Packing_list_batch",
+        [
+            ("Weight", "REAL"),
+            ("Pieces", "INTEGER"),
+        ],
+    )
+    _backfill_packing_list_line_quantities(conn)
 
 
 # TEXT columns that participate in a PRIMARY KEY. True = fold case with LOWER().
@@ -5102,6 +5197,8 @@ def list_packing_batch_candidates(
     match_name: bool = True,
     match_group: bool = True,
     include_batch_ids: Optional[list[str]] = None,
+    packing_list_id: Optional[int] = None,
+    packing_list_status: Optional[str] = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Return (dispatchable, blocked) heats matching the packing-list alloy."""
     _ensure_packing_list_ready()
@@ -5109,16 +5206,22 @@ def list_packing_batch_candidates(
     if not target:
         raise ValueError(f"Alloy {alloy_id} was not found.")
     include = {str(b) for b in (include_batch_ids or []) if b}
-    verified = fetch_all(
-        """
-        SELECT lb.Batch_ID AS "Batch_ID"
-        FROM Packing_list_batch lb
-        JOIN Packing_list p ON p.Packing_list_id = lb.Packing_list_id
-        WHERE p.Packing_list_status = ?
-        """,
-        (PACKING_STATUS_VERIFIED,),
+    this_packed: dict[str, dict[str, Any]] = {}
+    if packing_list_id:
+        for row in fetch_all(
+            """
+            SELECT Batch_ID AS "Batch_ID",
+                   Weight AS "Weight",
+                   Pieces AS "Pieces"
+            FROM Packing_list_batch
+            WHERE Packing_list_id = ?
+            """,
+            (int(packing_list_id),),
+        ):
+            this_packed[str(row["Batch_ID"])] = row
+    editing_verified = (
+        str(packing_list_status or "").strip() == PACKING_STATUS_VERIFIED
     )
-    taken = {str(r["Batch_ID"]) for r in verified} - include
     rows = fetch_all(
         """
         SELECT b.Batch_ID AS "Batch_ID",
@@ -5150,12 +5253,27 @@ def list_packing_batch_candidates(
         ):
             continue
         item = dict(row)
+        packed = this_packed.get(bid) or {}
+        packed_w = float(packed.get("Weight") or 0)
+        packed_p = int(float(packed.get("Pieces") or 0))
         status = item.get("Finished_Goods_Status") or ""
-        weight = float(item.get("Output_Weight") or 0)
-        if bid in taken:
-            item["Reason"] = "Already on a Verified packing list"
-            blocked.append(item)
-            continue
+        fg_w = float(item.get("Output_Weight") or 0)
+        fg_p = int(float(item.get("Output_pieces") or 0))
+        on_hand_w = fg_w if status in FG_DISPATCHABLE_STATUSES else 0.0
+        on_hand_p = fg_p if status in FG_DISPATCHABLE_STATUSES else 0
+        if editing_verified:
+            max_w = on_hand_w + packed_w
+            max_p = on_hand_p + packed_p
+        else:
+            max_w = on_hand_w
+            max_p = on_hand_p
+        item["On_hand_weight"] = on_hand_w
+        item["On_hand_pieces"] = on_hand_p
+        item["Packed_Weight"] = packed_w
+        item["Packed_Pieces"] = packed_p
+        item["Max_weight"] = max_w
+        item["Max_pieces"] = max_p
+        on_this_list = bid in include
         if (item.get("Production_status") or "") != BATCH_STATUS_COMPLETED:
             gaps = production_batch_completion_gaps_for_id(bid)
             if gaps:
@@ -5169,14 +5287,29 @@ def list_packing_batch_candidates(
                 )
             blocked.append(item)
             continue
-        if item.get("Bundle_id") in (None, "") or weight <= 0:
+        if item.get("Bundle_id") in (None, "") and not on_this_list:
             item["Reason"] = "Save product-alloy output on Batch Output"
             blocked.append(item)
             continue
-        if bid not in include and status not in FG_DISPATCHABLE_STATUSES:
-            item["Reason"] = (
-                f"Finished goods status is {status or 'missing'}"
-            )
+        if (
+            not on_this_list
+            and status
+            and status not in FG_DISPATCHABLE_STATUSES
+            and max_w <= 0
+        ):
+            if status == FG_STATUS_DISPATCHED:
+                item["Reason"] = "No remaining finished goods (already dispatched)"
+            else:
+                item["Reason"] = (
+                    f"Finished goods status is {status or 'missing'}"
+                )
+            blocked.append(item)
+            continue
+        if max_w <= 0.0005 or max_p <= 0:
+            if on_this_list and (packed_w > 0 or packed_p > 0):
+                eligible.append(item)
+                continue
+            item["Reason"] = "No remaining finished goods for this heat"
             blocked.append(item)
             continue
         eligible.append(item)
@@ -5253,66 +5386,115 @@ def get_packing_list(packing_list_id: int) -> Optional[dict[str, Any]]:
         return None
     header["batches"] = fetch_all(
         """
-        SELECT Batch_ID AS "Batch_ID"
-        FROM Packing_list_batch
-        WHERE Packing_list_id = ?
-        ORDER BY Batch_ID
+        SELECT lb.Batch_ID AS "Batch_ID",
+               lb.Weight AS "Weight",
+               lb.Pieces AS "Pieces",
+               b.Heat_no AS "Heat_no"
+        FROM Packing_list_batch lb
+        LEFT JOIN Production_batch b ON b.Batch_ID = lb.Batch_ID
+        WHERE lb.Packing_list_id = ?
+        ORDER BY lb.Batch_ID
         """,
         (packing_list_id,),
     )
     return header
 
 
-def _dispatch_batches_on_conn(
-    conn: Connection, batch_ids: list[str], *, dispatch: bool
-) -> None:
-    if not batch_ids:
-        return
-    placeholders = ", ".join("?" for _ in batch_ids)
-    if dispatch:
+def _fg_bundle_on_conn(conn: Connection, batch_id: str) -> Optional[dict[str, Any]]:
+    row = (
         _exec(
             conn,
-            f"""
-            UPDATE Finished_Goods_Inventory
-            SET Finished_Goods_Status = ?
-            WHERE Batch_ID IN ({placeholders})
-              AND Finished_Goods_Status IN (?, ?)
+            """
+            SELECT Bundle_id AS "Bundle_id",
+                   Batch_ID AS "Batch_ID",
+                   Output_Weight AS "Output_Weight",
+                   Output_pieces AS "Output_pieces",
+                   Finished_Goods_Status AS "Finished_Goods_Status"
+            FROM Finished_Goods_Inventory
+            WHERE Batch_ID = ?
+            ORDER BY Bundle_id DESC
+            LIMIT 1
             """,
-            (
-                FG_STATUS_DISPATCHED,
-                *batch_ids,
-                FG_STATUS_AVAILABLE,
-                FG_STATUS_ASSIGNED,
-            ),
+            (batch_id,),
         )
-        return
-    other_verified = {
-        str(r["Batch_ID"])
-        for r in _exec(
+        .mappings()
+        .first()
+    )
+    return dict(row) if row else None
+
+
+def _apply_packing_lines_to_fg(
+    conn: Connection,
+    lines: list[dict[str, Any]],
+    *,
+    restore: bool,
+) -> None:
+    """Add packed qty back to FG (restore) or subtract it (dispatch)."""
+    sign = 1 if restore else -1
+    for line in lines:
+        bid = str(line.get("Batch_ID") or "").strip()
+        if not bid:
+            continue
+        delta_w = sign * float(line.get("Weight") or 0)
+        delta_p = sign * int(float(line.get("Pieces") or 0))
+        if abs(delta_w) <= 0.0005 and delta_p == 0:
+            continue
+        row = _fg_bundle_on_conn(conn, bid)
+        if not row:
+            raise ValueError(
+                f"No finished-goods inventory found for {bid}."
+            )
+        new_w = float(row.get("Output_Weight") or 0) + delta_w
+        new_p = int(float(row.get("Output_pieces") or 0)) + delta_p
+        if new_w < -0.0005 or new_p < 0:
+            on_hand_w = float(row.get("Output_Weight") or 0)
+            on_hand_p = int(float(row.get("Output_pieces") or 0))
+            raise ValueError(
+                f"{bid} only has {on_hand_w:g} kg and {on_hand_p} pieces "
+                "remaining in finished goods."
+            )
+        new_w = max(new_w, 0.0)
+        new_p = max(new_p, 0)
+        status = (
+            FG_STATUS_AVAILABLE
+            if new_w > 0.0005 and new_p > 0
+            else FG_STATUS_DISPATCHED
+        )
+        _exec(
             conn,
             """
-            SELECT lb.Batch_ID AS "Batch_ID"
-            FROM Packing_list_batch lb
-            JOIN Packing_list p ON p.Packing_list_id = lb.Packing_list_id
-            WHERE p.Packing_list_status = ?
+            UPDATE Finished_Goods_Inventory
+            SET Output_Weight = ?, Output_pieces = ?, Finished_Goods_Status = ?
+            WHERE Bundle_id = ?
             """,
-            (PACKING_STATUS_VERIFIED,),
-        ).mappings()
-    }
-    restore = [b for b in batch_ids if b not in other_verified]
-    if not restore:
-        return
-    rest_ph = ", ".join("?" for _ in restore)
-    _exec(
-        conn,
-        f"""
-        UPDATE Finished_Goods_Inventory
-        SET Finished_Goods_Status = ?
-        WHERE Batch_ID IN ({rest_ph})
-          AND Finished_Goods_Status = ?
-        """,
-        (FG_STATUS_AVAILABLE, *restore, FG_STATUS_DISPATCHED),
-    )
+            (new_w, new_p, status, row["Bundle_id"]),
+        )
+
+
+def _normalize_packing_lines(
+    batch_lines: Optional[list[dict[str, Any]]],
+    batch_ids: Optional[list[str]],
+) -> list[dict[str, Any]]:
+    raw = list(batch_lines or [])
+    if not raw and batch_ids:
+        raw = [{"Batch_ID": bid} for bid in batch_ids]
+    unique: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for line in raw:
+        bid = str((line or {}).get("Batch_ID") or "").strip()
+        if not bid or bid in seen:
+            continue
+        seen.add(bid)
+        weight = float(line.get("Weight") or 0)
+        pieces = _as_whole_pieces(line.get("Pieces"))
+        unique.append(
+            {
+                "Batch_ID": bid,
+                "Weight": weight,
+                "Pieces": pieces or 0,
+            }
+        )
+    return unique
 
 
 def save_packing_list(
@@ -5327,9 +5509,10 @@ def save_packing_list(
     colour_code: Optional[str],
     vehicle_no: Optional[str],
     packing_list_status: str,
-    batch_ids: list[str],
+    batch_lines: Optional[list[dict[str, Any]]] = None,
+    batch_ids: Optional[list[str]] = None,
 ) -> int:
-    """Create or update a packing list. Verified lists dispatch FG stock."""
+    """Create or update a packing list. Verified lists subtract packed qty from FG."""
     _ensure_packing_list_ready()
     status = (packing_list_status or "").strip()
     if status not in PACKING_LIST_STATUS:
@@ -5348,42 +5531,57 @@ def save_packing_list(
         raise ValueError(
             f"Alloy {aid} is not on purchase order {po_no}."
         )
-    unique_batches = []
-    seen: set[str] = set()
-    for bid in batch_ids:
-        text = str(bid or "").strip()
-        if not text or text in seen:
-            continue
-        seen.add(text)
-        unique_batches.append(text)
-    if status == PACKING_STATUS_VERIFIED and not unique_batches:
+    unique_lines = _normalize_packing_lines(batch_lines, batch_ids)
+    if status == PACKING_STATUS_VERIFIED and not unique_lines:
         raise ValueError("Select at least one batch_id before marking Verified.")
+    for line in unique_lines:
+        if float(line["Weight"] or 0) <= 0 or int(line["Pieces"] or 0) <= 0:
+            raise ValueError(
+                f"{line['Batch_ID']} needs a packed weight and piece count greater than zero."
+            )
 
     previous = get_packing_list(packing_list_id) if packing_list_id else None
     if packing_list_id and not previous:
         raise ValueError(f"Packing list {packing_list_id} was not found.")
-    previous_batches = [
-        str(r["Batch_ID"]) for r in (previous.get("batches") or [])
-    ] if previous else []
     previous_status = (previous or {}).get("Packing_list_status")
-    if status == PACKING_STATUS_VERIFIED:
-        for bid in unique_batches:
-            if bid in previous_batches and previous_status == PACKING_STATUS_VERIFIED:
-                continue
-            rows = list_finished_goods(batch_id=bid)
-            if not any(
-                (r.get("Finished_Goods_Status") or "") in FG_DISPATCHABLE_STATUSES
-                for r in rows
-            ):
-                raise ValueError(
-                    f"No Available finished goods for {bid}. "
-                    "Save product output on Batch Output first."
-                )
+    previous_lines = []
+    for row in (previous or {}).get("batches") or []:
+        previous_lines.append(
+            {
+                "Batch_ID": str(row["Batch_ID"]),
+                "Weight": float(row.get("Weight") or 0),
+                "Pieces": int(float(row.get("Pieces") or 0)),
+            }
+        )
     by_val, dt_val = audit_stamp()
 
     with get_connection() as conn:
+        if previous_status == PACKING_STATUS_VERIFIED:
+            _apply_packing_lines_to_fg(conn, previous_lines, restore=True)
+        for line in unique_lines:
+            row = _fg_bundle_on_conn(conn, line["Batch_ID"])
+            if not row:
+                raise ValueError(
+                    f"No finished-goods inventory found for {line['Batch_ID']}."
+                )
+            status_fg = row.get("Finished_Goods_Status") or ""
+            on_hand_w = (
+                float(row.get("Output_Weight") or 0)
+                if status_fg in FG_DISPATCHABLE_STATUSES
+                else 0.0
+            )
+            on_hand_p = (
+                int(float(row.get("Output_pieces") or 0))
+                if status_fg in FG_DISPATCHABLE_STATUSES
+                else 0
+            )
+            if line["Weight"] - on_hand_w > 0.0005 or line["Pieces"] > on_hand_p:
+                raise ValueError(
+                    f"{line['Batch_ID']} only has {on_hand_w:g} kg and "
+                    f"{on_hand_p} pieces remaining in finished goods."
+                )
         if packing_list_id:
-            result = _exec(
+            _exec(
                 conn,
                 """
                 UPDATE Packing_list SET
@@ -5442,24 +5640,18 @@ def save_packing_list(
             )
             row = result.first()
             pid = int(row[0])
-        for bid in unique_batches:
+        for line in unique_lines:
             _exec(
                 conn,
                 """
-                INSERT INTO Packing_list_batch (Packing_list_id, Batch_ID)
-                VALUES (?, ?)
+                INSERT INTO Packing_list_batch
+                    (Packing_list_id, Batch_ID, Weight, Pieces)
+                VALUES (?, ?, ?, ?)
                 """,
-                (pid, bid),
+                (pid, line["Batch_ID"], line["Weight"], line["Pieces"]),
             )
-        if previous_status == PACKING_STATUS_VERIFIED:
-            dropped = (
-                previous_batches
-                if status != PACKING_STATUS_VERIFIED
-                else [b for b in previous_batches if b not in unique_batches]
-            )
-            _dispatch_batches_on_conn(conn, dropped, dispatch=False)
         if status == PACKING_STATUS_VERIFIED:
-            _dispatch_batches_on_conn(conn, unique_batches, dispatch=True)
+            _apply_packing_lines_to_fg(conn, unique_lines, restore=False)
     return pid
 
 
