@@ -4207,9 +4207,256 @@ def require_completed_batch_for_output(batch_id: str) -> None:
 
 # ---------- Production batches ----------
 
-def make_batch_id(furnace: str, heat_no: str | int) -> str:
-    """Unique Batch ID = Furnace + Heat number (e.g. F3-H07)."""
-    return f"F{furnace}-H{int(heat_no):02d}"
+def _coerce_production_date(value: object) -> date:
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    text = str(value or "").strip()
+    if not text:
+        raise ValueError("Production date is required to create a batch ID.")
+    try:
+        return date.fromisoformat(text[:10])
+    except ValueError as exc:
+        raise ValueError(f"Invalid production date '{value}'.") from exc
+
+
+def _month_code_on_conn(conn: Connection, production_date: object) -> str:
+    """Look up Month_code.Code for the calendar month of production_date."""
+    day = _coerce_production_date(production_date)
+    month_name = day.strftime("%B")
+    row = _exec(
+        conn,
+        """
+        SELECT Code AS "Code"
+        FROM Month_code
+        WHERE LOWER(Month) = LOWER(?)
+        """,
+        (month_name,),
+    ).mappings().first()
+    code = (row or {}).get("Code") if row else None
+    if not code:
+        raise ValueError(
+            f"No month code is defined for {month_name}. "
+            "Add it under Data Browser → Month codes."
+        )
+    return str(code).strip().upper()
+
+
+def month_code_for_date(production_date: object) -> str:
+    """Look up Month_code.Code for the calendar month of production_date."""
+    with get_connection() as conn:
+        return _month_code_on_conn(conn, production_date)
+
+
+def _heat_no_prefix_on_conn(
+    conn: Connection, furnace: str, production_date: object
+) -> str:
+    """YY-furnace+month code, e.g. 26-1H for 27-Aug-2026 on furnace 1."""
+    day = _coerce_production_date(production_date)
+    yy = f"{day.year % 100:02d}"
+    furnace_part = str(furnace or "").strip()
+    if not furnace_part:
+        raise ValueError("Furnace is required to create a heat no.")
+    return f"{yy}-{furnace_part}{_month_code_on_conn(conn, day)}"
+
+
+def _next_heat_no_on_conn(
+    conn: Connection, furnace: str, production_date: object
+) -> str:
+    """Next YY-furnace+month-code+counter for this furnace and production month."""
+    prefix = _heat_no_prefix_on_conn(conn, furnace, production_date)
+    rows = _exec(
+        conn,
+        'SELECT Heat_no AS "Heat_no" FROM Production_batch WHERE Furnace = ?',
+        (str(furnace).strip(),),
+    ).mappings()
+    max_n = 0
+    for row in rows:
+        heat = str(row["Heat_no"] or "")
+        if not heat.startswith(prefix):
+            continue
+        suffix = heat[len(prefix) :]
+        if suffix.isdigit() and len(suffix) == 3:
+            max_n = max(max_n, int(suffix))
+    if max_n >= 999:
+        raise ValueError(f"All heat numbers for {prefix} are used (001–999).")
+    return f"{prefix}{max_n + 1:03d}"
+
+
+def preview_next_heat_no(furnace: str, production_date: object) -> str:
+    """Next Heat_no for this furnace and production month (not reserved until create)."""
+    with get_connection() as conn:
+        return _next_heat_no_on_conn(conn, furnace, production_date)
+
+
+def build_production_batch_id(
+    furnace: str,
+    production_date: object,
+    shift: str,
+    melt_no: object,
+) -> str:
+    """Deterministic ID: DDMMYY + furnace + shift + melt, e.g. 2708261A1."""
+    day = _coerce_production_date(production_date)
+    furnace_part = str(furnace or "").strip()
+    if not furnace_part:
+        raise ValueError("Furnace is required to create a batch ID.")
+    shift_part = str(shift or "").strip().upper()
+    if not shift_part:
+        raise ValueError("Shift is required to create a batch ID.")
+    if shift_part not in SHIFTS:
+        raise ValueError(f"Shift must be one of {SHIFTS}.")
+    try:
+        melt_part = str(int(melt_no))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Melt no is required to create a batch ID.") from exc
+    return f"{day.strftime('%d%m%y')}{furnace_part}{shift_part}{melt_part}"
+
+
+def _find_batch_id_for_identity_on_conn(
+    conn: Connection,
+    furnace: str,
+    production_date: object,
+    shift: str,
+    melt_no: object,
+    *,
+    exclude_batch_id: Optional[str] = None,
+) -> Optional[str]:
+    """Return an existing Batch_ID for date + furnace + shift + melt, if any."""
+    day = _coerce_production_date(production_date)
+    try:
+        melt_i = int(melt_no)
+    except (TypeError, ValueError):
+        return None
+    shift_part = str(shift or "").strip().upper()
+    rows = _exec(
+        conn,
+        """
+        SELECT Batch_ID AS "Batch_ID", Production_Date AS "Production_Date"
+        FROM Production_batch
+        WHERE Furnace = ?
+          AND UPPER(TRIM(CAST(Shift AS TEXT))) = ?
+          AND Melt_No = ?
+        """,
+        (str(furnace).strip(), shift_part, melt_i),
+    ).mappings()
+    skip = str(exclude_batch_id) if exclude_batch_id else None
+    for row in rows:
+        bid = str(row["Batch_ID"] or "")
+        if skip and bid == skip:
+            continue
+        raw_date = row.get("Production_Date")
+        if raw_date in (None, ""):
+            continue
+        try:
+            if _coerce_production_date(raw_date) == day:
+                return bid
+        except ValueError:
+            continue
+    return None
+
+
+def find_batch_id_for_identity(
+    furnace: str,
+    production_date: object,
+    shift: str,
+    melt_no: object,
+    *,
+    exclude_batch_id: Optional[str] = None,
+) -> Optional[str]:
+    """Existing Batch_ID for this date, furnace, shift, and melt no."""
+    with get_connection() as conn:
+        return _find_batch_id_for_identity_on_conn(
+            conn,
+            furnace,
+            production_date,
+            shift,
+            melt_no,
+            exclude_batch_id=exclude_batch_id,
+        )
+
+
+def _require_unique_production_batch_identity(
+    conn: Connection,
+    furnace: str,
+    production_date: object,
+    shift: str,
+    melt_no: object,
+    *,
+    exclude_batch_id: Optional[str] = None,
+) -> str:
+    """Build the ID and reject date+furnace+shift+melt combinations already in use."""
+    batch_id = build_production_batch_id(furnace, production_date, shift, melt_no)
+    existing = _find_batch_id_for_identity_on_conn(
+        conn,
+        furnace,
+        production_date,
+        shift,
+        melt_no,
+        exclude_batch_id=exclude_batch_id,
+    )
+    if existing:
+        day = _coerce_production_date(production_date)
+        raise ValueError(
+            f"A production batch already exists for furnace {str(furnace).strip()}, "
+            f"{day.strftime('%d-%b-%Y')}, shift {str(shift).strip().upper()}, "
+            f"melt {int(melt_no)} (Batch ID {existing}). "
+            "Open that batch instead of creating a duplicate."
+        )
+    if exclude_batch_id and str(exclude_batch_id) == batch_id:
+        return batch_id
+    taken = _exec(
+        conn,
+        'SELECT Batch_ID AS "Batch_ID" FROM Production_batch WHERE Batch_ID = ?',
+        (batch_id,),
+    ).mappings().first()
+    if taken and str(taken["Batch_ID"]) != str(exclude_batch_id or ""):
+        raise ValueError(
+            f"Batch ID {batch_id} is already in use. "
+            "Choose a different production date, furnace, shift, or melt no."
+        )
+    return batch_id
+
+
+def preview_next_production_batch_id(
+    furnace: str,
+    production_date: object,
+    shift: str,
+    melt_no: object,
+) -> str:
+    """ID that will be assigned for this date, furnace, shift, and melt no."""
+    return build_production_batch_id(furnace, production_date, shift, melt_no)
+
+
+def list_furnace_batches(furnace: str) -> list[dict[str, Any]]:
+    """Batch_ID and Heat_no for one furnace, newest production date first."""
+    return fetch_all(
+        """
+        SELECT Batch_ID AS "Batch_ID", Heat_no AS "Heat_no"
+        FROM Production_batch
+        WHERE Furnace = ?
+        ORDER BY Production_Date DESC, Batch_ID DESC
+        """,
+        (str(furnace),),
+    )
+
+
+def list_furnace_batch_ids(furnace: str) -> list[str]:
+    return [
+        str(r["Batch_ID"])
+        for r in list_furnace_batches(furnace)
+        if r.get("Batch_ID")
+    ]
+
+
+def make_batch_id(
+    furnace: str,
+    production_date: object,
+    shift: str,
+    melt_no: object,
+) -> str:
+    """Preview the unique production batch ID for date + furnace + shift + melt."""
+    return build_production_batch_id(furnace, production_date, shift, melt_no)
 
 
 def _insert_charge_lines(conn: Connection, batch_id: str, inputs: list[dict[str, Any]]) -> None:
@@ -4309,7 +4556,6 @@ def _validate_batch_samples_and_supervisor(
 
 def create_batch(
     furnace: str,
-    heat_no: str | int,
     alloy_id: Optional[int],
     production_date: str,
     shift: str,
@@ -4332,15 +4578,9 @@ def create_batch(
     middle_sample_datetime: Optional[str] = None,
     bottom_sample_datetime: Optional[str] = None,
     production_supervisor: Optional[str] = None,
+    heat_no: Optional[str | int] = None,
 ) -> str:
-    batch_id = make_batch_id(furnace, heat_no)
-    existing = fetch_one(
-        'SELECT Batch_ID AS "Batch_ID" FROM Production_batch WHERE Batch_ID = ?',
-        (batch_id,),
-    )
-    if existing:
-        raise ValueError(f"Batch ID {batch_id} already exists. Choose another Heat No.")
-
+    batch_id = None
     _validate_batch_samples_and_supervisor(
         top_sample,
         middle_sample,
@@ -4352,6 +4592,11 @@ def create_batch(
     crucible_no = require_available_crucible(furnace)
 
     with get_connection() as conn:
+        batch_id = _require_unique_production_batch_identity(
+            conn, furnace, production_date, shift, melt_no
+        )
+        generated_heat = _next_heat_no_on_conn(conn, furnace, production_date)
+        heat_no = str(heat_no).strip() if heat_no not in (None, "") else generated_heat
         _exec(
             conn,
             """
@@ -4448,6 +4693,14 @@ def update_production_batch_input(
     )
 
     with get_connection() as conn:
+        _require_unique_production_batch_identity(
+            conn,
+            batch.get("Furnace") or "",
+            production_date,
+            shift,
+            melt_no,
+            exclude_batch_id=batch_id,
+        )
         _exec(
             conn,
             """

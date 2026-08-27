@@ -308,14 +308,10 @@ def empty_percent_input(
     allow_zero: bool = False,
 ) -> float | None:
     """Number input that starts blank instead of 0.00."""
-    if key in st.session_state:
-        if st.session_state[key] in (0, 0.0) and not allow_zero:
-            st.session_state[key] = None
-    else:
+    if key not in st.session_state:
         st.session_state[key] = _optional_percent(default, allow_zero=allow_zero)
     kwargs: dict[str, object] = {
         "min_value": min_value,
-        "value": None,
         "step": step,
         "key": key,
         "help": help,
@@ -338,21 +334,16 @@ def empty_int_input(
     disabled: bool = False,
 ) -> int | None:
     """Whole-number input that starts blank instead of 0."""
-    if key in st.session_state:
-        raw = st.session_state[key]
-        if raw in (0, 0.0):
-            st.session_state[key] = None
-        elif raw is not None:
-            try:
-                st.session_state[key] = int(raw)
-            except (TypeError, ValueError):
-                st.session_state[key] = None
-    else:
+    if key not in st.session_state:
         st.session_state[key] = _optional_int(default)
+    elif st.session_state[key] not in (None, ""):
+        try:
+            st.session_state[key] = int(st.session_state[key])
+        except (TypeError, ValueError):
+            st.session_state[key] = None
     return st.number_input(
         label,
         min_value=0,
-        value=None,
         step=1,
         format="%d",
         key=key,
@@ -961,6 +952,14 @@ def _furnace_key_prefix(furnace: str) -> str:
     return _furnace_form_key(furnace, "")
 
 
+def _production_batch_option_label(batch_id: object, heat_no: object) -> str:
+    bid = str(batch_id or "").strip()
+    heat = str(heat_no or "").strip()
+    if bid and heat:
+        return f"{bid} - {heat}"
+    return bid
+
+
 def _is_ephemeral_widget_key(key: object) -> bool:
     """True for widgets Streamlit forbids assigning via st.session_state."""
     if not isinstance(key, str):
@@ -974,6 +973,7 @@ def _is_ephemeral_widget_key(key: object) -> bool:
             "_add_charge",
             "_rem_charge",
             "_save_batch",
+            "_create_batch",
             "_complete_batch",
             "_open_all_elements",
         )
@@ -1069,18 +1069,13 @@ def _hydrate_production_batch_form(
     furnace: str,
     batch: dict | None,
     *,
-    heat_no: object,
     alloy_labels: dict[str, object],
     sample_blank: str,
 ) -> None:
-    """Load a saved batch into furnace-scoped widgets when the heat changes."""
+    """Load a saved batch into furnace-scoped widgets when the working batch changes."""
     pk = lambda name: _furnace_form_key(furnace, name)
     loaded_key = pk("_hydrated_batch_id")
-    token = (
-        str(batch["Batch_ID"])
-        if batch
-        else f"new:{furnace}:{heat_no}"
-    )
+    token = str(batch["Batch_ID"]) if batch else f"new:{furnace}"
     if st.session_state.get(loaded_key) == token:
         return
     st.session_state[loaded_key] = token
@@ -1874,11 +1869,18 @@ elif PAGE == "Furnace Oil Purchase":
 elif PAGE == "Production Batch & Chemistry":
     st.title("Production Batch & Chemistry Input")
     st.caption(
-        "Choose a furnace first, then enter alloy, samples, charge lines, and chemistry "
-        "for that furnace only. Switching furnace keeps this draft and opens a separate "
-        "form — it does not remap entries to the other furnace. "
-        "Batch ID is **F{Furnace}-H{Heat}** (e.g. Furnace 3 + Heat 7 → `F3-H07`). "
-        "Mark the heat **Completed** here after degassing, samples, K Mold, chemistry, "
+        "Choose a furnace first, then enter header details and charge lines. "
+        "Click **Save and create production batch** to store the heat as **In-Progress**. "
+        "Degassing, samples, and chemistry unlock only after that. "
+        "Switching furnace keeps this draft and opens a separate form — it does not "
+        "remap entries to the other furnace. "
+        "Batch ID is **DDMMYY + furnace + shift + melt no** from the production date "
+        "(e.g. 27-Aug-2026, furnace 1, shift A, melt 1 → `2708261A1`). "
+        "The same date, furnace, shift, and melt no cannot be used twice. "
+        "Heat no is assigned by the system as **YY-furnace + month code + 3-digit "
+        "counter** (e.g. 27-Aug-2026 on furnace 1 → `26-1H001`; September → `26-1K001`). "
+        "The counter is unique per furnace and resets to `001` each month. "
+        "Mark the heat **Completed** after degassing, samples, K Mold, chemistry, "
         "and at least one charge line. **Batch Output** can be entered only after that. "
         "A Completed heat is locked; only Admin can unlock it to correct history. "
         "Browse existing batches under **Production Batches**."
@@ -1937,13 +1939,63 @@ elif PAGE == "Production Batch & Chemistry":
         )
 
         sample_blank = "— not set —"
-        heat_no = st.selectbox("Heat no *", db.HEAT_NOS, key=_pk("heat_no"))
-        preview_id = db.make_batch_id(furnace, heat_no)
-        existing_batch = db.get_batch(preview_id)
+        NEW_BATCH = "New production batch"
+        furnace_rows = db.list_furnace_batches(furnace)
+        label_to_batch_id: dict[str, str | None] = {NEW_BATCH: None}
+        work_opts = [NEW_BATCH]
+        for row in furnace_rows:
+            bid = str(row.get("Batch_ID") or "").strip()
+            if not bid:
+                continue
+            label = _production_batch_option_label(bid, row.get("Heat_no"))
+            label_to_batch_id[label] = bid
+            work_opts.append(label)
+        wb_key = _pk("working_batch")
+        pending_batch = st.session_state.pop("_pb_select_batch", None)
+        if pending_batch:
+            pending_id = str(pending_batch)
+            pending_label = next(
+                (lbl for lbl, bid in label_to_batch_id.items() if bid == pending_id),
+                None,
+            )
+            if pending_label is None:
+                created = db.get_batch(pending_id)
+                pending_label = _production_batch_option_label(
+                    pending_id, (created or {}).get("Heat_no")
+                )
+                if pending_label not in work_opts:
+                    work_opts.append(pending_label)
+                    label_to_batch_id[pending_label] = pending_id
+            st.session_state[wb_key] = pending_label
+        current_choice = st.session_state.get(wb_key)
+        if current_choice not in work_opts:
+            mapped = next(
+                (
+                    lbl
+                    for lbl, bid in label_to_batch_id.items()
+                    if bid == current_choice
+                ),
+                NEW_BATCH,
+            )
+            st.session_state[wb_key] = mapped
+        working_label = st.selectbox(
+            "Production batch",
+            options=work_opts,
+            key=wb_key,
+            help=(
+                "Start a new heat, or pick an existing heat shown as "
+                "Batch ID - Heat no (e.g. 2708261A9 - 26-1H001)."
+            ),
+        )
+        working_batch_id = label_to_batch_id.get(working_label)
+        existing_batch = (
+            None
+            if working_label == NEW_BATCH or not working_batch_id
+            else db.get_batch(working_batch_id)
+        )
         _hydrate_production_batch_form(
             furnace,
             existing_batch,
-            heat_no=heat_no,
             alloy_labels=alloy_labels,
             sample_blank=sample_blank,
         )
@@ -1953,34 +2005,11 @@ elif PAGE == "Production Batch & Chemistry":
             and existing_batch.get("Production_status") == db.BATCH_STATUS_COMPLETED
         )
         is_admin = db.is_admin_user()
-        unlock_key = f"pb_unlock_{preview_id}"
-        status_col, unlock_col = st.columns([2, 2])
-        with status_col:
-            if existing_batch:
-                st.markdown(
-                    f"**Batch ID:** `{preview_id}` &nbsp;|&nbsp; "
-                    f"**Status:** `{existing_batch.get('Production_status')}`"
-                )
-            else:
-                st.markdown(
-                    f"**Batch ID:** `{preview_id}` &nbsp;|&nbsp; "
-                    "**Status:** new (will save as In-Progress)"
-                )
-        with unlock_col:
-            if is_completed and is_admin:
-                st.checkbox(
-                    "Correct history (unlock this completed batch)",
-                    key=unlock_key,
-                    help=(
-                        "Admin only. Check this to edit a Completed heat. "
-                        "Save writes a history correction; status stays Completed."
-                    ),
-                )
-            elif is_completed:
-                st.info(
-                    "This heat is Completed and locked. Ask an Admin to unlock "
-                    "it if history needs correction."
-                )
+        unlock_key = (
+            f"pb_unlock_{existing_batch['Batch_ID']}"
+            if existing_batch
+            else _pk("unlock_new")
+        )
         locked = bool(is_completed) and not (
             is_admin and st.session_state.get(unlock_key)
         )
@@ -2003,19 +2032,72 @@ elif PAGE == "Production Batch & Chemistry":
                     st.error(
                         "No crucible available for the respective furnace."
                     )
-            melt_no = st.selectbox(
-                "Melt no", db.MELT_NOS, key=_pk("melt_no"), disabled=locked
-            )
+            if existing_batch:
+                saved_melt = existing_batch.get("Melt_No")
+                try:
+                    melt_no = int(saved_melt)
+                except (TypeError, ValueError):
+                    melt_no = saved_melt
+                st.markdown("**Melt no**")
+                st.info(str(melt_no if melt_no not in (None, "") else "—"))
+                st.caption("Taken from this heat’s Batch ID. It cannot be changed after create.")
+            else:
+                melt_no = st.selectbox(
+                    "Melt no",
+                    db.MELT_NOS,
+                    key=_pk("melt_no"),
+                    disabled=locked,
+                    help=(
+                        "Part of Batch ID together with production date, furnace, "
+                        "and shift. Example: 27-Aug-2026, furnace 1, shift A, "
+                        "melt 9 → 2708261A9."
+                    ),
+                )
         with col2:
-            prod_date = ui_date_input(
-                "Production date",
-                value=date.today(),
-                key=_pk("prod_date"),
-                disabled=locked,
-            )
-            shift = st.selectbox(
-                "Shift", db.SHIFTS, key=_pk("shift"), disabled=locked
-            )
+            if existing_batch:
+                parsed_date = parse_any_date(existing_batch.get("Production_Date"))
+                if isinstance(parsed_date, datetime):
+                    prod_date = parsed_date.date()
+                elif isinstance(parsed_date, date):
+                    prod_date = parsed_date
+                else:
+                    prod_date = date.today()
+                st.markdown("**Production date**")
+                st.info(
+                    format_ui_date(existing_batch.get("Production_Date")) or "—"
+                )
+                st.caption(
+                    "Taken from this heat’s Batch ID. It cannot be changed after create."
+                )
+                shift = str(existing_batch.get("Shift") or "").strip().upper()
+                if shift not in db.SHIFTS:
+                    shift = db.SHIFTS[0]
+                st.markdown("**Shift**")
+                st.info(shift)
+                st.caption(
+                    "Taken from this heat’s Batch ID. It cannot be changed after create."
+                )
+            else:
+                prod_date = ui_date_input(
+                    "Production date",
+                    value=date.today(),
+                    key=_pk("prod_date"),
+                    disabled=locked,
+                    help=(
+                        "Year and month of this date set Heat no "
+                        "(e.g. Aug 2026 on furnace 1 → 26-1H001)."
+                    ),
+                )
+                shift = st.selectbox(
+                    "Shift",
+                    db.SHIFTS,
+                    key=_pk("shift"),
+                    disabled=locked,
+                    help=(
+                        "Part of Batch ID together with production date, furnace, "
+                        "and melt no."
+                    ),
+                )
             melting_team = st.selectbox(
                 "Melter name *", melters, key=_pk("melter"), disabled=locked
             )
@@ -2038,122 +2120,80 @@ elif PAGE == "Production Batch & Chemistry":
 
         alloy_id = None if alloy_label == "— none —" else alloy_labels[alloy_label]
 
-        st.markdown("#### Degassing & piece counts")
-        d1, d2, d3, d4 = st.columns(4)
-        with d1:
-            degassing_time = st.text_input(
-                "Degassing time",
-                placeholder="e.g. 14:30 or 12 min",
-                key=_pk("degassing_time"),
-                disabled=locked,
-            )
-        with d2:
-            sampled_pcs = empty_percent_input(
-                "Sampled pcs",
-                key=_pk("sampled_pcs"),
-                max_value=None,
-                step=1.0,
-                disabled=locked,
-            )
-        with d3:
-            defect_pcs = empty_percent_input(
-                "Defect pcs",
-                key=_pk("defect_pcs"),
-                max_value=None,
-                step=1.0,
-                allow_zero=True,
-                disabled=locked,
-            )
-        with d4:
-            st.caption("K Mold Value = Defect pcs / Sampled pcs")
-            if sampled_pcs and sampled_pcs > 0 and defect_pcs is not None:
-                k_mold = float(defect_pcs) / float(sampled_pcs)
-                css = "yield-bad" if k_mold > db.K_MOLD_MAX else "yield-ok"
+        preview_error = None
+        duplicate_id = None
+        heat_no_preview = ""
+        if existing_batch:
+            preview_id = str(existing_batch["Batch_ID"])
+            heat_no_preview = str(existing_batch.get("Heat_no") or "")
+        else:
+            try:
+                preview_id = db.build_production_batch_id(
+                    furnace, prod_date, shift, melt_no
+                )
+                duplicate_id = db.find_batch_id_for_identity(
+                    furnace, prod_date, shift, melt_no
+                )
+                if duplicate_id:
+                    preview_error = (
+                        f"A production batch already exists for this date, furnace, "
+                        f"shift, and melt no (Batch ID {duplicate_id}). "
+                        "Open that batch instead of creating a duplicate."
+                    )
+            except Exception as exc:
+                preview_id = ""
+                preview_error = str(exc)
+            try:
+                heat_no_preview = db.preview_next_heat_no(furnace, prod_date)
+            except Exception as exc:
+                heat_no_preview = ""
+                if preview_error:
+                    preview_error = f"{preview_error} {exc}"
+                else:
+                    preview_error = str(exc)
+
+        heat_no_label = heat_no_preview or "—"
+        status_col, unlock_col = st.columns([2, 2])
+        with status_col:
+            if existing_batch:
+                status = (
+                    existing_batch.get("Production_status")
+                    or db.BATCH_STATUS_IN_PROGRESS
+                )
                 st.markdown(
-                    f'<p class="{css}">K Mold Value<br>{k_mold:.3f}</p>',
-                    unsafe_allow_html=True,
+                    f"**Batch ID:** `{preview_id}` &nbsp;|&nbsp; "
+                    f"**Heat no:** `{heat_no_label}` &nbsp;|&nbsp; "
+                    f"**Production status:** `{status}`"
+                )
+            elif preview_id:
+                st.markdown(
+                    f"**Batch ID:** `{preview_id}` &nbsp;|&nbsp; "
+                    f"**Heat no:** `{heat_no_label}` &nbsp;|&nbsp; "
+                    "**Production status:** not created yet"
                 )
             else:
                 st.markdown(
-                    '<p class="yield-ok">K Mold Value<br>—</p>',
-                    unsafe_allow_html=True,
+                    f"**Batch ID:** — &nbsp;|&nbsp; "
+                    f"**Heat no:** `{heat_no_label}` &nbsp;|&nbsp; "
+                    "**Production status:** not created yet"
                 )
-
-        st.markdown("#### Sample results")
-        sample_opts = [sample_blank] + db.SAMPLE_OK_STATUS
-        s1, s2, s3, s4 = st.columns(4)
-        with s1:
-            top_sample = st.selectbox(
-                "Top sample", sample_opts, key=_pk("top_sample"), disabled=locked
-            )
-        with s2:
-            middle_sample = st.selectbox(
-                "Middle sample",
-                sample_opts,
-                key=_pk("middle_sample"),
-                disabled=locked,
-            )
-        with s3:
-            bottom_sample = st.selectbox(
-                "Bottom sample",
-                sample_opts,
-                key=_pk("bottom_sample"),
-                disabled=locked,
-            )
-        with s4:
-            vacum_sample = st.selectbox(
-                "Vacum sample",
-                sample_opts,
-                key=_pk("vacum_sample"),
-                disabled=locked,
-            )
-
-        r1, r2, r3, r4 = st.columns(4)
-        with r1:
-            top_sample_remarks = st.text_input(
-                "Remarks", key=_pk("top_sample_remarks"), disabled=locked
-            )
-        with r2:
-            middle_sample_remarks = st.text_input(
-                "Remarks", key=_pk("middle_sample_remarks"), disabled=locked
-            )
-        with r3:
-            bottom_sample_remarks = st.text_input(
-                "Remarks", key=_pk("bottom_sample_remarks"), disabled=locked
-            )
-        with r4:
-            st.empty()
-
-        d1, d2, d3, d4 = st.columns(4)
-        with d1:
-            top_sample_dt = ui_datetime_input(
-                "Datetime",
-                value=None,
-                step=60,
-                key=_pk("top_sample_dt"),
-                help="Open the calendar icon to pick date and time.",
-                disabled=locked,
-            )
-        with d2:
-            middle_sample_dt = ui_datetime_input(
-                "Datetime",
-                value=None,
-                step=60,
-                key=_pk("middle_sample_dt"),
-                help="Open the calendar icon to pick date and time.",
-                disabled=locked,
-            )
-        with d3:
-            bottom_sample_dt = ui_datetime_input(
-                "Datetime",
-                value=None,
-                step=60,
-                key=_pk("bottom_sample_dt"),
-                help="Open the calendar icon to pick date and time.",
-                disabled=locked,
-            )
-        with d4:
-            st.empty()
+        with unlock_col:
+            if is_completed and is_admin:
+                st.checkbox(
+                    "Correct history (unlock this completed batch)",
+                    key=unlock_key,
+                    help=(
+                        "Admin only. Check this to edit a Completed heat. "
+                        "Save writes a history correction; status stays Completed."
+                    ),
+                )
+            elif is_completed:
+                st.info(
+                    "This heat is Completed and locked. Ask an Admin to unlock "
+                    "it if history needs correction."
+                )
+        if preview_error:
+            st.error(preview_error)
 
         st.markdown("#### Charge / raw material inputs")
         st.caption(
@@ -2369,7 +2409,8 @@ elif PAGE == "Production Batch & Chemistry":
             scale_val = float(scale_w or 0)
             net_w = max(scale_val - tare_w, 0.0) if trolley_name and scale_val > 0 else 0.0
             net_key = _pk(f"wt_{idx}")
-            st.session_state[net_key] = float(net_w)
+            if st.session_state.get(net_key) != float(net_w):
+                st.session_state[net_key] = float(net_w)
             with r2c3:
                 st.number_input(
                     "Net weight (kg)",
@@ -2432,6 +2473,11 @@ elif PAGE == "Production Batch & Chemistry":
                     }
                 )
 
+        pending_charges_key = _pk("pending_charges")
+        if charge_inputs:
+            st.session_state[pending_charges_key] = charge_inputs
+        saved_pending_charges = st.session_state.get(pending_charges_key) or []
+
         add_col, rem_col, _ = st.columns([1, 1, 4])
         if add_col.button(
             "Add charge line", key=_pk("add_charge"), disabled=locked
@@ -2446,13 +2492,224 @@ elif PAGE == "Production Batch & Chemistry":
             drafts[furnace].pop()
             st.rerun()
 
+        display_charges = charge_inputs or saved_pending_charges
         saved_in = sum(float(c.get("Weight") or 0) for c in saved_charges)
-        extra_in = sum(c["Weight"] for c in charge_inputs)
+        extra_in = sum(float(c.get("Weight") or 0) for c in display_charges)
         total_in = saved_in + extra_in
-        total_lines = len(saved_charges) + len(charge_inputs)
+        total_lines = len(saved_charges) + len(display_charges)
         st.info(
             f"Total net input weight: **{total_in:,.2f} kg** across {total_lines} charge line(s)."
         )
+
+        if not existing_batch:
+            st.caption(
+                "Create the heat to unlock degassing, samples, and chemistry. "
+                "The batch is saved as **In-Progress**."
+            )
+            create_clicked = st.button(
+                "Save and create production batch",
+                type="primary",
+                disabled=available_crucible is None,
+                key=_pk("create_batch"),
+                help=(
+                    "Stores furnace, production date, shift, melt, alloy, and charge "
+                    "lines. Assigns Batch ID (DDMMYY + furnace + shift + melt) and "
+                    "Heat no (YY-furnace + month code + counter), then sets "
+                    "Production_status to In-Progress."
+                ),
+            )
+            if available_crucible is None:
+                st.error("No crucible available for the respective furnace.")
+            elif not charge_inputs and not saved_pending_charges:
+                st.caption("Add at least one charge line with net weight > 0.")
+            if create_clicked:
+                try:
+                    if available_crucible is None:
+                        raise ValueError(
+                            "No crucible available for the respective furnace."
+                        )
+                    inputs_to_save = charge_inputs or list(saved_pending_charges)
+                    if not inputs_to_save:
+                        raise ValueError(
+                            "Add at least one charge line with net weight > 0. "
+                            "Select raw material, lot, and trolley, and enter a "
+                            "weighment scale weight greater than the trolley tare."
+                        )
+                    if not preview_id:
+                        raise ValueError(
+                            preview_error or "Batch ID could not be generated."
+                        )
+                    if not heat_no_preview:
+                        raise ValueError(
+                            preview_error or "Heat no could not be generated."
+                        )
+                    if duplicate_id:
+                        raise ValueError(
+                            f"A production batch already exists for this date, "
+                            f"furnace, shift, and melt no (Batch ID {duplicate_id}). "
+                            "Open that batch instead of creating a duplicate."
+                        )
+                    bid = db.create_batch(
+                        furnace=furnace,
+                        alloy_id=alloy_id,
+                        production_date=prod_date.isoformat(),
+                        shift=shift,
+                        melt_no=melt_no,
+                        melting_team=melting_team,
+                        notes=notes.strip(),
+                        inputs=inputs_to_save,
+                        composition={},
+                        production_supervisor=production_supervisor,
+                    )
+                    drafts[furnace] = [
+                        {"material": "", "lot_id": None, "weight": 0.0, "notes": ""}
+                    ]
+                    st.session_state.pop(pending_charges_key, None)
+                    st.session_state.pop(_pk("_hydrated_batch_id"), None)
+                    st.session_state["_pb_select_batch"] = bid
+                    created = db.get_batch(bid) or {}
+                    created_heat = created.get("Heat_no") or heat_no_preview
+                    st.session_state["_pb_flash"] = (
+                        f"Created batch **{bid}** with heat no **{created_heat}**. "
+                        f"**Production status:** **{db.BATCH_STATUS_IN_PROGRESS}**. "
+                        "Enter degassing, samples, and chemistry below."
+                    )
+                    st.rerun()
+                except Exception as exc:
+                    st.error(str(exc))
+        else:
+            created_status = (
+                existing_batch.get("Production_status") or db.BATCH_STATUS_IN_PROGRESS
+            )
+            st.success(
+                f"**Batch ID:** `{preview_id}`  ·  "
+                f"**Heat no:** `{heat_no_label}`  ·  "
+                f"**Production status:** `{created_status}`"
+            )
+
+        later_locked = locked or existing_batch is None
+        if later_locked and not existing_batch:
+            st.info(
+                "Degassing, samples, and chemistry stay locked until you "
+                "**Save and create production batch**."
+            )
+
+        st.markdown("#### Degassing & piece counts")
+        d1, d2, d3, d4 = st.columns(4)
+        with d1:
+            degassing_time = st.text_input(
+                "Degassing time",
+                placeholder="e.g. 14:30 or 12 min",
+                key=_pk("degassing_time"),
+                disabled=later_locked,
+            )
+        with d2:
+            sampled_pcs = empty_percent_input(
+                "Sampled pcs",
+                key=_pk("sampled_pcs"),
+                max_value=None,
+                step=1.0,
+                disabled=later_locked,
+            )
+        with d3:
+            defect_pcs = empty_percent_input(
+                "Defect pcs",
+                key=_pk("defect_pcs"),
+                max_value=None,
+                step=1.0,
+                allow_zero=True,
+                disabled=later_locked,
+            )
+        with d4:
+            st.caption("K Mold Value = Defect pcs / Sampled pcs")
+            if sampled_pcs and sampled_pcs > 0 and defect_pcs is not None:
+                k_mold = float(defect_pcs) / float(sampled_pcs)
+                css = "yield-bad" if k_mold > db.K_MOLD_MAX else "yield-ok"
+                st.markdown(
+                    f'<p class="{css}">K Mold Value<br>{k_mold:.3f}</p>',
+                    unsafe_allow_html=True,
+                )
+            else:
+                st.markdown(
+                    '<p class="yield-ok">K Mold Value<br>—</p>',
+                    unsafe_allow_html=True,
+                )
+
+        st.markdown("#### Sample results")
+        sample_opts = [sample_blank] + db.SAMPLE_OK_STATUS
+        s1, s2, s3, s4 = st.columns(4)
+        with s1:
+            top_sample = st.selectbox(
+                "Top sample", sample_opts, key=_pk("top_sample"), disabled=later_locked
+            )
+        with s2:
+            middle_sample = st.selectbox(
+                "Middle sample",
+                sample_opts,
+                key=_pk("middle_sample"),
+                disabled=later_locked,
+            )
+        with s3:
+            bottom_sample = st.selectbox(
+                "Bottom sample",
+                sample_opts,
+                key=_pk("bottom_sample"),
+                disabled=later_locked,
+            )
+        with s4:
+            vacum_sample = st.selectbox(
+                "Vacum sample",
+                sample_opts,
+                key=_pk("vacum_sample"),
+                disabled=later_locked,
+            )
+
+        r1, r2, r3, r4 = st.columns(4)
+        with r1:
+            top_sample_remarks = st.text_input(
+                "Remarks", key=_pk("top_sample_remarks"), disabled=later_locked
+            )
+        with r2:
+            middle_sample_remarks = st.text_input(
+                "Remarks", key=_pk("middle_sample_remarks"), disabled=later_locked
+            )
+        with r3:
+            bottom_sample_remarks = st.text_input(
+                "Remarks", key=_pk("bottom_sample_remarks"), disabled=later_locked
+            )
+        with r4:
+            st.empty()
+
+        d1, d2, d3, d4 = st.columns(4)
+        with d1:
+            top_sample_dt = ui_datetime_input(
+                "Datetime",
+                value=None,
+                step=60,
+                key=_pk("top_sample_dt"),
+                help="Open the calendar icon to pick date and time.",
+                disabled=later_locked,
+            )
+        with d2:
+            middle_sample_dt = ui_datetime_input(
+                "Datetime",
+                value=None,
+                step=60,
+                key=_pk("middle_sample_dt"),
+                help="Open the calendar icon to pick date and time.",
+                disabled=later_locked,
+            )
+        with d3:
+            bottom_sample_dt = ui_datetime_input(
+                "Datetime",
+                value=None,
+                step=60,
+                key=_pk("bottom_sample_dt"),
+                help="Open the calendar icon to pick date and time.",
+                disabled=later_locked,
+            )
+        with d4:
+            st.empty()
 
         st.markdown("#### Batch chemistry (ladle / spectrometer)")
         st.caption(
@@ -2480,7 +2737,7 @@ elif PAGE == "Production Batch & Chemistry":
                 key=_pk("open_all_elements"),
                 help="Enter chemistry for every row in Element_Master",
                 use_container_width=True,
-                disabled=locked,
+                disabled=later_locked,
             ):
                 dialog_all_element_percentages(
                     full_chem_key,
@@ -2555,7 +2812,7 @@ elif PAGE == "Production Batch & Chemistry":
                         step=CHEM_PERCENT_STEP,
                         format=CHEM_PERCENT_FORMAT,
                         help=el["Element_Name"],
-                        disabled=locked,
+                        disabled=later_locked,
                     )
                 entered = float(batch_chem[sym] or 0.0)
                 bad = _spec_out_of_range(entered, spec)
@@ -2609,7 +2866,7 @@ elif PAGE == "Production Batch & Chemistry":
             chemistry_count=len(composition),
             charge_line_count=len(saved_charges) + len(charge_inputs),
         )
-        if not is_completed:
+        if existing_batch and not is_completed:
             if completion_gaps:
                 st.warning(
                     "Required before **Completed**: " + "; ".join(completion_gaps)
@@ -2659,27 +2916,19 @@ elif PAGE == "Production Batch & Chemistry":
             )
 
         def _save_chemistry_page(*, mark_completed: bool) -> str:
-            if existing_batch:
-                db.update_production_batch_input(
-                    preview_id,
-                    extra_inputs=charge_inputs,
-                    allow_completed=bool(
-                        is_completed and is_admin and st.session_state.get(unlock_key)
-                    ),
-                    **_batch_kwargs(),
+            if not existing_batch:
+                raise ValueError(
+                    "Create the production batch before saving degassing, samples, or chemistry."
                 )
-                bid = preview_id
-            else:
-                if available_crucible is None:
-                    raise ValueError("No crucible available for the respective furnace.")
-                if not charge_inputs:
-                    raise ValueError("Add at least one charge line with weight > 0.")
-                bid = db.create_batch(
-                    furnace=furnace,
-                    heat_no=heat_no,
-                    inputs=charge_inputs,
-                    **_batch_kwargs(),
-                )
+            db.update_production_batch_input(
+                preview_id,
+                extra_inputs=charge_inputs,
+                allow_completed=bool(
+                    is_completed and is_admin and st.session_state.get(unlock_key)
+                ),
+                **_batch_kwargs(),
+            )
+            bid = preview_id
             if mark_completed:
                 db.complete_production_batch(bid)
             drafts[furnace] = [
@@ -2689,69 +2938,62 @@ elif PAGE == "Production Batch & Chemistry":
             st.session_state.pop(_pk("_hydrated_batch_id"), None)
             return bid
 
-        b1, b2, _ = st.columns([1.4, 1.4, 2])
-        save_clicked = b1.button(
-            (
-                "Save history correction"
-                if is_completed
-                else ("Save changes" if existing_batch else "Create production batch")
-            ),
-            type="primary" if is_completed or not existing_batch else "secondary",
-            disabled=locked or (available_crucible is None and not existing_batch),
-            key=_pk("save_batch"),
-        )
-        complete_clicked = b2.button(
-            "Mark as Completed",
-            type="primary",
-            disabled=locked or is_completed or bool(completion_gaps),
-            key=_pk("complete_batch"),
-            help=(
-                "Requires degassing time, sampled/defect pcs, K Mold ≤ "
-                f"{db.K_MOLD_MAX:g}, top/middle/bottom samples and datetimes, "
-                "vacum sample, batch chemistry, and at least one charge line."
-            ),
-        )
-        if not is_completed and completion_gaps:
-            st.caption(
-                "**Mark as Completed** stays disabled until: "
-                + "; ".join(completion_gaps)
+        if existing_batch:
+            b1, b2, _ = st.columns([1.4, 1.4, 2])
+            save_clicked = b1.button(
+                "Save history correction" if is_completed else "Save changes",
+                type="primary" if is_completed else "secondary",
+                disabled=locked,
+                key=_pk("save_batch"),
             )
-        if save_clicked:
-            try:
-                bid = _save_chemistry_page(mark_completed=False)
-                if is_completed:
-                    st.session_state["_pb_flash"] = (
-                        f"Saved history correction for **{bid}**."
-                    )
-                elif existing_batch:
-                    st.session_state["_pb_flash"] = (
-                        f"Saved **{bid}**. Mark Completed when the checklist is done, "
-                        "then enter **Batch Output**."
-                    )
-                else:
-                    st.session_state["_pb_flash"] = (
-                        f"Created batch **{bid}** — Heat {heat_no}, Furnace {furnace}. "
-                        "Mark Completed when the checklist is done, then enter **Batch Output**."
-                    )
-                st.rerun()
-            except Exception as exc:
-                st.error(str(exc))
-        if complete_clicked:
-            if completion_gaps:
-                st.error(
-                    "Cannot mark Completed until these are entered: "
+            complete_clicked = b2.button(
+                "Mark as Completed",
+                type="primary",
+                disabled=locked or is_completed or bool(completion_gaps),
+                key=_pk("complete_batch"),
+                help=(
+                    "Requires degassing time, sampled/defect pcs, K Mold ≤ "
+                    f"{db.K_MOLD_MAX:g}, top/middle/bottom samples and datetimes, "
+                    "vacum sample, batch chemistry, and at least one charge line."
+                ),
+            )
+            if not is_completed and completion_gaps:
+                st.caption(
+                    "**Mark as Completed** stays disabled until: "
                     + "; ".join(completion_gaps)
                 )
-            else:
+            if save_clicked:
                 try:
-                    bid = _save_chemistry_page(mark_completed=True)
-                    st.session_state["_pb_flash"] = (
-                        f"Batch **{bid}** is **Completed** and locked. "
-                        "Enter product and non-spec output on **Batch Output**."
-                    )
+                    bid = _save_chemistry_page(mark_completed=False)
+                    if is_completed:
+                        st.session_state["_pb_flash"] = (
+                            f"Saved history correction for **{bid}**."
+                        )
+                    else:
+                        st.session_state["_pb_flash"] = (
+                            f"Saved **{bid}**. Production status remains "
+                            f"**{existing_batch.get('Production_status') or db.BATCH_STATUS_IN_PROGRESS}**. "
+                            "Mark Completed when the checklist is done, then enter **Batch Output**."
+                        )
                     st.rerun()
                 except Exception as exc:
                     st.error(str(exc))
+            if complete_clicked:
+                if completion_gaps:
+                    st.error(
+                        "Cannot mark Completed until these are entered: "
+                        + "; ".join(completion_gaps)
+                    )
+                else:
+                    try:
+                        bid = _save_chemistry_page(mark_completed=True)
+                        st.session_state["_pb_flash"] = (
+                            f"Batch **{bid}** is **Completed** and locked. "
+                            "Enter product and non-spec output on **Batch Output**."
+                        )
+                        st.rerun()
+                    except Exception as exc:
+                        st.error(str(exc))
 
         _snapshot_furnace_widgets(furnace)
 
