@@ -2121,8 +2121,29 @@ elif PAGE == "Production Batch & Chemistry":
             is_admin and st.session_state.get(unlock_key)
         )
 
-        col1, col2, col3 = st.columns(3)
-        with col1:
+        if existing_batch:
+            saved_melt = existing_batch.get("Melt_No")
+            try:
+                melt_no = int(saved_melt)
+            except (TypeError, ValueError):
+                melt_no = saved_melt
+            parsed_date = parse_any_date(existing_batch.get("Production_Date"))
+            if isinstance(parsed_date, datetime):
+                prod_date = parsed_date.date()
+            elif isinstance(parsed_date, date):
+                prod_date = parsed_date
+            else:
+                prod_date = date.today()
+            shift = str(existing_batch.get("Shift") or "").strip().upper()
+            if shift not in db.SHIFTS:
+                shift = db.SHIFTS[0]
+
+        identity_lock_note = (
+            "Taken from this heat’s Batch ID. It cannot be changed after create."
+        )
+
+        r1c1, r1c2, r1c3 = st.columns(3)
+        with r1c1:
             if existing_batch and existing_batch.get("Crucible_no"):
                 available_crucible = {"Crucible_no": existing_batch["Crucible_no"]}
                 st.markdown("**Crucible no**")
@@ -2139,15 +2160,38 @@ elif PAGE == "Production Batch & Chemistry":
                     st.error(
                         "No crucible available for the respective furnace."
                     )
+        with r1c2:
             if existing_batch:
-                saved_melt = existing_batch.get("Melt_No")
-                try:
-                    melt_no = int(saved_melt)
-                except (TypeError, ValueError):
-                    melt_no = saved_melt
+                st.markdown("**Production date**")
+                st.info(
+                    format_ui_date(existing_batch.get("Production_Date")) or "—"
+                )
+                st.caption(identity_lock_note)
+            else:
+                prod_date = ui_date_input(
+                    "Production date",
+                    value=date.today(),
+                    key=_pk("prod_date"),
+                    disabled=locked,
+                    help=(
+                        "Year and month of this date set Heat no "
+                        "(e.g. Aug 2026 on furnace 1 → 26-1H001)."
+                    ),
+                )
+        with r1c3:
+            alloy_label = st.selectbox(
+                "Alloy",
+                options=["— none —"] + list(alloy_labels.keys()),
+                key=_pk("alloy"),
+                disabled=locked,
+            )
+
+        r2c1, r2c2, r2c3 = st.columns(3)
+        with r2c1:
+            if existing_batch:
                 st.markdown("**Melt no**")
                 st.info(str(melt_no if melt_no not in (None, "") else "—"))
-                st.caption("Taken from this heat’s Batch ID. It cannot be changed after create.")
+                st.caption(identity_lock_note)
             else:
                 melt_no = st.selectbox(
                     "Melt no",
@@ -2160,41 +2204,12 @@ elif PAGE == "Production Batch & Chemistry":
                         "melt 9 → 2708261A9."
                     ),
                 )
-        with col2:
+        with r2c2:
             if existing_batch:
-                parsed_date = parse_any_date(existing_batch.get("Production_Date"))
-                if isinstance(parsed_date, datetime):
-                    prod_date = parsed_date.date()
-                elif isinstance(parsed_date, date):
-                    prod_date = parsed_date
-                else:
-                    prod_date = date.today()
-                st.markdown("**Production date**")
-                st.info(
-                    format_ui_date(existing_batch.get("Production_Date")) or "—"
-                )
-                st.caption(
-                    "Taken from this heat’s Batch ID. It cannot be changed after create."
-                )
-                shift = str(existing_batch.get("Shift") or "").strip().upper()
-                if shift not in db.SHIFTS:
-                    shift = db.SHIFTS[0]
                 st.markdown("**Shift**")
                 st.info(shift)
-                st.caption(
-                    "Taken from this heat’s Batch ID. It cannot be changed after create."
-                )
+                st.caption(identity_lock_note)
             else:
-                prod_date = ui_date_input(
-                    "Production date",
-                    value=date.today(),
-                    key=_pk("prod_date"),
-                    disabled=locked,
-                    help=(
-                        "Year and month of this date set Heat no "
-                        "(e.g. Aug 2026 on furnace 1 → 26-1H001)."
-                    ),
-                )
                 shift = st.selectbox(
                     "Shift",
                     db.SHIFTS,
@@ -2205,22 +2220,22 @@ elif PAGE == "Production Batch & Chemistry":
                         "and melt no."
                     ),
                 )
+        with r2c3:
             melting_team = st.selectbox(
                 "Melter name *", melters, key=_pk("melter"), disabled=locked
             )
-        with col3:
-            alloy_label = st.selectbox(
-                "Alloy",
-                options=["— none —"] + list(alloy_labels.keys()),
-                key=_pk("alloy"),
-                disabled=locked,
-            )
+
+        r3c1, r3c2, r3c3 = st.columns(3)
+        with r3c1:
             production_supervisor = st.selectbox(
                 "Production supervisor *",
                 supervisors,
                 key=_pk("supervisor"),
                 disabled=locked,
             )
+        with r3c2:
+            st.empty()
+        with r3c3:
             notes = st.text_area(
                 "Notes", height=68, key=_pk("notes"), disabled=locked
             )
@@ -2471,7 +2486,7 @@ elif PAGE == "Production Batch & Chemistry":
                 )
             with r2c2:
                 scale_w = empty_percent_input(
-                    "Weighment scale weight (kg) *",
+                    "Weighment Weight (kg) *",
                     key=_pk(f"scale_w_{idx}"),
                     max_value=None,
                     step=1.0,
