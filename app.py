@@ -1000,16 +1000,47 @@ def _snapshot_furnace_widgets(furnace: str) -> None:
 
 
 def _restore_furnace_widgets(furnace: str) -> None:
-    prefix = _furnace_key_prefix(furnace)
-    for k in list(st.session_state.keys()):
-        if isinstance(k, str) and k.startswith(prefix) and _is_ephemeral_widget_key(k):
-            st.session_state.pop(k, None)
+    """Re-apply a stored draft for this furnace.
+
+    Do not delete current ephemeral keys (buttons, cameras, file pickers).
+    Streamlit stores a button click in session state for this run; wiping
+    those keys here would swallow Save / Add charge / photo clicks.
+    """
     saved = (st.session_state.get("batch_drafts") or {}).get(str(furnace)) or {}
     for k, v in saved.items():
         if _is_ephemeral_widget_key(k):
             continue
         if k not in st.session_state:
             st.session_state[k] = v
+
+
+def _remember_ephemeral_clicks(furnace: str) -> None:
+    """Copy this-run button clicks aside before any other session-state edits."""
+    prefix = _furnace_key_prefix(furnace)
+    remembered = set(st.session_state.get("_pb_click_keys") or [])
+    for k in list(st.session_state.keys()):
+        if (
+            isinstance(k, str)
+            and k.startswith(prefix)
+            and _is_ephemeral_widget_key(k)
+            and st.session_state.get(k) is True
+        ):
+            remembered.add(k)
+    st.session_state["_pb_click_keys"] = remembered
+
+
+def _consume_ephemeral_click(key: str) -> bool:
+    remembered = set(st.session_state.get("_pb_click_keys") or [])
+    if key not in remembered:
+        return False
+    remembered.discard(key)
+    st.session_state["_pb_click_keys"] = remembered
+    return True
+
+
+def _button_clicked(clicked: bool, key: str) -> bool:
+    """True if Streamlit reported the click or we preserved it earlier this run."""
+    return _consume_ephemeral_click(key) or bool(clicked)
 
 
 def _on_working_furnace_change() -> None:
@@ -1065,6 +1096,76 @@ def _as_widget_datetime(value: object) -> datetime | None:
     return None
 
 
+def _clear_production_entry_fields(furnace: str, sample_blank: str) -> None:
+    """Drop charge, degassing, sample, and chemistry widgets for this furnace.
+
+    Used when the working production batch changes so a new unsaved heat does
+    not keep the previous heat’s entries.
+    """
+    prefix = _furnace_key_prefix(furnace)
+    pk = lambda name: _furnace_form_key(furnace, name)
+
+    indices: set[int] = {0}
+    drafts = st.session_state.setdefault("charge_lines_by_furnace", {})
+    for i in range(max(1, len(drafts.get(furnace) or []))):
+        indices.add(i)
+    for k in list(st.session_state.keys()):
+        if not isinstance(k, str) or not k.startswith(prefix + "mat_"):
+            continue
+        try:
+            indices.add(int(k[len(prefix + "mat_") :]))
+        except ValueError:
+            continue
+
+    # Selectboxes keep their last choice if the key is only deleted. Assign the
+    # blank option before the widgets render, and refresh the furnace draft so
+    # restore cannot put the previous heat’s material/trolley back.
+    for idx in indices:
+        st.session_state[pk(f"mat_{idx}")] = ""
+        st.session_state[pk(f"lot_{idx}")] = ""
+        st.session_state[pk(f"trolley_{idx}")] = ""
+        st.session_state[pk(f"trolley_w_{idx}")] = 0.0
+        st.session_state[pk(f"_prev_trolley_label_{idx}")] = ""
+        st.session_state[pk(f"scale_w_{idx}")] = None
+        st.session_state[pk(f"wt_{idx}")] = 0.0
+        st.session_state[pk(f"ln_{idx}")] = ""
+        for extra in (
+            f"wsp_open_{idx}",
+            f"wsp_bytes_{idx}",
+            f"inp_open_{idx}",
+            f"inp_bytes_{idx}",
+        ):
+            st.session_state.pop(pk(extra), None)
+
+    for k in list(st.session_state.keys()):
+        if not isinstance(k, str) or not k.startswith(prefix):
+            continue
+        rest = k[len(prefix) :]
+        if rest in {"pending_charges", "full_chem", "create_error"} or rest.startswith(
+            "bchem_"
+        ):
+            st.session_state.pop(k, None)
+
+    drafts[furnace] = [{"material": "", "lot_id": None, "weight": 0.0, "notes": ""}]
+
+    st.session_state[pk("degassing_time")] = ""
+    st.session_state[pk("sampled_pcs")] = None
+    st.session_state[pk("defect_pcs")] = None
+    st.session_state[pk("top_sample")] = sample_blank
+    st.session_state[pk("middle_sample")] = sample_blank
+    st.session_state[pk("bottom_sample")] = sample_blank
+    st.session_state[pk("vacum_sample")] = sample_blank
+    st.session_state[pk("top_sample_remarks")] = ""
+    st.session_state[pk("middle_sample_remarks")] = ""
+    st.session_state[pk("bottom_sample_remarks")] = ""
+    st.session_state[pk("top_sample_dt")] = None
+    st.session_state[pk("middle_sample_dt")] = None
+    st.session_state[pk("bottom_sample_dt")] = None
+    st.session_state[pk("full_chem")] = {}
+    st.session_state[pk("notes")] = ""
+    _snapshot_furnace_widgets(furnace)
+
+
 def _hydrate_production_batch_form(
     furnace: str,
     batch: dict | None,
@@ -1076,9 +1177,14 @@ def _hydrate_production_batch_form(
     pk = lambda name: _furnace_form_key(furnace, name)
     loaded_key = pk("_hydrated_batch_id")
     token = str(batch["Batch_ID"]) if batch else f"new:{furnace}"
-    if st.session_state.get(loaded_key) == token:
+    previous = st.session_state.get(loaded_key)
+    if previous == token:
         return
     st.session_state[loaded_key] = token
+    # Keep a restored in-progress *new* draft on first paint of this furnace.
+    # Any other working-batch change must drop the previous heat’s entries.
+    if previous is not None or batch is not None:
+        _clear_production_entry_fields(furnace, sample_blank)
     if not batch:
         return
 
@@ -1923,6 +2029,7 @@ elif PAGE == "Production Batch & Chemistry":
             st.stop()
 
         furnace = furnace_choice
+        _remember_ephemeral_clicks(furnace)
         _restore_furnace_widgets(furnace)
         st.session_state["_pb_prev_furnace"] = furnace
 
@@ -2479,15 +2586,21 @@ elif PAGE == "Production Batch & Chemistry":
         saved_pending_charges = st.session_state.get(pending_charges_key) or []
 
         add_col, rem_col, _ = st.columns([1, 1, 4])
-        if add_col.button(
-            "Add charge line", key=_pk("add_charge"), disabled=locked
+        if _button_clicked(
+            add_col.button(
+                "Add charge line", key=_pk("add_charge"), disabled=locked
+            ),
+            _pk("add_charge"),
         ):
             drafts[furnace].append(
                 {"material": "", "lot_id": None, "weight": 0.0, "notes": ""}
             )
             st.rerun()
-        if rem_col.button(
-            "Remove last line", key=_pk("rem_charge"), disabled=locked
+        if _button_clicked(
+            rem_col.button(
+                "Remove last line", key=_pk("rem_charge"), disabled=locked
+            ),
+            _pk("rem_charge"),
         ) and len(drafts[furnace]) > 1:
             drafts[furnace].pop()
             st.rerun()
@@ -2497,27 +2610,34 @@ elif PAGE == "Production Batch & Chemistry":
         extra_in = sum(float(c.get("Weight") or 0) for c in display_charges)
         total_in = saved_in + extra_in
         total_lines = len(saved_charges) + len(display_charges)
+        if total_in > 0:
+            st.session_state.pop(_pk("create_error"), None)
         st.info(
             f"Total net input weight: **{total_in:,.2f} kg** across {total_lines} charge line(s)."
         )
 
+        top_save_clicked = False
         if not existing_batch:
             st.caption(
                 "Create the heat to unlock degassing, samples, and chemistry. "
                 "The batch is saved as **In-Progress**."
             )
-            create_clicked = st.button(
-                "Save and create production batch",
-                type="primary",
-                disabled=available_crucible is None,
-                key=_pk("create_batch"),
-                help=(
-                    "Stores furnace, production date, shift, melt, alloy, and charge "
-                    "lines. Assigns Batch ID (DDMMYY + furnace + shift + melt) and "
-                    "Heat no (YY-furnace + month code + counter), then sets "
-                    "Production_status to In-Progress."
+            create_clicked = _button_clicked(
+                st.button(
+                    "Save and create production batch",
+                    type="primary",
+                    disabled=available_crucible is None,
+                    key=_pk("create_batch"),
+                    help=(
+                        "Stores furnace, production date, shift, melt, alloy, and charge "
+                        "lines. Assigns Batch ID (DDMMYY + furnace + shift + melt) and "
+                        "Heat no (YY-furnace + month code + counter), then sets "
+                        "Production_status to In-Progress."
+                    ),
                 ),
+                _pk("create_batch"),
             )
+            create_error_key = _pk("create_error")
             if available_crucible is None:
                 st.error("No crucible available for the respective furnace.")
             elif not charge_inputs and not saved_pending_charges:
@@ -2529,11 +2649,13 @@ elif PAGE == "Production Batch & Chemistry":
                             "No crucible available for the respective furnace."
                         )
                     inputs_to_save = charge_inputs or list(saved_pending_charges)
-                    if not inputs_to_save:
+                    total_save_weight = sum(
+                        float(c.get("Weight") or 0) for c in inputs_to_save
+                    )
+                    if not inputs_to_save or total_save_weight <= 0:
                         raise ValueError(
-                            "Add at least one charge line with net weight > 0. "
-                            "Select raw material, lot, and trolley, and enter a "
-                            "weighment scale weight greater than the trolley tare."
+                            "The Total net input weight must be greater than zero "
+                            "to save and create a new batch."
                         )
                     if not preview_id:
                         raise ValueError(
@@ -2566,6 +2688,7 @@ elif PAGE == "Production Batch & Chemistry":
                     ]
                     st.session_state.pop(pending_charges_key, None)
                     st.session_state.pop(_pk("_hydrated_batch_id"), None)
+                    st.session_state.pop(create_error_key, None)
                     st.session_state["_pb_select_batch"] = bid
                     created = db.get_batch(bid) or {}
                     created_heat = created.get("Heat_no") or heat_no_preview
@@ -2576,7 +2699,10 @@ elif PAGE == "Production Batch & Chemistry":
                     )
                     st.rerun()
                 except Exception as exc:
-                    st.error(str(exc))
+                    st.session_state[create_error_key] = str(exc)
+            persist_error = st.session_state.get(create_error_key)
+            if persist_error:
+                st.error(persist_error)
         else:
             created_status = (
                 existing_batch.get("Production_status") or db.BATCH_STATUS_IN_PROGRESS
@@ -2586,6 +2712,24 @@ elif PAGE == "Production Batch & Chemistry":
                 f"**Heat no:** `{heat_no_label}`  ·  "
                 f"**Production status:** `{created_status}`"
             )
+            if not is_completed:
+                top_save_clicked = _button_clicked(
+                    st.button(
+                        "Save changes",
+                        type="secondary",
+                        disabled=locked,
+                        key=_pk("save_batch_top"),
+                        help=(
+                            "Save alloy, notes, and new charge lines here so you "
+                            "do not have to scroll past degassing, samples, and chemistry."
+                        ),
+                    ),
+                    _pk("save_batch_top"),
+                )
+                st.caption(
+                    "Saves header details and any new charge lines. "
+                    "A matching **Save changes** button remains at the bottom."
+                )
 
         later_locked = locked or existing_batch is None
         if later_locked and not existing_batch:
@@ -2940,22 +3084,28 @@ elif PAGE == "Production Batch & Chemistry":
 
         if existing_batch:
             b1, b2, _ = st.columns([1.4, 1.4, 2])
-            save_clicked = b1.button(
-                "Save history correction" if is_completed else "Save changes",
-                type="primary" if is_completed else "secondary",
-                disabled=locked,
-                key=_pk("save_batch"),
-            )
-            complete_clicked = b2.button(
-                "Mark as Completed",
-                type="primary",
-                disabled=locked or is_completed or bool(completion_gaps),
-                key=_pk("complete_batch"),
-                help=(
-                    "Requires degassing time, sampled/defect pcs, K Mold ≤ "
-                    f"{db.K_MOLD_MAX:g}, top/middle/bottom samples and datetimes, "
-                    "vacum sample, batch chemistry, and at least one charge line."
+            save_clicked = _button_clicked(
+                b1.button(
+                    "Save history correction" if is_completed else "Save changes",
+                    type="primary" if is_completed else "secondary",
+                    disabled=locked,
+                    key=_pk("save_batch"),
                 ),
+                _pk("save_batch"),
+            ) or top_save_clicked
+            complete_clicked = _button_clicked(
+                b2.button(
+                    "Mark as Completed",
+                    type="primary",
+                    disabled=locked or is_completed or bool(completion_gaps),
+                    key=_pk("complete_batch"),
+                    help=(
+                        "Requires degassing time, sampled/defect pcs, K Mold ≤ "
+                        f"{db.K_MOLD_MAX:g}, top/middle/bottom samples and datetimes, "
+                        "vacum sample, batch chemistry, and at least one charge line."
+                    ),
+                ),
+                _pk("complete_batch"),
             )
             if not is_completed and completion_gaps:
                 st.caption(
