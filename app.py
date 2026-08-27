@@ -3765,14 +3765,16 @@ elif PAGE == "Packing List":
             _clear_packing_form()
             st.rerun()
 
-    h1, h2, h3 = st.columns(3)
-    with h1:
+    r1c1, r1c2, r1c3 = st.columns(3)
+    with r1c1:
         invoice_date = ui_date_input(
             "Invoice date *",
             value=date.today(),
             key="pl_invoice_date",
         )
+    with r1c2:
         invoice_number = st.text_input("Invoice number *", key="pl_invoice")
+    with r1c3:
         po_no = st.selectbox(
             "P.O. Number *",
             options=[""] + po_numbers,
@@ -3811,12 +3813,13 @@ elif PAGE == "Packing List":
     if len(cust_opts) == 1 and not st.session_state.get("pl_cust"):
         st.session_state["pl_cust"] = next(iter(cust_opts))
 
-    with h2:
+    r2c1, r2c2, r2c3 = st.columns(3)
+    with r2c1:
         cust_label = st.selectbox(
             "Customer name *",
             options=[""] + list(cust_opts.keys()),
             key="pl_cust",
-            help="Customers on this P.O., names from customer_master.",
+            help="Filled from this P.O. when it has one customer.",
         )
         cust_row = cust_opts.get(cust_label) or {}
         cust_code = cust_row.get("Cust_code")
@@ -3855,11 +3858,12 @@ elif PAGE == "Packing List":
         if len(alloy_opts) == 1 and not st.session_state.get("pl_alloy"):
             st.session_state["pl_alloy"] = next(iter(alloy_opts))
 
+    with r2c2:
         alloy_label = st.selectbox(
             "Alloy Name *",
             options=[""] + list(alloy_opts.keys()),
             key="pl_alloy",
-            help="Alloys on this P.O. for the selected customer.",
+            help="Filled from this P.O. for the selected customer.",
         )
         alloy_row = alloy_opts.get(alloy_label) or {}
         alloy_id = alloy_row.get("Alloy_id")
@@ -3869,20 +3873,26 @@ elif PAGE == "Packing List":
             colour_code = master.get("Colour_code") or ""
         else:
             colour_code = ""
+    with r2c3:
         st.text_input(
             "Colour code",
             value=colour_code,
             disabled=True,
             help="Filled from alloy_master for the selected alloy.",
         )
-    with h3:
+
+    r3c1, r3c2, r3c3 = st.columns(3)
+    with r3c1:
         vehicle_no = st.text_input("Vehicle No", key="pl_vehicle")
+    with r3c2:
         status = st.selectbox(
             "Packing list status *",
             options=db.PACKING_LIST_STATUS,
             key="pl_status",
             help="In-Progress keeps stock Available. Verified dispatches the selected batches.",
         )
+    with r3c3:
+        st.empty()
 
     if st.session_state.get("pl_alloy_seen") != alloy_id:
         previous_alloy = st.session_state.get("pl_alloy_seen")
@@ -3944,6 +3954,7 @@ elif PAGE == "Packing List":
                     {
                         "Select": str(r["Batch_ID"]) in set(include_ids),
                         "Batch_ID": str(r["Batch_ID"]),
+                        "Heat_no": str(r.get("Heat_no") or "—"),
                         "Weight (kg)": float(r.get("Output_Weight") or 0),
                         "Pieces": int(float(r.get("Output_pieces") or 0)),
                         "Alloy": r.get("Alloy_name") or "—",
@@ -3954,7 +3965,7 @@ elif PAGE == "Packing List":
             editor_key = (
                 f"pl_batch_editor_{alloy_id}_"
                 f"{int(bool(match_name))}_{int(bool(match_group))}_"
-                f"{int(editing_id or 0)}"
+                f"{int(editing_id or 0)}_heat"
             )
             edited = st.data_editor(
                 pick_df,
@@ -3966,7 +3977,7 @@ elif PAGE == "Packing List":
                     "Weight (kg)": st.column_config.NumberColumn(format="%.2f"),
                     "Pieces": st.column_config.NumberColumn(format="%d"),
                 },
-                disabled=["Batch_ID", "Weight (kg)", "Pieces", "Alloy"],
+                disabled=["Batch_ID", "Heat_no", "Weight (kg)", "Pieces", "Alloy"],
                 hide_index=True,
                 use_container_width=True,
                 key=editor_key,
@@ -3988,6 +3999,7 @@ elif PAGE == "Packing List":
                 [
                     {
                         "Batch_ID": r["Batch_ID"],
+                        "Heat_no": str(r.get("Heat_no") or "—"),
                         "Weight (kg)": float(r.get("Output_Weight") or 0),
                         "Pieces": int(float(r.get("Output_pieces") or 0)),
                     }
@@ -4018,6 +4030,7 @@ elif PAGE == "Packing List":
                         [
                             {
                                 "Batch_ID": r["Batch_ID"],
+                                "Heat_no": str(r.get("Heat_no") or "—"),
                                 "Weight (kg)": float(r.get("Output_Weight") or 0),
                                 "Pieces": int(float(r.get("Output_pieces") or 0)),
                                 "Status": r.get("Production_status") or "—",

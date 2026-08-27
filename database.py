@@ -5122,6 +5122,7 @@ def list_packing_batch_candidates(
     rows = fetch_all(
         """
         SELECT b.Batch_ID AS "Batch_ID",
+               b.Heat_no AS "Heat_no",
                b.Production_status AS "Production_status",
                a.Alloy_id AS "Alloy_id",
                a.Alloy_name AS "Alloy_name",
