@@ -101,6 +101,9 @@ st.markdown(
         text-transform: uppercase;
         margin: 0.85rem 0 0.25rem 0;
     }}
+    div[class*="st-key-prod_crew_fields"] [data-testid="stVerticalBlock"] {{
+        gap: 0.35rem;
+    }}
     </style>
     """,
     unsafe_allow_html=True,
@@ -2142,8 +2145,8 @@ elif PAGE == "Production Batch & Chemistry":
             "Taken from this heat’s Batch ID. It cannot be changed after create."
         )
 
-        r1c1, r1c2, r1c3 = st.columns(3)
-        with r1c1:
+        h1, h2, h3 = st.columns(3, gap="small")
+        with h1:
             if existing_batch and existing_batch.get("Crucible_no"):
                 available_crucible = {"Crucible_no": existing_batch["Crucible_no"]}
                 st.markdown("**Crucible no**")
@@ -2160,7 +2163,23 @@ elif PAGE == "Production Batch & Chemistry":
                     st.error(
                         "No crucible available for the respective furnace."
                     )
-        with r1c2:
+            if existing_batch:
+                st.markdown("**Melt no**")
+                st.info(str(melt_no if melt_no not in (None, "") else "—"))
+                st.caption(identity_lock_note)
+            else:
+                melt_no = st.selectbox(
+                    "Melt no",
+                    db.MELT_NOS,
+                    key=_pk("melt_no"),
+                    disabled=locked,
+                    help=(
+                        "Part of Batch ID together with production date, furnace, "
+                        "and shift. Example: 27-Aug-2026, furnace 1, shift A, "
+                        "melt 9 → 2708261A9."
+                    ),
+                )
+        with h2:
             if existing_batch:
                 st.markdown("**Production date**")
                 st.info(
@@ -2178,33 +2197,6 @@ elif PAGE == "Production Batch & Chemistry":
                         "(e.g. Aug 2026 on furnace 1 → 26-1H001)."
                     ),
                 )
-        with r1c3:
-            alloy_label = st.selectbox(
-                "Alloy",
-                options=["— none —"] + list(alloy_labels.keys()),
-                key=_pk("alloy"),
-                disabled=locked,
-            )
-
-        r2c1, r2c2, r2c3 = st.columns(3)
-        with r2c1:
-            if existing_batch:
-                st.markdown("**Melt no**")
-                st.info(str(melt_no if melt_no not in (None, "") else "—"))
-                st.caption(identity_lock_note)
-            else:
-                melt_no = st.selectbox(
-                    "Melt no",
-                    db.MELT_NOS,
-                    key=_pk("melt_no"),
-                    disabled=locked,
-                    help=(
-                        "Part of Batch ID together with production date, furnace, "
-                        "and shift. Example: 27-Aug-2026, furnace 1, shift A, "
-                        "melt 9 → 2708261A9."
-                    ),
-                )
-        with r2c2:
             if existing_batch:
                 st.markdown("**Shift**")
                 st.info(shift)
@@ -2220,25 +2212,26 @@ elif PAGE == "Production Batch & Chemistry":
                         "and melt no."
                     ),
                 )
-        with r2c3:
-            melting_team = st.selectbox(
-                "Melter name *", melters, key=_pk("melter"), disabled=locked
-            )
-
-        r3c1, r3c2, r3c3 = st.columns(3)
-        with r3c1:
-            production_supervisor = st.selectbox(
-                "Production supervisor *",
-                supervisors,
-                key=_pk("supervisor"),
-                disabled=locked,
-            )
-        with r3c2:
-            st.empty()
-        with r3c3:
             notes = st.text_area(
                 "Notes", height=68, key=_pk("notes"), disabled=locked
             )
+        with h3:
+            with st.container(gap="small", key="prod_crew_fields"):
+                alloy_label = st.selectbox(
+                    "Alloy",
+                    options=["— none —"] + list(alloy_labels.keys()),
+                    key=_pk("alloy"),
+                    disabled=locked,
+                )
+                melting_team = st.selectbox(
+                    "Melter name *", melters, key=_pk("melter"), disabled=locked
+                )
+                production_supervisor = st.selectbox(
+                    "Production supervisor *",
+                    supervisors,
+                    key=_pk("supervisor"),
+                    disabled=locked,
+                )
 
         alloy_id = None if alloy_label == "— none —" else alloy_labels[alloy_label]
 
@@ -2493,7 +2486,7 @@ elif PAGE == "Production Batch & Chemistry":
                 )
                 wsp_open_key = _pk(f"wsp_open_{idx}")
                 if st.button(
-                    "📷 Weighment scale photo",
+                    "📷 Weighment photo",
                     key=_pk(f"wsp_btn_{idx}"),
                     help="Open camera or choose a photo from the phone gallery",
                     use_container_width=True,
@@ -2520,11 +2513,11 @@ elif PAGE == "Production Batch & Chemistry":
                     scale_photo_bytes = photo_bytes(wsp_cam) or photo_bytes(wsp_file)
                     if scale_photo_bytes:
                         st.session_state[_pk(f"wsp_bytes_{idx}")] = scale_photo_bytes
-                        st.success("Weighment scale photo ready to save with this charge line.")
+                        st.success("Weighment photo ready to save with this charge line.")
                 else:
                     scale_photo_bytes = st.session_state.get(_pk(f"wsp_bytes_{idx}"))
                     if scale_photo_bytes:
-                        st.caption("Weighment scale photo attached.")
+                        st.caption("Weighment photo attached.")
 
             # Net charge = weighment scale − trolley tare (always recompute into widget state)
             tare_w = float(st.session_state.get(tare_key, trolley_w) or 0.0)
