@@ -1357,6 +1357,7 @@ NAV_SECTIONS: list[tuple[str, list[str]]] = [
             "All Purchase Orders",
             "Finished Goods Inventory",
             "Packing List",
+            "Test Certificate",
             "Bill of Materials",
         ],
     ),
@@ -1701,6 +1702,147 @@ def _render_packing_list_summary(summary: dict) -> None:
             'background:#fff;cursor:pointer;font-size:0.9rem;">Print summary</button>',
             unsafe_allow_html=True,
         )
+
+
+def _tc_sync_editor(lines: list[dict], edited) -> list[dict]:
+    """Copy printed kg / heat / selection from the data editor back onto lines."""
+    if edited is None:
+        return lines
+    by_no = {int(row.get("Line_no") or 0): row for row in edited.to_dict("records")}
+    out = []
+    for line in lines:
+        row = by_no.get(int(line["Line_no"]), {})
+        item = dict(line)
+        if "Heat no" in row:
+            item["Display_heat_no"] = str(row.get("Heat no") or "").strip()
+        if "Printed kg" in row:
+            item["Weight"] = float(row.get("Printed kg") or 0)
+        item["_selected"] = bool(row.get("Select"))
+        out.append(item)
+    return out
+
+
+def _render_certificate_print(header: dict, cert: dict, lines: list[dict]) -> None:
+    st.markdown(
+        f"""
+        <style>
+        .packing-summary-wrap {{
+            border: 1px solid #ddd; border-radius: 6px;
+            padding: 1.25rem 1.5rem; background: #fff; color: {_BRAND_INK};
+        }}
+        .packing-summary-title {{
+            margin: 0 0 0.25rem 0; color: {_BRAND_INK};
+            border-bottom: 2px solid {_BRAND_ORANGE}; padding-bottom: 0.35rem;
+        }}
+        .packing-summary-table {{
+            width: 100%; border-collapse: collapse; margin: 0.75rem 0 0 0;
+            font-size: 0.95rem;
+        }}
+        .packing-summary-table th, .packing-summary-table td {{
+            border: 1px solid #bdbdbd; padding: 0.55rem 0.7rem;
+            text-align: left; vertical-align: top;
+        }}
+        .packing-summary-meta td:first-child {{
+            width: 30%; font-weight: 600; background: #f7f7f7;
+        }}
+        .packing-summary-batches th {{ background: #f0f0f0; font-weight: 700; }}
+        .packing-summary-batches tfoot td {{ font-weight: 700; background: #fafafa; }}
+        @media print {{
+            [data-testid="stSidebar"], [data-testid="stToolbar"],
+            footer, header, .no-print {{ display: none !important; }}
+            .block-container {{ max-width: 100% !important; padding: 0.25rem !important; }}
+            .packing-summary-wrap {{ border: none; padding: 0; }}
+        }}
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+    meta_rows = [
+        ("Certificate no", cert.get("Certificate_no") or "—"),
+        ("Status", cert.get("Status") or "—"),
+        ("Issued date", format_ui_date(cert.get("Issued_date"), empty="—")),
+        ("Invoice number", header.get("Invoice_number") or "—"),
+        ("Invoice date", format_ui_date(header.get("Invoice_date"), empty="—")),
+        ("P.O. Number", header.get("Customer_PO_No") or "—"),
+        ("Customer name", header.get("Customer_name") or "—"),
+        ("Alloy name", header.get("Alloy_name") or "—"),
+        ("Colour code", header.get("Colour_code") or "—"),
+        ("Vehicle No", header.get("Vehicle_no") or "—"),
+        ("Packing list", f"#{header.get('Packing_list_id')}"),
+    ]
+    meta_html = "".join(
+        f"<tr><td>{html.escape(label)}</td><td>{html.escape(str(value))}</td></tr>"
+        for label, value in meta_rows
+    )
+    total_w = 0.0
+    total_p = 0
+    body = ""
+    for line in lines:
+        weight = float(line.get("Weight") or 0)
+        pieces = int(float(line.get("Pieces") or 0))
+        total_w += weight
+        total_p += pieces
+        batches = ", ".join(
+            str(src.get("Batch_ID") or "")
+            for src in (line.get("sources") or [])
+            if src.get("Batch_ID")
+        )
+        blend = "Yes" if line.get("Is_blended") else "No"
+        body += (
+            "<tr>"
+            f"<td>{html.escape(str(line.get('Line_no') or ''))}</td>"
+            f"<td>{html.escape(str(line.get('Display_heat_no') or '—'))}</td>"
+            f"<td>{html.escape(batches or '—')}</td>"
+            f"<td style='text-align:right'>{weight:,.2f}</td>"
+            f"<td style='text-align:right'>{pieces:,}</td>"
+            f"<td>{blend}</td>"
+            "</tr>"
+        )
+    if not body:
+        body = (
+            "<tr><td colspan='6' style='text-align:center;color:#666'>"
+            "No printed lines</td></tr>"
+        )
+        footer = ""
+    else:
+        footer = (
+            "<tfoot><tr><td colspan='3'>Total</td>"
+            f"<td style='text-align:right'>{total_w:,.2f}</td>"
+            f"<td style='text-align:right'>{total_p:,}</td>"
+            "<td></td></tr></tfoot>"
+        )
+    packed_w = float(cert.get("Source_weight") or 0)
+    packed_p = int(float(cert.get("Source_pieces") or 0))
+    summary = db.certificate_weight_summary(packed_w, total_w)
+    st.markdown(
+        f"""
+        <div class="packing-summary-wrap">
+            <h2 class="packing-summary-title">Test Certificate — {html.escape(str(cert.get('Certificate_no') or ''))}</h2>
+            <table class="packing-summary-table packing-summary-meta">
+                <tbody>{meta_html}</tbody>
+            </table>
+            <table class="packing-summary-table packing-summary-batches">
+                <thead>
+                    <tr>
+                        <th>#</th><th>Heat No</th><th>Source Batch ID</th>
+                        <th style="text-align:right">Weight (kg)</th>
+                        <th style="text-align:right">Pieces</th>
+                        <th>Blended</th>
+                    </tr>
+                </thead>
+                <tbody>{body}</tbody>
+                {footer}
+            </table>
+            <p class="packing-summary-note">
+                Packed baseline: {packed_w:,.2f} kg / {packed_p:,} pieces.
+                Printed vs packed: {summary['delta_kg']:+.2f} kg
+                ({summary['delta_pct']:+.3f}%; max round-up {summary['max_pct']:g}%).
+                Pieces must match packed. Inventory and production weights are unchanged.
+            </p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -4151,7 +4293,13 @@ elif PAGE == "Packing List":
             help="In-Progress does not take stock. Verified subtracts packed kg and pieces from finished goods.",
         )
     with r3c3:
-        st.empty()
+        if editing_id and status == db.PACKING_STATUS_VERIFIED:
+            if st.button("Open test certificate", key="pl_open_tc"):
+                st.session_state.nav_page = "Test Certificate"
+                st.session_state["tc_packing_list_id"] = int(editing_id)
+                st.rerun()
+        else:
+            st.empty()
 
     if st.session_state.get("pl_alloy_seen") != alloy_id:
         previous_alloy = st.session_state.get("pl_alloy_seen")
@@ -4548,6 +4696,402 @@ elif PAGE == "Packing List":
                     if r.get("Batch_ID")
                 }
                 st.rerun()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Test Certificate
+# ═══════════════════════════════════════════════════════════════════════════════
+elif PAGE == "Test Certificate":
+    st.title("Test Certificate")
+    st.caption(
+        "Print dispatch weights from a **Verified** packing list. Merge heats onto "
+        "one printed line and round **up** total kg by at most "
+        f"**{db.CERT_WEIGHT_ROUND_MAX_PCT:g}%**. Pieces must stay exact. "
+        "Finished-goods and production quantities are not changed."
+    )
+
+    try:
+        verified_lists = db.list_packing_lists_for_certificate()
+    except Exception as exc:
+        _show_db_connection_error(exc)
+        st.stop()
+
+    if not verified_lists:
+        st.info("Verify a packing list first, then open it here.")
+        st.stop()
+
+    list_opts = {
+        (
+            f"#{r['Packing_list_id']}  |  {r.get('Invoice_number') or '—'}  |  "
+            f"{r.get('Customer_name') or '—'}  |  "
+            f"{r.get('Certificate_status') or 'no certificate'}"
+        ): int(r["Packing_list_id"])
+        for r in verified_lists
+    }
+    preset_id = st.session_state.get("tc_packing_list_id")
+    labels = list(list_opts.keys())
+    default_ix = 0
+    if preset_id:
+        for i, lab in enumerate(labels):
+            if list_opts[lab] == int(preset_id):
+                default_ix = i
+                break
+    pick = st.selectbox(
+        "Verified packing list",
+        options=labels,
+        index=default_ix,
+        key="tc_list_pick",
+    )
+    packing_list_id = list_opts[pick]
+    if st.session_state.get("tc_packing_list_id") != packing_list_id:
+        st.session_state["tc_packing_list_id"] = packing_list_id
+        st.session_state.pop("tc_lines", None)
+        st.session_state.pop("tc_loaded_id", None)
+
+    header = db.get_packing_list(packing_list_id)
+    if not header:
+        st.error("That packing list was not found.")
+        st.stop()
+
+    cert = db.get_packing_list_certificate(packing_list_id)
+    packed_batches = list(header.get("batches") or [])
+    packed_w = sum(float(r.get("Weight") or 0) for r in packed_batches)
+    packed_p = sum(int(float(r.get("Pieces") or 0)) for r in packed_batches)
+
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Packed kg", f"{packed_w:,.2f}")
+    m2.metric("Packed pieces", f"{packed_p:,}")
+    m3.metric("Invoice", header.get("Invoice_number") or "—")
+    m4.metric("Alloy", header.get("Alloy_name") or "—")
+    st.caption(
+        f"Customer: {header.get('Customer_name') or '—'}  ·  "
+        f"PO: {header.get('Customer_PO_No') or '—'}  ·  "
+        f"Vehicle: {header.get('Vehicle_no') or '—'}"
+    )
+
+    if cert is None or cert.get("Status") == db.CERT_STATUS_VOID:
+        label = (
+            "Create new draft from packed batches"
+            if cert and cert.get("Status") == db.CERT_STATUS_VOID
+            else "Create draft from packed batches"
+        )
+        if st.button(label, type="primary", key="tc_create"):
+            try:
+                cert = db.create_packing_list_certificate_draft(packing_list_id)
+                st.session_state["tc_lines"] = cert.get("lines") or []
+                st.session_state["tc_loaded_id"] = packing_list_id
+                st.session_state["tc_editor_n"] = (
+                    int(st.session_state.get("tc_editor_n") or 0) + 1
+                )
+                st.success(f"Draft **{cert.get('Certificate_no')}** created.")
+                st.rerun()
+            except Exception as exc:
+                st.error(str(exc))
+        if cert is None:
+            st.stop()
+        st.caption(
+            f"Previous certificate {cert.get('Certificate_no')} is **Void**. "
+            "Create a new draft to edit again."
+        )
+        if cert.get("Status") == db.CERT_STATUS_VOID and not st.session_state.get("tc_show_void"):
+            if st.button("View voided certificate", key="tc_view_void"):
+                st.session_state["tc_show_void"] = True
+                st.rerun()
+            st.stop()
+
+    locked = cert.get("Status") in {db.CERT_STATUS_ISSUED, db.CERT_STATUS_VOID}
+    if (
+        st.session_state.get("tc_loaded_id") != packing_list_id
+        or "tc_lines" not in st.session_state
+    ):
+        st.session_state["tc_lines"] = [dict(row) for row in (cert.get("lines") or [])]
+        st.session_state["tc_loaded_id"] = packing_list_id
+
+    if "tc_cert_no" not in st.session_state or st.session_state.get("tc_cert_no_for") != packing_list_id:
+        st.session_state["tc_cert_no"] = cert.get("Certificate_no") or f"TC-{packing_list_id:04d}"
+        st.session_state["tc_cert_no_for"] = packing_list_id
+        issued_raw = cert.get("Issued_date")
+        st.session_state["tc_issued_date"] = (
+            _parse_master_date(issued_raw) if issued_raw else date.today()
+        )
+
+    h1, h2, h3 = st.columns(3)
+    with h1:
+        certificate_no = st.text_input(
+            "Certificate no",
+            key="tc_cert_no",
+            disabled=locked,
+        )
+    with h2:
+        issued_date = ui_date_input(
+            "Issued date",
+            key="tc_issued_date",
+            disabled=locked,
+        )
+    with h3:
+        st.text_input(
+            "Status",
+            value=cert.get("Status") or "",
+            disabled=True,
+            key="tc_status_display",
+        )
+
+    if st.session_state.get("tc_show_print"):
+        _render_certificate_print(header, cert, st.session_state.get("tc_lines") or [])
+        b1, b2, _b3 = st.columns([1, 1, 2])
+        with b1:
+            if st.button("Back to editor", key="tc_print_back"):
+                st.session_state.pop("tc_show_print", None)
+                st.rerun()
+        with b2:
+            st.markdown(
+                '<button class="no-print" onclick="window.print()" '
+                'style="padding:0.45rem 1rem;border:1px solid #ccc;border-radius:0.5rem;'
+                'background:#fff;cursor:pointer;font-size:0.9rem;">Print</button>',
+                unsafe_allow_html=True,
+            )
+        st.stop()
+
+    lines = list(st.session_state.get("tc_lines") or [])
+    editor_rows = []
+    for line in lines:
+        sources = line.get("sources") or []
+        source_kg = sum(float(src.get("Source_weight") or 0) for src in sources)
+        editor_rows.append(
+            {
+                "Select": bool(line.get("_selected")),
+                "Line_no": int(line.get("Line_no") or 0),
+                "Heat no": line.get("Display_heat_no") or "",
+                "Batch IDs": ", ".join(
+                    str(src.get("Batch_ID") or "")
+                    for src in sources
+                    if src.get("Batch_ID")
+                ),
+                "Source kg": source_kg,
+                "Printed kg": float(line.get("Weight") or 0),
+                "Pieces": int(float(line.get("Pieces") or 0)),
+                "Blended": "Yes" if line.get("Is_blended") else "No",
+            }
+        )
+    editor_df = pd.DataFrame(editor_rows)
+    editor_key = f"tc_editor_{packing_list_id}_{int(st.session_state.get('tc_editor_n') or 0)}"
+    edited = st.data_editor(
+        editor_df,
+        column_config={
+            "Select": st.column_config.CheckboxColumn(
+                "Select",
+                help="Tick lines to merge, or one merged line to split.",
+                disabled=locked,
+            ),
+            "Line_no": st.column_config.NumberColumn("Line", format="%d"),
+            "Heat no": st.column_config.TextColumn(
+                "Heat no",
+                help="Printed heat number on the test certificate.",
+                disabled=locked,
+            ),
+            "Source kg": st.column_config.NumberColumn(format="%.2f"),
+            "Printed kg": st.column_config.NumberColumn(
+                format="%.2f",
+                min_value=0.0,
+                help="May be rounded up. Total round-up capped at 0.15%.",
+                disabled=locked,
+            ),
+            "Pieces": st.column_config.NumberColumn(format="%d"),
+        },
+        disabled=["Line_no", "Batch IDs", "Source kg", "Pieces", "Blended"],
+        hide_index=True,
+        use_container_width=True,
+        key=editor_key,
+    )
+    lines = _tc_sync_editor(lines, edited)
+    st.session_state["tc_lines"] = lines
+
+    printed_w = sum(float(row.get("Weight") or 0) for row in lines)
+    printed_p = sum(int(float(row.get("Pieces") or 0)) for row in lines)
+    summary = db.certificate_weight_summary(packed_w, printed_w)
+    s1, s2, s3, s4 = st.columns(4)
+    s1.metric("Printed kg", f"{printed_w:,.2f}")
+    s2.metric("Printed pieces", f"{printed_p:,}")
+    s3.metric(
+        "Weight delta",
+        f"{summary['delta_kg']:+.2f} kg",
+        delta=f"{summary['delta_pct']:+.3f}%",
+        delta_color="off",
+    )
+    s4.metric("Max extra kg", f"{summary['allowed_kg']:.2f}")
+    if printed_p != packed_p:
+        st.error(f"Pieces must match packed ({packed_p}). Printed is {printed_p}.")
+    elif not summary["ok"]:
+        st.error(
+            "Weight is outside the allowed round-up. Printed kg must be at least "
+            f"packed ({packed_w:.2f}) and at most "
+            f"{packed_w + summary['allowed_kg']:.2f} "
+            f"(+{db.CERT_WEIGHT_ROUND_MAX_PCT:g}%)."
+        )
+    else:
+        st.success(
+            f"Within cap: {summary['delta_kg']:.2f} kg extra "
+            f"({summary['delta_pct']:.3f}% of packed)."
+        )
+
+    errors = db.validate_certificate_lines(packed_batches, lines)
+    if errors:
+        for msg in errors:
+            st.warning(msg)
+
+    selected_nos = [
+        int(row["Line_no"]) for row in lines if row.get("_selected")
+    ]
+    if not locked:
+        st.markdown("#### Merge or split printed lines")
+        allow_blend = st.checkbox(
+            "Allow blended chemistry (different heat numbers on one printed line)",
+            key="tc_allow_blend",
+            help="Required when merging batches that do not share the same Heat_no.",
+        )
+        merge_heat = st.text_input(
+            "Merged heat no (optional)",
+            key="tc_merge_heat",
+            help="Leave blank to keep the shared heat, or BLEND when heats differ.",
+        )
+        c_merge, c_split, c_reset = st.columns(3)
+        with c_merge:
+            if st.button("Merge selected", key="tc_merge"):
+                try:
+                    st.session_state["tc_lines"] = db.merge_certificate_lines(
+                        lines,
+                        selected_nos,
+                        display_heat_no=merge_heat,
+                        allow_blend=allow_blend,
+                    )
+                    st.session_state["tc_editor_n"] = (
+                        int(st.session_state.get("tc_editor_n") or 0) + 1
+                    )
+                    st.rerun()
+                except Exception as exc:
+                    st.error(str(exc))
+        with c_split:
+            if st.button("Split selected", key="tc_split"):
+                if len(selected_nos) != 1:
+                    st.error("Select exactly one merged line to split.")
+                else:
+                    try:
+                        st.session_state["tc_lines"] = db.split_certificate_line(
+                            lines, selected_nos[0]
+                        )
+                        st.session_state["tc_editor_n"] = (
+                            int(st.session_state.get("tc_editor_n") or 0) + 1
+                        )
+                        st.rerun()
+                    except Exception as exc:
+                        st.error(str(exc))
+        with c_reset:
+            if st.button("Reset to packed batches", key="tc_reset"):
+                try:
+                    rebuilt = db.create_packing_list_certificate_draft(
+                        packing_list_id,
+                        certificate_no=certificate_no,
+                    )
+                    st.session_state["tc_lines"] = rebuilt.get("lines") or []
+                    st.session_state["tc_editor_n"] = (
+                        int(st.session_state.get("tc_editor_n") or 0) + 1
+                    )
+                    st.success("Draft reset to one printed line per packed batch.")
+                    st.rerun()
+                except Exception as exc:
+                    st.error(str(exc))
+
+    if selected_nos:
+        st.markdown("#### Chemistry for selected line")
+        focus = next(
+            (row for row in lines if int(row["Line_no"]) == selected_nos[0]),
+            None,
+        )
+        if focus:
+            chem = db.blended_certificate_chemistry(focus.get("sources") or [])
+            if chem:
+                label = (
+                    "Weighted average (blended heats)"
+                    if focus.get("Is_blended")
+                    else "Heat chemistry"
+                )
+                st.caption(label)
+                show_dataframe(df_from_rows(chem))
+            else:
+                st.info("No chemistry saved on the source batches yet.")
+
+    a1, a2, a3, a4 = st.columns(4)
+    with a1:
+        if st.button("View / print", key="tc_view_print"):
+            st.session_state["tc_show_print"] = True
+            st.rerun()
+    with a2:
+        save_clicked = st.button(
+            "Save draft",
+            key="tc_save",
+            disabled=locked,
+            type="primary" if not locked else "secondary",
+        )
+    with a3:
+        issue_clicked = st.button("Issue certificate", key="tc_issue", disabled=locked)
+    with a4:
+        void_clicked = st.button(
+            "Void certificate",
+            key="tc_void",
+            disabled=cert.get("Status") == db.CERT_STATUS_VOID,
+        )
+
+    if save_clicked:
+        try:
+            saved = db.save_packing_list_certificate_draft(
+                packing_list_id,
+                lines,
+                certificate_no=certificate_no,
+                issued_date=to_storage_date(issued_date),
+            )
+            st.session_state["tc_lines"] = saved.get("lines") or []
+            st.success(f"Saved draft **{saved.get('Certificate_no')}**.")
+            st.rerun()
+        except Exception as exc:
+            st.error(str(exc))
+    if issue_clicked:
+        try:
+            issued = db.issue_packing_list_certificate(
+                packing_list_id,
+                lines,
+                certificate_no=certificate_no,
+                issued_date=to_storage_date(issued_date),
+            )
+            st.session_state["tc_lines"] = issued.get("lines") or []
+            st.success(f"Issued **{issued.get('Certificate_no')}**. Printed lines are locked.")
+            st.rerun()
+        except Exception as exc:
+            st.error(str(exc))
+    if void_clicked:
+        try:
+            db.void_packing_list_certificate(packing_list_id)
+            st.session_state.pop("tc_lines", None)
+            st.session_state.pop("tc_loaded_id", None)
+            st.warning("Certificate voided. Packed inventory is unchanged.")
+            st.rerun()
+        except Exception as exc:
+            st.error(str(exc))
+
+    st.divider()
+    st.markdown("#### Packed baseline (not editable)")
+    show_dataframe(
+        df_from_rows(
+            [
+                {
+                    "Batch_ID": r.get("Batch_ID"),
+                    "Heat_no": r.get("Heat_no"),
+                    "Weight": r.get("Weight"),
+                    "Pieces": r.get("Pieces"),
+                }
+                for r in packed_batches
+            ]
+        )
+    )
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -6152,7 +6696,10 @@ elif PAGE == "Masters Overview":
             | 25 | Electricity_Consumption | Daily opening/closing power readings per EB Line 1 / EB Line 2 |
             | 26 | Cost_of_conversion | Monthly conversion rates per kg (oil, electricity, labour, salaries, consumables, overheads) |
             | 27 | Packing_list | Dispatch header (invoice, PO, customer, alloy, vehicle; status In-Progress / Verified) |
-            | 28 | Packing_list_batch | Batch IDs on a packing list; Verified lists mark FG **Dispatched** |
+            | 28 | Packing_list_batch | Batch IDs on a packing list; Verified lists subtract packed kg/pieces from FG |
+            | 29 | Packing_list_certificate | Test-certificate header (Draft / Issued / Void); 1:1 with a Verified packing list |
+            | 30 | Packing_list_certificate_line | Printed TC lines (may merge heats; weight may round up ≤ 0.15%) |
+            | 31 | Packing_list_certificate_source | Maps each printed TC line back to packing_list_batch |
 
             Extra production columns: sample fields, `Production_supervisor`.
             """
