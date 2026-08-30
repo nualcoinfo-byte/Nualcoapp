@@ -6,8 +6,10 @@ Runs on Neon Postgres (DATABASE_URL) with local SQLite as fallback.
 
 from __future__ import annotations
 
+import base64
 import html
 import os
+import re
 from datetime import date, datetime
 from pathlib import Path
 
@@ -15,6 +17,7 @@ import pandas as pd
 import streamlit as st
 
 LOGO_PATH = Path(__file__).resolve().parent / "assets" / "nualco_logo.png"
+ISO_LOGO_PATH = Path(__file__).resolve().parent / "assets" / "iso_9001_2015.png"
 _BRAND_ORANGE = "#F15A22"
 _BRAND_INK = "#1A1A1A"
 
@@ -116,6 +119,7 @@ def bootstrap() -> str:
     if db.IS_POSTGRES:
         try:
             db._ensure_packing_list_ready()
+            db._ensure_company_ready()
             return "neon"
         except Exception as exc:
             st.session_state["_neon_init_error"] = str(exc)
@@ -885,6 +889,63 @@ def format_ui_date(value: object, *, with_time: bool | None = None, empty: str =
     return day.strftime(UI_DATE_FORMAT).upper()
 
 
+def format_cert_print_date(value: object, empty: str = "—") -> str:
+    """Formal certificate dates match the QMS form: DD-MM-YYYY."""
+    parsed = parse_any_date(value)
+    if parsed is None:
+        return empty if _is_blank_date(value) else str(value)
+    day = parsed.date() if isinstance(parsed, datetime) else parsed
+    return day.strftime("%d-%m-%Y")
+
+
+def _image_data_uri(path: Path) -> str:
+    if not path.exists():
+        return ""
+    mime = "image/png" if path.suffix.lower() == ".png" else "image/jpeg"
+    encoded = base64.b64encode(path.read_bytes()).decode("ascii")
+    return f"data:{mime};base64,{encoded}"
+
+
+def _certificate_logo_data_uri() -> str:
+    for path in (LOGO_PATH, LOGO_PATH.with_suffix(".jpg")):
+        uri = _image_data_uri(path)
+        if uri:
+            return uri
+    return ""
+
+
+def _iso_logo_data_uri() -> str:
+    return _image_data_uri(ISO_LOGO_PATH)
+
+
+def _company_letterhead(company: dict) -> dict[str, str]:
+    street = " ".join(str(company.get("Address") or "").strip().rstrip(".").split())
+    city = str(company.get("City") or "").strip()
+    pin = str(company.get("Pincode") or "").strip()
+    pin_fmt = f"{pin[:3]} {pin[3:]}" if pin.isdigit() and len(pin) == 6 else pin
+    if city and pin_fmt:
+        place = f"{city} - {pin_fmt}"
+    else:
+        place = city or pin_fmt
+    address = ", ".join(part for part in (street, place) if part)
+    if address:
+        address = address.rstrip(".") + "."
+    phone = str(company.get("Phone1") or "").strip()
+    email = str(company.get("Email1") or "").strip()
+    contact_bits = []
+    if phone:
+        contact_bits.append(f"Phone : {phone}")
+    if email:
+        contact_bits.append(f"Email : {email}")
+    gst = str(company.get("GST") or "").strip()
+    return {
+        "name": str(company.get("Company_name") or "Nualco Private Limited").strip(),
+        "address": address,
+        "contact": "  ".join(contact_bits),
+        "gst": f"GSTIN : {gst}" if gst else "",
+    }
+
+
 def to_storage_date(value: object, *, with_time: bool = False) -> str | None:
     """Convert a UI or ISO date back to the ISO string stored in the database."""
     parsed = parse_any_date(value)
@@ -1382,6 +1443,7 @@ NAV_SECTIONS: list[tuple[str, list[str]]] = [
     (
         "Masters",
         [
+            "Company",
             "Customers",
             "Vendors",
             "Raw Material Master",
@@ -1714,7 +1776,9 @@ def _tc_sync_editor(lines: list[dict], edited) -> list[dict]:
         row = by_no.get(int(line["Line_no"]), {})
         item = dict(line)
         if "Heat no" in row:
-            item["Display_heat_no"] = str(row.get("Heat no") or "").strip()
+            item["Display_heat_no"] = db.certificate_display_heat_no(
+                row.get("Heat no")
+            )
         if "Printed kg" in row:
             item["Weight"] = float(row.get("Printed kg") or 0)
         item["_selected"] = bool(row.get("Select"))
@@ -1722,153 +1786,472 @@ def _tc_sync_editor(lines: list[dict], edited) -> list[dict]:
     return out
 
 
+def _certificate_pdf_bytes(payload: dict) -> bytes:
+    """Build an A4 PDF of the formal test certificate."""
+    from fpdf import FPDF
+
+    orange = (241, 90, 34)
+    ink = (26, 26, 26)
+    fill = (247, 247, 247)
+    line = (122, 122, 122)
+    letterhead = _company_letterhead(payload.get("company") or {})
+    heats = payload.get("heats") or []
+    elements = payload.get("elements") or []
+    inspection = payload.get("inspection") or []
+
+    class _CertPDF(FPDF):
+        def footer(self) -> None:
+            return None
+
+    pdf = _CertPDF(orientation="P", unit="mm", format="A4")
+    # One A4 sheet: do not spill onto a second page. 10 mm keeps
+    # content inside a typical desktop printer's unprintable edge.
+    pdf.set_auto_page_break(auto=False)
+    pdf.set_margins(10, 10, 10)
+    pdf.add_page()
+    pdf.set_text_color(*ink)
+    pdf.set_draw_color(*line)
+    page_w = pdf.w - pdf.l_margin - pdf.r_margin
+    left = pdf.l_margin
+    y = pdf.get_y()
+    side = 24
+
+    if LOGO_PATH.exists():
+        pdf.image(str(LOGO_PATH), x=left, y=y, w=20)
+    if ISO_LOGO_PATH.exists():
+        pdf.image(str(ISO_LOGO_PATH), x=left + page_w - 20, y=y, w=20)
+
+    pdf.set_xy(left + side, y)
+    pdf.set_font("Helvetica", "B", 13)
+    pdf.cell(page_w - 2 * side, 6, letterhead["name"], align="C", new_x="LMARGIN", new_y="NEXT")
+    pdf.set_font("Helvetica", "", 8)
+    for line_text in (
+        letterhead["address"],
+        letterhead["contact"],
+        letterhead["gst"],
+    ):
+        if line_text:
+            pdf.set_x(left + side)
+            pdf.cell(page_w - 2 * side, 4, line_text, align="C", new_x="LMARGIN", new_y="NEXT")
+    pdf.set_y(max(pdf.get_y(), y + 24) + 2)
+
+    pdf.set_font("Helvetica", "B", 12)
+    pdf.cell(page_w, 7, "TEST CERTIFICATE", border=1, align="C", new_x="LMARGIN", new_y="NEXT")
+
+    def _fit(text: str, width: float, size: int = 7) -> str:
+        pdf.set_font("Helvetica", "", size)
+        out = str(text or "")
+        while out and pdf.get_string_width(out) > width - 1.4:
+            out = out[:-1]
+        return out
+
+    def _meta_row(cells: list[tuple[str, float, bool]]) -> None:
+        h = 5.6
+        x = left
+        y0 = pdf.get_y()
+        for text, width, is_label in cells:
+            pdf.set_xy(x, y0)
+            pdf.set_font("Helvetica", "B" if is_label else "", 8)
+            if is_label:
+                pdf.set_fill_color(*fill)
+            shown = text if is_label else _fit(str(text), width, 8)
+            pdf.cell(width, h, shown, border=1, align="L", fill=is_label)
+            x += width
+        pdf.set_y(y0 + h)
+
+    lw, vw = page_w * 0.16, page_w * 0.34
+    meta_pairs = [
+        ("Report No.", payload.get("certificate_no") or "—"),
+        ("Grade", payload.get("grade") or "—"),
+        ("Report Date", format_cert_print_date(payload.get("issued_date"))),
+        ("Colour Code", payload.get("colour_code") or "—"),
+        ("Customer", payload.get("customer_name") or "—"),
+        ("Customer Reference", payload.get("cust_code") or "—"),
+        ("Invoice No", payload.get("invoice_no") or "—"),
+        ("Invoice Date", format_cert_print_date(payload.get("invoice_date"))),
+        ("P.O No", payload.get("po_no") or "—"),
+        ("P.O Date", format_cert_print_date(payload.get("po_date"))),
+    ]
+    for i in range(0, len(meta_pairs), 2):
+        left_label, left_value = meta_pairs[i]
+        right_label, right_value = meta_pairs[i + 1]
+        _meta_row(
+            [
+                (str(left_label), lw, True),
+                (str(left_value), vw, False),
+                (str(right_label), lw, True),
+                (str(right_value), vw, False),
+            ]
+        )
+    doc_id = str(payload.get("document_id") or "").strip()
+    total_w = f"{db._format_cert_number(payload.get('total_weight'))} Kgs"
+    _meta_row(
+        [
+            ("Total Weight", lw, True),
+            (total_w, vw, False),
+            (doc_id, lw + vw, False),
+        ]
+    )
+
+    def _section(title: str) -> None:
+        pdf.set_fill_color(*orange)
+        pdf.set_text_color(255, 255, 255)
+        pdf.set_font("Helvetica", "B", 9)
+        pdf.cell(page_w, 6, title, border=1, align="C", fill=True, new_x="LMARGIN", new_y="NEXT")
+        pdf.set_text_color(*ink)
+
+    _section("CHEMICAL ANALYSIS REPORT")
+    heat_count = max(len(heats), 1)
+    elem_w, spec_w = 42.0, 30.0
+    heat_w = (page_w - elem_w - spec_w) / heat_count
+    head_h = 15.0
+    row_h = 5.0
+    y0 = pdf.get_y()
+    pdf.set_font("Helvetica", "B", 7)
+    pdf.set_fill_color(243, 243, 243)
+    pdf.rect(left, y0, elem_w, head_h, style="DF")
+    pdf.rect(left + elem_w, y0, spec_w, head_h, style="DF")
+    pdf.set_xy(left, y0 + 5)
+    pdf.cell(elem_w, 5, "ELEMENTS", align="C")
+    pdf.set_xy(left + elem_w, y0 + 5)
+    pdf.cell(spec_w, 5, "SPECIFICATION %", align="C")
+    for index, heat in enumerate(heats or [{"Heat_no": "—", "Kgs": "", "Pieces": ""}]):
+        x = left + elem_w + spec_w + index * heat_w
+        pdf.rect(x, y0, heat_w, 5, style="DF")
+        pdf.rect(x, y0 + 5, heat_w, 5, style="DF")
+        pdf.rect(x, y0 + 10, heat_w, 5, style="DF")
+        pdf.set_xy(x, y0)
+        pdf.cell(heat_w, 5, _fit(f"Heat No : {heat.get('Heat_no') or '—'}", heat_w), align="C")
+        pdf.set_xy(x, y0 + 5)
+        kgs = db._format_cert_number(heat.get("Kgs"))
+        pcs = str(int(float(heat.get("Pieces") or 0)))
+        pdf.cell(heat_w, 5, _fit(f"Kgs : {kgs}   Pcs : {pcs}", heat_w), align="C")
+        pdf.set_xy(x, y0 + 10)
+        pdf.cell(heat_w, 5, "ACTUAL %", align="C")
+    pdf.set_y(y0 + head_h)
+
+    if not elements:
+        pdf.set_font("Helvetica", "", 8)
+        pdf.cell(page_w, row_h, "No customer specification found for this alloy.", border=1, align="C", new_x="LMARGIN", new_y="NEXT")
+    for row in elements:
+        y1 = pdf.get_y()
+        pdf.set_font("Helvetica", "", 7)
+        pdf.rect(left, y1, elem_w, row_h)
+        pdf.rect(left + elem_w, y1, spec_w, row_h)
+        pdf.set_xy(left, y1)
+        pdf.cell(elem_w, row_h, _fit(str(row.get("Display_label") or row.get("Element_Name") or ""), elem_w))
+        pdf.set_xy(left + elem_w, y1)
+        pdf.cell(spec_w, row_h, _fit(str(row.get("Spec_text") or ""), spec_w), align="C")
+        actuals = row.get("actuals") or ["—"] * heat_count
+        for index in range(heat_count):
+            x = left + elem_w + spec_w + index * heat_w
+            pdf.rect(x, y1, heat_w, row_h)
+            pdf.set_xy(x, y1)
+            value = actuals[index] if index < len(actuals) else "—"
+            pdf.cell(heat_w, row_h, _fit(str(value), heat_w), align="C")
+        pdf.set_y(y1 + row_h)
+
+    _section("INSTRUMENT DETAILS")
+    inst_rows = [
+        ("Analysis Method", payload.get("analysis_method") or ""),
+        ("Instrument", payload.get("instrument") or ""),
+        ("Instrument Make", payload.get("instrument_make") or ""),
+    ]
+    label_w = page_w * 0.28
+    for label, value in inst_rows:
+        y1 = pdf.get_y()
+        pdf.set_fill_color(*fill)
+        pdf.set_font("Helvetica", "B", 8)
+        pdf.rect(left, y1, label_w, 6, style="DF")
+        pdf.set_xy(left, y1)
+        pdf.cell(label_w, 6, str(label))
+        pdf.set_font("Helvetica", "", 8)
+        pdf.rect(left + label_w, y1, page_w - label_w, 6)
+        pdf.set_xy(left + label_w, y1)
+        pdf.cell(page_w - label_w, 6, str(value))
+        pdf.set_y(y1 + 6)
+
+    _section("VISUAL INSPECTIONS : CUSTOMER REQUIREMENT STATUS")
+    q_w, s_w, v_w = page_w * 0.76, page_w * 0.12, page_w * 0.12
+    pdf.set_font("Helvetica", "B", 7)
+    pdf.set_fill_color(243, 243, 243)
+    pdf.cell(q_w, 6, "Requirement", border=1, align="C", fill=True)
+    pdf.cell(s_w, 6, "STATUS", border=1, align="C", fill=True)
+    pdf.cell(v_w, 6, "VERIFY", border=1, align="C", fill=True, new_x="LMARGIN", new_y="NEXT")
+    insp_h = 5.3
+    for row in inspection:
+        y1 = pdf.get_y()
+        answer = str(row.get("Answer") or "").strip()
+        status = "Ok" if answer.upper() == "OK" else (answer or "—")
+        verify = "Yes" if row.get("Verified") else ""
+        pdf.set_font("Helvetica", "", 7)
+        pdf.rect(left, y1, q_w, insp_h)
+        pdf.set_xy(left, y1)
+        pdf.cell(q_w, insp_h, _fit(str(row.get("Question_text") or ""), q_w, 7))
+        pdf.set_font("Helvetica", "B", 7)
+        pdf.rect(left + q_w, y1, s_w, insp_h)
+        pdf.set_xy(left + q_w, y1)
+        pdf.cell(s_w, insp_h, status, align="C")
+        pdf.rect(left + q_w + s_w, y1, v_w, insp_h)
+        pdf.set_xy(left + q_w + s_w, y1)
+        pdf.cell(v_w, insp_h, verify, align="C")
+        pdf.set_y(y1 + insp_h)
+
+    pdf.ln(3)
+    pdf.set_font("Helvetica", "B", 10)
+    pdf.cell(page_w, 6, f"Approved by : {payload.get('approved_by') or ''}")
+    return bytes(pdf.output())
+
+
 def _render_certificate_print(
     header: dict, cert: dict, lines: list[dict], inspection: list[dict] | None = None
-) -> None:
+) -> dict:
+    payload = db.get_test_certificate_print_payload(
+        int(header["Packing_list_id"]),
+        lines=lines,
+        inspection=inspection,
+    )
+    letterhead = _company_letterhead(payload.get("company") or {})
+    logo_src = _certificate_logo_data_uri()
+    iso_src = _iso_logo_data_uri()
+    logo_html = (
+        f'<img class="tc-logo" src="{logo_src}" alt="Nualco">'
+        if logo_src
+        else '<div class="tc-logo-fallback">NUALCO</div>'
+    )
+    iso_html = (
+        f'<img class="tc-iso" src="{iso_src}" alt="ISO 9001:2015 Certified Company">'
+        if iso_src
+        else ""
+    )
+    esc = html.escape
+    meta_pairs = [
+        ("Report No.", payload.get("certificate_no") or "—"),
+        ("Grade", payload.get("grade") or "—"),
+        ("Report Date", format_cert_print_date(payload.get("issued_date"))),
+        ("Colour Code", payload.get("colour_code") or "—"),
+        ("Customer", payload.get("customer_name") or "—"),
+        ("Customer Reference", payload.get("cust_code") or "—"),
+        ("Invoice No", payload.get("invoice_no") or "—"),
+        ("Invoice Date", format_cert_print_date(payload.get("invoice_date"))),
+        ("P.O No", payload.get("po_no") or "—"),
+        ("P.O Date", format_cert_print_date(payload.get("po_date"))),
+    ]
+    meta_rows_html = ""
+    for i in range(0, len(meta_pairs), 2):
+        left_label, left_value = meta_pairs[i]
+        right_label, right_value = meta_pairs[i + 1]
+        meta_rows_html += (
+            "<tr>"
+            f"<td class='tc-label'>{esc(left_label)}</td>"
+            f"<td class='tc-value'>{esc(str(left_value))}</td>"
+            f"<td class='tc-label'>{esc(right_label)}</td>"
+            f"<td class='tc-value'>{esc(str(right_value))}</td>"
+            "</tr>"
+        )
+    document_id = str(payload.get("document_id") or "").strip()
+    meta_rows_html += (
+        "<tr>"
+        "<td class='tc-label'>Total Weight</td>"
+        f"<td class='tc-value'>{esc(db._format_cert_number(payload.get('total_weight')))} Kgs</td>"
+        f"<td class='tc-docid-cell' colspan='2'>{esc(document_id)}</td>"
+        "</tr>"
+    )
+    heats = payload.get("heats") or []
+    heat_count = max(len(heats), 1)
+    heat_head = ""
+    heat_qty = ""
+    heat_actual = ""
+    for heat in heats:
+        heat_head += (
+            f"<th class='tc-heat' colspan='1'>"
+            f"Heat No : {esc(str(heat.get('Heat_no') or '—'))}</th>"
+        )
+        heat_qty += (
+            "<th class='tc-heat-sub'>"
+            f"Kgs : {esc(db._format_cert_number(heat.get('Kgs')))}<br>"
+            f"Pcs : {esc(str(int(float(heat.get('Pieces') or 0))))}"
+            "</th>"
+        )
+        heat_actual += "<th class='tc-heat-sub'>ACTUAL %</th>"
+    if not heats:
+        heat_head = "<th class='tc-heat'>Heat No : —</th>"
+        heat_qty = "<th class='tc-heat-sub'>Kgs : — &nbsp; Pcs : —</th>"
+        heat_actual = "<th class='tc-heat-sub'>ACTUAL %</th>"
+    chem_body = ""
+    for row in payload.get("elements") or []:
+        cells = "".join(
+            f"<td class='tc-actual'>{esc(str(value))}</td>"
+            for value in (row.get("actuals") or ["—"] * heat_count)
+        )
+        chem_body += (
+            "<tr>"
+            f"<td class='tc-elem'>{esc(str(row.get('Display_label') or row.get('Element_Name') or ''))}</td>"
+            f"<td class='tc-spec'>{esc(str(row.get('Spec_text') or ''))}</td>"
+            f"{cells}"
+            "</tr>"
+        )
+    if not chem_body:
+        chem_body = (
+            f"<tr><td colspan='{2 + heat_count}' class='tc-empty'>"
+            "No customer specification found for this alloy.</td></tr>"
+        )
+    insp_body = ""
+    for row in payload.get("inspection") or []:
+        answer = str(row.get("Answer") or "").strip()
+        status = "Ok" if answer.upper() == "OK" else (answer or "—")
+        verify = "✓" if row.get("Verified") else ""
+        insp_body += (
+            "<tr>"
+            f"<td class='tc-insp-q'>{esc(str(row.get('Question_text') or ''))}</td>"
+            f"<td class='tc-insp-status'>{esc(status)}</td>"
+            f"<td class='tc-insp-verify'>{verify}</td>"
+            "</tr>"
+        )
     st.markdown(
         f"""
         <style>
-        .packing-summary-wrap {{
-            border: 1px solid #ddd; border-radius: 6px;
-            padding: 1.25rem 1.5rem; background: #fff; color: {_BRAND_INK};
+        .tc-doc {{
+            background: #fff; color: {_BRAND_INK};
+            border: 1px solid #cfcfcf; padding: 0.85rem 1rem 1.1rem;
+            font-family: Arial, Helvetica, sans-serif; font-size: 12.5px;
         }}
-        .packing-summary-title {{
-            margin: 0 0 0.25rem 0; color: {_BRAND_INK};
-            border-bottom: 2px solid {_BRAND_ORANGE}; padding-bottom: 0.35rem;
+        .block-container {{ max-width: 1100px !important; }}
+        .tc-head {{
+            display: flex; align-items: flex-start;
+            gap: 0.45rem; margin: 0 0 0.2rem 0;
         }}
-        .packing-summary-table {{
-            width: 100%; border-collapse: collapse; margin: 0.75rem 0 0 0;
-            font-size: 0.95rem;
+        .tc-head-left, .tc-head-right {{
+            flex: 0 0 96px; width: 96px;
         }}
-        .packing-summary-table th, .packing-summary-table td {{
-            border: 1px solid #bdbdbd; padding: 0.55rem 0.7rem;
-            text-align: left; vertical-align: top;
+        .tc-head-left {{ text-align: left; }}
+        .tc-head-right {{ text-align: center; }}
+        .tc-head-center {{
+            flex: 1 1 auto; text-align: center; min-width: 0;
+            padding-top: 0.15rem;
         }}
-        .packing-summary-meta td:first-child {{
-            width: 30%; font-weight: 600; background: #f7f7f7;
+        .tc-logo {{ width: 86px; height: auto; display: inline-block; }}
+        .tc-logo-fallback {{
+            font-weight: 800; color: {_BRAND_ORANGE}; font-size: 1.1rem;
         }}
-        .packing-summary-batches th {{ background: #f0f0f0; font-weight: 700; }}
-        .packing-summary-batches tfoot td {{ font-weight: 700; background: #fafafa; }}
+        .tc-company-name {{
+            margin: 0 auto; font-size: 1.2rem; font-weight: 800;
+            letter-spacing: 0.02em; text-align: center; line-height: 1.25;
+            white-space: nowrap;
+        }}
+        .tc-company-line {{
+            margin: 0.16rem auto 0; line-height: 1.4; text-align: center;
+        }}
+        .tc-iso {{
+            width: 88px; height: auto; display: block;
+            margin: 0 auto;
+        }}
+        .tc-meta .tc-docid-cell {{
+            font-weight: 700; text-align: center; letter-spacing: 0.01em;
+        }}
+        .tc-title {{
+            margin: 0.7rem 0 0.45rem; text-align: center;
+            font-size: 1.15rem; font-weight: 800;
+            border: 1px solid {_BRAND_INK}; padding: 0.28rem 0;
+            letter-spacing: 0.06em;
+        }}
+        .tc-table {{
+            width: 100%; border-collapse: collapse; margin: 0;
+        }}
+        .tc-table th, .tc-table td {{
+            border: 1px solid #7a7a7a; padding: 0.28rem 0.4rem;
+            vertical-align: middle;
+        }}
+        .tc-meta .tc-label {{
+            width: 16%; font-weight: 700; background: #f7f7f7; white-space: nowrap;
+        }}
+        .tc-meta .tc-value {{ width: 34%; font-weight: 600; }}
+        .tc-section {{
+            background: {_BRAND_ORANGE}; color: #fff; font-weight: 800;
+            text-align: center; letter-spacing: 0.04em;
+            padding: 0.28rem 0.4rem; margin: 0.55rem 0 0;
+            border: 1px solid #c24a12;
+        }}
+        .tc-chem thead th {{
+            background: #f3f3f3; font-weight: 700; text-align: center;
+        }}
+        .tc-chem .tc-elem {{ text-align: left; font-weight: 600; width: 24%; }}
+        .tc-chem .tc-spec {{ text-align: center; width: 16%; }}
+        .tc-chem .tc-actual {{ text-align: center; font-weight: 600; }}
+        .tc-chem .tc-heat, .tc-chem .tc-heat-sub {{ min-width: 7.5rem; }}
+        .tc-empty {{ text-align: center; color: #666; }}
+        .tc-inst td:first-child {{ width: 22%; font-weight: 700; background: #f7f7f7; }}
+        .tc-insp-q {{ text-align: left; }}
+        .tc-insp-status, .tc-insp-verify {{
+            text-align: center; font-weight: 700; width: 12%;
+        }}
+        .tc-approve {{
+            margin: 0.85rem 0 0; font-weight: 700; font-size: 0.95rem;
+        }}
         @media print {{
             [data-testid="stSidebar"], [data-testid="stToolbar"],
-            footer, header, .no-print {{ display: none !important; }}
-            .block-container {{ max-width: 100% !important; padding: 0.25rem !important; }}
-            .packing-summary-wrap {{ border: none; padding: 0; }}
+            footer, header, .no-print,
+            .stAppToolbar, [data-testid="stHeading"],
+            [data-testid="stSelectbox"], [data-testid="stCaption"] {{
+                display: none !important;
+            }}
+            .block-container {{ max-width: 100% !important; padding: 0.2rem !important; }}
+            .tc-doc {{ border: none; padding: 0; }}
         }}
         </style>
-        """,
-        unsafe_allow_html=True,
-    )
-    meta_rows = [
-        ("Certificate no", cert.get("Certificate_no") or "—"),
-        ("Status", cert.get("Status") or "—"),
-        ("Issued date", format_ui_date(cert.get("Issued_date"), empty="—")),
-        ("Invoice number", header.get("Invoice_number") or "—"),
-        ("Invoice date", format_ui_date(header.get("Invoice_date"), empty="—")),
-        ("P.O. Number", header.get("Customer_PO_No") or "—"),
-        ("Customer name", header.get("Customer_name") or "—"),
-        ("Alloy name", header.get("Alloy_name") or "—"),
-        ("Colour code", header.get("Colour_code") or "—"),
-        ("Vehicle No", header.get("Vehicle_no") or "—"),
-        ("Packing list", f"#{header.get('Packing_list_id')}"),
-    ]
-    meta_html = "".join(
-        f"<tr><td>{html.escape(label)}</td><td>{html.escape(str(value))}</td></tr>"
-        for label, value in meta_rows
-    )
-    total_w = 0.0
-    total_p = 0
-    body = ""
-    for line in lines:
-        weight = float(line.get("Weight") or 0)
-        pieces = int(float(line.get("Pieces") or 0))
-        total_w += weight
-        total_p += pieces
-        batches = ", ".join(
-            str(src.get("Batch_ID") or "")
-            for src in (line.get("sources") or [])
-            if src.get("Batch_ID")
-        )
-        blend = "Yes" if line.get("Is_blended") else "No"
-        body += (
-            "<tr>"
-            f"<td>{html.escape(str(line.get('Line_no') or ''))}</td>"
-            f"<td>{html.escape(str(line.get('Display_heat_no') or '—'))}</td>"
-            f"<td>{html.escape(batches or '—')}</td>"
-            f"<td style='text-align:right'>{weight:,.2f}</td>"
-            f"<td style='text-align:right'>{pieces:,}</td>"
-            f"<td>{blend}</td>"
-            "</tr>"
-        )
-    if not body:
-        body = (
-            "<tr><td colspan='6' style='text-align:center;color:#666'>"
-            "No printed lines</td></tr>"
-        )
-        footer = ""
-    else:
-        footer = (
-            "<tfoot><tr><td colspan='3'>Total</td>"
-            f"<td style='text-align:right'>{total_w:,.2f}</td>"
-            f"<td style='text-align:right'>{total_p:,}</td>"
-            "<td></td></tr></tfoot>"
-        )
-    packed_w = float(cert.get("Source_weight") or 0)
-    packed_p = int(float(cert.get("Source_pieces") or 0))
-    summary = db.certificate_weight_summary(packed_w, total_w)
-    insp_body = ""
-    for row in inspection or []:
-        insp_body += (
-            "<tr>"
-            f"<td>{html.escape(str(row.get('Question_no') or ''))}</td>"
-            f"<td>{html.escape(str(row.get('Question_text') or ''))}</td>"
-            f"<td>{html.escape(str(row.get('Answer') or '—'))}</td>"
-            f"<td>{'Verified' if row.get('Verified') else '—'}</td>"
-            "</tr>"
-        )
-    insp_table = ""
-    if insp_body:
-        insp_table = f"""
-            <table class="packing-summary-table packing-summary-batches">
+        <div class="tc-doc">
+            <div class="tc-head">
+                <div class="tc-head-left">{logo_html}</div>
+                <div class="tc-head-center">
+                    <div class="tc-company-name">{esc(letterhead["name"])}</div>
+                    <div class="tc-company-line">{esc(letterhead["address"])}</div>
+                    <div class="tc-company-line">{esc(letterhead["contact"])}</div>
+                    <div class="tc-company-line">{esc(letterhead["gst"])}</div>
+                </div>
+                <div class="tc-head-right">{iso_html}</div>
+            </div>
+            <div class="tc-title">TEST CERTIFICATE</div>
+            <table class="tc-table tc-meta">
+                <tbody>{meta_rows_html}</tbody>
+            </table>
+            <div class="tc-section">CHEMICAL ANALYSIS REPORT</div>
+            <table class="tc-table tc-chem">
                 <thead>
                     <tr>
-                        <th>#</th><th>Visual inspection</th>
-                        <th>Answer</th><th>Verified</th>
+                        <th rowspan="3">ELEMENTS</th>
+                        <th rowspan="3">SPECIFICATION %</th>
+                        {heat_head}
+                    </tr>
+                    <tr>{heat_qty}</tr>
+                    <tr>{heat_actual}</tr>
+                </thead>
+                <tbody>{chem_body}</tbody>
+            </table>
+            <div class="tc-section">INSTRUMENT DETAILS</div>
+            <table class="tc-table tc-inst">
+                <tbody>
+                    <tr><td>Analysis Method</td><td>{esc(str(payload.get("analysis_method") or ""))}</td></tr>
+                    <tr><td>Instrument</td><td>{esc(str(payload.get("instrument") or ""))}</td></tr>
+                    <tr><td>Instrument Make</td><td>{esc(str(payload.get("instrument_make") or ""))}</td></tr>
+                </tbody>
+            </table>
+            <div class="tc-section">VISUAL INSPECTIONS : CUSTOMER REQUIREMENT STATUS</div>
+            <table class="tc-table tc-insp">
+                <thead>
+                    <tr>
+                        <th>Requirement</th>
+                        <th>STATUS</th>
+                        <th>VERIFY</th>
                     </tr>
                 </thead>
                 <tbody>{insp_body}</tbody>
             </table>
-        """
-    st.markdown(
-        f"""
-        <div class="packing-summary-wrap">
-            <h2 class="packing-summary-title">Test Certificate — {html.escape(str(cert.get('Certificate_no') or ''))}</h2>
-            <table class="packing-summary-table packing-summary-meta">
-                <tbody>{meta_html}</tbody>
-            </table>
-            {insp_table}
-            <table class="packing-summary-table packing-summary-batches">
-                <thead>
-                    <tr>
-                        <th>#</th><th>Heat No</th><th>Source Batch ID</th>
-                        <th style="text-align:right">Weight (kg)</th>
-                        <th style="text-align:right">Pieces</th>
-                        <th>Blended</th>
-                    </tr>
-                </thead>
-                <tbody>{body}</tbody>
-                {footer}
-            </table>
-            <p class="packing-summary-note">
-                Packed baseline: {packed_w:,.2f} kg / {packed_p:,} pieces.
-                Printed vs packed: {summary['delta_kg']:+.2f} kg
-                ({summary['delta_pct']:+.3f}%; max round-up {summary['max_pct']:g}%).
-                Pieces must match packed. Inventory and production weights are unchanged.
-            </p>
+            <p class="tc-approve">Approved by : {esc(str(payload.get("approved_by") or ""))}</p>
         </div>
         """,
         unsafe_allow_html=True,
     )
+    return payload
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -4774,6 +5157,8 @@ elif PAGE == "Test Certificate":
         st.session_state["tc_packing_list_id"] = packing_list_id
         st.session_state.pop("tc_lines", None)
         st.session_state.pop("tc_loaded_id", None)
+        st.session_state.pop("tc_show_print", None)
+        st.session_state.pop("tc_show_void", None)
 
     header = db.get_packing_list(packing_list_id)
     if not header:
@@ -4781,6 +5166,48 @@ elif PAGE == "Test Certificate":
         st.stop()
 
     cert = db.get_packing_list_certificate(packing_list_id)
+    if st.session_state.get("tc_show_print") and cert:
+        if (
+            st.session_state.get("tc_loaded_id") != packing_list_id
+            or "tc_lines" not in st.session_state
+        ):
+            st.session_state["tc_lines"] = [dict(row) for row in (cert.get("lines") or [])]
+            st.session_state["tc_loaded_id"] = packing_list_id
+        payload = _render_certificate_print(
+            header,
+            cert,
+            st.session_state.get("tc_lines") or cert.get("lines") or [],
+        )
+        cert_no = str(payload.get("certificate_no") or "test-certificate").strip()
+        pdf_name = re.sub(r"[^\w.-]+", "_", cert_no) + ".pdf"
+        try:
+            pdf_bytes = _certificate_pdf_bytes(payload)
+        except Exception as exc:
+            pdf_bytes = None
+            st.error(f"PDF could not be created: {exc}")
+        b1, b2, b3, _b4 = st.columns([1.1, 0.9, 1.3, 2])
+        with b1:
+            if st.button("Back to editor", key="tc_print_back"):
+                st.session_state.pop("tc_show_print", None)
+                st.rerun()
+        with b2:
+            st.markdown(
+                '<button class="no-print" onclick="window.print()" '
+                'style="padding:0.45rem 1rem;border:1px solid #ccc;border-radius:0.5rem;'
+                'background:#fff;cursor:pointer;font-size:0.9rem;">Print</button>',
+                unsafe_allow_html=True,
+            )
+        with b3:
+            if pdf_bytes:
+                st.download_button(
+                    "Download PDF",
+                    data=pdf_bytes,
+                    file_name=pdf_name,
+                    mime="application/pdf",
+                    key="tc_download_pdf",
+                )
+        st.stop()
+
     packed_batches = list(header.get("batches") or [])
     packed_w = sum(float(r.get("Weight") or 0) for r in packed_batches)
     packed_p = sum(int(float(r.get("Pieces") or 0)) for r in packed_batches)
@@ -4903,6 +5330,7 @@ elif PAGE == "Test Certificate":
         if cert.get("Status") == db.CERT_STATUS_VOID and not st.session_state.get("tc_show_void"):
             if st.button("View voided certificate", key="tc_view_void"):
                 st.session_state["tc_show_void"] = True
+                st.session_state["tc_show_print"] = True
                 st.rerun()
             st.stop()
 
@@ -4943,27 +5371,6 @@ elif PAGE == "Test Certificate":
             key="tc_status_display",
         )
 
-    if st.session_state.get("tc_show_print"):
-        _render_certificate_print(
-            header,
-            cert,
-            st.session_state.get("tc_lines") or [],
-            inspection_rows,
-        )
-        b1, b2, _b3 = st.columns([1, 1, 2])
-        with b1:
-            if st.button("Back to editor", key="tc_print_back"):
-                st.session_state.pop("tc_show_print", None)
-                st.rerun()
-        with b2:
-            st.markdown(
-                '<button class="no-print" onclick="window.print()" '
-                'style="padding:0.45rem 1rem;border:1px solid #ccc;border-radius:0.5rem;'
-                'background:#fff;cursor:pointer;font-size:0.9rem;">Print</button>',
-                unsafe_allow_html=True,
-            )
-        st.stop()
-
     lines = list(st.session_state.get("tc_lines") or [])
     editor_rows = []
     for line in lines:
@@ -4973,7 +5380,7 @@ elif PAGE == "Test Certificate":
             {
                 "Select": bool(line.get("_selected")),
                 "Line_no": int(line.get("Line_no") or 0),
-                "Heat no": line.get("Display_heat_no") or "",
+                "Heat no": db.certificate_display_heat_no(line.get("Display_heat_no")),
                 "Batch IDs": ", ".join(
                     str(src.get("Batch_ID") or "")
                     for src in sources
@@ -4986,7 +5393,10 @@ elif PAGE == "Test Certificate":
             }
         )
     editor_df = pd.DataFrame(editor_rows)
-    editor_key = f"tc_editor_{packing_list_id}_{int(st.session_state.get('tc_editor_n') or 0)}"
+    editor_key = (
+        f"tc_editor_{packing_list_id}_"
+        f"{int(st.session_state.get('tc_editor_n') or 0)}_h2"
+    )
     edited = st.data_editor(
         editor_df,
         column_config={
@@ -5209,6 +5619,185 @@ elif PAGE == "Test Certificate":
             ]
         )
     )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Company (issuer — not a customer)
+# ═══════════════════════════════════════════════════════════════════════════════
+elif PAGE == "Company":
+    st.title("Company")
+    st.caption(
+        "Nualco is the **issuer** on packing lists, invoices, and test certificates. "
+        "These details stay in **Company_profile**, not Customer Master."
+    )
+    try:
+        profile = db.get_company_profile()
+    except Exception as exc:
+        st.error(str(exc))
+        profile = dict(db.DEFAULT_COMPANY_PROFILE)
+
+    def _co_date(value: object) -> date:
+        try:
+            return date.fromisoformat(str(value or "")[:10])
+        except ValueError:
+            return date(2017, 11, 8)
+
+    states = db.list_states()
+    saved_state = str(profile.get("State") or "")
+    state_options = [""] + states
+    if saved_state and saved_state not in state_options:
+        state_options.append(saved_state)
+
+    c1, c2 = st.columns(2)
+    with c1:
+        company_name = st.text_input(
+            "Company name *",
+            value=str(profile.get("Company_name") or ""),
+            key="co_name",
+        )
+        contact_person = st.text_input(
+            "Contact person",
+            value=str(profile.get("Contact_person") or ""),
+            key="co_contact",
+        )
+        phone1 = st.text_input(
+            "Contact no 1",
+            value=str(profile.get("Phone1") or ""),
+            key="co_phone1",
+        )
+        phone2 = st.text_input(
+            "Contact no 2",
+            value=str(profile.get("Phone2") or ""),
+            key="co_phone2",
+        )
+        email1 = st.text_input(
+            "E-mail 1",
+            value=str(profile.get("Email1") or ""),
+            key="co_email1",
+        )
+        email2 = st.text_input(
+            "E-mail 2",
+            value=str(profile.get("Email2") or ""),
+            key="co_email2",
+        )
+        pan = st.text_input("PAN", value=str(profile.get("PAN") or ""), key="co_pan")
+        gst = st.text_input("GST", value=str(profile.get("GST") or ""), key="co_gst")
+        cin = st.text_input(
+            "CIN (Corporate Identity Number)",
+            value=str(profile.get("CIN") or ""),
+            key="co_cin",
+        )
+        msme = st.text_input(
+            "MSME UAM",
+            value=str(profile.get("MSME_UAM") or ""),
+            key="co_msme",
+        )
+        hsn = st.text_input(
+            "HSN code",
+            value=str(profile.get("HSN_code") or ""),
+            key="co_hsn",
+        )
+    with c2:
+        address = st.text_input(
+            "Address",
+            value=str(profile.get("Address") or ""),
+            key="co_address",
+        )
+        state = st.selectbox(
+            "State",
+            options=state_options,
+            index=state_options.index(saved_state) if saved_state in state_options else 0,
+            key="co_state",
+        )
+        cities = db.list_cities(state) if state else []
+        saved_city = str(profile.get("City") or "")
+        city_options = [""] + cities
+        if saved_city and saved_city not in city_options:
+            city_options.append(saved_city)
+        city = st.selectbox(
+            "City",
+            options=city_options,
+            index=city_options.index(saved_city) if saved_city in city_options else 0,
+            key="co_city",
+            disabled=not bool(state),
+        )
+        pincode = st.text_input(
+            "Pincode",
+            value=str(profile.get("Pincode") or ""),
+            key="co_pincode",
+        )
+        country = st.text_input(
+            "Country",
+            value=str(profile.get("Country") or "India"),
+            key="co_country",
+        )
+        incorporation = st.date_input(
+            "Date of incorporation",
+            value=_co_date(profile.get("Incorporation_date")),
+            key="co_inc",
+        )
+        iec = st.text_input(
+            "IEC code",
+            value=str(profile.get("IEC_code") or ""),
+            key="co_iec",
+        )
+        bank_name = st.text_input(
+            "Bank",
+            value=str(profile.get("Bank_name") or ""),
+            key="co_bank",
+        )
+        branch = st.text_input(
+            "Branch",
+            value=str(profile.get("Branch") or ""),
+            key="co_branch",
+        )
+        bank_account = st.text_input(
+            "Account number",
+            value=str(profile.get("Bank_account") or ""),
+            key="co_account",
+        )
+        ifsc = st.text_input(
+            "IFSC",
+            value=str(profile.get("IFSC_code") or ""),
+            key="co_ifsc",
+        )
+
+    if st.button("Save company details", type="primary", key="co_save"):
+        try:
+            saved = db.save_company_profile(
+                {
+                    "Company_name": company_name,
+                    "Address": address,
+                    "City": city,
+                    "State": state,
+                    "Pincode": pincode,
+                    "Country": country,
+                    "Contact_person": contact_person,
+                    "Phone1": phone1,
+                    "Phone2": phone2,
+                    "Email1": email1,
+                    "Email2": email2,
+                    "PAN": pan,
+                    "GST": gst,
+                    "CIN": cin,
+                    "MSME_UAM": msme,
+                    "HSN_code": hsn,
+                    "Incorporation_date": incorporation.isoformat()
+                    if incorporation
+                    else None,
+                    "IEC_code": iec,
+                    "Bank_name": bank_name,
+                    "Branch": branch,
+                    "Bank_account": bank_account,
+                    "IFSC_code": ifsc,
+                }
+            )
+            st.success(f"Saved **{saved.get('Company_name')}**.")
+            st.rerun()
+        except Exception as exc:
+            st.error(str(exc))
+
+    show_dataframe(df_from_rows([db.get_company_profile()]))
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -6818,6 +7407,7 @@ elif PAGE == "Masters Overview":
             | 30 | Packing_list_certificate_line | Printed TC lines (may merge heats; weight may round up ≤ 0.15%) |
             | 31 | Packing_list_certificate_source | Maps each printed TC line back to packing_list_batch |
             | 32 | Packing_list_visual_inspection | OK / NOT OK + Verified checks required before generating a test certificate |
+            | 33 | Company_profile | Our company (issuer) — legal, contact, GST/CIN/MSME, and bank details |
 
             Extra production columns: sample fields, `Production_supervisor`.
             """

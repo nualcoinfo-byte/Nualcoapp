@@ -400,6 +400,25 @@ CERT_STATUSES = [CERT_STATUS_DRAFT, CERT_STATUS_ISSUED, CERT_STATUS_VOID]
 CERT_WEIGHT_ROUND_MAX_PCT = 0.15
 CERT_WEIGHT_ROUND_MAX_RATIO = CERT_WEIGHT_ROUND_MAX_PCT / 100.0
 CERT_WEIGHT_EPS_KG = 0.0005
+CERT_DOCUMENT_ID = "NPL / QMS / 8.6a / Rev : 02 / Date : 05.07.2022"
+CERT_ANALYSIS_METHOD = "Optical emission spectrometer"
+CERT_INSTRUMENT = "Spectro"
+CERT_INSTRUMENT_MAKE = "Bruker Q2 ION"
+CERT_APPROVED_BY = "LAB SUPERVISOR"
+CERT_SPEC_HIDDEN_SYMBOLS = frozenset({"OE", "OT"})
+
+
+def certificate_display_heat_no(heat_no: object) -> str:
+    """Printed heat on the test certificate: drop leading YY- (year + hyphen).
+
+    Stored Heat_no is like 26-2H001. The certificate shows 2H001.
+    """
+    text = str(heat_no or "").strip()
+    if len(text) >= 3 and text[:2].isdigit() and text[2] == "-":
+        return text[3:]
+    return text
+
+
 VISUAL_INSPECTION_QUESTIONS: tuple[str, ...] = (
     "Material test certificate should be given along with the supply for individual Heat",
     "The Heat No. should be marked on each ingot",
@@ -410,6 +429,60 @@ VISUAL_INSPECTION_QUESTIONS: tuple[str, ...] = (
     "Colour code marked on each ingot",
     "K mold test",
     "The material does not have any Radioactive contamination",
+)
+COMPANY_PROFILE_ID = 1
+# Issuer / letterhead identity. Not a customer — kept out of Customer_Master.
+DEFAULT_COMPANY_PROFILE: dict[str, Any] = {
+    "Company_id": COMPANY_PROFILE_ID,
+    "Company_name": "Nualco Private Limited",
+    "Address": "F-21 , 10th Street Ambattur Industrial Estate.",
+    "City": "Chennai",
+    "State": "Tamil Nadu",
+    "Pincode": "600058",
+    "Country": "India",
+    "Contact_person": "John Eapen",
+    "Phone1": "9840483517",
+    "Phone2": "9884497644",
+    "Email1": "nualcoinfo@gmail.com",
+    "Email2": "info@nualco.com",
+    "PAN": "AAFCN7399M",
+    "GST": "33AAFCN7399M1ZQ",
+    "CIN": "U74999TN2017PTC118080",
+    "MSME_UAM": "UDYAM-TN-02-0029969",
+    "HSN_code": "76012010",
+    "Incorporation_date": "2017-11-08",
+    "IEC_code": "AAFCN7399M",
+    "Bank_name": "SBI",
+    "Branch": "SME Branch Ambattur",
+    "Bank_account": "41456353757",
+    "IFSC_code": "SBIN0014376",
+}
+COMPANY_PROFILE_COLUMNS: tuple[str, ...] = (
+    "Company_id",
+    "Company_name",
+    "Address",
+    "City",
+    "State",
+    "Pincode",
+    "Country",
+    "Contact_person",
+    "Phone1",
+    "Phone2",
+    "Email1",
+    "Email2",
+    "PAN",
+    "GST",
+    "CIN",
+    "MSME_UAM",
+    "HSN_code",
+    "Incorporation_date",
+    "IEC_code",
+    "Bank_name",
+    "Branch",
+    "Bank_account",
+    "IFSC_code",
+    "Last_updated_by",
+    "Last_updated_datetime",
 )
 # Non-spec metal taken off a heat: samples, furnace heel, and off-chemistry ingot.
 # These IDs live in Alloy_Master but have no Alloy_Master_spec rows.
@@ -451,6 +524,7 @@ AUDIT_TABLES = {
     "packing_list",
     "packing_list_certificate",
     "packing_list_visual_inspection",
+    "company_profile",
 }
 _ACTING_USER: str = "system"
 
@@ -737,6 +811,33 @@ CREATE TABLE IF NOT EXISTS Packing_list_visual_inspection (
     Last_updated_by TEXT,
     Last_updated_datetime TEXT,
     PRIMARY KEY (Packing_list_id, Question_no)
+);
+CREATE TABLE IF NOT EXISTS Company_profile (
+    Company_id INTEGER PRIMARY KEY CHECK (Company_id = 1),
+    Company_name TEXT NOT NULL,
+    Address TEXT,
+    City TEXT,
+    State TEXT,
+    Pincode TEXT,
+    Country TEXT,
+    Contact_person TEXT,
+    Phone1 TEXT,
+    Phone2 TEXT,
+    Email1 TEXT,
+    Email2 TEXT,
+    PAN TEXT,
+    GST TEXT,
+    CIN TEXT,
+    MSME_UAM TEXT,
+    HSN_code TEXT,
+    Incorporation_date TEXT,
+    IEC_code TEXT,
+    Bank_name TEXT,
+    Branch TEXT,
+    Bank_account TEXT,
+    IFSC_code TEXT,
+    Last_updated_by TEXT,
+    Last_updated_datetime TEXT
 );
 CREATE TABLE IF NOT EXISTS batch_input (
     Batch_ID TEXT NOT NULL REFERENCES Production_batch(Batch_ID),
@@ -1119,6 +1220,7 @@ def init_db() -> None:
         _ensure_raw_material_purchase_header(conn)
         _ensure_sidestream_remelt_inventory(conn)
         _ensure_packing_list(conn)
+        _ensure_company_profile(conn)
         _ensure_columns(
             conn,
             "Alloy_Master",
@@ -2261,6 +2363,94 @@ def _ensure_packing_list_certificate(conn: Connection) -> None:
     )
 
 
+def _ensure_company_profile(conn: Connection) -> None:
+    """Singleton issuer row — Nualco's legal, contact, and bank details."""
+    _exec(
+        conn,
+        """
+        CREATE TABLE IF NOT EXISTS Company_profile (
+            Company_id INTEGER PRIMARY KEY CHECK (Company_id = 1),
+            Company_name TEXT NOT NULL,
+            Address TEXT,
+            City TEXT,
+            State TEXT,
+            Pincode TEXT,
+            Country TEXT,
+            Contact_person TEXT,
+            Phone1 TEXT,
+            Phone2 TEXT,
+            Email1 TEXT,
+            Email2 TEXT,
+            PAN TEXT,
+            GST TEXT,
+            CIN TEXT,
+            MSME_UAM TEXT,
+            HSN_code TEXT,
+            Incorporation_date TEXT,
+            IEC_code TEXT,
+            Bank_name TEXT,
+            Branch TEXT,
+            Bank_account TEXT,
+            IFSC_code TEXT,
+            Last_updated_by TEXT,
+            Last_updated_datetime TEXT
+        )
+        """,
+    )
+    _ensure_columns(
+        conn,
+        "Company_profile",
+        [
+            ("Company_name", "TEXT"),
+            ("Address", "TEXT"),
+            ("City", "TEXT"),
+            ("State", "TEXT"),
+            ("Pincode", "TEXT"),
+            ("Country", "TEXT"),
+            ("Contact_person", "TEXT"),
+            ("Phone1", "TEXT"),
+            ("Phone2", "TEXT"),
+            ("Email1", "TEXT"),
+            ("Email2", "TEXT"),
+            ("PAN", "TEXT"),
+            ("GST", "TEXT"),
+            ("CIN", "TEXT"),
+            ("MSME_UAM", "TEXT"),
+            ("HSN_code", "TEXT"),
+            ("Incorporation_date", "TEXT"),
+            ("IEC_code", "TEXT"),
+            ("Bank_name", "TEXT"),
+            ("Branch", "TEXT"),
+            ("Bank_account", "TEXT"),
+            ("IFSC_code", "TEXT"),
+            ("Last_updated_by", "TEXT"),
+            ("Last_updated_datetime", "TEXT"),
+        ],
+    )
+    seed = dict(DEFAULT_COMPANY_PROFILE)
+    by_val, dt_val = audit_stamp()
+    cols = [c for c in COMPANY_PROFILE_COLUMNS if c != "Company_id"]
+    placeholders = ", ".join("?" for _ in range(len(cols) + 1))
+    insert_cols = ", ".join(["Company_id", *cols])
+    values = [COMPANY_PROFILE_ID]
+    for col in cols:
+        if col == "Last_updated_by":
+            values.append(by_val)
+        elif col == "Last_updated_datetime":
+            values.append(dt_val)
+        else:
+            values.append(seed.get(col))
+    _exec(
+        conn,
+        f"""
+        INSERT INTO Company_profile ({insert_cols})
+        VALUES ({placeholders})
+        ON CONFLICT (Company_id) DO NOTHING
+        """,
+        tuple(values),
+    )
+
+
 # TEXT columns that participate in a PRIMARY KEY. True = fold case with LOWER().
 _TEXT_PK_CI: list[tuple[str, list[tuple[str, bool]]]] = [
     ("Customer_Master", [("Cust_code", True)]),
@@ -2788,6 +2978,14 @@ def get_all_records(table_name: str, order_by: str | None = None) -> list[dict[s
 # Tables users can inspect and correct from the Data Browser page.
 # `pk` / `order_by` / `identity` use the physical (Postgres-lowercase) names.
 EDITABLE_TABLES: list[dict[str, Any]] = [
+    {
+        "key": "company_profile",
+        "label": "Company",
+        "pk": ["company_id"],
+        "order_by": "company_id",
+        "identity": ["company_id"],
+        "allow_add": False,
+    },
     {
         "key": "customer_master",
         "label": "Customers",
@@ -3662,6 +3860,7 @@ def get_alloy(alloy_id: object) -> Optional[dict[str, Any]]:
         """
         SELECT a.Alloy_id AS "Alloy_id", a.Alloy_name AS "Alloy_name",
                a.Alloy_group AS "Alloy_group", a.Colour_code AS "Colour_code",
+               a.Bis_Designation AS "Bis_Designation",
                a.Cust_code AS "Cust_code", c.Customer_name AS "Customer_name"
         FROM Alloy_Master a
         LEFT JOIN Customer_Master c ON c.Cust_code = a.Cust_code
@@ -3721,7 +3920,54 @@ def list_inventory_lots(
     return fetch_all(sql, params)
 
 
-# ---------- Customers / Suppliers ----------
+# ---------- Company (issuer) / Customers / Suppliers ----------
+
+def _company_select_sql() -> str:
+    parts = [f'{col} AS "{col}"' for col in COMPANY_PROFILE_COLUMNS]
+    return "SELECT " + ", ".join(parts) + " FROM Company_profile WHERE Company_id = ?"
+
+
+def get_company_profile() -> dict[str, Any]:
+    _ensure_company_ready()
+    row = fetch_one(_company_select_sql(), (COMPANY_PROFILE_ID,))
+    return dict(row) if row else dict(DEFAULT_COMPANY_PROFILE)
+
+
+def save_company_profile(data: dict[str, Any]) -> dict[str, Any]:
+    _ensure_company_ready()
+    name = str(data.get("Company_name") or "").strip()
+    if not name:
+        raise ValueError("Company name is required.")
+    by_val, dt_val = audit_stamp()
+    payload = dict(DEFAULT_COMPANY_PROFILE)
+    for col in COMPANY_PROFILE_COLUMNS:
+        if col in ("Company_id", "Last_updated_by", "Last_updated_datetime"):
+            continue
+        if col in data:
+            value = data.get(col)
+            if value is None:
+                payload[col] = None
+            else:
+                text = str(value).strip()
+                payload[col] = text or None
+    payload["Company_name"] = name
+    payload["Company_id"] = COMPANY_PROFILE_ID
+    payload["Last_updated_by"] = by_val
+    payload["Last_updated_datetime"] = dt_val
+    cols = [c for c in COMPANY_PROFILE_COLUMNS if c != "Company_id"]
+    assignments = ", ".join(f"{col}=excluded.{col}" for col in cols)
+    placeholders = ", ".join("?" for _ in range(len(cols) + 1))
+    values = [COMPANY_PROFILE_ID, *[payload.get(col) for col in cols]]
+    execute(
+        f"""
+        INSERT INTO Company_profile (Company_id, {", ".join(cols)})
+        VALUES ({placeholders})
+        ON CONFLICT (Company_id) DO UPDATE SET {assignments}
+        """,
+        tuple(values),
+    )
+    return get_company_profile()
+
 
 def upsert_customer(data: dict[str, Any]) -> None:
     """Insert or update a customer keyed on Cust_code."""
@@ -5294,6 +5540,12 @@ def backfill_finished_goods_from_output() -> int:
 def _ensure_packing_list_ready() -> None:
     with get_connection() as conn:
         _ensure_packing_list(conn)
+        _ensure_company_profile(conn)
+
+
+def _ensure_company_ready() -> None:
+    with get_connection() as conn:
+        _ensure_company_profile(conn)
 
 
 def list_packing_po_numbers() -> list[str]:
@@ -5920,7 +6172,7 @@ def _certificate_lines_from_packed(
             {
                 "Line_id": None,
                 "Line_no": index,
-                "Display_heat_no": heat,
+                "Display_heat_no": certificate_display_heat_no(heat),
                 "Weight": weight,
                 "Pieces": pieces,
                 "Is_blended": 0,
@@ -5967,7 +6219,9 @@ def _normalize_certificate_lines(
             {
                 "Line_id": raw.get("Line_id"),
                 "Line_no": int(raw.get("Line_no") or index),
-                "Display_heat_no": str(raw.get("Display_heat_no") or "").strip(),
+                "Display_heat_no": certificate_display_heat_no(
+                    raw.get("Display_heat_no")
+                ),
                 "Weight": float(raw.get("Weight") or 0),
                 "Pieces": int(float(raw.get("Pieces") or 0)),
                 "Is_blended": 1 if blended else 0,
@@ -6139,9 +6393,13 @@ def merge_certificate_lines(
             + ", ".join(sorted(heats))
             + "). Tick Allow blended chemistry to merge them."
         )
-    heat_label = (display_heat_no or "").strip()
+    heat_label = certificate_display_heat_no(display_heat_no)
     if not heat_label:
-        heat_label = next(iter(heats)) if len(heats) == 1 else "BLEND"
+        heat_label = (
+            certificate_display_heat_no(next(iter(heats)))
+            if len(heats) == 1
+            else "BLEND"
+        )
     merged = {
         "Line_id": None,
         "Line_no": min(int(row["Line_no"]) for row in selected),
@@ -6171,7 +6429,7 @@ def split_certificate_line(
             {
                 "Line_id": None,
                 "Line_no": 0,
-                "Display_heat_no": str(src.get("Heat_no") or ""),
+                "Display_heat_no": certificate_display_heat_no(src.get("Heat_no")),
                 "Weight": float(src.get("Source_weight") or 0),
                 "Pieces": int(src.get("Source_pieces") or 0),
                 "Is_blended": 0,
@@ -6386,10 +6644,220 @@ def get_packing_list_certificate(
     header["lines"] = []
     for row in line_rows:
         item = dict(row)
+        item["Display_heat_no"] = certificate_display_heat_no(
+            item.get("Display_heat_no")
+        )
         item["Is_blended"] = 1 if item.get("Is_blended") else 0
         item["sources"] = by_line.get(int(row["Line_id"]), [])
         header["lines"].append(item)
     return header
+
+
+def _format_cert_number(value: object) -> str:
+    if value is None or value == "":
+        return ""
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return str(value)
+    if abs(number - round(number)) < 1e-9:
+        return str(int(round(number)))
+    return f"{number:.4f}".rstrip("0").rstrip(".")
+
+
+def format_alloy_spec_percent(min_percent: object, max_percent: object) -> str:
+    """Customer spec text: '10 - 13.5' or '1.3 max' when min is 0."""
+    try:
+        low = float(min_percent or 0)
+    except (TypeError, ValueError):
+        low = 0.0
+    try:
+        high = float(max_percent or 0)
+    except (TypeError, ValueError):
+        high = 0.0
+    if abs(low) < 1e-9:
+        return f"{_format_cert_number(high)} max"
+    return f"{_format_cert_number(low)} - {_format_cert_number(high)}"
+
+
+def list_certificate_spec_rows(alloy_id: int) -> list[dict[str, Any]]:
+    """Alloy spec elements for the test certificate, plus Aluminium remainder."""
+    rows = fetch_all(
+        """
+        SELECT b.Element_Name AS "Element_Name",
+               b.Element_Symbol AS "Element_Symbol",
+               a.Min_percent AS "Min_percent",
+               a.Max_percent AS "Max_percent"
+        FROM Alloy_Master_spec a
+        LEFT JOIN Element_Master b ON b.Element_Symbol = a.Element_symbol
+        WHERE a.Alloy_id = ?
+        ORDER BY COALESCE(b.Serial_no, 9999), a.Element_symbol
+        """,
+        (int(alloy_id),),
+    )
+    out: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for row in rows:
+        raw_symbol = str(row.get("Element_Symbol") or "").strip()
+        symbol = raw_symbol.upper()
+        if not symbol or symbol in CERT_SPEC_HIDDEN_SYMBOLS:
+            continue
+        seen.add(symbol)
+        name = str(row.get("Element_Name") or raw_symbol).strip()
+        out.append(
+            {
+                "Element_Name": name,
+                "Element_Symbol": symbol,
+                "Display_label": name,
+                "Spec_text": format_alloy_spec_percent(
+                    row.get("Min_percent"), row.get("Max_percent")
+                ),
+                "Is_remainder": False,
+            }
+        )
+    if "AL" not in seen:
+        out.append(
+            {
+                "Element_Name": "Aluminium",
+                "Element_Symbol": "AL",
+                "Display_label": "Aluminium",
+                "Spec_text": "Remainder",
+                "Is_remainder": True,
+            }
+        )
+    return out
+
+
+def get_purchase_order_date(po_no: object, alloy_id: object) -> Optional[str]:
+    po = str(po_no or "").strip()
+    if not po:
+        return None
+    params: list[Any] = [po]
+    sql = """
+        SELECT Order_Date AS "Order_Date"
+        FROM Purchase_Order
+        WHERE Customer_PO_No = ?
+    """
+    try:
+        aid = int(alloy_id)
+    except (TypeError, ValueError):
+        aid = None
+    if aid is not None:
+        sql += " AND Alloy_Id = ?"
+        params.append(aid)
+    sql += " ORDER BY Order_Date DESC"
+    row = fetch_one(sql, tuple(params))
+    if row and row.get("Order_Date"):
+        return str(row["Order_Date"])
+    fallback = fetch_one(
+        """
+        SELECT Order_Date AS "Order_Date"
+        FROM Purchase_Order
+        WHERE Customer_PO_No = ?
+        ORDER BY Order_Date DESC
+        """,
+        (po,),
+    )
+    return str(fallback["Order_Date"]) if fallback and fallback.get("Order_Date") else None
+
+
+def get_test_certificate_print_payload(
+    packing_list_id: int,
+    *,
+    lines: list[dict[str, Any]] | None = None,
+    inspection: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Assemble letterhead, header fields, spec, heats, and inspection for print."""
+    header = get_packing_list(packing_list_id)
+    if not header:
+        raise ValueError(f"Packing list {packing_list_id} was not found.")
+    cert = get_packing_list_certificate(packing_list_id)
+    if not cert:
+        raise ValueError("Create a test certificate draft first.")
+    printed = _normalize_certificate_lines(lines if lines is not None else cert.get("lines") or [])
+    alloy = get_alloy(header.get("Alloy_id")) or {}
+    customer = get_customer(str(header.get("Cust_code") or "")) or {}
+    company = get_company_profile()
+    alloy_name = str(header.get("Alloy_name") or alloy.get("Alloy_name") or "").strip()
+    bis = str(alloy.get("Bis_Designation") or "").strip()
+    grade = f"{alloy_name} - {bis}" if alloy_name and bis else (alloy_name or bis or "—")
+    colour = str(
+        alloy.get("Colour_code") or header.get("Colour_code") or ""
+    ).strip()
+    spec_rows = list_certificate_spec_rows(int(header["Alloy_id"]))
+    heats: list[dict[str, Any]] = []
+    for line in printed:
+        sources = line.get("sources") or []
+        chem_by_symbol: dict[str, object] = {}
+        batch_id = ""
+        for src in sources:
+            bid = str(src.get("Batch_ID") or "").strip()
+            if bid:
+                batch_id = batch_id or bid
+                for chem in get_batch_chemistry(bid):
+                    symbol = str(chem.get("Element_symbol") or "").strip().upper()
+                    if symbol and symbol not in chem_by_symbol:
+                        chem_by_symbol[symbol] = chem.get("Percentage")
+                break
+        source_kg = sum(float(src.get("Source_weight") or 0) for src in sources)
+        source_pcs = sum(int(float(src.get("Source_pieces") or 0)) for src in sources)
+        heats.append(
+            {
+                "Heat_no": certificate_display_heat_no(line.get("Display_heat_no")),
+                "Kgs": source_kg if source_kg else float(line.get("Weight") or 0),
+                "Pieces": source_pcs
+                if source_pcs
+                else int(float(line.get("Pieces") or 0)),
+                "Batch_ID": batch_id,
+                "actuals": chem_by_symbol,
+            }
+        )
+    element_rows: list[dict[str, Any]] = []
+    for spec in spec_rows:
+        symbol = str(spec["Element_Symbol"]).upper()
+        actuals: list[str] = []
+        for heat in heats:
+            if spec.get("Is_remainder"):
+                actuals.append("Remainder")
+            else:
+                raw = heat["actuals"].get(symbol)
+                actuals.append(_format_cert_number(raw) if raw is not None else "—")
+        element_rows.append(
+            {
+                "Element_Name": spec["Element_Name"],
+                "Display_label": spec.get("Display_label") or spec["Element_Name"],
+                "Spec_text": spec["Spec_text"],
+                "actuals": actuals,
+            }
+        )
+    return {
+        "company": company,
+        "document_id": CERT_DOCUMENT_ID,
+        "certificate_no": cert.get("Certificate_no") or "—",
+        "issued_date": cert.get("Issued_date"),
+        "po_no": header.get("Customer_PO_No") or "—",
+        "po_date": get_purchase_order_date(
+            header.get("Customer_PO_No"), header.get("Alloy_id")
+        ),
+        "customer_name": customer.get("Customer_name")
+        or header.get("Customer_name")
+        or "—",
+        "cust_code": header.get("Cust_code") or "—",
+        "invoice_no": header.get("Invoice_number") or "—",
+        "invoice_date": header.get("Invoice_date"),
+        "total_weight": float(cert.get("Source_weight") or 0),
+        "grade": grade,
+        "colour_code": colour or "—",
+        "heats": heats,
+        "elements": element_rows,
+        "inspection": _normalize_visual_inspection_rows(
+            inspection if inspection is not None else get_visual_inspection(packing_list_id)
+        ),
+        "analysis_method": CERT_ANALYSIS_METHOD,
+        "instrument": CERT_INSTRUMENT,
+        "instrument_make": CERT_INSTRUMENT_MAKE,
+        "approved_by": CERT_APPROVED_BY,
+    }
 
 
 def _blank_visual_inspection_rows() -> list[dict[str, Any]]:
