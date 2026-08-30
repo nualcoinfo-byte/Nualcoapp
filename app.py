@@ -1456,7 +1456,18 @@ NAV_SECTIONS: list[tuple[str, list[str]]] = [
     ),
     ("Tools", ["Data Browser", "Masters Overview"]),
 ]
-_NAV_PAGES = [page for _section, pages in NAV_SECTIONS for page in pages]
+ADMIN_NAV_SECTION = "Admin"
+ADMIN_PAGE_CANCEL_ISSUED = "Cancel issued certificate"
+ADMIN_NAV_PAGES = [ADMIN_PAGE_CANCEL_ISSUED]
+_BASE_NAV_PAGES = [page for _section, pages in NAV_SECTIONS for page in pages]
+_ALL_NAV_PAGES = _BASE_NAV_PAGES + ADMIN_NAV_PAGES
+
+
+def _nav_sections(*, include_admin: bool) -> list[tuple[str, list[str]]]:
+    sections = list(NAV_SECTIONS)
+    if include_admin:
+        sections.append((ADMIN_NAV_SECTION, list(ADMIN_NAV_PAGES)))
+    return sections
 
 
 def _on_nav_section(section: str) -> None:
@@ -1464,15 +1475,37 @@ def _on_nav_section(section: str) -> None:
     if not chosen:
         return
     st.session_state.nav_page = chosen
-    for other, _pages in NAV_SECTIONS:
+    for other, _pages in _nav_sections(include_admin=True):
         if other != section:
             st.session_state[f"nav_radio_{other}"] = None
 
 
-if st.session_state.get("nav_page") not in _NAV_PAGES:
+st.sidebar.divider()
+users = db.list_access_users()
+if users:
+    if "acting_user" not in st.session_state or st.session_state.acting_user not in users:
+        st.session_state.acting_user = users[0]
+    acting = st.sidebar.selectbox(
+        "Last updated by",
+        users,
+        index=users.index(st.session_state.acting_user),
+        help="Stamped on master-table saves as Last_updated_by.",
+    )
+    st.session_state.acting_user = acting
+    db.set_acting_user(acting)
+else:
+    db.set_acting_user("system")
+    st.sidebar.caption("Last updated by: system (no Access_matrix users)")
+
+is_admin = db.is_admin_user()
+nav_sections = _nav_sections(include_admin=is_admin)
+
+if st.session_state.get("nav_page") not in _ALL_NAV_PAGES:
+    st.session_state.nav_page = "Dashboard"
+if st.session_state.get("nav_page") in ADMIN_NAV_PAGES and not is_admin:
     st.session_state.nav_page = "Dashboard"
 
-for section, pages in NAV_SECTIONS:
+for section, pages in nav_sections:
     st.sidebar.markdown(
         f'<div class="nav-section">{html.escape(section)}</div>',
         unsafe_allow_html=True,
@@ -1494,23 +1527,6 @@ for section, pages in NAV_SECTIONS:
     )
 
 PAGE = st.session_state.nav_page
-
-st.sidebar.divider()
-users = db.list_access_users()
-if users:
-    if "acting_user" not in st.session_state or st.session_state.acting_user not in users:
-        st.session_state.acting_user = users[0]
-    acting = st.sidebar.selectbox(
-        "Last updated by",
-        users,
-        index=users.index(st.session_state.acting_user),
-        help="Stamped on master-table saves as Last_updated_by.",
-    )
-    st.session_state.acting_user = acting
-    db.set_acting_user(acting)
-else:
-    db.set_acting_user("system")
-    st.sidebar.caption("Last updated by: system (no Access_matrix users)")
 
 st.sidebar.markdown(
     f"**Yield target:** {db.YIELD_TARGET_PCT:.0f}%  \n"
@@ -2299,6 +2315,130 @@ def _render_certificate_print(
         unsafe_allow_html=True,
     )
     return payload
+
+
+def _style_spec_check_table(data: pd.DataFrame) -> pd.io.formats.style.Styler:
+    """Highlight rows whose Status starts with Out of spec."""
+
+    def _row_style(row: pd.Series) -> list[str]:
+        status = str(row.get("Status") or "")
+        if status.startswith("Out of spec"):
+            return ["background-color: #fdecea; color: #c62828; font-weight: 700"] * len(
+                row
+            )
+        return [""] * len(row)
+
+    return data.style.apply(_row_style, axis=1)
+
+
+def _render_tc_spec_and_deviation(packing_list_id: int, *, locked: bool) -> tuple[bool, bool]:
+    """Show batch chemistry vs alloy spec and the deviation-letter upload."""
+    st.markdown("#### Alloy specification check")
+    st.caption(
+        "Each packed batch is compared to the packing-list alloy master spec. "
+        "An element is out of specification when its percentage is at or below min, "
+        "or at or above max."
+    )
+    comparison = db.list_packing_list_chemistry_vs_spec(packing_list_id)
+    deviations = [row for row in comparison if row.get("Out_of_spec")]
+    has_letter = db.has_packing_list_deviation_letter(packing_list_id)
+    if not comparison:
+        st.info(
+            "No saved batch chemistry to compare against the alloy specification yet."
+        )
+    else:
+        table_rows = [
+            {
+                "Batch_ID": row.get("Batch_ID"),
+                "Heat_no": row.get("Heat_no"),
+                "Element": row.get("Element_symbol"),
+                "Actual %": row.get("Percentage"),
+                "Spec": row.get("Spec"),
+                "Status": (
+                    f"Out of spec — {row.get('Reason')}"
+                    if row.get("Out_of_spec")
+                    else "Within spec"
+                ),
+            }
+            for row in comparison
+        ]
+        table = df_from_rows(table_rows)
+        st.dataframe(
+            _style_spec_check_table(table),
+            use_container_width=True,
+            hide_index=True,
+            height=min(560, 40 + 36 * max(len(table_rows), 3)),
+        )
+        if deviations:
+            st.error(
+                f"{len(deviations)} element(s) are outside specification. "
+                "Upload the customer acceptance of deviation letter before "
+                "creating or issuing the test certificate."
+            )
+        else:
+            st.success(
+                "All packed batch elements with recorded chemistry are within specification."
+            )
+
+    if deviations or has_letter:
+        st.markdown("#### Customer acceptance of deviation")
+        if deviations and not has_letter:
+            st.warning(
+                "A customer acceptance of deviation letter is required because "
+                "one or more packed batches are outside the alloy specification."
+            )
+        u2 = None
+        if not locked:
+            uploaded = st.file_uploader(
+                "Upload deviation letter",
+                type=["pdf", "doc", "docx", "jpg", "jpeg", "png"],
+                key=f"tc_dev_letter_{packing_list_id}",
+                help="PDF, Word, or a scan (JPEG/PNG).",
+            )
+            u1, u2, _ = st.columns([1.2, 1.2, 3])
+            if u1.button(
+                "Save letter",
+                type="primary",
+                disabled=uploaded is None,
+                key="tc_dev_save",
+            ):
+                try:
+                    db.save_packing_list_deviation_letter(
+                        packing_list_id,
+                        uploaded.getvalue(),
+                        uploaded.name,
+                        content_type=getattr(uploaded, "type", None),
+                    )
+                    st.success(f"Saved **{uploaded.name}**.")
+                    st.rerun()
+                except Exception as exc:
+                    st.error(str(exc))
+
+        letter = db.get_packing_list_deviation_letter(packing_list_id)
+        blob = _as_photo_bytes((letter or {}).get("Deviation_letter"))
+        if letter and blob:
+            st.caption(
+                f"Attached: **{letter.get('Deviation_letter_name') or 'deviation letter'}**"
+            )
+            st.download_button(
+                "Download letter",
+                data=blob,
+                file_name=letter.get("Deviation_letter_name")
+                or f"deviation-letter-{packing_list_id}.bin",
+                mime=letter.get("Deviation_letter_type") or "application/octet-stream",
+                key="tc_dev_download",
+            )
+            if not locked and u2 is not None and u2.button("Remove letter", key="tc_dev_remove"):
+                try:
+                    db.clear_packing_list_deviation_letter(packing_list_id)
+                    st.success("Deviation letter removed.")
+                    st.rerun()
+                except Exception as exc:
+                    st.error(str(exc))
+        elif not locked:
+            st.caption("No deviation letter attached yet.")
+
+    return bool(deviations), has_letter
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -4571,7 +4711,9 @@ elif PAGE == "Packing List":
         "Enter invoice details, then select **batch_id**s from Available finished goods. "
         "A heat can be packed in part: enter only the kg and pieces on this list. "
         "Saving as **Verified** subtracts that quantity from finished-goods inventory; "
-        "the remainder stays Available. Avg piece is packed weight ÷ pieces; typical "
+        "the remainder stays Available. **Cancel packing list** returns packed qty to "
+        "finished goods. After the test certificate is **Issued**, dispatch is final "
+        "and only an Admin can reverse it. Avg piece is packed weight ÷ pieces; typical "
         f"product alloy pieces are **{db.ALLOY_PIECE_KG_MIN:g}–{db.ALLOY_PIECE_KG_MAX:g} kg** "
         "and show in red if outside that range."
     )
@@ -4595,14 +4737,28 @@ elif PAGE == "Packing List":
     existing_lists = db.list_packing_lists()
     po_numbers = db.list_packing_po_numbers()
     editing_id = st.session_state.get("pl_edit_id")
+    edit_cert = (
+        db.get_packing_list_certificate(int(editing_id)) if editing_id else None
+    )
+    issued_locked = bool(
+        edit_cert and edit_cert.get("Status") == db.CERT_STATUS_ISSUED
+    )
 
     top1, top2, top3 = st.columns([3, 1, 1])
     with top1:
         if editing_id:
-            st.info(
-                f"Editing packing list **#{editing_id}**. "
-                "Save to update, or start a new list."
-            )
+            if issued_locked:
+                st.warning(
+                    f"Packing list **#{editing_id}** has issued test certificate "
+                    f"**{edit_cert.get('Certificate_no') or ''}**. Dispatch is final. "
+                    "Packed batches cannot be changed or cancelled here. An Admin "
+                    "can reverse this from **Admin → Cancel issued certificate**."
+                )
+            else:
+                st.info(
+                    f"Editing packing list **#{editing_id}**. "
+                    "Save to update, or start a new list."
+                )
         else:
             st.markdown("#### New packing list")
     with top2:
@@ -4746,6 +4902,7 @@ elif PAGE == "Packing List":
             "Packing list status *",
             options=db.PACKING_LIST_STATUS,
             key="pl_status",
+            disabled=issued_locked,
             help="In-Progress does not take stock. Verified subtracts packed kg and pieces from finished goods.",
         )
     with r3c3:
@@ -5026,7 +5183,40 @@ elif PAGE == "Packing List":
         for r in selected_lines
     }
 
-    if st.button("Save packing list", type="primary", key="pl_save"):
+    save_col, cancel_col = st.columns(2)
+    can_cancel_list = bool(
+        editing_id
+        and not issued_locked
+        and status == db.PACKING_STATUS_VERIFIED
+    )
+    with save_col:
+        save_clicked = st.button(
+            "Save packing list",
+            type="primary",
+            key="pl_save",
+            disabled=issued_locked,
+        )
+    with cancel_col:
+        cancel_list_clicked = st.button(
+            "Cancel packing list",
+            key="pl_cancel_list",
+            disabled=not can_cancel_list,
+            help="Returns packed kg and pieces to finished goods and sets the list to In-Progress.",
+        )
+
+    if cancel_list_clicked and editing_id:
+        try:
+            cancelled = db.cancel_packing_list(int(editing_id))
+            st.session_state["pl_status"] = db.PACKING_STATUS_IN_PROGRESS
+            st.success(
+                f"Packing list **#{cancelled.get('Packing_list_id')}** cancelled. "
+                "Packed quantity is back in finished goods."
+            )
+            st.rerun()
+        except Exception as exc:
+            st.error(str(exc))
+
+    if save_clicked:
         if not invoice_number.strip():
             st.error("Invoice number is required.")
         elif not po_no:
@@ -5085,6 +5275,7 @@ elif PAGE == "Packing List":
             (
                 f"#{r['Packing_list_id']}  |  {r.get('Invoice_number') or '—'}  |  "
                 f"{r.get('Customer_name') or '—'}  |  {r.get('Packing_list_status')}"
+                f"  |  {r.get('Certificate_status') or 'no certificate'}"
             ): int(r["Packing_list_id"])
             for r in existing_lists
         }
@@ -5164,7 +5355,8 @@ elif PAGE == "Test Certificate":
         "inspection** first (OK / NOT OK and Verified on every item). Merge heats onto "
         "one printed line and round **up** total kg by at most "
         f"**{db.CERT_WEIGHT_ROUND_MAX_PCT:g}%**. Pieces must stay exact. "
-        "Finished-goods and production quantities are not changed."
+        "**Issue** is the final dispatch step. After that, packed inventory cannot be "
+        "reversed here — only an Admin can cancel an issued certificate."
     )
 
     try:
@@ -5342,6 +5534,12 @@ elif PAGE == "Test Certificate":
             except Exception as exc:
                 st.error(str(exc))
 
+    has_deviations, has_letter = _render_tc_spec_and_deviation(
+        packing_list_id,
+        locked=insp_locked,
+    )
+    spec_blocked = has_deviations and not has_letter
+
     if cert is None or cert.get("Status") == db.CERT_STATUS_VOID:
         label = (
             "Create new draft from packed batches"
@@ -5352,7 +5550,7 @@ elif PAGE == "Test Certificate":
             label,
             type="primary",
             key="tc_create",
-            disabled=not insp_ready,
+            disabled=not insp_ready or spec_blocked,
         ):
             try:
                 db.save_visual_inspection(packing_list_id, inspection_rows)
@@ -5368,6 +5566,11 @@ elif PAGE == "Test Certificate":
                 st.error(str(exc))
         if not insp_ready:
             st.info("Finish visual inspection before generating the test certificate.")
+        elif spec_blocked:
+            st.info(
+                "Upload the customer acceptance of deviation letter before "
+                "generating the test certificate."
+            )
         if cert is None:
             st.stop()
         st.caption(
@@ -5585,11 +5788,52 @@ elif PAGE == "Test Certificate":
                     else "Heat chemistry"
                 )
                 st.caption(label)
-                show_dataframe(df_from_rows(chem))
+                try:
+                    alloy_id = int(header.get("Alloy_id") or 0)
+                except (TypeError, ValueError):
+                    alloy_id = 0
+                specs = db.get_alloy_specs(alloy_id) if alloy_id else {}
+                chem_rows = []
+                for row in chem:
+                    symbol = str(row.get("Element_symbol") or "").strip()
+                    spec = specs.get(symbol)
+                    pct = row.get("Percentage")
+                    oos = bool(
+                        spec
+                        and db.element_percent_out_of_spec(
+                            pct,
+                            spec.get("Min_percent"),
+                            spec.get("Max_percent"),
+                        )
+                    )
+                    chem_rows.append(
+                        {
+                            "Element": symbol,
+                            "Actual %": pct,
+                            "Spec": (
+                                db.format_alloy_spec_percent(
+                                    spec.get("Min_percent"),
+                                    spec.get("Max_percent"),
+                                )
+                                if spec
+                                else "—"
+                            ),
+                            "Status": (
+                                "Out of spec"
+                                if oos
+                                else ("Within spec" if spec else "No spec")
+                            ),
+                        }
+                    )
+                st.dataframe(
+                    _style_spec_check_table(df_from_rows(chem_rows)),
+                    use_container_width=True,
+                    hide_index=True,
+                )
             else:
                 st.info("No chemistry saved on the source batches yet.")
 
-    a1, a2, a3, a4 = st.columns(4)
+    a1, a2, a3 = st.columns(3)
     with a1:
         if st.button("View / print", key="tc_view_print"):
             st.session_state["tc_show_print"] = True
@@ -5605,13 +5849,18 @@ elif PAGE == "Test Certificate":
         issue_clicked = st.button(
             "Issue certificate",
             key="tc_issue",
-            disabled=locked or not insp_ready,
+            disabled=locked or not insp_ready or spec_blocked,
         )
-    with a4:
-        void_clicked = st.button(
-            "Void certificate",
-            key="tc_void",
-            disabled=cert.get("Status") == db.CERT_STATUS_VOID,
+    if cert.get("Status") == db.CERT_STATUS_ISSUED:
+        st.info(
+            "This certificate is issued. Dispatch is final. Packed inventory "
+            "cannot be reversed here. An Admin can cancel it from "
+            "**Admin → Cancel issued certificate**."
+        )
+    if spec_blocked and not locked:
+        st.info(
+            "Upload the customer acceptance of deviation letter before issuing "
+            "the test certificate."
         )
 
     if save_clicked:
@@ -5638,15 +5887,6 @@ elif PAGE == "Test Certificate":
             )
             st.session_state["tc_lines"] = issued.get("lines") or []
             st.success(f"Issued **{issued.get('Certificate_no')}**. Printed lines are locked.")
-            st.rerun()
-        except Exception as exc:
-            st.error(str(exc))
-    if void_clicked:
-        try:
-            db.void_packing_list_certificate(packing_list_id)
-            st.session_state.pop("tc_lines", None)
-            st.session_state.pop("tc_loaded_id", None)
-            st.warning("Certificate voided. Packed inventory is unchanged.")
             st.rerun()
         except Exception as exc:
             st.error(str(exc))
@@ -7459,3 +7699,108 @@ elif PAGE == "Masters Overview":
             Extra production columns: sample fields, `Production_supervisor`.
             """
         )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Admin — Cancel issued certificate
+# ═══════════════════════════════════════════════════════════════════════════════
+elif PAGE == ADMIN_PAGE_CANCEL_ISSUED:
+    if not db.is_admin_user():
+        st.error("This page is available only to Admin users.")
+        st.stop()
+    st.title("Cancel issued certificate")
+    st.caption(
+        "Issue is the final dispatch step. Use this page only to reverse a "
+        "shipment that should not have been issued. Cancelling voids the "
+        "certificate, sets the packing list back to **In-Progress**, and "
+        "returns packed kg and pieces to finished-goods inventory."
+    )
+    try:
+        issued_rows = db.list_issued_certificates()
+    except Exception as exc:
+        st.error(str(exc))
+        issued_rows = []
+    if not issued_rows:
+        st.info("There are no issued test certificates to cancel.")
+        st.stop()
+
+    show_dataframe(
+        df_from_rows(
+            [
+                {
+                    "Packing_list_id": row.get("Packing_list_id"),
+                    "Certificate_no": row.get("Certificate_no"),
+                    "Issued_date": row.get("Issued_date"),
+                    "Invoice": row.get("Invoice_number"),
+                    "Customer": row.get("Customer_name"),
+                    "Alloy": row.get("Alloy_name"),
+                    "Packed kg": row.get("Source_weight"),
+                    "Packed pieces": row.get("Source_pieces"),
+                    "Issued by": row.get("Last_updated_by"),
+                }
+                for row in issued_rows
+            ]
+        )
+    )
+    opts = {
+        (
+            f"{row.get('Certificate_no') or '—'}  |  "
+            f"PL #{row.get('Packing_list_id')}  |  "
+            f"{row.get('Customer_name') or '—'}  |  "
+            f"{row.get('Invoice_number') or '—'}"
+        ): int(row["Packing_list_id"])
+        for row in issued_rows
+    }
+    pick = st.selectbox(
+        "Issued certificate",
+        options=list(opts.keys()),
+        key="admin_cancel_issued_pick",
+    )
+    packing_list_id = opts[pick]
+    chosen = next(
+        (row for row in issued_rows if int(row["Packing_list_id"]) == packing_list_id),
+        None,
+    )
+    if chosen:
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Certificate", chosen.get("Certificate_no") or "—")
+        c2.metric("Packed kg", f"{float(chosen.get('Source_weight') or 0):,.2f}")
+        c3.metric("Packed pieces", f"{int(float(chosen.get('Source_pieces') or 0)):,}")
+        c4.metric("Customer", chosen.get("Customer_name") or "—")
+        header = db.get_packing_list(packing_list_id)
+        if header:
+            st.markdown("##### Packed batches to return")
+            show_dataframe(
+                df_from_rows(
+                    [
+                        {
+                            "Batch_ID": row.get("Batch_ID"),
+                            "Heat_no": row.get("Heat_no"),
+                            "Weight": row.get("Weight"),
+                            "Pieces": row.get("Pieces"),
+                        }
+                        for row in (header.get("batches") or [])
+                    ]
+                )
+            )
+    confirm = st.checkbox(
+        "I confirm this issued certificate should be cancelled and packed "
+        "quantity returned to finished goods.",
+        key="admin_cancel_issued_confirm",
+    )
+    if st.button(
+        "Cancel issued certificate",
+        type="primary",
+        key="admin_cancel_issued_go",
+        disabled=not confirm,
+    ):
+        try:
+            voided = db.cancel_issued_test_certificate(packing_list_id)
+            st.success(
+                f"Cancelled **{voided.get('Certificate_no')}**. "
+                "The packing list is In-Progress and packed quantity is back "
+                "in finished goods."
+            )
+            st.rerun()
+        except Exception as exc:
+            st.error(str(exc))
