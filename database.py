@@ -1,10 +1,10 @@
 """
 Database layer for Nualco Aluminum Alloy Manufacturing Tracker.
 
-Runs on Neon Postgres when DATABASE_URL is available (from the environment or
+Runs on Postgres when DATABASE_URL is available (from the environment or
 .env.local), otherwise falls back to the local SQLite file. Native Postgres
-on port 5432 is preferred; if that path is blocked, queries go over Neon's
-HTTPS SQL endpoint instead. All SQL is written in the portable subset both
+on port 5432 is preferred; if that path is blocked and the host is Neon,
+queries go over Neon's HTTPS SQL endpoint instead. All SQL is written in the portable subset both
 dialects support:
 
 - placeholders use `?` and are translated to `%s` for Postgres
@@ -140,8 +140,21 @@ def _database_url() -> str | None:
     return _prepare_postgres_url(chosen) if chosen else None
 
 
+def _postgres_label(url: str) -> str:
+    host = (urlparse(url).hostname or "").lower()
+    if "supabase.co" in host:
+        return "Supabase Postgres"
+    if "neon.tech" in host:
+        return "Neon Postgres"
+    return "Postgres"
+
+
+def _is_neon_host(url: str) -> bool:
+    return "neon.tech" in (urlparse(url).hostname or "").lower()
+
+
 def _postgres_ssl_ready(url: str, timeout: float = 4.0) -> bool:
-    """True only if Neon answers the Postgres SSLRequest. TCP-open is not enough."""
+    """True only if the host answers the Postgres SSLRequest. TCP-open is not enough."""
     host = urlparse(url).hostname
     if not host:
         return False
@@ -180,15 +193,29 @@ if _URL and _postgres_ssl_ready(_URL):
             "gssencmode": "disable",
         },
     )
-    DB_LABEL = "Neon Postgres"
-elif _URL:
+    DB_LABEL = _postgres_label(_URL)
+elif _URL and _is_neon_host(_URL):
     # Port 5432 often times out on this Windows network (TCP open, SSL never
     # completes). Neon SQL-over-HTTPS on 443 still works.
     from neon_http import HttpEngine
 
     _USE_NEON_HTTP = True
     ENGINE = HttpEngine(_URL)
-    DB_LABEL = "Neon Postgres"
+    DB_LABEL = _postgres_label(_URL)
+elif _URL:
+    ENGINE = create_engine(
+        _URL,
+        pool_pre_ping=True,
+        pool_recycle=280,
+        pool_size=5,
+        max_overflow=5,
+        connect_args={
+            "connect_timeout": 8,
+            "sslmode": "require",
+            "gssencmode": "disable",
+        },
+    )
+    DB_LABEL = _postgres_label(_URL)
 else:
     # check_same_thread=False because Streamlit reruns scripts on worker
     # threads, so connections cross thread boundaries.
