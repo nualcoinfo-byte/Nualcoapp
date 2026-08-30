@@ -6442,6 +6442,7 @@ def split_certificate_line(
 def blended_certificate_chemistry(sources: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Weighted-average chemistry of source batches (weight = packed kg)."""
     totals: dict[str, float] = {}
+    serials: dict[str, int] = {}
     total_w = 0.0
     for src in sources or []:
         weight = float(src.get("Source_weight") or 0)
@@ -6457,11 +6458,15 @@ def blended_certificate_chemistry(sources: list[dict[str, Any]]) -> list[dict[st
                 continue
             pct = float(row.get("Percentage") or 0)
             totals[sym] = totals.get(sym, 0.0) + pct * weight
+            try:
+                serials[sym] = int(row.get("Serial_no") or 9999)
+            except (TypeError, ValueError):
+                serials.setdefault(sym, 9999)
     if total_w <= 0:
         return []
     return [
         {"Element_symbol": sym, "Percentage": totals[sym] / total_w}
-        for sym in sorted(totals)
+        for sym in sorted(totals, key=lambda symbol: (serials.get(symbol, 9999), symbol))
     ]
 
 
@@ -7889,7 +7894,8 @@ def _sync_sidestream_inventory(conn: Connection, batch_id: str) -> None:
 def get_batch_chemistry(batch_id: str) -> list[dict[str, Any]]:
     return fetch_all(
         """
-        SELECT s.Element_symbol AS "Element_symbol", s.Percentage AS "Percentage"
+        SELECT s.Element_symbol AS "Element_symbol", s.Percentage AS "Percentage",
+               COALESCE(_el.Serial_no, 9999) AS "Serial_no"
         FROM Batch_Chemical_Composition s
         LEFT JOIN Element_Master _el ON _el.Element_Symbol = s.Element_symbol
         WHERE s.Batch_ID = ?
