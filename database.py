@@ -8396,6 +8396,58 @@ def list_purchase_orders() -> list[dict[str, Any]]:
     )
 
 
+def list_po_supply_status() -> list[dict[str, Any]]:
+    """Open-order kg, verified dispatch, packing-in-progress, and FG on hand."""
+    return fetch_all(
+        """
+        SELECT p.Customer_PO_No AS "Customer_PO_No",
+               p.Cust_code AS "Cust_code",
+               p.Customer_name AS "Customer_name",
+               p.Alloy_Id AS "Alloy_Id",
+               a.Alloy_name AS "Alloy_name",
+               p.Order_Date AS "Order_Date",
+               p.Delivery_Date AS "Delivery_Date",
+               COALESCE(p.Order_Qty, 0) AS "Order_Qty",
+               COALESCE(p.Purchase_Order_Status, 'Open') AS "Purchase_Order_Status",
+               COALESCE(d.Dispatched_Qty, 0) AS "Dispatched_Qty",
+               COALESCE(d.In_packing_Qty, 0) AS "In_packing_Qty",
+               COALESCE(p.Order_Qty, 0) - COALESCE(d.Dispatched_Qty, 0)
+                   AS "Balance_Qty",
+               COALESCE(fg.FG_Available_Qty, 0) AS "FG_Available_Qty",
+               COALESCE(fg.FG_Under_Testing_Qty, 0) AS "FG_Under_Testing_Qty"
+        FROM Purchase_Order p
+        LEFT JOIN Alloy_Master a ON a.Alloy_id = p.Alloy_Id
+        LEFT JOIN (
+            SELECT pl.Customer_PO_No AS po_no,
+                   pl.Alloy_id AS alloy_id,
+                   SUM(CASE WHEN pl.Packing_list_status = 'Verified'
+                            THEN COALESCE(lb.Weight, 0) ELSE 0 END)
+                       AS Dispatched_Qty,
+                   SUM(CASE WHEN pl.Packing_list_status = 'In-Progress'
+                            THEN COALESCE(lb.Weight, 0) ELSE 0 END)
+                       AS In_packing_Qty
+            FROM Packing_list pl
+            JOIN Packing_list_batch lb
+                ON lb.Packing_list_id = pl.Packing_list_id
+            GROUP BY pl.Customer_PO_No, pl.Alloy_id
+        ) d ON d.po_no = p.Customer_PO_No AND d.alloy_id = p.Alloy_Id
+        LEFT JOIN (
+            SELECT b.Alloy_id AS alloy_id,
+                   SUM(CASE WHEN fg.Finished_Goods_Status = 'Available'
+                            THEN COALESCE(fg.Output_Weight, 0) ELSE 0 END)
+                       AS FG_Available_Qty,
+                   SUM(CASE WHEN fg.Finished_Goods_Status = 'Under_Testing'
+                            THEN COALESCE(fg.Output_Weight, 0) ELSE 0 END)
+                       AS FG_Under_Testing_Qty
+            FROM Finished_Goods_Inventory fg
+            JOIN Production_batch b ON b.Batch_ID = fg.Batch_ID
+            GROUP BY b.Alloy_id
+        ) fg ON fg.alloy_id = p.Alloy_Id
+        ORDER BY p.Delivery_Date, p.Customer_name, p.Customer_PO_No, a.Alloy_name
+        """
+    )
+
+
 def _require_alloy_id(alloy_id: Any) -> int:
     if alloy_id is None or alloy_id == "":
         raise ValueError(
