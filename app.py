@@ -1722,7 +1722,9 @@ def _tc_sync_editor(lines: list[dict], edited) -> list[dict]:
     return out
 
 
-def _render_certificate_print(header: dict, cert: dict, lines: list[dict]) -> None:
+def _render_certificate_print(
+    header: dict, cert: dict, lines: list[dict], inspection: list[dict] | None = None
+) -> None:
     st.markdown(
         f"""
         <style>
@@ -1814,6 +1816,29 @@ def _render_certificate_print(header: dict, cert: dict, lines: list[dict]) -> No
     packed_w = float(cert.get("Source_weight") or 0)
     packed_p = int(float(cert.get("Source_pieces") or 0))
     summary = db.certificate_weight_summary(packed_w, total_w)
+    insp_body = ""
+    for row in inspection or []:
+        insp_body += (
+            "<tr>"
+            f"<td>{html.escape(str(row.get('Question_no') or ''))}</td>"
+            f"<td>{html.escape(str(row.get('Question_text') or ''))}</td>"
+            f"<td>{html.escape(str(row.get('Answer') or '—'))}</td>"
+            f"<td>{'Verified' if row.get('Verified') else '—'}</td>"
+            "</tr>"
+        )
+    insp_table = ""
+    if insp_body:
+        insp_table = f"""
+            <table class="packing-summary-table packing-summary-batches">
+                <thead>
+                    <tr>
+                        <th>#</th><th>Visual inspection</th>
+                        <th>Answer</th><th>Verified</th>
+                    </tr>
+                </thead>
+                <tbody>{insp_body}</tbody>
+            </table>
+        """
     st.markdown(
         f"""
         <div class="packing-summary-wrap">
@@ -1821,6 +1846,7 @@ def _render_certificate_print(header: dict, cert: dict, lines: list[dict]) -> No
             <table class="packing-summary-table packing-summary-meta">
                 <tbody>{meta_html}</tbody>
             </table>
+            {insp_table}
             <table class="packing-summary-table packing-summary-batches">
                 <thead>
                     <tr>
@@ -4704,7 +4730,8 @@ elif PAGE == "Packing List":
 elif PAGE == "Test Certificate":
     st.title("Test Certificate")
     st.caption(
-        "Print dispatch weights from a **Verified** packing list. Merge heats onto "
+        "Print dispatch weights from a **Verified** packing list. Complete **Visual "
+        "inspection** first (OK / NOT OK and Verified on every item). Merge heats onto "
         "one printed line and round **up** total kg by at most "
         f"**{db.CERT_WEIGHT_ROUND_MAX_PCT:g}%**. Pieces must stay exact. "
         "Finished-goods and production quantities are not changed."
@@ -4769,14 +4796,92 @@ elif PAGE == "Test Certificate":
         f"Vehicle: {header.get('Vehicle_no') or '—'}"
     )
 
+    insp_locked = bool(cert and cert.get("Status") == db.CERT_STATUS_ISSUED)
+    try:
+        inspection = db.get_visual_inspection(packing_list_id)
+    except Exception as exc:
+        st.error(str(exc))
+        inspection = [
+            {
+                "Question_no": index,
+                "Question_text": text,
+                "Answer": "",
+                "Verified": 0,
+            }
+            for index, text in enumerate(db.VISUAL_INSPECTION_QUESTIONS, start=1)
+        ]
+
+    st.markdown("#### Visual inspection")
+    st.caption(
+        "Complete every check as **OK** or **NOT OK**, then tick **Verified**. "
+        "All items must be OK and Verified before the test certificate can be generated."
+    )
+    answer_choices = ["", *db.SAMPLE_OK_STATUS]
+    inspection_rows: list[dict] = []
+    for row in inspection:
+        qno = int(row.get("Question_no") or 0)
+        text = str(row.get("Question_text") or "")
+        saved_answer = str(row.get("Answer") or "").strip()
+        q_col, a_col, v_col = st.columns([5.0, 2.4, 1.8])
+        q_col.markdown(f"**{qno}.** {text}")
+        answer = a_col.selectbox(
+            f"Answer {qno}",
+            options=answer_choices,
+            index=(
+                answer_choices.index(saved_answer)
+                if saved_answer in answer_choices
+                else 0
+            ),
+            format_func=lambda value: "Answer" if value == "" else value,
+            key=f"tc_insp_ans_{packing_list_id}_{qno}",
+            disabled=insp_locked,
+            label_visibility="collapsed",
+        )
+        verified = v_col.checkbox(
+            "Verified",
+            value=bool(row.get("Verified")),
+            key=f"tc_insp_ver_{packing_list_id}_{qno}",
+            disabled=insp_locked,
+        )
+        inspection_rows.append(
+            {
+                "Question_no": qno,
+                "Question_text": text,
+                "Answer": str(answer or "").strip(),
+                "Verified": 1 if verified else 0,
+            }
+        )
+    insp_errors = db.visual_inspection_errors(inspection_rows)
+    insp_ready = not insp_errors
+    if insp_errors:
+        for msg in insp_errors:
+            st.warning(msg)
+    else:
+        st.success("Visual inspection is complete. You can generate the test certificate.")
+
+    if not insp_locked:
+        if st.button("Save inspection", key="tc_insp_save"):
+            try:
+                db.save_visual_inspection(packing_list_id, inspection_rows)
+                st.success("Visual inspection saved.")
+                st.rerun()
+            except Exception as exc:
+                st.error(str(exc))
+
     if cert is None or cert.get("Status") == db.CERT_STATUS_VOID:
         label = (
             "Create new draft from packed batches"
             if cert and cert.get("Status") == db.CERT_STATUS_VOID
             else "Create draft from packed batches"
         )
-        if st.button(label, type="primary", key="tc_create"):
+        if st.button(
+            label,
+            type="primary",
+            key="tc_create",
+            disabled=not insp_ready,
+        ):
             try:
+                db.save_visual_inspection(packing_list_id, inspection_rows)
                 cert = db.create_packing_list_certificate_draft(packing_list_id)
                 st.session_state["tc_lines"] = cert.get("lines") or []
                 st.session_state["tc_loaded_id"] = packing_list_id
@@ -4787,6 +4892,8 @@ elif PAGE == "Test Certificate":
                 st.rerun()
             except Exception as exc:
                 st.error(str(exc))
+        if not insp_ready:
+            st.info("Finish visual inspection before generating the test certificate.")
         if cert is None:
             st.stop()
         st.caption(
@@ -4837,7 +4944,12 @@ elif PAGE == "Test Certificate":
         )
 
     if st.session_state.get("tc_show_print"):
-        _render_certificate_print(header, cert, st.session_state.get("tc_lines") or [])
+        _render_certificate_print(
+            header,
+            cert,
+            st.session_state.get("tc_lines") or [],
+            inspection_rows,
+        )
         b1, b2, _b3 = st.columns([1, 1, 2])
         with b1:
             if st.button("Back to editor", key="tc_print_back"):
@@ -5033,7 +5145,11 @@ elif PAGE == "Test Certificate":
             type="primary" if not locked else "secondary",
         )
     with a3:
-        issue_clicked = st.button("Issue certificate", key="tc_issue", disabled=locked)
+        issue_clicked = st.button(
+            "Issue certificate",
+            key="tc_issue",
+            disabled=locked or not insp_ready,
+        )
     with a4:
         void_clicked = st.button(
             "Void certificate",
@@ -5056,6 +5172,7 @@ elif PAGE == "Test Certificate":
             st.error(str(exc))
     if issue_clicked:
         try:
+            db.save_visual_inspection(packing_list_id, inspection_rows)
             issued = db.issue_packing_list_certificate(
                 packing_list_id,
                 lines,
@@ -6700,6 +6817,7 @@ elif PAGE == "Masters Overview":
             | 29 | Packing_list_certificate | Test-certificate header (Draft / Issued / Void); 1:1 with a Verified packing list |
             | 30 | Packing_list_certificate_line | Printed TC lines (may merge heats; weight may round up ≤ 0.15%) |
             | 31 | Packing_list_certificate_source | Maps each printed TC line back to packing_list_batch |
+            | 32 | Packing_list_visual_inspection | OK / NOT OK + Verified checks required before generating a test certificate |
 
             Extra production columns: sample fields, `Production_supervisor`.
             """

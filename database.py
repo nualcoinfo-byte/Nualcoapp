@@ -400,6 +400,17 @@ CERT_STATUSES = [CERT_STATUS_DRAFT, CERT_STATUS_ISSUED, CERT_STATUS_VOID]
 CERT_WEIGHT_ROUND_MAX_PCT = 0.15
 CERT_WEIGHT_ROUND_MAX_RATIO = CERT_WEIGHT_ROUND_MAX_PCT / 100.0
 CERT_WEIGHT_EPS_KG = 0.0005
+VISUAL_INSPECTION_QUESTIONS: tuple[str, ...] = (
+    "Material test certificate should be given along with the supply for individual Heat",
+    "The Heat No. should be marked on each ingot",
+    "Ingot surface should be free from slag/dross/dirts",
+    "Ingot should not be in wet condition",
+    "Ingot surface should be free from porosity",
+    "60% no porosity on visual and 40% mild porosity is allowed",
+    "Colour code marked on each ingot",
+    "K mold test",
+    "The material does not have any Radioactive contamination",
+)
 # Non-spec metal taken off a heat: samples, furnace heel, and off-chemistry ingot.
 # These IDs live in Alloy_Master but have no Alloy_Master_spec rows.
 SIDESTREAM_ALLOY_IDS = (78, 79, 80)
@@ -439,6 +450,7 @@ AUDIT_TABLES = {
     "raw_material_purchase",
     "packing_list",
     "packing_list_certificate",
+    "packing_list_visual_inspection",
 }
 _ACTING_USER: str = "system"
 
@@ -713,6 +725,18 @@ CREATE TABLE IF NOT EXISTS Packing_list_certificate_source (
     Source_weight {float} NOT NULL,
     Source_pieces INTEGER NOT NULL,
     PRIMARY KEY (Line_id, Batch_ID)
+);
+CREATE TABLE IF NOT EXISTS Packing_list_visual_inspection (
+    Packing_list_id INTEGER NOT NULL REFERENCES Packing_list(Packing_list_id),
+    Question_no INTEGER NOT NULL,
+    Question_text TEXT NOT NULL,
+    Answer TEXT
+        CHECK (Answer IS NULL OR Answer IN ('OK', 'NOT OK')),
+    Verified INTEGER NOT NULL DEFAULT 0
+        CHECK (Verified IN (0, 1)),
+    Last_updated_by TEXT,
+    Last_updated_datetime TEXT,
+    PRIMARY KEY (Packing_list_id, Question_no)
 );
 CREATE TABLE IF NOT EXISTS batch_input (
     Batch_ID TEXT NOT NULL REFERENCES Production_batch(Batch_ID),
@@ -2205,6 +2229,34 @@ def _ensure_packing_list_certificate(conn: Connection) -> None:
             ("Batch_ID", "TEXT"),
             ("Source_weight", float_sql),
             ("Source_pieces", "INTEGER"),
+        ],
+    )
+    _exec(
+        conn,
+        """
+        CREATE TABLE IF NOT EXISTS Packing_list_visual_inspection (
+            Packing_list_id INTEGER NOT NULL REFERENCES Packing_list(Packing_list_id),
+            Question_no INTEGER NOT NULL,
+            Question_text TEXT NOT NULL,
+            Answer TEXT
+                CHECK (Answer IS NULL OR Answer IN ('OK', 'NOT OK')),
+            Verified INTEGER NOT NULL DEFAULT 0
+                CHECK (Verified IN (0, 1)),
+            Last_updated_by TEXT,
+            Last_updated_datetime TEXT,
+            PRIMARY KEY (Packing_list_id, Question_no)
+        )
+        """,
+    )
+    _ensure_columns(
+        conn,
+        "Packing_list_visual_inspection",
+        [
+            ("Question_text", "TEXT"),
+            ("Answer", "TEXT"),
+            ("Verified", "INTEGER DEFAULT 0"),
+            ("Last_updated_by", "TEXT"),
+            ("Last_updated_datetime", "TEXT"),
         ],
     )
 
@@ -6340,6 +6392,160 @@ def get_packing_list_certificate(
     return header
 
 
+def _blank_visual_inspection_rows() -> list[dict[str, Any]]:
+    rows = []
+    for index, text in enumerate(VISUAL_INSPECTION_QUESTIONS, start=1):
+        rows.append(
+            {
+                "Question_no": index,
+                "Question_text": text,
+                "Answer": "",
+                "Verified": 0,
+            }
+        )
+    return rows
+
+
+def _normalize_visual_inspection_rows(
+    rows: list[dict[str, Any]] | None,
+) -> list[dict[str, Any]]:
+    by_no: dict[int, dict[str, Any]] = {}
+    for raw in rows or []:
+        try:
+            number = int(raw.get("Question_no") or 0)
+        except (TypeError, ValueError):
+            continue
+        if number < 1 or number > len(VISUAL_INSPECTION_QUESTIONS):
+            continue
+        answer = str(raw.get("Answer") or "").strip()
+        if answer not in SAMPLE_OK_STATUS:
+            answer = ""
+        by_no[number] = {
+            "Question_no": number,
+            "Question_text": VISUAL_INSPECTION_QUESTIONS[number - 1],
+            "Answer": answer,
+            "Verified": 1 if raw.get("Verified") else 0,
+        }
+    out = []
+    for index, text in enumerate(VISUAL_INSPECTION_QUESTIONS, start=1):
+        out.append(
+            by_no.get(
+                index,
+                {
+                    "Question_no": index,
+                    "Question_text": text,
+                    "Answer": "",
+                    "Verified": 0,
+                },
+            )
+        )
+    return out
+
+
+def visual_inspection_errors(rows: list[dict[str, Any]] | None) -> list[str]:
+    """Blocking reasons the test certificate must not be generated yet."""
+    normalized = _normalize_visual_inspection_rows(rows)
+    unanswered = [
+        str(row["Question_no"])
+        for row in normalized
+        if row["Answer"] not in SAMPLE_OK_STATUS
+    ]
+    unverified = [
+        str(row["Question_no"])
+        for row in normalized
+        if not row["Verified"]
+    ]
+    not_ok = [
+        str(row["Question_no"])
+        for row in normalized
+        if row["Answer"] == "NOT OK"
+    ]
+    errors: list[str] = []
+    if unanswered:
+        errors.append(
+            "Answer OK or NOT OK for visual inspection item"
+            f"{'' if len(unanswered) == 1 else 's'} {', '.join(unanswered)}."
+        )
+    if unverified:
+        errors.append(
+            "Check Verified for visual inspection item"
+            f"{'' if len(unverified) == 1 else 's'} {', '.join(unverified)}."
+        )
+    if not_ok:
+        errors.append(
+            "Visual inspection item"
+            f"{'' if len(not_ok) == 1 else 's'} {', '.join(not_ok)} "
+            "marked NOT OK. Correct them before generating the test certificate."
+        )
+    return errors
+
+
+def get_visual_inspection(packing_list_id: int) -> list[dict[str, Any]]:
+    _ensure_packing_list_ready()
+    saved = fetch_all(
+        """
+        SELECT Question_no AS "Question_no",
+               Question_text AS "Question_text",
+               Answer AS "Answer",
+               Verified AS "Verified"
+        FROM Packing_list_visual_inspection
+        WHERE Packing_list_id = ?
+        ORDER BY Question_no
+        """,
+        (packing_list_id,),
+    )
+    return _normalize_visual_inspection_rows(saved)
+
+
+def save_visual_inspection(
+    packing_list_id: int, rows: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    _ensure_packing_list_ready()
+    header = get_packing_list(packing_list_id)
+    if not header:
+        raise ValueError(f"Packing list {packing_list_id} was not found.")
+    cert = get_packing_list_certificate(packing_list_id)
+    if cert and cert.get("Status") == CERT_STATUS_ISSUED:
+        raise ValueError(
+            "Issued test certificates lock visual inspection. Void it first."
+        )
+    normalized = _normalize_visual_inspection_rows(rows)
+    by_val, dt_val = audit_stamp()
+    with get_connection() as conn:
+        _exec(
+            conn,
+            "DELETE FROM Packing_list_visual_inspection WHERE Packing_list_id = ?",
+            (packing_list_id,),
+        )
+        for row in normalized:
+            _exec(
+                conn,
+                """
+                INSERT INTO Packing_list_visual_inspection (
+                    Packing_list_id, Question_no, Question_text,
+                    Answer, Verified, Last_updated_by, Last_updated_datetime
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    packing_list_id,
+                    int(row["Question_no"]),
+                    row["Question_text"],
+                    row["Answer"] or None,
+                    1 if row["Verified"] else 0,
+                    by_val,
+                    dt_val,
+                ),
+            )
+    return get_visual_inspection(packing_list_id)
+
+
+def _require_visual_inspection_complete(packing_list_id: int) -> None:
+    errors = visual_inspection_errors(get_visual_inspection(packing_list_id))
+    if errors:
+        raise ValueError(" ".join(errors))
+
+
 def create_packing_list_certificate_draft(
     packing_list_id: int,
     *,
@@ -6352,6 +6558,7 @@ def create_packing_list_certificate_draft(
         raise ValueError(f"Packing list {packing_list_id} was not found.")
     if (header.get("Packing_list_status") or "") != PACKING_STATUS_VERIFIED:
         raise ValueError("Verify the packing list before creating a test certificate.")
+    _require_visual_inspection_complete(packing_list_id)
     existing = get_packing_list_certificate(packing_list_id)
     if existing and existing.get("Status") == CERT_STATUS_ISSUED:
         raise ValueError(
@@ -6492,6 +6699,7 @@ def issue_packing_list_certificate(
     certificate_no: Optional[str] = None,
     issued_date: Optional[str] = None,
 ) -> dict[str, Any]:
+    _require_visual_inspection_complete(packing_list_id)
     saved = save_packing_list_certificate_draft(
         packing_list_id,
         lines,
