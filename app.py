@@ -1786,6 +1786,26 @@ def _tc_sync_editor(lines: list[dict], edited) -> list[dict]:
     return out
 
 
+def _pdf_safe_text(value: object) -> str:
+    """Helvetica core fonts only cover Latin-1; map common Unicode first."""
+    text = str(value if value is not None else "")
+    text = (
+        text.replace("\u2014", "-")
+        .replace("\u2013", "-")
+        .replace("\u2212", "-")
+        .replace("\u2018", "'")
+        .replace("\u2019", "'")
+        .replace("\u201c", '"')
+        .replace("\u201d", '"')
+        .replace("\u2026", "...")
+        .replace("\u00a0", " ")
+        .replace("\u2713", "Y")
+        .replace("\u2714", "Y")
+        .replace("\u00b7", "-")
+    )
+    return text.encode("latin-1", "replace").decode("latin-1")
+
+
 def _certificate_pdf_bytes(payload: dict) -> bytes:
     """Build an A4 PDF of the formal test certificate."""
     from fpdf import FPDF
@@ -1823,7 +1843,14 @@ def _certificate_pdf_bytes(payload: dict) -> bytes:
 
     pdf.set_xy(left + side, y)
     pdf.set_font("Helvetica", "B", 13)
-    pdf.cell(page_w - 2 * side, 6, letterhead["name"], align="C", new_x="LMARGIN", new_y="NEXT")
+    pdf.cell(
+        page_w - 2 * side,
+        6,
+        _pdf_safe_text(letterhead["name"]),
+        align="C",
+        new_x="LMARGIN",
+        new_y="NEXT",
+    )
     pdf.set_font("Helvetica", "", 8)
     for line_text in (
         letterhead["address"],
@@ -1832,7 +1859,14 @@ def _certificate_pdf_bytes(payload: dict) -> bytes:
     ):
         if line_text:
             pdf.set_x(left + side)
-            pdf.cell(page_w - 2 * side, 4, line_text, align="C", new_x="LMARGIN", new_y="NEXT")
+            pdf.cell(
+                page_w - 2 * side,
+                4,
+                _pdf_safe_text(line_text),
+                align="C",
+                new_x="LMARGIN",
+                new_y="NEXT",
+            )
     pdf.set_y(max(pdf.get_y(), y + 24) + 2)
 
     pdf.set_font("Helvetica", "B", 12)
@@ -1840,7 +1874,7 @@ def _certificate_pdf_bytes(payload: dict) -> bytes:
 
     def _fit(text: str, width: float, size: int = 7) -> str:
         pdf.set_font("Helvetica", "", size)
-        out = str(text or "")
+        out = _pdf_safe_text(text)
         while out and pdf.get_string_width(out) > width - 1.4:
             out = out[:-1]
         return out
@@ -1854,7 +1888,7 @@ def _certificate_pdf_bytes(payload: dict) -> bytes:
             pdf.set_font("Helvetica", "B" if is_label else "", 8)
             if is_label:
                 pdf.set_fill_color(*fill)
-            shown = text if is_label else _fit(str(text), width, 8)
+            shown = _pdf_safe_text(text) if is_label else _fit(str(text), width, 8)
             pdf.cell(width, h, shown, border=1, align="L", fill=is_label)
             x += width
         pdf.set_y(y0 + h)
@@ -1897,7 +1931,16 @@ def _certificate_pdf_bytes(payload: dict) -> bytes:
         pdf.set_fill_color(*orange)
         pdf.set_text_color(255, 255, 255)
         pdf.set_font("Helvetica", "B", 9)
-        pdf.cell(page_w, 6, title, border=1, align="C", fill=True, new_x="LMARGIN", new_y="NEXT")
+        pdf.cell(
+            page_w,
+            6,
+            _pdf_safe_text(title),
+            border=1,
+            align="C",
+            fill=True,
+            new_x="LMARGIN",
+            new_y="NEXT",
+        )
         pdf.set_text_color(*ink)
 
     _section("CHEMICAL ANALYSIS REPORT")
@@ -1964,11 +2007,11 @@ def _certificate_pdf_bytes(payload: dict) -> bytes:
         pdf.set_font("Helvetica", "B", 8)
         pdf.rect(left, y1, label_w, 6, style="DF")
         pdf.set_xy(left, y1)
-        pdf.cell(label_w, 6, str(label))
+        pdf.cell(label_w, 6, _pdf_safe_text(label))
         pdf.set_font("Helvetica", "", 8)
         pdf.rect(left + label_w, y1, page_w - label_w, 6)
         pdf.set_xy(left + label_w, y1)
-        pdf.cell(page_w - label_w, 6, str(value))
+        pdf.cell(page_w - label_w, 6, _pdf_safe_text(value))
         pdf.set_y(y1 + 6)
 
     _section("VISUAL INSPECTIONS : CUSTOMER REQUIREMENT STATUS")
@@ -1982,7 +2025,7 @@ def _certificate_pdf_bytes(payload: dict) -> bytes:
     for row in inspection:
         y1 = pdf.get_y()
         answer = str(row.get("Answer") or "").strip()
-        status = "Ok" if answer.upper() == "OK" else (answer or "—")
+        status = "Ok" if answer.upper() == "OK" else (answer or "-")
         verify = "Yes" if row.get("Verified") else ""
         pdf.set_font("Helvetica", "", 7)
         pdf.rect(left, y1, q_w, insp_h)
@@ -1991,15 +2034,19 @@ def _certificate_pdf_bytes(payload: dict) -> bytes:
         pdf.set_font("Helvetica", "B", 7)
         pdf.rect(left + q_w, y1, s_w, insp_h)
         pdf.set_xy(left + q_w, y1)
-        pdf.cell(s_w, insp_h, status, align="C")
+        pdf.cell(s_w, insp_h, _pdf_safe_text(status), align="C")
         pdf.rect(left + q_w + s_w, y1, v_w, insp_h)
         pdf.set_xy(left + q_w + s_w, y1)
-        pdf.cell(v_w, insp_h, verify, align="C")
+        pdf.cell(v_w, insp_h, _pdf_safe_text(verify), align="C")
         pdf.set_y(y1 + insp_h)
 
     pdf.ln(3)
     pdf.set_font("Helvetica", "B", 10)
-    pdf.cell(page_w, 6, f"Approved by : {payload.get('approved_by') or ''}")
+    pdf.cell(
+        page_w,
+        6,
+        _pdf_safe_text(f"Approved by : {payload.get('approved_by') or ''}"),
+    )
     return bytes(pdf.output())
 
 
