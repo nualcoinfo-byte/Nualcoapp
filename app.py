@@ -79,11 +79,6 @@ if not _secret_url:
     )
 if not _secret_url:
     _secret_url = _url_from_key_file(Path(__file__).resolve().parent / ".env.local")
-if not _secret_url:
-    _secret_url = (
-        "postgresql://postgres.wdbeyyfgdeiqkyatwowo:Nualco%4021fAadhya@"
-        "aws-1-ap-south-1.pooler.supabase.com:5432/postgres?sslmode=require"
-    )
 
 if _secret_url:
     os.environ["DATABASE_URL"] = _secret_url
@@ -103,17 +98,21 @@ import importlib
 # file on disk is newer than the copy currently loaded in this process.
 _db_mtime = Path(db.__file__).resolve().stat().st_mtime
 if getattr(db, "_LOADED_MTIME", None) != _db_mtime:
+    # Reloading rebinds a brand new engine, so release the old pool first
+    # instead of abandoning its checked-in connections on the server.
+    _old_engine = getattr(db, "ENGINE", None)
+    if _old_engine is not None:
+        try:
+            _old_engine.dispose()
+        except Exception:
+            pass
     db = importlib.reload(db)
     db._LOADED_MTIME = _db_mtime
     st.cache_resource.clear()
 
-# A previous script run may have bound SQLite. Rebind to Supabase in-process
-# so the sidebar cannot stay stuck on nualco.db.
-if _secret_url and not getattr(db, "IS_POSTGRES", False):
-    db._rebind_postgres_engine(_secret_url)
-    st.cache_resource.clear()
-elif not getattr(db, "IS_POSTGRES", False):
-    _rebind_url = db._database_url()
+# A previous script run in this process may have left the engine unbound.
+if not getattr(db, "IS_POSTGRES", False):
+    _rebind_url = _secret_url or db._database_url()
     if _rebind_url:
         db._rebind_postgres_engine(_rebind_url)
         st.cache_resource.clear()
@@ -201,13 +200,14 @@ def _init_postgres() -> bool:
 def bootstrap() -> str:
     """Open the database. Full init_db() is skipped on Postgres (it can hang)."""
     if not db.IS_POSTGRES:
-        url = _secret_url or getattr(db, "_DEFAULT_SUPABASE_URL", "")
-        if url:
-            try:
-                db._rebind_postgres_engine(url)
-            except Exception as exc:
-                st.session_state["_neon_init_error"] = str(exc)
-                return "postgres-error"
+        if not _secret_url:
+            st.session_state["_neon_init_error"] = db.NO_DATABASE_URL_MESSAGE
+            return "unconfigured"
+        try:
+            db._rebind_postgres_engine(_secret_url)
+        except Exception as exc:
+            st.session_state["_neon_init_error"] = str(exc)
+            return "postgres-error"
     if db.IS_POSTGRES:
         try:
             db.adopt_supabase_pooler()
@@ -238,18 +238,18 @@ def bootstrap() -> str:
 
 
 _db_mode = bootstrap()
+if _db_mode == "unconfigured":
+    st.error(db.NO_DATABASE_URL_MESSAGE)
+    st.stop()
 
 
 def _sidebar_db_line() -> str:
-    """Always show the live engine label, rebinding off nualco.db if needed."""
-    label = str(getattr(db, "DB_LABEL", ""))
-    if (not db.IS_POSTGRES) or label.endswith(".db"):
-        url = _secret_url or getattr(db, "_DEFAULT_SUPABASE_URL", "")
-        if url:
-            try:
-                db._rebind_postgres_engine(url)
-            except Exception:
-                pass
+    """Show the live engine label, rebinding if the engine came loose."""
+    if not db.IS_POSTGRES and _secret_url:
+        try:
+            db._rebind_postgres_engine(_secret_url)
+        except Exception:
+            pass
     return f"**DB:** `{db.DB_LABEL}`  \n`build {APP_BUILD}`"
 
 

@@ -1,11 +1,12 @@
 """
 Database layer for Nualco Aluminum Alloy Manufacturing Tracker.
 
-Runs on Postgres when DATABASE_URL is available (from the environment or
-.env.local), otherwise falls back to the local SQLite file. Native Postgres
-on port 5432 is preferred; if that path is blocked and the host is Neon,
-queries go over Neon's HTTPS SQL endpoint instead. All SQL is written in the portable subset both
-dialects support:
+Runs on Postgres, using DATABASE_URL from the environment, Streamlit secrets,
+`.streamlit/secrets.toml`, or `.env.local`. Without one the engine stays unbound
+and every query raises, rather than silently opening a local SQLite file that
+looks like the shared database. If the host is Neon and port 5432 is blocked,
+queries go over Neon's HTTPS SQL endpoint instead. All SQL is written in the
+portable subset both dialects support:
 
 - placeholders use `?` and are translated to `%s` for Postgres
 - upserts use `ON CONFLICT` (supported by both Postgres and SQLite 3.24+)
@@ -37,9 +38,11 @@ from sqlalchemy.exc import OperationalError
 DB_PATH = Path(__file__).resolve().parent / "nualco.db"
 ENV_FILE = Path(__file__).resolve().parent / ".env.local"
 SECRETS_FILE = Path(__file__).resolve().parent / ".streamlit" / "secrets.toml"
-_DEFAULT_SUPABASE_URL = (
-    "postgresql://postgres.wdbeyyfgdeiqkyatwowo:Nualco%4021fAadhya@"
-    "aws-1-ap-south-1.pooler.supabase.com:5432/postgres?sslmode=require"
+
+NO_DATABASE_URL_MESSAGE = (
+    "No DATABASE_URL is configured. Set it as an environment variable, or copy "
+    "`.streamlit/secrets.toml.example` to `.streamlit/secrets.toml` and put the "
+    "Supabase connection string there. Never commit that file."
 )
 
 
@@ -352,8 +355,6 @@ def _database_url() -> str | None:
 
     _take_key_file(SECRETS_FILE)
     _take_key_file(ENV_FILE)
-    if not primary:
-        _take_primary(_DEFAULT_SUPABASE_URL)
 
     # A leftover FORCE_SQLITE flag must not hide a real Supabase URL.
     if _force_sqlite() and not primary and not unpooled:
@@ -451,22 +452,15 @@ elif _URL and _is_neon_host(_URL):
     ENGINE = HttpEngine(_URL)
     DB_LABEL = _postgres_label(_URL)
 else:
-    # Never bind nualco.db by accident. Local and cloud both use Supabase.
-    ENGINE = create_engine(
-        _prepare_postgres_url(_DEFAULT_SUPABASE_URL),
-        pool_pre_ping=True,
-        pool_recycle=280,
-        pool_size=5,
-        max_overflow=5,
-        connect_args=_PG_CONNECT_ARGS,
-    )
-    DB_LABEL = _postgres_label(_DEFAULT_SUPABASE_URL)
-    _URL = _prepare_postgres_url(_DEFAULT_SUPABASE_URL)
+    # No credential available. Stay unbound rather than silently opening a
+    # local SQLite file that looks like the shared database.
+    ENGINE = None
+    DB_LABEL = "not configured"
 
-IS_POSTGRES = ENGINE.dialect.name == "postgresql"
+IS_POSTGRES = bool(ENGINE is not None and ENGINE.dialect.name == "postgresql")
 
 _T = TypeVar("_T")
-_CONNECT_RETRIES = 1
+_CONNECT_RETRIES = 3
 _CONNECT_BACKOFF_S = 1.5
 
 
@@ -506,13 +500,6 @@ def adopt_supabase_pooler() -> bool:
         return False
     _rebind_postgres_engine(discovered)
     return True
-
-
-def switch_to_sqlite() -> None:
-    """Kept for callers. SQLite is disabled so the UI cannot show nualco.db."""
-    url = _database_url() or _DEFAULT_SUPABASE_URL
-    if url:
-        _rebind_postgres_engine(url)
 
 
 def _is_transient_db_error(exc: BaseException) -> bool:
@@ -571,6 +558,8 @@ def _exec(conn: Connection, sql: str, params: Any = None) -> CursorResult:
 @contextmanager
 def get_connection() -> Generator[Connection, None, None]:
     """Open a connection wrapped in a transaction (commit/rollback on exit)."""
+    if ENGINE is None:
+        raise RuntimeError(NO_DATABASE_URL_MESSAGE)
     delay = _CONNECT_BACKOFF_S
     for attempt in range(_CONNECT_RETRIES):
         cm = None
@@ -578,17 +567,21 @@ def get_connection() -> Generator[Connection, None, None]:
             cm = ENGINE.begin()
             conn = cm.__enter__()
             _apply_rls_session(conn)
-        except OperationalError as exc:
+        except BaseException as exc:
+            # Any failure before the caller gets the connection must still
+            # return it to the pool, or the pool bleeds a slot per failure.
             if cm is not None:
                 try:
                     cm.__exit__(type(exc), exc, exc.__traceback__)
                 except Exception:
                     pass
-            if (
-                not IS_POSTGRES
-                or not _is_transient_db_error(exc)
-                or attempt == _CONNECT_RETRIES - 1
-            ):
+            retryable = (
+                isinstance(exc, OperationalError)
+                and IS_POSTGRES
+                and _is_transient_db_error(exc)
+                and attempt < _CONNECT_RETRIES - 1
+            )
+            if not retryable:
                 raise
             try:
                 ENGINE.dispose()
@@ -5252,10 +5245,19 @@ def _heat_no_prefix_on_conn(
 
 
 def _next_heat_no_on_conn(
-    conn: Connection, furnace: str, production_date: object
+    conn: Connection, furnace: str, production_date: object, *, reserve: bool = False
 ) -> str:
     """Next YY-furnace+month-code+counter for this furnace and production month."""
     prefix = _heat_no_prefix_on_conn(conn, furnace, production_date)
+    if reserve and IS_POSTGRES:
+        # Serialize allocation per furnace for the rest of this transaction, so
+        # two concurrent creates cannot read the same maximum counter. Preview
+        # callers skip this: they must not block a real create.
+        _exec(
+            conn,
+            "SELECT pg_advisory_xact_lock(hashtext(?))",
+            (f"nualco:heat_no:{prefix}",),
+        )
     rows = _exec(
         conn,
         'SELECT Heat_no AS "Heat_no" FROM Production_batch WHERE Furnace = ?',
@@ -5451,29 +5453,42 @@ def make_batch_id(
 
 def _insert_charge_lines(conn: Connection, batch_id: str, inputs: list[dict[str, Any]]) -> None:
     for item in inputs:
-        lot = _exec(
-            conn,
-            'SELECT Remaining_Weight AS "Remaining_Weight" '
-            "FROM Raw_Material_Inventory WHERE Lot_id = ?",
-            (item["Lot_id"],),
-        ).mappings().first()
-        if not lot:
-            raise ValueError(f"Lot {item['Lot_id']} not found.")
-        remaining = float(lot["Remaining_Weight"] or 0)
         w = float(item["Weight"])
-        if w > remaining + 1e-9:
+        # Check and decrement in one statement. Reading the balance first and
+        # comparing in Python lets two concurrent charges from the same lot
+        # both pass the check and drive Remaining_Weight negative.
+        claimed = (
+            _exec(
+                conn,
+                """
+                UPDATE Raw_Material_Inventory
+                SET Remaining_Weight = Remaining_Weight - ?
+                WHERE Lot_id = ?
+                  AND Remaining_Weight >= ?
+                RETURNING Remaining_Weight AS "Remaining_Weight"
+                """,
+                (w, item["Lot_id"], w - 1e-9),
+            )
+            .mappings()
+            .first()
+        )
+        if not claimed:
+            lot = (
+                _exec(
+                    conn,
+                    'SELECT Remaining_Weight AS "Remaining_Weight" '
+                    "FROM Raw_Material_Inventory WHERE Lot_id = ?",
+                    (item["Lot_id"],),
+                )
+                .mappings()
+                .first()
+            )
+            if not lot:
+                raise ValueError(f"Lot {item['Lot_id']} not found.")
+            remaining = float(lot["Remaining_Weight"] or 0)
             raise ValueError(
                 f"Insufficient stock on Lot {item['Lot_id']}: need {w}, have {remaining}."
             )
-        _exec(
-            conn,
-            """
-            UPDATE Raw_Material_Inventory
-            SET Remaining_Weight = Remaining_Weight - ?
-            WHERE Lot_id = ?
-            """,
-            (w, item["Lot_id"]),
-        )
         _exec(
             conn,
             """
@@ -5585,7 +5600,9 @@ def create_batch(
         batch_id = _require_unique_production_batch_identity(
             conn, furnace, production_date, shift, melt_no
         )
-        generated_heat = _next_heat_no_on_conn(conn, furnace, production_date)
+        generated_heat = _next_heat_no_on_conn(
+            conn, furnace, production_date, reserve=True
+        )
         heat_no = str(heat_no).strip() if heat_no not in (None, "") else generated_heat
         _exec(
             conn,
@@ -6527,10 +6544,15 @@ def _apply_rls_session(conn: Connection) -> None:
         _exec(conn, "SELECT set_config('nualco.role_name', ?, true)", (role_name,))
         _exec(conn, "SELECT set_config('nualco.employee_id', ?, true)", (employee_id,))
     except Exception:
+        # Fail closed. Swallowing this would leave the transaction stamped with
+        # whatever role was set last, and the fallback used to be the
+        # privileged 'system' role, so a lookup error granted full access.
         try:
-            _exec(conn, "SELECT set_config('nualco.role_name', 'system', true)")
+            _exec(conn, "SELECT set_config('nualco.role_name', 'denied', true)")
+            _exec(conn, "SELECT set_config('nualco.employee_id', '', true)")
         except Exception:
             pass
+        raise
 
 
 def _ensure_row_level_security(conn: Connection) -> None:
@@ -6713,11 +6735,72 @@ def _ensure_row_level_security(conn: Connection) -> None:
         _exec(conn, "GRANT USAGE ON SCHEMA public TO anon")
 
 
+_NON_NEGATIVE_GUARDS = (
+    ("raw_material_inventory", "rm_remaining_weight_non_negative", "Remaining_Weight >= 0"),
+    ("finished_goods_inventory", "fg_output_weight_non_negative", "Output_Weight >= -0.0005"),
+    ("finished_goods_inventory", "fg_output_pieces_non_negative", "Output_pieces >= 0"),
+)
+
+
+def _ensure_inventory_guards(conn: Connection) -> None:
+    """Backstop the atomic inventory updates with database constraints.
+
+    Added NOT VALID so historical rows that already went negative do not block
+    the migration; the constraint still rejects every new write.
+    """
+    if not IS_POSTGRES:
+        return
+    for table, name, expression in _NON_NEGATIVE_GUARDS:
+        if not _exec(conn, "SELECT to_regclass(?)", (f"public.{table}",)).scalar():
+            continue
+        exists = _exec(
+            conn,
+            "SELECT 1 FROM pg_constraint WHERE conname = ? LIMIT 1",
+            (name,),
+        ).first()
+        if exists:
+            continue
+        _exec(
+            conn,
+            f"ALTER TABLE {_sql_ident(table)} "
+            f"ADD CONSTRAINT {_sql_ident(name)} CHECK ({expression}) NOT VALID",
+        )
+
+    if not _exec(conn, "SELECT to_regclass('public.production_batch')").scalar():
+        return
+    if _exec(
+        conn,
+        "SELECT 1 FROM pg_constraint WHERE conname = 'production_batch_heat_no_unique' LIMIT 1",
+    ).first():
+        return
+    # A unique constraint cannot be added while duplicates exist. Leave it off
+    # and let the advisory lock prevent new collisions until they are cleaned up.
+    duplicated = _exec(
+        conn,
+        """
+        SELECT 1
+        FROM Production_batch
+        WHERE Heat_no IS NOT NULL AND btrim(Heat_no) <> ''
+        GROUP BY Furnace, Heat_no
+        HAVING COUNT(*) > 1
+        LIMIT 1
+        """,
+    ).first()
+    if duplicated:
+        return
+    _exec(
+        conn,
+        "ALTER TABLE Production_batch "
+        "ADD CONSTRAINT production_batch_heat_no_unique UNIQUE (Furnace, Heat_no)",
+    )
+
+
 def _ensure_packing_list_ready() -> None:
     with get_connection() as conn:
         _ensure_packing_list(conn)
         _ensure_company_profile(conn)
         _ensure_employees(conn)
+        _ensure_inventory_guards(conn)
         _ensure_row_level_security(conn)
 
 
@@ -7066,17 +7149,36 @@ def _apply_packing_lines_to_fg(
             raise ValueError(
                 f"No finished-goods inventory found for {bid}."
             )
-        new_w = float(row.get("Output_Weight") or 0) + delta_w
-        new_p = int(float(row.get("Output_pieces") or 0)) + delta_p
-        if new_w < -0.0005 or new_p < 0:
-            on_hand_w = float(row.get("Output_Weight") or 0)
-            on_hand_p = int(float(row.get("Output_pieces") or 0))
+        # Apply the delta in SQL. Computing new totals from a prior read and
+        # writing them back loses a concurrent dispatch against the same bundle.
+        applied = (
+            _exec(
+                conn,
+                """
+                UPDATE Finished_Goods_Inventory
+                SET Output_Weight = Output_Weight + ?,
+                    Output_pieces = Output_pieces + ?
+                WHERE Bundle_id = ?
+                  AND Output_Weight + ? >= -0.0005
+                  AND Output_pieces + ? >= 0
+                RETURNING Output_Weight AS "Output_Weight",
+                          Output_pieces AS "Output_pieces"
+                """,
+                (delta_w, delta_p, row["Bundle_id"], delta_w, delta_p),
+            )
+            .mappings()
+            .first()
+        )
+        if not applied:
+            on_hand = _fg_bundle_on_conn(conn, bid) or {}
+            on_hand_w = float(on_hand.get("Output_Weight") or 0)
+            on_hand_p = int(float(on_hand.get("Output_pieces") or 0))
             raise ValueError(
                 f"{bid} only has {on_hand_w:g} kg and {on_hand_p} pieces "
                 "remaining in finished goods."
             )
-        new_w = max(new_w, 0.0)
-        new_p = max(new_p, 0)
+        new_w = max(float(applied["Output_Weight"] or 0), 0.0)
+        new_p = max(int(float(applied["Output_pieces"] or 0)), 0)
         status = (
             FG_STATUS_AVAILABLE
             if new_w > 0.0005 and new_p > 0
@@ -9823,22 +9925,48 @@ def _oil_qty(value: Any) -> float:
     return qty if qty > 0 else 0.0
 
 
-def rebuild_furnace_oil_inventory() -> None:
+_FURNACE_OIL_LOCK_KEY = "nualco:furnace_oil_ledger"
+
+
+def _lock_furnace_oil_ledger(conn: Connection) -> None:
+    """Serialize ledger rebuilds for the rest of this transaction.
+
+    The ledger is recomputed by deleting every row and re-inserting it, so two
+    concurrent writers would otherwise interleave a delete with the other's
+    inserts.
+    """
+    if IS_POSTGRES:
+        _exec(
+            conn,
+            "SELECT pg_advisory_xact_lock(hashtext(?))",
+            (_FURNACE_OIL_LOCK_KEY,),
+        )
+
+
+def _rebuild_furnace_oil_inventory_on_conn(conn: Connection) -> None:
     """Rebuild the daily inventory ledger from purchases and consumption."""
     by_val, dt_val = audit_stamp()
-    purchases = fetch_all(
-        """
-        SELECT Received_date AS "Received_date", Quantity AS "Quantity",
-               Purchase_type AS "Purchase_type"
-        FROM Furnace_Oil_Purchase
-        """
-    )
-    consumed = fetch_all(
-        """
-        SELECT Consumption_date AS "Consumption_date", Quantity AS "Quantity"
-        FROM Furnace_Oil_Consumption
-        """
-    )
+    purchases = [
+        dict(r)
+        for r in _exec(
+            conn,
+            """
+            SELECT Received_date AS "Received_date", Quantity AS "Quantity",
+                   Purchase_type AS "Purchase_type"
+            FROM Furnace_Oil_Purchase
+            """,
+        ).mappings()
+    ]
+    consumed = [
+        dict(r)
+        for r in _exec(
+            conn,
+            """
+            SELECT Consumption_date AS "Consumption_date", Quantity AS "Quantity"
+            FROM Furnace_Oil_Consumption
+            """,
+        ).mappings()
+    ]
     days: dict[str, dict[str, float]] = {}
 
     def _day(key: str) -> dict[str, float]:
@@ -9868,30 +9996,47 @@ def rebuild_furnace_oil_inventory() -> None:
         ledger.append((key, opening, rec["purchase"], rec["consumption"], closing))
         carried = closing
 
+    _exec(conn, "DELETE FROM Furnace_Oil_Inventory")
+    for key, opening, purchase, consumption, closing in ledger:
+        _exec(
+            conn,
+            """
+            INSERT INTO Furnace_Oil_Inventory
+                (Inventory_date, Opening_qty, Purchase_qty, Consumption_qty,
+                 Closing_qty, Last_updated_by, Last_updated_datetime)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (key, opening, purchase, consumption, closing, by_val, dt_val),
+        )
+
+
+def rebuild_furnace_oil_inventory() -> None:
+    """Rebuild the daily furnace-oil ledger in a single transaction."""
     with get_connection() as conn:
-        _exec(conn, "DELETE FROM Furnace_Oil_Inventory")
-        for key, opening, purchase, consumption, closing in ledger:
-            _exec(
-                conn,
-                """
-                INSERT INTO Furnace_Oil_Inventory
-                    (Inventory_date, Opening_qty, Purchase_qty, Consumption_qty,
-                     Closing_qty, Last_updated_by, Last_updated_datetime)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-                """,
-                (key, opening, purchase, consumption, closing, by_val, dt_val),
-            )
+        _lock_furnace_oil_ledger(conn)
+        _rebuild_furnace_oil_inventory_on_conn(conn)
+
+
+_FURNACE_OIL_STOCK_SQL = """
+    SELECT Closing_qty AS "Closing_qty"
+    FROM Furnace_Oil_Inventory
+    ORDER BY Inventory_date DESC
+    LIMIT 1
+"""
+
+
+def _furnace_oil_stock_on_conn(conn: Connection) -> float:
+    row = _exec(conn, _FURNACE_OIL_STOCK_SQL).mappings().first()
+    if not row:
+        return 0.0
+    try:
+        return float(row["Closing_qty"] or 0)
+    except (TypeError, ValueError):
+        return 0.0
 
 
 def get_furnace_oil_stock() -> float:
-    row = fetch_one(
-        """
-        SELECT Closing_qty AS "Closing_qty"
-        FROM Furnace_Oil_Inventory
-        ORDER BY Inventory_date DESC
-        LIMIT 1
-        """
-    )
+    row = fetch_one(_FURNACE_OIL_STOCK_SQL)
     if not row:
         return 0.0
     try:
@@ -10023,7 +10168,8 @@ def add_furnace_oil_purchase(
             ),
         )
         purchase_id = int(result.scalar_one())
-    rebuild_furnace_oil_inventory()
+        _lock_furnace_oil_ledger(conn)
+        _rebuild_furnace_oil_inventory_on_conn(conn)
     return purchase_id
 
 
@@ -10049,27 +10195,46 @@ def add_furnace_oil_consumption(
     day = _as_effective_date(consumption_date)
     if not day:
         raise ValueError("Consumption date is required.")
-    existing = get_furnace_oil_consumption_row(day)
-    available = get_furnace_oil_stock() + _oil_qty(existing.get("Quantity") if existing else 0)
-    if qty > available + 1e-9:
-        raise ValueError(
-            f"Consumption {qty:g} L exceeds available stock {available:g} L."
-        )
     by_val, dt_val = audit_stamp()
-    execute(
-        """
-        INSERT INTO Furnace_Oil_Consumption
-            (Consumption_date, Quantity, Notes, Last_updated_by, Last_updated_datetime)
-        VALUES (?, ?, ?, ?, ?)
-        ON CONFLICT(Consumption_date) DO UPDATE SET
-            Quantity=excluded.Quantity,
-            Notes=excluded.Notes,
-            Last_updated_by=excluded.Last_updated_by,
-            Last_updated_datetime=excluded.Last_updated_datetime
-        """,
-        (day, qty, (notes or "").strip() or None, by_val, dt_val),
-    )
-    rebuild_furnace_oil_inventory()
+    # Stock check, write, and ledger rebuild share one transaction. Split across
+    # three, two operators could each pass the check and jointly overdraw.
+    with get_connection() as conn:
+        _lock_furnace_oil_ledger(conn)
+        existing = (
+            _exec(
+                conn,
+                """
+                SELECT Quantity AS "Quantity"
+                FROM Furnace_Oil_Consumption
+                WHERE Consumption_date = ?
+                """,
+                (day,),
+            )
+            .mappings()
+            .first()
+        )
+        available = _furnace_oil_stock_on_conn(conn) + _oil_qty(
+            existing["Quantity"] if existing else 0
+        )
+        if qty > available + 1e-9:
+            raise ValueError(
+                f"Consumption {qty:g} L exceeds available stock {available:g} L."
+            )
+        _exec(
+            conn,
+            """
+            INSERT INTO Furnace_Oil_Consumption
+                (Consumption_date, Quantity, Notes, Last_updated_by, Last_updated_datetime)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(Consumption_date) DO UPDATE SET
+                Quantity=excluded.Quantity,
+                Notes=excluded.Notes,
+                Last_updated_by=excluded.Last_updated_by,
+                Last_updated_datetime=excluded.Last_updated_datetime
+            """,
+            (day, qty, (notes or "").strip() or None, by_val, dt_val),
+        )
+        _rebuild_furnace_oil_inventory_on_conn(conn)
 
 
 def furnace_oil_month_totals(year: int, month: int) -> dict[str, float]:
