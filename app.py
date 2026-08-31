@@ -28,6 +28,25 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
+
+def _load_env_local() -> None:
+    """Put .env.local into the process env before database.py binds the engine."""
+    env_file = Path(__file__).resolve().parent / ".env.local"
+    if not env_file.exists():
+        return
+    for line in env_file.read_text(encoding="utf-8").splitlines():
+        text = line.strip()
+        if not text or text.startswith("#") or "=" not in text:
+            continue
+        key, _, raw = text.partition("=")
+        name = key.strip()
+        value = raw.strip().strip('"').strip("'")
+        if name and value:
+            os.environ[name] = value
+
+
+_load_env_local()
+
 # Inject Streamlit Cloud secrets into the environment BEFORE importing the
 # database module, which binds SQLAlchemy's engine at import time.
 _secret_url = ""
