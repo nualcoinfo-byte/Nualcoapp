@@ -65,8 +65,8 @@ def _quote_pg_password(url: str) -> str:
 
 
 def _should_probe_pooler() -> bool:
-    """Linux/Streamlit Cloud can reach the pooler; this Windows network cannot."""
-    return os.name != "nt"
+    """Try the IPv4 session pooler on every OS, including Windows."""
+    return True
 
 
 def _supabase_pooler_region(direct_host: str) -> str:
@@ -6966,17 +6966,18 @@ def verify_schema_ready() -> None:
         "section_table_permissions",
         "inventory_movements",
     )
-    row = fetch_one(
-        """
-        SELECT COUNT(*) AS "ready"
-        FROM unnest(?::text[]) AS required(name)
-        WHERE to_regclass('public.' || required.name) IS NOT NULL
-        """,
-        (list(required),),
-    )
-    if not row or int(row.get("ready") or 0) != len(required):
+    missing: list[str] = []
+    for name in required:
+        row = fetch_one(
+            'SELECT to_regclass(?) AS "rel"',
+            (f"public.{name}",),
+        )
+        if not row or not row.get("rel"):
+            missing.append(name)
+    if missing:
         raise RuntimeError(
-            "Database migrations are incomplete; run scripts/apply_migrations.py."
+            "Database migrations are incomplete; run scripts/apply_migrations.py. "
+            "Missing: " + ", ".join(missing)
         )
 
 

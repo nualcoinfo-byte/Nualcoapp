@@ -29,20 +29,42 @@ st.set_page_config(
 )
 
 
-def _load_env_local() -> None:
-    """Put .env.local into the process env before database.py binds the engine."""
-    env_file = Path(__file__).resolve().parent / ".env.local"
-    if not env_file.exists():
-        return
-    for line in env_file.read_text(encoding="utf-8").splitlines():
-        text = line.strip()
-        if not text or text.startswith("#") or "=" not in text:
+def _read_local_text(path: Path) -> str:
+    data = path.read_bytes()
+    for encoding in ("utf-8-sig", "utf-16", "utf-16-le", "cp1252", "utf-8"):
+        try:
+            return data.decode(encoding)
+        except UnicodeDecodeError:
             continue
-        key, _, raw = text.partition("=")
-        name = key.strip()
-        value = raw.strip().strip('"').strip("'")
-        if name and value:
-            os.environ[name] = value
+    return data.decode("utf-8", errors="replace")
+
+
+def _assign_env_value(name: str, raw: str) -> None:
+    value = raw.strip().strip('"').strip("'")
+    if name and value:
+        os.environ[name] = value
+
+
+def _load_env_local() -> None:
+    """Load local secrets before database.py binds the engine at import time."""
+    root = Path(__file__).resolve().parent
+    for env_file in (root / ".env.local", root / ".env", root / "env.local"):
+        if not env_file.exists():
+            continue
+        for line in _read_local_text(env_file).splitlines():
+            text = line.strip()
+            if not text or text.startswith("#") or "=" not in text:
+                continue
+            key, _, raw = text.partition("=")
+            _assign_env_value(key.strip(), raw)
+    secrets_file = root / ".streamlit" / "secrets.toml"
+    if secrets_file.exists():
+        for line in _read_local_text(secrets_file).splitlines():
+            text = line.strip()
+            if not text or text.startswith("#") or "=" not in text:
+                continue
+            key, _, raw = text.partition("=")
+            _assign_env_value(key.strip(), raw)
 
 
 _load_env_local()
@@ -159,6 +181,10 @@ def _init_postgres() -> bool:
     return True
 
 
+def _configured_database_url() -> str:
+    return (os.environ.get("DATABASE_URL") or os.environ.get("ADMIN_DATABASE_URL") or "").strip()
+
+
 def bootstrap() -> str:
     """Open the database. Full init_db() is skipped on Postgres (it can hang)."""
     if db.IS_POSTGRES:
@@ -186,7 +212,8 @@ def bootstrap() -> str:
                         _init_postgres.clear()
                     except Exception:
                         pass
-            if _on_streamlit_cloud():
+            configured = _configured_database_url().lower()
+            if _on_streamlit_cloud() or "supabase" in configured:
                 return "postgres-error"
             db.switch_to_sqlite()
             db.init_db()
@@ -1654,12 +1681,18 @@ st.sidebar.divider()
 auth_employee = st.session_state.get("auth_employee")
 if not auth_employee:
     db.clear_session_actor()
-    if _db_mode == "postgres-error":
+    if _db_mode == "postgres-error" or not db.IS_POSTGRES:
         st.sidebar.error(
-            "Could not reach Supabase yet. Click **Retry**, or reboot the app."
+            "This app is not using Supabase. Put the session-pooler URI in "
+            "`.env.local` next to `app.py`, then click **Retry**."
         )
+        neon_err = st.session_state.get("_neon_init_error")
+        if neon_err:
+            st.sidebar.caption(f"Database init error: {neon_err}")
         if st.sidebar.button("Retry database connection"):
             st.session_state.pop("_neon_init_error", None)
+            st.session_state.pop("use_sqlite", None)
+            os.environ.pop("NUALCO_FORCE_SQLITE", None)
             st.cache_resource.clear()
             st.rerun()
     try:
@@ -1750,10 +1783,10 @@ elif st.session_state.get("use_sqlite") or os.environ.get("NUALCO_FORCE_SQLITE")
         st.rerun()
 elif not db.IS_POSTGRES:
     st.sidebar.error(
-        "Not connected to the database. In Streamlit Cloud go to "
-        "**Manage app → Settings → Secrets** and set:\n\n"
-        '```\nDATABASE_URL = "postgresql://..."\n```\n\n'
-        "Remove any leftover `DATABASE_URL_UNPOOLED` Neon URL, then reboot the app."
+        "Not connected to Supabase. Create `.env.local` next to `app.py` with:\n\n"
+        '`DATABASE_URL="postgresql://postgres.<project-ref>:...@aws-1-ap-south-1.pooler.supabase.com:5432/postgres?sslmode=require"`\n\n'
+        "Then stop Streamlit and start it again. Remove any leftover Neon "
+        "`DATABASE_URL_UNPOOLED`."
     )
 
 
