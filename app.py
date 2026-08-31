@@ -2681,14 +2681,17 @@ if PAGE == "Dashboard":
     try:
         supply_rows = db.list_po_supply_status()
         batches = db.list_batches(limit=100)
+        batch_count = db.count_batches()
         materials = cached_raw_materials()
         lots = db.list_inventory_lots(limit=250)
+        lot_count = db.count_inventory_lots()
         alloys = cached_alloys()
         oil_stock = db.get_furnace_oil_stock()
         elec_month = db.electricity_month_totals(today.year, today.month)
     except Exception as exc:
         _show_db_connection_error(exc)
         supply_rows, batches, materials, lots, alloys = [], [], [], [], []
+        batch_count = lot_count = 0
         oil_stock = 0.0
         elec_month = {"consumed": 0.0, "by_line": {}}
 
@@ -2864,9 +2867,9 @@ if PAGE == "Dashboard":
 
     st.divider()
     c1, c2, c3, c4, c5, c6 = st.columns(6)
-    c1.metric("Batches", len(batches))
+    c1.metric("Batches", batch_count)
     c2.metric("Raw materials", len(materials))
-    c3.metric("Active lots", len(lots))
+    c3.metric("Active lots", lot_count)
     c4.metric("Alloys", len(alloys))
     c5.metric("Furnace oil (L)", f"{oil_stock:,.1f}")
     c6.metric("Electricity this month", f"{elec_month['consumed']:,.1f}")

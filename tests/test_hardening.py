@@ -197,6 +197,16 @@ def test_packing_candidates_do_not_query_each_incomplete_batch(database, monkeyp
     assert len(calls) == 1
 
 
+def test_dashboard_counts_are_not_limited_to_recent_rows(database):
+    for batch_id in ("B-10", "B-11", "B-12"):
+        database.execute(
+            "INSERT INTO Production_batch (Batch_ID) VALUES (?)",
+            (batch_id,),
+        )
+    assert len(database.list_batches(limit=1)) == 1
+    assert database.count_batches() == 3
+
+
 def test_migration_contract_contains_split_rls_and_traceability_indexes():
     sql = (
         Path(__file__).parents[1] / "migrations" / "001_harden_supabase.sql"

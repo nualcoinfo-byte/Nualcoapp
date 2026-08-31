@@ -4456,6 +4456,25 @@ def list_inventory_lots(
     return fetch_all(sql, params)
 
 
+def count_inventory_lots(
+    material: Optional[str] = None,
+    ready_only: bool = False,
+) -> int:
+    sql = """
+        SELECT COUNT(*) AS "count"
+        FROM Raw_Material_Inventory
+        WHERE Remaining_Weight > 0
+    """
+    params: list[Any] = []
+    if material:
+        sql += " AND Raw_Material_Name = ?"
+        params.append(material)
+    if ready_only:
+        sql += " AND Raw_Material_Status = 'Ready For Melt'"
+    row = fetch_one(sql, params)
+    return int((row or {}).get("count") or 0)
+
+
 # ---------- Company (issuer) / Customers / Suppliers ----------
 
 def _company_select_sql() -> str:
@@ -9880,6 +9899,11 @@ def list_batches(limit: int | None = None) -> list[dict[str, Any]]:
         sql += " LIMIT ?"
         params.append(max(1, min(int(limit), 1000)))
     return fetch_all(sql, params)
+
+
+def count_batches() -> int:
+    row = fetch_one('SELECT COUNT(*) AS "count" FROM Production_batch')
+    return int((row or {}).get("count") or 0)
 
 
 def calc_yield(input_weight: float, output_weight: float) -> dict[str, float]:
