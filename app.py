@@ -125,7 +125,12 @@ st.markdown(
 
 
 def _on_streamlit_cloud() -> bool:
-    return os.path.isdir("/mount/src") or os.path.isdir("/home/appuser")
+    return (
+        os.path.isdir("/mount/src")
+        or os.path.isdir("/home/appuser")
+        or bool(os.environ.get("RAILWAY_ENVIRONMENT"))
+        or bool(os.environ.get("RAILWAY_PROJECT_ID"))
+    )
 
 
 @st.cache_resource
@@ -1500,9 +1505,25 @@ NAV_SECTIONS: list[tuple[str, list[str]]] = [
 ]
 ADMIN_NAV_SECTION = "Admin"
 ADMIN_PAGE_CANCEL_ISSUED = "Cancel issued certificate"
-ADMIN_NAV_PAGES = [ADMIN_PAGE_CANCEL_ISSUED]
+ADMIN_PAGE_ROLES = "Roles & permissions"
+ADMIN_PAGE_PASSWORDS = "Employee passwords"
+ADMIN_NAV_PAGES = [
+    ADMIN_PAGE_CANCEL_ISSUED,
+    ADMIN_PAGE_ROLES,
+    ADMIN_PAGE_PASSWORDS,
+]
+_NAV_SECTION_KEY = {
+    "Overview": "overview",
+    "Purchasing & inventory": "purchasing",
+    "Production": "production",
+    "Utilities & conversion": "utilities",
+    "Masters": "masters",
+    "Tools": "tools",
+    ADMIN_NAV_SECTION: "admin",
+}
 _BASE_NAV_PAGES = [page for _section, pages in NAV_SECTIONS for page in pages]
 _ALL_NAV_PAGES = _BASE_NAV_PAGES + ADMIN_NAV_PAGES
+_ALL_SECTION_NAMES = [section for section, _pages in NAV_SECTIONS] + [ADMIN_NAV_SECTION]
 
 
 def _nav_sections(*, include_admin: bool) -> list[tuple[str, list[str]]]:
@@ -1512,40 +1533,130 @@ def _nav_sections(*, include_admin: bool) -> list[tuple[str, list[str]]]:
     return sections
 
 
+def _nav_sections_for_role(role_id: object, role_name: object) -> list[tuple[str, list[str]]]:
+    allowed = set(db.nav_section_keys_for_role(role_id, role_name))
+    if db.role_is_admin(role_name, role_id):
+        allowed = set(db.ALL_NAV_SECTION_KEYS)
+    sections: list[tuple[str, list[str]]] = []
+    for section, pages in NAV_SECTIONS:
+        if _NAV_SECTION_KEY.get(section) in allowed:
+            sections.append((section, list(pages)))
+    if "admin" in allowed:
+        sections.append((ADMIN_NAV_SECTION, list(ADMIN_NAV_PAGES)))
+    return sections
+
+
 def _on_nav_section(section: str) -> None:
     chosen = st.session_state.get(f"nav_radio_{section}")
     if not chosen:
         return
     st.session_state.nav_page = chosen
-    for other, _pages in _nav_sections(include_admin=True):
+    for other in _ALL_SECTION_NAMES:
         if other != section:
             st.session_state[f"nav_radio_{other}"] = None
 
 
-st.sidebar.divider()
-users = db.list_access_users()
-if users:
-    if "acting_user" not in st.session_state or st.session_state.acting_user not in users:
-        st.session_state.acting_user = users[0]
-    acting = st.sidebar.selectbox(
-        "Last updated by",
-        users,
-        index=users.index(st.session_state.acting_user),
-        help="Stamped on master-table saves as Last_updated_by.",
+def _apply_logged_in_actor(emp: dict) -> None:
+    db.set_session_actor(
+        name=db.employee_display_name(emp),
+        employee_id=str(emp.get("employee_id") or ""),
+        role_name=str(emp.get("role_name") or ""),
+        role_id=emp.get("role_id"),
     )
-    st.session_state.acting_user = acting
-    db.set_acting_user(acting)
-else:
-    db.set_acting_user("system")
-    st.sidebar.caption("Last updated by: system (no Access_matrix users)")
 
+
+def _render_login() -> None:
+    st.sidebar.caption("Sign in with your employee ID.")
+    st.title("Sign in")
+    st.caption("Use the employee ID from the employees table. Admin sets passwords.")
+    first_setup = not db.any_employee_has_password()
+    if first_setup:
+        st.info(
+            "No passwords are set yet. Create the first Admin password here, "
+            "then use **Employee passwords** to set passwords for everyone else."
+        )
+        candidates = db.list_admin_employees() or db.list_employees(include_inactive=False)
+        if not candidates:
+            st.error("There are no employees in the database. Load the employees table first.")
+            return
+        labels = {
+            f"{db.employee_display_name(row)}  ·  {row.get('employee_id')}  ·  "
+            f"{row.get('role_name') or '—'}": str(row.get("employee_id"))
+            for row in candidates
+        }
+        with st.form("first_admin_password"):
+            pick = st.selectbox("Admin employee", list(labels.keys()))
+            password = st.text_input("New password", type="password")
+            confirm = st.text_input("Confirm password", type="password")
+            submitted = st.form_submit_button("Set password and sign in", type="primary")
+        if submitted:
+            if password != confirm:
+                st.error("Passwords do not match.")
+                return
+            try:
+                emp = db.bootstrap_first_admin_password(labels[pick], password)
+            except Exception as exc:
+                st.error(str(exc))
+                return
+            st.session_state.auth_employee = emp
+            st.session_state.nav_page = "Dashboard"
+            st.rerun()
+        return
+
+    with st.form("employee_login"):
+        login_id = st.text_input("Employee ID", placeholder="AL-2026-001")
+        password = st.text_input("Password", type="password")
+        submitted = st.form_submit_button("Sign in", type="primary")
+    if submitted:
+        emp = db.authenticate_employee(login_id, password)
+        if not emp:
+            st.error("Invalid employee ID or password.")
+            return
+        st.session_state.auth_employee = emp
+        st.session_state.nav_page = "Dashboard"
+        st.rerun()
+
+
+st.sidebar.divider()
+auth_employee = st.session_state.get("auth_employee")
+if not auth_employee:
+    db.clear_session_actor()
+    if _db_mode == "postgres-error":
+        st.sidebar.error(
+            "Could not reach Supabase yet. Click **Retry**, or reboot the app."
+        )
+        if st.sidebar.button("Retry database connection"):
+            st.session_state.pop("_neon_init_error", None)
+            st.cache_resource.clear()
+            st.rerun()
+    try:
+        _render_login()
+    except Exception as exc:
+        st.error(f"Could not load the login page: {exc}")
+    st.sidebar.markdown(f"**DB:** `{db.DB_LABEL}`")
+    st.stop()
+
+_apply_logged_in_actor(auth_employee)
 is_admin = db.is_admin_user()
-nav_sections = _nav_sections(include_admin=is_admin)
+nav_sections = _nav_sections_for_role(
+    auth_employee.get("role_id"),
+    auth_employee.get("role_name"),
+)
+allowed_pages = [page for _section, pages in nav_sections for page in pages]
 
-if st.session_state.get("nav_page") not in _ALL_NAV_PAGES:
+st.sidebar.markdown(
+    f"**{html.escape(db.employee_display_name(auth_employee))}**  \n"
+    f"`{html.escape(str(auth_employee.get('employee_id') or ''))}` · "
+    f"{html.escape(str(auth_employee.get('role_name') or '—'))}"
+)
+if st.sidebar.button("Log out"):
+    st.session_state.pop("auth_employee", None)
+    db.clear_session_actor()
     st.session_state.nav_page = "Dashboard"
-if st.session_state.get("nav_page") in ADMIN_NAV_PAGES and not is_admin:
-    st.session_state.nav_page = "Dashboard"
+    st.rerun()
+
+if st.session_state.get("nav_page") not in allowed_pages:
+    st.session_state.nav_page = allowed_pages[0] if allowed_pages else "Dashboard"
 
 for section, pages in nav_sections:
     st.sidebar.markdown(
@@ -1569,6 +1680,9 @@ for section, pages in nav_sections:
     )
 
 PAGE = st.session_state.nav_page
+if PAGE not in allowed_pages:
+    st.error("You do not have access to this page.")
+    st.stop()
 
 st.sidebar.markdown(
     f"**Yield target:** {db.YIELD_TARGET_PCT:.0f}%  \n"
@@ -8079,3 +8193,158 @@ elif PAGE == ADMIN_PAGE_CANCEL_ISSUED:
             st.rerun()
         except Exception as exc:
             st.error(str(exc))
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Admin — Roles & permissions
+# ═══════════════════════════════════════════════════════════════════════════════
+elif PAGE == ADMIN_PAGE_ROLES:
+    if not db.is_admin_user():
+        st.error("This page is available only to Admin users.")
+        st.stop()
+    st.title("Roles & permissions")
+    st.caption(
+        "Admin is the super user and always has every section. "
+        "Other roles follow the navigation you save here."
+    )
+    roles = db.list_roles()
+    granted = db.list_role_permissions()
+    if not roles:
+        st.warning("No roles in the database yet.")
+    else:
+        rows = []
+        for role in roles:
+            rid = int(role["role_id"])
+            keys = granted.get(rid) or list(
+                db.default_sections_for_role(rid, role.get("role_name"))
+            )
+            rows.append(
+                {
+                    "Role ID": rid,
+                    "Role": role.get("role_name"),
+                    "Sections": ", ".join(
+                        db.NAV_SECTION_LABELS[k]
+                        for k in db.ALL_NAV_SECTION_KEYS
+                        if k in keys
+                    ),
+                }
+            )
+        show_dataframe(df_from_rows(rows))
+
+        st.subheader("Edit access")
+        for role in roles:
+            rid = int(role["role_id"])
+            rname = str(role.get("role_name") or "")
+            locked = db.role_is_admin(rname, rid)
+            current = set(granted.get(rid) or db.default_sections_for_role(rid, rname))
+            with st.expander(f"{rname}  (Role ID {rid})", expanded=False):
+                if locked:
+                    st.caption("Admin always has full access.")
+                chosen: list[str] = []
+                cols = st.columns(2)
+                for i, (key, label) in enumerate(db.NAV_SECTION_DEFS):
+                    with cols[i % 2]:
+                        checked = st.checkbox(
+                            label,
+                            value=True if locked else key in current,
+                            disabled=locked,
+                            key=f"role_perm_{rid}_{key}",
+                        )
+                    if locked or checked:
+                        chosen.append(key)
+                if st.button("Save permissions", key=f"save_role_perm_{rid}", disabled=locked):
+                    try:
+                        db.save_role_sections(rid, chosen)
+                        st.success(f"Saved permissions for {rname}.")
+                        st.rerun()
+                    except Exception as exc:
+                        st.error(str(exc))
+
+    st.subheader("Add role")
+    with st.form("add_role_form"):
+        new_name = st.text_input("Role name")
+        new_keys: list[str] = []
+        cols = st.columns(2)
+        for i, (key, label) in enumerate(db.NAV_SECTION_DEFS):
+            with cols[i % 2]:
+                if st.checkbox(label, value=key == "overview", key=f"new_role_{key}"):
+                    new_keys.append(key)
+        add_clicked = st.form_submit_button("Add role")
+    if add_clicked:
+        try:
+            db.add_role(new_name, new_keys)
+            st.success(f"Added role **{new_name}**.")
+            st.rerun()
+        except Exception as exc:
+            st.error(str(exc))
+
+    if st.button("Reset all roles to company defaults"):
+        try:
+            db.reset_role_permissions_to_defaults()
+            st.success("Role permissions restored to the company defaults.")
+            st.rerun()
+        except Exception as exc:
+            st.error(str(exc))
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Admin — Employee passwords
+# ═══════════════════════════════════════════════════════════════════════════════
+elif PAGE == ADMIN_PAGE_PASSWORDS:
+    if not db.is_admin_user():
+        st.error("This page is available only to Admin users.")
+        st.stop()
+    st.title("Employee passwords")
+    st.caption(
+        "Set or reset a password for each employee. Employees sign in with "
+        "their employee ID. Passwords are stored hashed, not in plain text."
+    )
+    employees = db.list_employees(include_inactive=True)
+    if not employees:
+        st.warning("No employees found.")
+        st.stop()
+    show_dataframe(
+        df_from_rows(
+            [
+                {
+                    "Employee ID": row.get("employee_id"),
+                    "Name": db.employee_display_name(row),
+                    "Email": row.get("email"),
+                    "Role ID": row.get("role_id"),
+                    "Role": row.get("role_name"),
+                    "Status": row.get("status"),
+                    "Password": "Set" if row.get("has_password") else "Not set",
+                    "Password updated": row.get("password_updated_at"),
+                }
+                for row in employees
+            ]
+        )
+    )
+    labels = {
+        f"{row.get('employee_id')}  ·  {db.employee_display_name(row)}  ·  "
+        f"{row.get('role_name') or '—'}  ·  "
+        f"{'password set' if row.get('has_password') else 'no password'}": str(
+            row.get("employee_id")
+        )
+        for row in employees
+    }
+    pick = st.selectbox("Employee", list(labels.keys()), key="pwd_employee_pick")
+    employee_id = labels[pick]
+    with st.form("set_employee_password"):
+        password = st.text_input(
+            "New password",
+            type="password",
+            help=f"At least {db.MIN_PASSWORD_LENGTH} characters.",
+        )
+        confirm = st.text_input("Confirm password", type="password")
+        submitted = st.form_submit_button("Set / reset password", type="primary")
+    if submitted:
+        if password != confirm:
+            st.error("Passwords do not match.")
+        else:
+            try:
+                db.set_employee_password(employee_id, password)
+                st.success(f"Password saved for **{employee_id}**.")
+                st.rerun()
+            except Exception as exc:
+                st.error(str(exc))

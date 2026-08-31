@@ -1,0 +1,12 @@
+.venv
+.git
+.gitignore
+.cursor
+.agents
+nualco.db
+.env
+.env.local
+__pycache__
+*.pyc
+.neon
+agent-transcripts

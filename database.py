@@ -16,8 +16,11 @@ dialects support:
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import os
 import re
+import secrets
 import socket
 import struct
 import sys
@@ -546,6 +549,7 @@ def get_connection() -> Generator[Connection, None, None]:
         try:
             cm = ENGINE.begin()
             conn = cm.__enter__()
+            _apply_rls_session(conn)
         except OperationalError as exc:
             if cm is not None:
                 try:
@@ -789,6 +793,56 @@ AUDIT_TABLES = {
     "company_profile",
 }
 _ACTING_USER: str = "system"
+_ACTING_EMPLOYEE_ID: str = ""
+_ACTING_ROLE_NAME: str = "system"
+_ACTING_ROLE_ID: int | None = None
+
+NAV_SECTION_DEFS: list[tuple[str, str]] = [
+    ("overview", "Overview"),
+    ("purchasing", "Purchasing & inventory"),
+    ("production", "Production"),
+    ("utilities", "Utilities & conversion"),
+    ("masters", "Masters"),
+    ("tools", "Tools"),
+    ("admin", "Admin"),
+]
+ALL_NAV_SECTION_KEYS: tuple[str, ...] = tuple(key for key, _label in NAV_SECTION_DEFS)
+NAV_SECTION_LABELS: dict[str, str] = {key: label for key, label in NAV_SECTION_DEFS}
+
+_STANDARD_SECTIONS = (
+    "overview",
+    "purchasing",
+    "production",
+    "utilities",
+    "masters",
+)
+_NO_MASTERS_SECTIONS = (
+    "overview",
+    "purchasing",
+    "production",
+    "utilities",
+)
+_LIMITED_SECTIONS = ("overview", "purchasing", "utilities")
+DEFAULT_ROLE_SECTIONS_BY_NAME: dict[str, tuple[str, ...]] = {
+    "admin": ALL_NAV_SECTION_KEYS,
+    "management": _STANDARD_SECTIONS,
+    "purchase": _STANDARD_SECTIONS,
+    "production": _NO_MASTERS_SECTIONS,
+    "accounts": _LIMITED_SECTIONS,
+    "inventory": _LIMITED_SECTIONS,
+}
+DEFAULT_ROLE_SECTIONS_BY_ID: dict[int, tuple[str, ...]] = {
+    1: _STANDARD_SECTIONS,  # Management
+    2: ALL_NAV_SECTION_KEYS,  # Admin
+    5: _STANDARD_SECTIONS,  # Purchase
+    6: _NO_MASTERS_SECTIONS,  # Production
+    11: _LIMITED_SECTIONS,  # accounts
+    13: _LIMITED_SECTIONS,  # Inventory
+}
+_PASSWORD_SCHEME = "pbkdf2_sha256"
+_PASSWORD_ROUNDS = 210_000
+MIN_PASSWORD_LENGTH = 8
+_SECRET_COLUMNS = frozenset({"password_hash"})
 
 
 def set_acting_user(name: str | None) -> None:
@@ -798,8 +852,42 @@ def set_acting_user(name: str | None) -> None:
     _ACTING_USER = text or "system"
 
 
+def set_session_actor(
+    *,
+    name: str | None = None,
+    employee_id: str | None = None,
+    role_name: str | None = None,
+    role_id: int | None = None,
+) -> None:
+    """Bind the logged-in employee for audit stamps, nav, and RLS."""
+    global _ACTING_EMPLOYEE_ID, _ACTING_ROLE_NAME, _ACTING_ROLE_ID
+    set_acting_user(name)
+    _ACTING_EMPLOYEE_ID = (employee_id or "").strip()
+    _ACTING_ROLE_NAME = (role_name or "").strip() or "system"
+    try:
+        _ACTING_ROLE_ID = int(role_id) if role_id is not None else None
+    except (TypeError, ValueError):
+        _ACTING_ROLE_ID = None
+
+
+def clear_session_actor() -> None:
+    set_session_actor(name="system", employee_id="", role_name="system", role_id=None)
+
+
 def get_acting_user() -> str:
     return _ACTING_USER or "system"
+
+
+def get_acting_employee_id() -> str:
+    return _ACTING_EMPLOYEE_ID or ""
+
+
+def get_acting_role_name() -> str:
+    return _ACTING_ROLE_NAME or "system"
+
+
+def get_acting_role_id() -> int | None:
+    return _ACTING_ROLE_ID
 
 
 def audit_stamp() -> tuple[str, str]:
@@ -965,6 +1053,26 @@ CREATE TABLE IF NOT EXISTS Access_matrix (
     ID TEXT PRIMARY KEY,
     Name TEXT NOT NULL,
     Access TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS roles (
+    role_id {autopk},
+    role_name TEXT NOT NULL UNIQUE
+);
+CREATE TABLE IF NOT EXISTS employees (
+    employee_id TEXT PRIMARY KEY,
+    first_name TEXT NOT NULL,
+    last_name TEXT NOT NULL,
+    email TEXT,
+    role_id INTEGER REFERENCES roles(role_id),
+    status TEXT DEFAULT 'Active',
+    password_hash TEXT,
+    password_updated_at TEXT,
+    created_at TEXT DEFAULT {now}
+);
+CREATE TABLE IF NOT EXISTS role_permissions (
+    role_id INTEGER NOT NULL REFERENCES roles(role_id) ON DELETE CASCADE,
+    section_key TEXT NOT NULL,
+    PRIMARY KEY (role_id, section_key)
 );
 CREATE TABLE IF NOT EXISTS Production_supervisor (
     Production_supervisor TEXT PRIMARY KEY,
@@ -1483,6 +1591,8 @@ def init_db() -> None:
         _ensure_sidestream_remelt_inventory(conn)
         _ensure_packing_list(conn)
         _ensure_company_profile(conn)
+        _ensure_employees(conn)
+        _ensure_row_level_security(conn)
         _ensure_columns(
             conn,
             "Alloy_Master",
@@ -3191,7 +3301,7 @@ def _rename_column(
 
 def fetch_all(sql: str, params: Iterable[Any] = ()) -> list[dict[str, Any]]:
     def _run() -> list[dict[str, Any]]:
-        with ENGINE.connect() as conn:
+        with get_connection() as conn:
             return [dict(r) for r in _exec(conn, sql, tuple(params)).mappings()]
 
     return _retry_on_disconnect(_run)
@@ -3199,7 +3309,7 @@ def fetch_all(sql: str, params: Iterable[Any] = ()) -> list[dict[str, Any]]:
 
 def fetch_one(sql: str, params: Iterable[Any] = ()) -> Optional[dict[str, Any]]:
     def _run() -> Optional[dict[str, Any]]:
-        with ENGINE.connect() as conn:
+        with get_connection() as conn:
             row = _exec(conn, sql, tuple(params)).mappings().first()
             return dict(row) if row is not None else None
 
@@ -3393,6 +3503,22 @@ EDITABLE_TABLES: list[dict[str, Any]] = [
         "allow_add": True,
     },
     {
+        "key": "roles",
+        "label": "Roles",
+        "pk": ["role_id"],
+        "order_by": "role_id",
+        "identity": ["role_id"],
+        "allow_add": True,
+    },
+    {
+        "key": "employees",
+        "label": "Employees",
+        "pk": ["employee_id"],
+        "order_by": "employee_id",
+        "identity": [],
+        "allow_add": True,
+    },
+    {
         "key": "finished_goods_inventory",
         "label": "Finished goods inventory",
         "pk": ["bundle_id"],
@@ -3494,6 +3620,8 @@ def editable_columns(table_name: str) -> list[str]:
         for c in sa_inspect(ENGINE).get_columns(resolved):
             type_name = type(c["type"]).__name__.upper()
             if "BLOB" in type_name or "BYTEA" in type_name or "LARGEBINARY" in type_name:
+                continue
+            if str(c["name"]).lower() in _SECRET_COLUMNS:
                 continue
             cols.append(c["name"])
         return cols
@@ -4847,12 +4975,42 @@ def list_access_users() -> list[str]:
 
 
 def is_admin_user(name: str | None = None) -> bool:
-    """True when the acting user is Admin (Name or Access_matrix.Access)."""
+    """True when the logged-in employee (or Access_matrix fallback) is Admin."""
+    if name is None:
+        if role_is_admin(get_acting_role_name(), get_acting_role_id()):
+            return True
     user = (name or get_acting_user() or "").strip()
     if not user:
         return False
-    if user.lower() == "admin":
-        return True
+    emp_id = get_acting_employee_id() if name is None else ""
+    try:
+        if emp_id:
+            row = fetch_one(
+                """
+                SELECT e.role_id AS "role_id", r.role_name AS "role_name"
+                FROM employees e
+                LEFT JOIN roles r ON r.role_id = e.role_id
+                WHERE lower(e.employee_id) = lower(?)
+                """,
+                (emp_id,),
+            )
+            if row and role_is_admin(row.get("role_name"), row.get("role_id")):
+                return True
+        row = fetch_one(
+            """
+            SELECT e.role_id AS "role_id", r.role_name AS "role_name"
+            FROM employees e
+            LEFT JOIN roles r ON r.role_id = e.role_id
+            WHERE lower(trim(e.first_name) || ' ' || trim(e.last_name)) = lower(?)
+               OR lower(e.employee_id) = lower(?)
+               OR lower(trim(e.first_name)) = lower(?)
+            """,
+            (user, user, user),
+        )
+        if row and role_is_admin(row.get("role_name"), row.get("role_id")):
+            return True
+    except Exception:
+        pass
     try:
         row = fetch_one(
             """
@@ -5814,15 +5972,716 @@ def backfill_finished_goods_from_output() -> int:
     return updated
 
 
+def _ensure_employees(conn: Connection) -> None:
+    """Create roles, employees, and role_permissions. Seed default nav access."""
+    if IS_POSTGRES:
+        _exec(
+            conn,
+            """
+            CREATE TABLE IF NOT EXISTS roles (
+                role_id INTEGER PRIMARY KEY GENERATED BY DEFAULT AS IDENTITY,
+                role_name VARCHAR(50) NOT NULL UNIQUE
+            )
+            """,
+        )
+        _exec(
+            conn,
+            """
+            CREATE TABLE IF NOT EXISTS employees (
+                employee_id VARCHAR(15) PRIMARY KEY,
+                first_name VARCHAR(50) NOT NULL,
+                last_name VARCHAR(50) NOT NULL,
+                email VARCHAR(100),
+                role_id INT REFERENCES roles(role_id),
+                status VARCHAR(20) DEFAULT 'Active',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+            """,
+        )
+        _exec(conn, "ALTER TABLE employees DROP CONSTRAINT IF EXISTS employees_email_key")
+        _ensure_columns(
+            conn,
+            "employees",
+            [
+                ("password_hash", "TEXT"),
+                ("password_updated_at", "TIMESTAMP"),
+            ],
+        )
+        _exec(
+            conn,
+            """
+            CREATE TABLE IF NOT EXISTS role_permissions (
+                role_id INTEGER NOT NULL REFERENCES roles(role_id) ON DELETE CASCADE,
+                section_key TEXT NOT NULL,
+                PRIMARY KEY (role_id, section_key)
+            )
+            """,
+        )
+        _seed_role_permissions(conn)
+        return
+    _exec(
+        conn,
+        """
+        CREATE TABLE IF NOT EXISTS roles (
+            role_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            role_name TEXT NOT NULL UNIQUE
+        )
+        """,
+    )
+    _exec(
+        conn,
+        """
+        CREATE TABLE IF NOT EXISTS employees (
+            employee_id TEXT PRIMARY KEY,
+            first_name TEXT NOT NULL,
+            last_name TEXT NOT NULL,
+            email TEXT,
+            role_id INTEGER REFERENCES roles(role_id),
+            status TEXT DEFAULT 'Active',
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )
+        """,
+    )
+    _ensure_columns(
+        conn,
+        "employees",
+        [
+            ("password_hash", "TEXT"),
+            ("password_updated_at", "TEXT"),
+        ],
+    )
+    _exec(
+        conn,
+        """
+        CREATE TABLE IF NOT EXISTS role_permissions (
+            role_id INTEGER NOT NULL REFERENCES roles(role_id) ON DELETE CASCADE,
+            section_key TEXT NOT NULL,
+            PRIMARY KEY (role_id, section_key)
+        )
+        """,
+    )
+    _seed_role_permissions(conn)
+
+
+def _normalize_role_name(name: object) -> str:
+    return str(name or "").strip().lower()
+
+
+def role_is_admin(role_name: object = None, role_id: object = None) -> bool:
+    if _normalize_role_name(role_name) == "admin":
+        return True
+    try:
+        return int(role_id) == 2
+    except (TypeError, ValueError):
+        return False
+
+
+def default_sections_for_role(role_id: object, role_name: object) -> tuple[str, ...]:
+    if role_is_admin(role_name, role_id):
+        return ALL_NAV_SECTION_KEYS
+    by_name = DEFAULT_ROLE_SECTIONS_BY_NAME.get(_normalize_role_name(role_name))
+    if by_name:
+        return by_name
+    try:
+        by_id = DEFAULT_ROLE_SECTIONS_BY_ID.get(int(role_id))
+    except (TypeError, ValueError):
+        by_id = None
+    return by_id or ("overview",)
+
+
+def _seed_role_permissions(conn: Connection) -> None:
+    count_row = _exec(conn, "SELECT COUNT(*) FROM role_permissions").first()
+    if count_row and int(count_row[0] or 0) > 0:
+        return
+    roles = list(
+        _exec(
+            conn,
+            'SELECT role_id AS "role_id", role_name AS "role_name" FROM roles',
+        ).mappings()
+    )
+    for role in roles:
+        for key in default_sections_for_role(role.get("role_id"), role.get("role_name")):
+            _exec(
+                conn,
+                """
+                INSERT INTO role_permissions (role_id, section_key)
+                VALUES (?, ?)
+                ON CONFLICT (role_id, section_key) DO NOTHING
+                """,
+                (role["role_id"], key),
+            )
+
+
+def employee_display_name(row: dict[str, Any] | None) -> str:
+    if not row:
+        return "user"
+    first = str(row.get("first_name") or "").strip()
+    last = str(row.get("last_name") or "").strip()
+    if last in {"", "-"}:
+        return first or str(row.get("employee_id") or "user")
+    return f"{first} {last}".strip() or str(row.get("employee_id") or "user")
+
+
+def hash_password(password: str) -> str:
+    salt = secrets.token_hex(16)
+    digest = hashlib.pbkdf2_hmac(
+        "sha256",
+        password.encode("utf-8"),
+        salt.encode("utf-8"),
+        _PASSWORD_ROUNDS,
+    )
+    return f"{_PASSWORD_SCHEME}${_PASSWORD_ROUNDS}${salt}${digest.hex()}"
+
+
+def _verify_password(password: str, stored: str) -> bool:
+    try:
+        scheme, rounds_s, salt, digest = str(stored).split("$", 3)
+        if scheme != _PASSWORD_SCHEME:
+            return False
+        rounds = int(rounds_s)
+        check = hashlib.pbkdf2_hmac(
+            "sha256",
+            password.encode("utf-8"),
+            salt.encode("utf-8"),
+            rounds,
+        )
+        return hmac.compare_digest(check.hex(), digest)
+    except Exception:
+        return False
+
+
+def _validate_new_password(password: str) -> str:
+    text = password or ""
+    if len(text) < MIN_PASSWORD_LENGTH:
+        raise ValueError(
+            f"Password must be at least {MIN_PASSWORD_LENGTH} characters."
+        )
+    if text.strip() != text:
+        raise ValueError("Password cannot start or end with a space.")
+    return text
+
+
+_EMPLOYEE_SELECT = """
+SELECT e.employee_id AS "employee_id",
+       e.first_name AS "first_name",
+       e.last_name AS "last_name",
+       e.email AS "email",
+       e.role_id AS "role_id",
+       r.role_name AS "role_name",
+       e.status AS "status",
+       e.created_at AS "created_at",
+       e.password_updated_at AS "password_updated_at",
+       CASE
+           WHEN e.password_hash IS NULL OR trim(e.password_hash) = '' THEN 0
+           ELSE 1
+       END AS "has_password"
+FROM employees e
+LEFT JOIN roles r ON r.role_id = e.role_id
+"""
+
+
+def list_roles() -> list[dict[str, Any]]:
+    return fetch_all(
+        """
+        SELECT role_id AS "role_id", role_name AS "role_name"
+        FROM roles
+        ORDER BY role_id
+        """
+    )
+
+
+def list_employees(*, include_inactive: bool = True) -> list[dict[str, Any]]:
+    sql = _EMPLOYEE_SELECT
+    if not include_inactive:
+        sql += " WHERE lower(COALESCE(e.status, 'Active')) = 'active'"
+    sql += " ORDER BY e.employee_id"
+    return fetch_all(sql)
+
+
+def get_employee(employee_id: str) -> Optional[dict[str, Any]]:
+    return fetch_one(
+        _EMPLOYEE_SELECT + " WHERE lower(e.employee_id) = lower(?)",
+        ((employee_id or "").strip(),),
+    )
+
+
+def list_admin_employees() -> list[dict[str, Any]]:
+    return [
+        row
+        for row in list_employees(include_inactive=False)
+        if role_is_admin(row.get("role_name"), row.get("role_id"))
+    ]
+
+
+def any_employee_has_password() -> bool:
+    row = fetch_one(
+        """
+        SELECT 1 AS "ok"
+        FROM employees
+        WHERE password_hash IS NOT NULL AND trim(password_hash) <> ''
+        LIMIT 1
+        """
+    )
+    return bool(row)
+
+
+def authenticate_employee(login_id: str, password: str) -> Optional[dict[str, Any]]:
+    login_id = (login_id or "").strip()
+    if not login_id or not password:
+        return None
+    row = fetch_one(
+        """
+        SELECT e.employee_id AS "employee_id",
+               e.first_name AS "first_name",
+               e.last_name AS "last_name",
+               e.email AS "email",
+               e.role_id AS "role_id",
+               r.role_name AS "role_name",
+               e.status AS "status",
+               e.password_hash AS "password_hash"
+        FROM employees e
+        LEFT JOIN roles r ON r.role_id = e.role_id
+        WHERE lower(e.employee_id) = lower(?)
+        """,
+        (login_id,),
+    )
+    if not row:
+        return None
+    status = str(row.get("status") or "Active").strip().lower()
+    if status and status != "active":
+        return None
+    stored = str(row.get("password_hash") or "")
+    if not stored or not _verify_password(password, stored):
+        return None
+    row.pop("password_hash", None)
+    return row
+
+
+def set_employee_password(
+    employee_id: str,
+    password: str,
+    *,
+    require_admin: bool = True,
+) -> None:
+    if require_admin and not is_admin_user():
+        raise ValueError("Only an Admin can set or reset employee passwords.")
+    employee_id = (employee_id or "").strip()
+    if not employee_id:
+        raise ValueError("Choose an employee.")
+    emp = get_employee(employee_id)
+    if not emp:
+        raise ValueError("Employee not found.")
+    hashed = hash_password(_validate_new_password(password))
+    stamp = datetime.now().isoformat(timespec="seconds")
+    execute(
+        """
+        UPDATE employees
+        SET password_hash = ?, password_updated_at = ?
+        WHERE lower(employee_id) = lower(?)
+        """,
+        (hashed, stamp, employee_id),
+    )
+
+
+def bootstrap_first_admin_password(employee_id: str, password: str) -> dict[str, Any]:
+    """Allow the first Admin password when nobody has logged in yet."""
+    if any_employee_has_password():
+        raise ValueError("Passwords already exist. Sign in, then use Employee passwords.")
+    emp = get_employee(employee_id)
+    if not emp:
+        raise ValueError("Employee not found.")
+    admins = list_admin_employees()
+    if admins and not role_is_admin(emp.get("role_name"), emp.get("role_id")):
+        raise ValueError("The first password must be set for an Admin employee.")
+    set_employee_password(employee_id, password, require_admin=False)
+    ready = get_employee(employee_id)
+    if not ready:
+        raise ValueError("Could not load the employee after setting the password.")
+    return ready
+
+
+def nav_section_keys_for_role(role_id: object, role_name: object = None) -> list[str]:
+    if role_is_admin(role_name, role_id):
+        return list(ALL_NAV_SECTION_KEYS)
+    keys: list[str] = []
+    try:
+        rid = int(role_id) if role_id is not None else None
+    except (TypeError, ValueError):
+        rid = None
+    if rid is not None:
+        rows = fetch_all(
+            """
+            SELECT section_key AS "section_key"
+            FROM role_permissions
+            WHERE role_id = ?
+            """,
+            (rid,),
+        )
+        keys = [
+            str(row["section_key"])
+            for row in rows
+            if row.get("section_key") in NAV_SECTION_LABELS
+        ]
+    if keys:
+        return keys
+    return list(default_sections_for_role(role_id, role_name))
+
+
+def list_role_permissions() -> dict[int, list[str]]:
+    granted: dict[int, list[str]] = {}
+    for row in fetch_all(
+        """
+        SELECT role_id AS "role_id", section_key AS "section_key"
+        FROM role_permissions
+        ORDER BY role_id, section_key
+        """
+    ):
+        try:
+            rid = int(row["role_id"])
+        except (TypeError, ValueError, KeyError):
+            continue
+        key = str(row.get("section_key") or "")
+        if key not in NAV_SECTION_LABELS:
+            continue
+        granted.setdefault(rid, []).append(key)
+    return granted
+
+
+def save_role_sections(role_id: int, section_keys: Iterable[str]) -> None:
+    if not is_admin_user():
+        raise ValueError("Only an Admin can change role permissions.")
+    role = fetch_one(
+        """
+        SELECT role_id AS "role_id", role_name AS "role_name"
+        FROM roles
+        WHERE role_id = ?
+        """,
+        (role_id,),
+    )
+    if not role:
+        raise ValueError("Role not found.")
+    allowed = {key for key, _label in NAV_SECTION_DEFS}
+    keys = [key for key in section_keys if key in allowed]
+    if role_is_admin(role.get("role_name"), role.get("role_id")):
+        keys = list(ALL_NAV_SECTION_KEYS)
+    elif "overview" not in keys:
+        keys = ["overview", *keys]
+    with get_connection() as conn:
+        _exec(conn, "DELETE FROM role_permissions WHERE role_id = ?", (role_id,))
+        for key in keys:
+            _exec(
+                conn,
+                """
+                INSERT INTO role_permissions (role_id, section_key)
+                VALUES (?, ?)
+                ON CONFLICT (role_id, section_key) DO NOTHING
+                """,
+                (role_id, key),
+            )
+
+
+def add_role(role_name: str, section_keys: Iterable[str]) -> int:
+    if not is_admin_user():
+        raise ValueError("Only an Admin can add a role.")
+    name = (role_name or "").strip()
+    if not name:
+        raise ValueError("Role name is required.")
+    existing = fetch_one(
+        "SELECT role_id AS \"role_id\" FROM roles WHERE lower(role_name) = lower(?)",
+        (name,),
+    )
+    if existing:
+        raise ValueError(f"Role '{name}' already exists.")
+    with get_connection() as conn:
+        row = (
+            _exec(
+                conn,
+                "INSERT INTO roles (role_name) VALUES (?) RETURNING role_id",
+                (name,),
+            )
+            .mappings()
+            .first()
+        )
+        if not row:
+            raise ValueError("Could not create the role.")
+        role_id = int(row["role_id"])
+    save_role_sections(role_id, section_keys)
+    return role_id
+
+
+def reset_role_permissions_to_defaults() -> None:
+    if not is_admin_user():
+        raise ValueError("Only an Admin can reset role permissions.")
+    with get_connection() as conn:
+        _exec(conn, "DELETE FROM role_permissions")
+        _seed_role_permissions(conn)
+
+
+
+def _sql_ident(name: str) -> str:
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
+        raise ValueError(f"Invalid identifier: {name}")
+    return name
+
+
+def _sql_literal(value: str) -> str:
+    return "'" + value.replace("'", "''") + "'"
+
+
+def _apply_rls_session(conn: Connection) -> None:
+    """Stamp the acting user's role onto this transaction for RLS policies."""
+    if not IS_POSTGRES:
+        return
+    role_name = get_acting_role_name() or "system"
+    employee_id = get_acting_employee_id()
+    user = (get_acting_user() or "").strip()
+    try:
+        _exec(conn, "SELECT set_config('nualco.role_name', 'system', true)")
+        _exec(conn, "SELECT set_config('nualco.employee_id', '', true)")
+        if employee_id:
+            row = (
+                _exec(
+                    conn,
+                    """
+                    SELECT e.employee_id AS "employee_id",
+                           r.role_name AS "role_name"
+                    FROM employees e
+                    LEFT JOIN roles r ON r.role_id = e.role_id
+                    WHERE lower(e.employee_id) = lower(?)
+                    LIMIT 1
+                    """,
+                    (employee_id,),
+                )
+                .mappings()
+                .first()
+            )
+            if row:
+                employee_id = str(row.get("employee_id") or employee_id)
+                role_name = str(row.get("role_name") or role_name or "system")
+        elif user and user.lower() != "system":
+            row = (
+                _exec(
+                    conn,
+                    """
+                    SELECT e.employee_id AS "employee_id",
+                           r.role_name AS "role_name"
+                    FROM employees e
+                    LEFT JOIN roles r ON r.role_id = e.role_id
+                    WHERE lower(btrim(e.first_name) || ' ' || btrim(e.last_name))
+                          = lower(?)
+                       OR lower(btrim(e.first_name)) = lower(?)
+                    LIMIT 1
+                    """,
+                    (user, user),
+                )
+                .mappings()
+                .first()
+            )
+            if row:
+                employee_id = str(row.get("employee_id") or "")
+                role_name = str(row.get("role_name") or "system")
+            else:
+                acc = (
+                    _exec(
+                        conn,
+                        """
+                        SELECT Access AS "Access"
+                        FROM Access_matrix
+                        WHERE lower(Name) = lower(?)
+                        """,
+                        (user,),
+                    )
+                    .mappings()
+                    .first()
+                )
+                if acc and acc.get("Access"):
+                    role_name = str(acc["Access"])
+        _exec(conn, "SELECT set_config('nualco.role_name', ?, true)", (role_name,))
+        _exec(conn, "SELECT set_config('nualco.employee_id', ?, true)", (employee_id,))
+    except Exception:
+        try:
+            _exec(conn, "SELECT set_config('nualco.role_name', 'system', true)")
+        except Exception:
+            pass
+
+
+def _ensure_row_level_security(conn: Connection) -> None:
+    """Enable RLS on every public table and install role-based policies."""
+    if not IS_POSTGRES:
+        return
+    _exec(
+        conn,
+        """
+        CREATE OR REPLACE FUNCTION public.nualco_role_name()
+        RETURNS text
+        LANGUAGE sql
+        STABLE
+        PARALLEL SAFE
+        AS $fn$
+          SELECT lower(btrim(COALESCE(
+            NULLIF(current_setting('nualco.role_name', true), ''),
+            ''
+          )))
+        $fn$
+        """,
+    )
+    _exec(
+        conn,
+        """
+        CREATE OR REPLACE FUNCTION public.nualco_is_privileged()
+        RETURNS boolean
+        LANGUAGE sql
+        STABLE
+        PARALLEL SAFE
+        AS $fn$
+          SELECT public.nualco_role_name() IN ('admin', 'management', 'system')
+        $fn$
+        """,
+    )
+    _exec(
+        conn,
+        """
+        CREATE OR REPLACE FUNCTION public.nualco_table_allowed(p_table text)
+        RETURNS boolean
+        LANGUAGE sql
+        STABLE
+        PARALLEL SAFE
+        AS $fn$
+          SELECT
+            public.nualco_is_privileged()
+            OR (
+              public.nualco_role_name() = 'purchase'
+              AND p_table = ANY (ARRAY[
+                'vendor_master','raw_material_purchase','raw_material_inventory',
+                'raw_material_master','raw_material_spec','isri_code_table',
+                'purchase_order','furnace_oil_purchase','customer_master',
+                'state_city_master','month_code','element_master','alloy_master',
+                'alloy_master_spec','company_profile','roles'
+              ])
+            )
+            OR (
+              public.nualco_role_name() = 'production'
+              AND p_table = ANY (ARRAY[
+                'production_batch','production_supervisor','batch_input',
+                'batch_output','batch_chemical_composition','furnace_master',
+                'crucible_master','melter_master','trolley_master',
+                'furnace_oil_consumption','furnace_oil_inventory',
+                'furnace_oil_consumption__daily','electricity_consumption',
+                'electricity_consumption__lines','alloy_master',
+                'alloy_master_spec','element_master','build_of_material',
+                'cost_of_conversion','raw_material_inventory',
+                'raw_material_master','raw_material_spec','isri_code_table',
+                'finished_goods_inventory','company_profile',
+                'alloy_data_checker','roles'
+              ])
+            )
+            OR (
+              public.nualco_role_name() = 'inventory'
+              AND p_table = ANY (ARRAY[
+                'raw_material_inventory','raw_material_master','raw_material_spec',
+                'isri_code_table','finished_goods_inventory','packing_list',
+                'packing_list_batch','packing_list_certificate',
+                'packing_list_certificate_line','packing_list_certificate_source',
+                'packing_list_visual_inspection','customer_master','alloy_master',
+                'alloy_master_spec','element_master','company_profile',
+                'vendor_master','state_city_master','trolley_master','roles'
+              ])
+            )
+            OR (
+              public.nualco_role_name() = 'accounts'
+              AND p_table = ANY (ARRAY[
+                'packing_list','packing_list_batch','packing_list_certificate',
+                'packing_list_certificate_line','packing_list_certificate_source',
+                'packing_list_visual_inspection','purchase_order',
+                'customer_master','company_profile','finished_goods_inventory',
+                'vendor_master','alloy_master','element_master',
+                'state_city_master','month_code','roles'
+              ])
+            )
+        $fn$
+        """,
+    )
+    has_anon = bool(
+        _exec(conn, "SELECT 1 FROM pg_roles WHERE rolname = 'anon'").first()
+    )
+    has_authenticated = bool(
+        _exec(conn, "SELECT 1 FROM pg_roles WHERE rolname = 'authenticated'").first()
+    )
+    tables = [
+        str(row[0])
+        for row in _exec(
+            conn,
+            """
+            SELECT c.relname
+            FROM pg_class c
+            JOIN pg_namespace n ON n.oid = c.relnamespace
+            WHERE n.nspname = 'public' AND c.relkind = 'r'
+            ORDER BY 1
+            """,
+        )
+    ]
+    for raw_name in tables:
+        ident = _sql_ident(raw_name)
+        _exec(conn, f"ALTER TABLE {ident} ENABLE ROW LEVEL SECURITY")
+        _exec(conn, f"DROP POLICY IF EXISTS nualco_all ON {ident}")
+        if raw_name == "employees":
+            _exec(
+                conn,
+                f"""
+                CREATE POLICY nualco_all ON {ident}
+                FOR ALL
+                USING (
+                    public.nualco_is_privileged()
+                    OR employee_id = NULLIF(
+                        current_setting('nualco.employee_id', true), ''
+                    )
+                )
+                WITH CHECK (
+                    public.nualco_is_privileged()
+                    OR employee_id = NULLIF(
+                        current_setting('nualco.employee_id', true), ''
+                    )
+                )
+                """,
+            )
+        else:
+            lit = _sql_literal(raw_name)
+            _exec(
+                conn,
+                f"""
+                CREATE POLICY nualco_all ON {ident}
+                FOR ALL
+                USING (public.nualco_table_allowed({lit}))
+                WITH CHECK (public.nualco_table_allowed({lit}))
+                """,
+            )
+        _exec(conn, f"REVOKE ALL ON TABLE {ident} FROM PUBLIC")
+        if has_anon:
+            _exec(conn, f"REVOKE ALL ON TABLE {ident} FROM anon")
+        if has_authenticated:
+            _exec(
+                conn,
+                f"GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE {ident} TO authenticated",
+            )
+    if has_authenticated:
+        _exec(conn, "GRANT USAGE ON SCHEMA public TO authenticated")
+    if has_anon:
+        _exec(conn, "GRANT USAGE ON SCHEMA public TO anon")
+
+
 def _ensure_packing_list_ready() -> None:
     with get_connection() as conn:
         _ensure_packing_list(conn)
         _ensure_company_profile(conn)
+        _ensure_employees(conn)
+        _ensure_row_level_security(conn)
 
 
 def _ensure_company_ready() -> None:
     with get_connection() as conn:
         _ensure_company_profile(conn)
+        _ensure_employees(conn)
+        _ensure_row_level_security(conn)
 
 
 def list_packing_po_numbers() -> list[str]:
