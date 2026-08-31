@@ -121,34 +121,43 @@ def _pg_login_status(url: str, timeout: int = 8) -> str:
 
 
 def _supabase_pooler_url(url: str, ref: str, direct_host: str, port: int = 6543) -> str:
-    """IPv4 pooler URL. On Streamlit Cloud, probe aws-0..aws-3 for the tenant."""
+    """IPv4 pooler URL. Probe aws-0..aws-3; new projects are often not on aws-0."""
     parsed = urlparse(_quote_pg_password(url))
-    region = _supabase_pooler_region(direct_host)
+    detected = _supabase_pooler_region(direct_host)
     user = parsed.username or "postgres"
     if "." not in user:
         user = f"{user}.{ref}"
-    password = parsed.password or ""
+    password = quote(parsed.password or "", safe="")
+    regions = [detected]
+    for extra in ("ap-south-1", "ap-southeast-1", "ap-south-2", "us-east-1"):
+        if extra not in regions:
+            regions.append(extra)
 
-    def _make(idx: int, pooler_port: int) -> str:
+    def _make(idx: int, region: str, pooler_port: int) -> str:
         pooler = f"aws-{idx}-{region}.pooler.supabase.com"
         netloc = f"{user}:{password}@{pooler}:{pooler_port}"
         return urlunparse(parsed._replace(netloc=netloc))
 
-    if not _should_probe_pooler():
-        return _make(0, port)
-
-    last = _make(0, port)
-    for idx in (0, 1, 2, 3):
-        for pooler_port in (6543, 5432):
-            candidate = _make(idx, pooler_port)
-            last = candidate
+    last = _make(0, detected, port)
+    reached_pooler = False
+    for region in regions:
+        for idx in (0, 1, 2, 3):
             host = f"aws-{idx}-{region}.pooler.supabase.com"
             try:
-                socket.getaddrinfo(host, pooler_port, socket.AF_INET, socket.SOCK_STREAM)
+                socket.getaddrinfo(host, 6543, socket.AF_INET, socket.SOCK_STREAM)
             except OSError:
                 continue
-            if _pg_login_status(candidate, timeout=8) == "ok":
-                return candidate
+            for pooler_port in (6543, 5432):
+                candidate = _make(idx, region, pooler_port)
+                last = candidate
+                status = _pg_login_status(candidate, timeout=6)
+                if status == "ok":
+                    return candidate
+                if status == "wrong_tenant":
+                    reached_pooler = True
+                    continue
+                if status == "timeout" and not reached_pooler and os.name == "nt":
+                    return last
     return last
 
 
