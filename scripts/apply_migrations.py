@@ -39,7 +39,11 @@ def _app_url(admin_url: str, password: str) -> str:
     parsed = urlparse(admin_url)
     host = parsed.hostname or ""
     port = f":{parsed.port}" if parsed.port else ""
-    netloc = f"{APP_ROLE}:{quote(password, safe='')}@{host}{port}"
+    admin_user = parsed.username or ""
+    app_user = APP_ROLE
+    if "pooler.supabase.com" in host and "." in admin_user:
+        app_user = f"{APP_ROLE}.{admin_user.split('.', 1)[1]}"
+    netloc = f"{app_user}:{quote(password, safe='')}@{host}{port}"
     return urlunparse(parsed._replace(netloc=netloc))
 
 

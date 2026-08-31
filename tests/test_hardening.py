@@ -209,3 +209,15 @@ def test_migration_contract_contains_split_rls_and_traceability_indexes():
     assert "force row level security" in sql
     assert "idx_inventory_movements_lot_time" in sql
     assert "idx_batch_input_lot_id" in sql
+
+
+def test_restricted_pooler_url_keeps_supabase_tenant_suffix():
+    from scripts.apply_migrations import _app_url
+
+    url = _app_url(
+        "postgresql://postgres.project-ref:owner@aws-1.pooler.supabase.com:5432/postgres",
+        "p@ss word",
+    )
+    assert url.startswith(
+        "postgresql://nualco_app.project-ref:p%40ss%20word@"
+    )
