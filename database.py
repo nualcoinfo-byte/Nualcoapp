@@ -36,6 +36,7 @@ from sqlalchemy.exc import OperationalError
 
 DB_PATH = Path(__file__).resolve().parent / "nualco.db"
 ENV_FILE = Path(__file__).resolve().parent / ".env.local"
+SECRETS_FILE = Path(__file__).resolve().parent / ".streamlit" / "secrets.toml"
 
 
 def _force_sqlite() -> bool:
@@ -251,9 +252,6 @@ def _is_neon_pooler_url(url: str) -> bool:
 
 
 def _database_url() -> str | None:
-    if _force_sqlite():
-        return None
-
     def _clean(value: str | None) -> str | None:
         if not value:
             return None
@@ -282,6 +280,24 @@ def _database_url() -> str | None:
             _take_unpooled(secrets[key])
         else:
             _take_primary(secrets[key])
+
+    def _take_key_file(path: Path) -> None:
+        if not path.is_file():
+            return
+        try:
+            lines = path.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            return
+        for line in lines:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, raw = line.partition("=")
+            name = key.strip()
+            if name in {"DATABASE_URL_UNPOOLED", "database_url_unpooled"}:
+                _take_unpooled(raw)
+            elif name in {"DATABASE_URL", "database_url"}:
+                _take_primary(raw)
 
     _take_unpooled(os.environ.get("DATABASE_URL_UNPOOLED"))
     _take_primary(os.environ.get("DATABASE_URL"))
@@ -320,17 +336,12 @@ def _database_url() -> str | None:
         except Exception:
             pass
 
-    if ENV_FILE.exists():
-        for line in ENV_FILE.read_text().splitlines():
-            line = line.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            key, _, raw = line.partition("=")
-            name = key.strip()
-            if name == "DATABASE_URL_UNPOOLED":
-                _take_unpooled(raw)
-            elif name == "DATABASE_URL":
-                _take_primary(raw)
+    _take_key_file(SECRETS_FILE)
+    _take_key_file(ENV_FILE)
+
+    # A leftover FORCE_SQLITE flag must not hide a real Supabase URL.
+    if _force_sqlite() and not primary and not unpooled:
+        return None
 
     # DATABASE_URL is the app's chosen database. The Neon unpooled URL is
     # only a substitute when DATABASE_URL is the Neon pooler, which drops

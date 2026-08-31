@@ -32,13 +32,12 @@ def _clean_database_url(value: object) -> str:
     return str(value or "").strip().strip('"').strip("'")
 
 
-def _url_from_env_file() -> str:
-    """Read DATABASE_URL from .env.local so `streamlit run` works without exporting it."""
-    env_file = Path(__file__).resolve().parent / ".env.local"
-    if not env_file.is_file():
+def _url_from_key_file(path: Path) -> str:
+    """Read DATABASE_URL from a local key=value file next to the app."""
+    if not path.is_file():
         return ""
     try:
-        lines = env_file.read_text(encoding="utf-8").splitlines()
+        lines = path.read_text(encoding="utf-8").splitlines()
     except OSError:
         return ""
     for line in lines:
@@ -46,12 +45,12 @@ def _url_from_env_file() -> str:
         if not line or line.startswith("#") or "=" not in line:
             continue
         key, _, raw = line.partition("=")
-        if key.strip() == "DATABASE_URL":
+        if key.strip() in {"DATABASE_URL", "database_url"}:
             return _clean_database_url(raw)
     return ""
 
 
-# Inject Streamlit secrets / .env.local into the environment BEFORE importing
+# Inject Streamlit secrets / local files into the environment BEFORE importing
 # the database module, which binds SQLAlchemy's engine at import time.
 _secret_url = ""
 try:
@@ -62,7 +61,11 @@ except Exception:
 if not _secret_url:
     _secret_url = _clean_database_url(os.environ.get("DATABASE_URL"))
 if not _secret_url:
-    _secret_url = _url_from_env_file()
+    _secret_url = _url_from_key_file(
+        Path(__file__).resolve().parent / ".streamlit" / "secrets.toml"
+    )
+if not _secret_url:
+    _secret_url = _url_from_key_file(Path(__file__).resolve().parent / ".env.local")
 
 if _secret_url:
     os.environ["DATABASE_URL"] = _secret_url
@@ -86,9 +89,9 @@ if getattr(db, "_LOADED_MTIME", None) != _db_mtime:
     db._LOADED_MTIME = _db_mtime
     st.cache_resource.clear()
 
-# Reload only when switching Neon <-> SQLite. Reloading on every rerun
+# Reload only when switching Postgres <-> SQLite. Reloading on every rerun
 # drops the engine and forces a new handshake each click.
-_want_sqlite = bool(st.session_state.get("use_sqlite"))
+_want_sqlite = bool(st.session_state.get("use_sqlite")) and not _secret_url
 if _want_sqlite:
     if getattr(db, "IS_POSTGRES", False):
         os.environ["NUALCO_FORCE_SQLITE"] = "1"
