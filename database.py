@@ -91,17 +91,60 @@ def _supabase_pooler_region(direct_host: str) -> str:
     return "ap-south-1"
 
 
+def _pg_login_status(url: str, timeout: int = 8) -> str:
+    """Return ok, wrong_tenant, timeout, or error for a Postgres URL."""
+    try:
+        import psycopg2
+
+        parsed = urlparse(_quote_pg_password(url))
+        conn = psycopg2.connect(
+            host=parsed.hostname,
+            port=parsed.port or 5432,
+            user=unquote(parsed.username or ""),
+            password=unquote(parsed.password or ""),
+            dbname=(parsed.path or "/postgres").lstrip("/") or "postgres",
+            sslmode="require",
+            connect_timeout=timeout,
+            gssencmode="disable",
+        )
+        conn.close()
+        return "ok"
+    except Exception as exc:
+        text = str(exc).lower()
+        if "tenant" in text or "enotfound" in text:
+            return "wrong_tenant"
+        if "timeout" in text or "timed out" in text:
+            return "timeout"
+        if "password" in text or "authentication" in text:
+            return "ok"
+        return "error"
+
+
 def _supabase_pooler_url(url: str, ref: str, direct_host: str, port: int = 6543) -> str:
-    """IPv4 transaction pooler URL for Streamlit Cloud (no IPv6)."""
+    """IPv4 pooler URL. On Streamlit Cloud, probe aws-0..aws-3 for the tenant."""
     parsed = urlparse(_quote_pg_password(url))
     region = _supabase_pooler_region(direct_host)
-    pooler = f"aws-0-{region}.pooler.supabase.com"
     user = parsed.username or "postgres"
     if "." not in user:
         user = f"{user}.{ref}"
     password = parsed.password or ""
-    netloc = f"{user}:{password}@{pooler}:{port}"
-    return urlunparse(parsed._replace(netloc=netloc))
+
+    def _make(idx: int, pooler_port: int) -> str:
+        pooler = f"aws-{idx}-{region}.pooler.supabase.com"
+        netloc = f"{user}:{password}@{pooler}:{pooler_port}"
+        return urlunparse(parsed._replace(netloc=netloc))
+
+    if not _on_streamlit_cloud():
+        return _make(0, port)
+
+    last = _make(0, port)
+    for idx in (0, 1, 2, 3):
+        for pooler_port in (6543, 5432):
+            candidate = _make(idx, pooler_port)
+            last = candidate
+            if _pg_login_status(candidate, timeout=10) == "ok":
+                return candidate
+    return last
 
 
 def _rewrite_supabase_ipv4(url: str) -> str:
