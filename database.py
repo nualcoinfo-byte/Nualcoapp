@@ -59,9 +59,9 @@ def _quote_pg_password(url: str) -> str:
     return f"{scheme}://{user}:{encoded}@{hostpart}"
 
 
-def _on_streamlit_cloud() -> bool:
-    """Streamlit Community Cloud mounts the app under /mount/src."""
-    return os.path.isdir("/mount/src") or os.path.isdir("/home/appuser")
+def _should_probe_pooler() -> bool:
+    """Linux/Streamlit Cloud can reach the pooler; this Windows network cannot."""
+    return os.name != "nt"
 
 
 def _supabase_pooler_region(direct_host: str) -> str:
@@ -134,7 +134,7 @@ def _supabase_pooler_url(url: str, ref: str, direct_host: str, port: int = 6543)
         netloc = f"{user}:{password}@{pooler}:{pooler_port}"
         return urlunparse(parsed._replace(netloc=netloc))
 
-    if not _on_streamlit_cloud():
+    if not _should_probe_pooler():
         return _make(0, port)
 
     last = _make(0, port)
@@ -142,7 +142,12 @@ def _supabase_pooler_url(url: str, ref: str, direct_host: str, port: int = 6543)
         for pooler_port in (6543, 5432):
             candidate = _make(idx, pooler_port)
             last = candidate
-            if _pg_login_status(candidate, timeout=10) == "ok":
+            host = f"aws-{idx}-{region}.pooler.supabase.com"
+            try:
+                socket.getaddrinfo(host, pooler_port, socket.AF_INET, socket.SOCK_STREAM)
+            except OSError:
+                continue
+            if _pg_login_status(candidate, timeout=8) == "ok":
                 return candidate
     return last
 
@@ -287,6 +292,9 @@ def _database_url() -> str | None:
 
 def _postgres_label(url: str) -> str:
     host = (urlparse(url).hostname or "").lower()
+    match = re.match(r"^(aws-\d+-[a-z0-9-]+)\.pooler\.supabase\.com$", host)
+    if match:
+        return f"Supabase Postgres ({match.group(1)})"
     if "supabase.co" in host or "supabase.com" in host:
         return "Supabase Postgres"
     if "neon.tech" in host:
@@ -324,7 +332,7 @@ def _postgres_ssl_ready(url: str, timeout: float = 4.0) -> bool:
 
 _URL = _database_url()
 _USE_NEON_HTTP = False
-_CONNECT_TIMEOUT = 20 if _on_streamlit_cloud() else 8
+_CONNECT_TIMEOUT = 20 if _should_probe_pooler() else 8
 _PG_CONNECT_ARGS = {
     "connect_timeout": _CONNECT_TIMEOUT,
     "sslmode": "require",
