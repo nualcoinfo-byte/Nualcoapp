@@ -6516,6 +6516,22 @@ def _ensure_row_level_security(conn: Connection) -> None:
     """Enable RLS on every public table and install role-based policies."""
     if not IS_POSTGRES:
         return
+    already = _exec(
+        conn,
+        """
+        SELECT 1
+        FROM pg_proc p
+        JOIN pg_namespace n ON n.oid = p.pronamespace
+        WHERE n.nspname = 'public' AND p.proname = 'nualco_role_name'
+        LIMIT 1
+        """,
+    ).first()
+    policy_count = _exec(
+        conn,
+        "SELECT COUNT(*) FROM pg_policy WHERE polname = 'nualco_all'",
+    ).first()
+    if already and policy_count and int(policy_count[0] or 0) > 0:
+        return
     _exec(
         conn,
         """

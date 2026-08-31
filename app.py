@@ -28,22 +28,47 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# Inject Streamlit Cloud secrets into the environment BEFORE importing the
-# database module, which binds SQLAlchemy's engine at import time.
+def _clean_database_url(value: object) -> str:
+    return str(value or "").strip().strip('"').strip("'")
+
+
+def _url_from_env_file() -> str:
+    """Read DATABASE_URL from .env.local so `streamlit run` works without exporting it."""
+    env_file = Path(__file__).resolve().parent / ".env.local"
+    if not env_file.is_file():
+        return ""
+    try:
+        lines = env_file.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return ""
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, raw = line.partition("=")
+        if key.strip() == "DATABASE_URL":
+            return _clean_database_url(raw)
+    return ""
+
+
+# Inject Streamlit secrets / .env.local into the environment BEFORE importing
+# the database module, which binds SQLAlchemy's engine at import time.
 _secret_url = ""
 try:
     if "DATABASE_URL" in st.secrets:
-        _secret_url = str(st.secrets["DATABASE_URL"]).strip().strip('"').strip("'")
-        os.environ["DATABASE_URL"] = _secret_url
-        # A leftover Neon DATABASE_URL_UNPOOLED must not override Supabase.
-        if "neon.tech" not in _secret_url.lower() and "DATABASE_URL_UNPOOLED" in os.environ:
-            os.environ.pop("DATABASE_URL_UNPOOLED", None)
+        _secret_url = _clean_database_url(st.secrets["DATABASE_URL"])
 except Exception:
     pass
+if not _secret_url:
+    _secret_url = _clean_database_url(os.environ.get("DATABASE_URL"))
+if not _secret_url:
+    _secret_url = _url_from_env_file()
 
-# A previous SQLite fallback must not lock the session when a Postgres URL
-# is configured. Streamlit Cloud keeps session_state across reruns.
-if _secret_url or os.environ.get("DATABASE_URL"):
+if _secret_url:
+    os.environ["DATABASE_URL"] = _secret_url
+    # A leftover Neon DATABASE_URL_UNPOOLED must not override Supabase.
+    if "neon.tech" not in _secret_url.lower() and "DATABASE_URL_UNPOOLED" in os.environ:
+        os.environ.pop("DATABASE_URL_UNPOOLED", None)
     os.environ.pop("NUALCO_FORCE_SQLITE", None)
     st.session_state.pop("use_sqlite", None)
     st.session_state.pop("_offline_sqlite", None)
@@ -137,7 +162,6 @@ def _on_streamlit_cloud() -> bool:
 def _init_postgres() -> bool:
     """Handshake once per process. Failures are cleared by the caller."""
     db._ensure_packing_list_ready()
-    db._ensure_company_ready()
     return True
 
 
@@ -168,7 +192,9 @@ def bootstrap() -> str:
                         _init_postgres.clear()
                     except Exception:
                         pass
-            if _on_streamlit_cloud():
+            # A configured Supabase/Postgres URL must not silently become nualco.db
+            # on local `streamlit run`. Show a retry error instead.
+            if _on_streamlit_cloud() or _secret_url:
                 return "postgres-error"
             db.switch_to_sqlite()
             db.init_db()
