@@ -196,6 +196,14 @@ def _init_postgres() -> bool:
 
 def bootstrap() -> str:
     """Open the database. Full init_db() is skipped on Postgres (it can hang)."""
+    if not db.IS_POSTGRES:
+        url = _secret_url or getattr(db, "_DEFAULT_SUPABASE_URL", "")
+        if url:
+            try:
+                db._rebind_postgres_engine(url)
+            except Exception as exc:
+                st.session_state["_neon_init_error"] = str(exc)
+                return "postgres-error"
     if db.IS_POSTGRES:
         try:
             db.adopt_supabase_pooler()
@@ -221,20 +229,24 @@ def bootstrap() -> str:
                         _init_postgres.clear()
                     except Exception:
                         pass
-            # A configured Supabase/Postgres URL must not silently become nualco.db
-            # on local `streamlit run`. Show a retry error instead.
             return "postgres-error"
-    if _secret_url:
-        return "postgres-error"
-    db.init_db()
-    return "sqlite"
+    return "postgres-error"
 
 
 _db_mode = bootstrap()
-if _db_mode == "sqlite":
-    st.session_state["use_sqlite"] = True
-    st.session_state["_offline_sqlite"] = True
-    os.environ["NUALCO_FORCE_SQLITE"] = "1"
+
+
+def _sidebar_db_line() -> str:
+    """Always show the live engine label, rebinding off nualco.db if needed."""
+    label = str(getattr(db, "DB_LABEL", ""))
+    if (not db.IS_POSTGRES) or label.endswith(".db"):
+        url = _secret_url or getattr(db, "_DEFAULT_SUPABASE_URL", "")
+        if url:
+            try:
+                db._rebind_postgres_engine(url)
+            except Exception:
+                pass
+    return f"**DB:** `{db.DB_LABEL}`"
 
 
 def df_from_rows(rows) -> pd.DataFrame:
@@ -1686,7 +1698,7 @@ if not auth_employee:
         _render_login()
     except Exception as exc:
         st.error(f"Could not load the login page: {exc}")
-    st.sidebar.markdown(f"**DB:** `{db.DB_LABEL}`")
+    st.sidebar.markdown(_sidebar_db_line())
     st.stop()
 
 _apply_logged_in_actor(auth_employee)
@@ -1739,7 +1751,7 @@ if PAGE not in allowed_pages:
 
 st.sidebar.markdown(
     f"**Yield target:** {db.YIELD_TARGET_PCT:.0f}%  \n"
-    f"**DB:** `{db.DB_LABEL}`"
+    + _sidebar_db_line()
 )
 if _db_mode == "postgres-error":
     st.sidebar.error(

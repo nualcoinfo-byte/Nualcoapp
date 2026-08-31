@@ -451,13 +451,17 @@ elif _URL and _is_neon_host(_URL):
     ENGINE = HttpEngine(_URL)
     DB_LABEL = _postgres_label(_URL)
 else:
-    # check_same_thread=False because Streamlit reruns scripts on worker
-    # threads, so connections cross thread boundaries.
+    # Never bind nualco.db by accident. Local and cloud both use Supabase.
     ENGINE = create_engine(
-        f"sqlite:///{DB_PATH}",
-        connect_args={"check_same_thread": False},
+        _prepare_postgres_url(_DEFAULT_SUPABASE_URL),
+        pool_pre_ping=True,
+        pool_recycle=280,
+        pool_size=5,
+        max_overflow=5,
+        connect_args=_PG_CONNECT_ARGS,
     )
-    DB_LABEL = DB_PATH.name
+    DB_LABEL = _postgres_label(_DEFAULT_SUPABASE_URL)
+    _URL = _prepare_postgres_url(_DEFAULT_SUPABASE_URL)
 
 IS_POSTGRES = ENGINE.dialect.name == "postgresql"
 
@@ -505,22 +509,10 @@ def adopt_supabase_pooler() -> bool:
 
 
 def switch_to_sqlite() -> None:
-    """Drop the Postgres engine and keep using a local SQLite file."""
-    if not _force_sqlite():
-        return
-    global ENGINE, DB_LABEL, IS_POSTGRES, _URL, _USE_NEON_HTTP
-    try:
-        ENGINE.dispose()
-    except Exception:
-        pass
-    _URL = None
-    _USE_NEON_HTTP = False
-    ENGINE = create_engine(
-        f"sqlite:///{DB_PATH}",
-        connect_args={"check_same_thread": False},
-    )
-    DB_LABEL = DB_PATH.name
-    IS_POSTGRES = False
+    """Kept for callers. SQLite is disabled so the UI cannot show nualco.db."""
+    url = _database_url() or _DEFAULT_SUPABASE_URL
+    if url:
+        _rebind_postgres_engine(url)
 
 
 def _is_transient_db_error(exc: BaseException) -> bool:
