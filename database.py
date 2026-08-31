@@ -59,6 +59,11 @@ def _quote_pg_password(url: str) -> str:
     return f"{scheme}://{user}:{encoded}@{hostpart}"
 
 
+def _on_streamlit_cloud() -> bool:
+    """Streamlit Community Cloud mounts the app under /mount/src."""
+    return os.path.isdir("/mount/src") or os.path.isdir("/home/appuser")
+
+
 def _supabase_pooler_region(direct_host: str) -> str:
     """Map the IPv6-only db.<ref>.supabase.co host to a pooler region."""
     try:
@@ -86,29 +91,37 @@ def _supabase_pooler_region(direct_host: str) -> str:
     return "ap-south-1"
 
 
-def _rewrite_supabase_ipv4(url: str) -> str:
-    """Use the IPv4 pooler when the direct Supabase db host is unreachable."""
-    quoted = _quote_pg_password(url)
-    parsed = urlparse(quoted)
-    host = (parsed.hostname or "").lower()
-    match = re.match(r"^db\.([a-z0-9]+)\.supabase\.co$", host)
-    if not match:
-        return quoted
-    if _postgres_ssl_ready(quoted, timeout=2.0):
-        return quoted
-    ref = match.group(1)
-    region = _supabase_pooler_region(host)
+def _supabase_pooler_url(url: str, ref: str, direct_host: str, port: int = 6543) -> str:
+    """IPv4 transaction pooler URL for Streamlit Cloud (no IPv6)."""
+    parsed = urlparse(_quote_pg_password(url))
+    region = _supabase_pooler_region(direct_host)
     pooler = f"aws-0-{region}.pooler.supabase.com"
     user = parsed.username or "postgres"
     if "." not in user:
         user = f"{user}.{ref}"
     password = parsed.password or ""
-    for pooler_port in (6543, 5432):
-        netloc = f"{user}:{password}@{pooler}:{pooler_port}"
-        candidate = urlunparse(parsed._replace(netloc=netloc))
-        if _postgres_ssl_ready(candidate, timeout=2.0):
-            return candidate
-    return quoted
+    netloc = f"{user}:{password}@{pooler}:{port}"
+    return urlunparse(parsed._replace(netloc=netloc))
+
+
+def _rewrite_supabase_ipv4(url: str) -> str:
+    """Use the IPv4 pooler when db.<ref>.supabase.co has no IPv4 address."""
+    quoted = _quote_pg_password(url)
+    parsed = urlparse(quoted)
+    host = (parsed.hostname or "").lower()
+    if "pooler.supabase.com" in host:
+        return quoted
+    match = re.match(r"^db\.([a-z0-9]+)\.supabase\.co$", host)
+    if not match:
+        return quoted
+    # Direct db host is IPv6-only. Streamlit Cloud (and many Windows DNS
+    # stacks) cannot resolve AAAA, so always switch to the IPv4 pooler
+    # unless this machine has an A record for the direct host.
+    try:
+        socket.getaddrinfo(host, parsed.port or 5432, socket.AF_INET, socket.SOCK_STREAM)
+        return quoted
+    except OSError:
+        return _supabase_pooler_url(quoted, match.group(1), host)
 
 
 def _prepare_postgres_url(url: str) -> str:
@@ -231,7 +244,7 @@ def _database_url() -> str | None:
 
 def _postgres_label(url: str) -> str:
     host = (urlparse(url).hostname or "").lower()
-    if "supabase.co" in host:
+    if "supabase.co" in host or "supabase.com" in host:
         return "Supabase Postgres"
     if "neon.tech" in host:
         return "Neon Postgres"
@@ -268,7 +281,23 @@ def _postgres_ssl_ready(url: str, timeout: float = 4.0) -> bool:
 
 _URL = _database_url()
 _USE_NEON_HTTP = False
-if _URL and _postgres_ssl_ready(_URL):
+_CONNECT_TIMEOUT = 20 if _on_streamlit_cloud() else 8
+_PG_CONNECT_ARGS = {
+    "connect_timeout": _CONNECT_TIMEOUT,
+    "sslmode": "require",
+    "gssencmode": "disable",
+}
+if _URL and not _is_neon_host(_URL):
+    ENGINE = create_engine(
+        _URL,
+        pool_pre_ping=True,
+        pool_recycle=280,
+        pool_size=5,
+        max_overflow=5,
+        connect_args=_PG_CONNECT_ARGS,
+    )
+    DB_LABEL = _postgres_label(_URL)
+elif _URL and _postgres_ssl_ready(_URL):
     # Neon compute can scale to zero. Recycle before the typical 5-minute
     # suspend, ping before checkout, and disable GSS (Windows libpq can hang
     # for minutes on gssencmode=prefer).
@@ -278,11 +307,7 @@ if _URL and _postgres_ssl_ready(_URL):
         pool_recycle=280,
         pool_size=5,
         max_overflow=5,
-        connect_args={
-            "connect_timeout": 8,
-            "sslmode": "require",
-            "gssencmode": "disable",
-        },
+        connect_args=_PG_CONNECT_ARGS,
     )
     DB_LABEL = _postgres_label(_URL)
 elif _URL and _is_neon_host(_URL):
@@ -292,20 +317,6 @@ elif _URL and _is_neon_host(_URL):
 
     _USE_NEON_HTTP = True
     ENGINE = HttpEngine(_URL)
-    DB_LABEL = _postgres_label(_URL)
-elif _URL:
-    ENGINE = create_engine(
-        _URL,
-        pool_pre_ping=True,
-        pool_recycle=280,
-        pool_size=5,
-        max_overflow=5,
-        connect_args={
-            "connect_timeout": 8,
-            "sslmode": "require",
-            "gssencmode": "disable",
-        },
-    )
     DB_LABEL = _postgres_label(_URL)
 else:
     # check_same_thread=False because Streamlit reruns scripts on worker

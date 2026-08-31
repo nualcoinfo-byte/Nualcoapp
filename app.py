@@ -30,18 +30,25 @@ st.set_page_config(
 
 # Inject Streamlit Cloud secrets into the environment BEFORE importing the
 # database module, which binds SQLAlchemy's engine at import time.
-if st.session_state.get("use_sqlite"):
+_secret_url = ""
+try:
+    if "DATABASE_URL" in st.secrets:
+        _secret_url = str(st.secrets["DATABASE_URL"]).strip().strip('"').strip("'")
+        os.environ["DATABASE_URL"] = _secret_url
+        # A leftover Neon DATABASE_URL_UNPOOLED must not override Supabase.
+        if "neon.tech" not in _secret_url.lower() and "DATABASE_URL_UNPOOLED" in os.environ:
+            os.environ.pop("DATABASE_URL_UNPOOLED", None)
+except Exception:
+    pass
+
+# A previous SQLite fallback must not lock the session when a Postgres URL
+# is configured. Streamlit Cloud keeps session_state across reruns.
+if _secret_url or os.environ.get("DATABASE_URL"):
+    os.environ.pop("NUALCO_FORCE_SQLITE", None)
+    st.session_state.pop("use_sqlite", None)
+    st.session_state.pop("_offline_sqlite", None)
+elif st.session_state.get("use_sqlite"):
     os.environ["NUALCO_FORCE_SQLITE"] = "1"
-else:
-    try:
-        if "DATABASE_URL" in st.secrets:
-            os.environ["DATABASE_URL"] = str(st.secrets["DATABASE_URL"]).strip().strip('"').strip("'")
-            db_url = os.environ["DATABASE_URL"]
-            # A leftover Neon DATABASE_URL_UNPOOLED must not override Supabase.
-            if "neon.tech" not in db_url.lower() and "DATABASE_URL_UNPOOLED" in os.environ:
-                os.environ.pop("DATABASE_URL_UNPOOLED", None)
-    except Exception:
-        pass
 
 import database as db  # noqa: E402
 import importlib
@@ -117,16 +124,34 @@ st.markdown(
 )
 
 
+def _on_streamlit_cloud() -> bool:
+    return os.path.isdir("/mount/src") or os.path.isdir("/home/appuser")
+
+
 @st.cache_resource
+def _init_postgres() -> bool:
+    """Handshake once per process. Failures are cleared by the caller."""
+    db._ensure_packing_list_ready()
+    db._ensure_company_ready()
+    return True
+
+
 def bootstrap() -> str:
-    """Open the database. Full init_db() is skipped on Neon (it can hang)."""
+    """Open the database. Full init_db() is skipped on Postgres (it can hang)."""
     if db.IS_POSTGRES:
         try:
-            db._ensure_packing_list_ready()
-            db._ensure_company_ready()
-            return "neon"
+            _init_postgres()
+            st.session_state.pop("_neon_init_error", None)
+            return "postgres"
         except Exception as exc:
             st.session_state["_neon_init_error"] = str(exc)
+            try:
+                _init_postgres.clear()
+            except Exception:
+                pass
+            # Community Cloud has no useful local SQLite. Keep retrying Postgres.
+            if _on_streamlit_cloud():
+                return "postgres-error"
             db.switch_to_sqlite()
             db.init_db()
             return "sqlite"
@@ -1536,7 +1561,18 @@ st.sidebar.markdown(
     f"**Yield target:** {db.YIELD_TARGET_PCT:.0f}%  \n"
     f"**DB:** `{db.DB_LABEL}`"
 )
-if st.session_state.get("use_sqlite") or os.environ.get("NUALCO_FORCE_SQLITE"):
+if _db_mode == "postgres-error":
+    st.sidebar.error(
+        "Could not reach Supabase. The app will retry on the next reload."
+    )
+    neon_err = st.session_state.get("_neon_init_error")
+    if neon_err:
+        st.sidebar.caption(f"Database init error: {neon_err}")
+    if st.sidebar.button("Retry database connection"):
+        st.session_state.pop("_neon_init_error", None)
+        st.cache_resource.clear()
+        st.rerun()
+elif st.session_state.get("use_sqlite") or os.environ.get("NUALCO_FORCE_SQLITE"):
     st.sidebar.warning(
         "Offline SQLite mode. Rows you save stay on this PC and are not "
         "written to the shared database."
