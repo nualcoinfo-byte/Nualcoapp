@@ -63,8 +63,8 @@ def _quote_pg_password(url: str) -> str:
 
 
 def _should_probe_pooler() -> bool:
-    """Linux/Streamlit Cloud can reach the pooler; this Windows network cannot."""
-    return os.name != "nt"
+    """Try the IPv4 session pooler on every OS, including Windows."""
+    return True
 
 
 def _supabase_pooler_region(direct_host: str) -> str:
@@ -251,9 +251,6 @@ def _is_neon_pooler_url(url: str) -> bool:
 
 
 def _database_url() -> str | None:
-    if _force_sqlite():
-        return None
-
     def _clean(value: str | None) -> str | None:
         if not value:
             return None
@@ -341,6 +338,10 @@ def _database_url() -> str | None:
         chosen = unpooled or primary
     if chosen:
         chosen = _rewrite_supabase_ipv4(chosen)
+    # A sticky NUALCO_FORCE_SQLITE from a previous SQLite fallback must not
+    # hide a configured Supabase URI and lock the app onto nualco.db.
+    if _force_sqlite() and not (chosen and "supabase" in chosen.lower()):
+        return None
     return _prepare_postgres_url(chosen) if chosen else None
 
 
