@@ -259,6 +259,21 @@ def df_from_rows(rows) -> pd.DataFrame:
     return pd.DataFrame([dict(r) for r in rows])
 
 
+# Streamlit reruns the whole script on every interaction, so anything expensive
+# called at render time runs again on each click. These are bounded so the
+# caches cannot grow without limit, and the existing st.cache_data.clear()
+# calls after saves drop them.
+@st.cache_data(ttl=600, max_entries=1, show_spinner=False)
+def _refresh_finished_goods() -> int:
+    """Reconcile finished goods from batch output. Walks every completed batch."""
+    return db.backfill_finished_goods_from_output()
+
+
+@st.cache_data(ttl=120, max_entries=32, show_spinner=False)
+def _spec_comparison(packing_list_id: int) -> list[dict]:
+    return db.list_packing_list_chemistry_vs_spec(packing_list_id)
+
+
 def _show_db_connection_error(exc: BaseException) -> None:
     st.error(f"Could not load data from the database: {exc}")
 
@@ -2577,7 +2592,7 @@ def _render_tc_spec_and_deviation(packing_list_id: int, *, locked: bool) -> tupl
         "An element is out of specification when its percentage is at or below min, "
         "or at or above max."
     )
-    comparison = db.list_packing_list_chemistry_vs_spec(packing_list_id)
+    comparison = _spec_comparison(packing_list_id)
     deviations = [row for row in comparison if row.get("Out_of_spec")]
     has_letter = db.has_packing_list_deviation_letter(packing_list_id)
     if not comparison:
@@ -5118,7 +5133,7 @@ elif PAGE == "Finished Goods Inventory":
         "if outside that range so you can check the piece count."
     )
     try:
-        db.backfill_finished_goods_from_output()
+        _refresh_finished_goods()
     except Exception as exc:
         st.warning(f"Could not refresh finished goods from batch output: {exc}")
 
@@ -5176,7 +5191,7 @@ elif PAGE == "Packing List":
         "and show in red if outside that range."
     )
     try:
-        db.backfill_finished_goods_from_output()
+        _refresh_finished_goods()
     except Exception as exc:
         st.warning(f"Could not refresh finished goods from batch output: {exc}")
 

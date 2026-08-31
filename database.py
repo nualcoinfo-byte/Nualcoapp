@@ -25,6 +25,7 @@ import secrets
 import socket
 import struct
 import sys
+import threading
 import time
 from contextlib import contextmanager
 from datetime import date, datetime
@@ -555,9 +556,39 @@ def _exec(conn: Connection, sql: str, params: Any = None) -> CursorResult:
     return conn.exec_driver_sql(q, params)
 
 
+_ACTIVE_CONN = threading.local()
+
+
+@contextmanager
+def shared_connection() -> Generator[Connection, None, None]:
+    """Run a block of queries on one connection and one transaction.
+
+    Every fetch_all/fetch_one/execute normally opens its own transaction, and
+    each one re-stamps the RLS session, so a report that issues 40 reads pays
+    40 transactions and ~160 extra statements. Wrapping the block here makes
+    the nested calls reuse this connection instead.
+    """
+    existing = getattr(_ACTIVE_CONN, "conn", None)
+    if existing is not None:
+        yield existing
+        return
+    with get_connection() as conn:
+        _ACTIVE_CONN.conn = conn
+        try:
+            yield conn
+        finally:
+            _ACTIVE_CONN.conn = None
+
+
 @contextmanager
 def get_connection() -> Generator[Connection, None, None]:
     """Open a connection wrapped in a transaction (commit/rollback on exit)."""
+    joined = getattr(_ACTIVE_CONN, "conn", None)
+    if joined is not None:
+        # Inside shared_connection(): join that transaction rather than open a
+        # second one. Commit/rollback stays with the outermost block.
+        yield joined
+        return
     if ENGINE is None:
         raise RuntimeError(NO_DATABASE_URL_MESSAGE)
     delay = _CONNECT_BACKOFF_S
@@ -3238,22 +3269,29 @@ def _ensure_finished_goods_release_trigger(conn: Connection) -> None:
     )
 
 
+_TABLE_COLUMNS: dict[str, set[str]] = {}
+
+
 def _ensure_columns(conn: Connection, table: str, columns: list[tuple[str, str]]) -> None:
     if IS_POSTGRES:
         physical = table.lower()
-        rows = _exec(
-            conn,
-            """
-            SELECT column_name AS name
-            FROM information_schema.columns
-            WHERE table_schema = 'public' AND table_name = ?
-            """,
-            (physical,),
-        ).mappings()
-        existing = {row["name"] for row in rows}
+        existing = _TABLE_COLUMNS.get(physical)
+        if existing is None:
+            rows = _exec(
+                conn,
+                """
+                SELECT column_name AS name
+                FROM information_schema.columns
+                WHERE table_schema = 'public' AND table_name = ?
+                """,
+                (physical,),
+            ).mappings()
+            existing = {row["name"] for row in rows}
+            _TABLE_COLUMNS[physical] = existing
         for name, typedef in columns:
             if name.lower() not in existing:
                 _exec(conn, f"ALTER TABLE {table} ADD COLUMN {name} {typedef}")
+                existing.add(name.lower())
     else:
         existing = {
             row["name"] for row in _exec(conn, f"PRAGMA table_info({table})").mappings()
@@ -3347,6 +3385,14 @@ def execute_many(sql: str, seq: list[tuple[Any, ...]]) -> None:
         _exec(conn, sql, seq)
 
 
+def _is_binary_column(column: Any) -> bool:
+    try:
+        name = type(column.type).__name__.upper()
+    except Exception:
+        return False
+    return "BYTEA" in name or "BLOB" in name or "BINARY" in name
+
+
 def get_all_records(table_name: str, order_by: str | None = None) -> list[dict[str, Any]]:
     """Return all records from the given table as a list of dicts.
 
@@ -3365,7 +3411,11 @@ def get_all_records(table_name: str, order_by: str | None = None) -> list[dict[s
             with ENGINE.connect() as conn:
                 return [dict(r) for r in _exec(conn, sql).mappings()]
         table = Table(table_name, MetaData(), autoload_with=ENGINE)
-        stmt = select(table)
+        # Project columns explicitly and skip binary ones. select(table) would
+        # pull every BYTEA for every row; purchase_order alone holds ~578 KB of
+        # document per row, so a whole-table read would be tens of megabytes.
+        wanted = [c for c in table.columns if not _is_binary_column(c)]
+        stmt = select(*wanted) if wanted else select(table)
         if order_by is not None:
             stmt = stmt.order_by(table.c[order_by])
         with ENGINE.connect() as conn:
@@ -6473,6 +6523,35 @@ def _sql_literal(value: str) -> str:
     return "'" + value.replace("'", "''") + "'"
 
 
+_ROLE_CACHE: dict[tuple[str, str, str], tuple[str, str]] = {}
+_ROLE_CACHE_TTL_S = 120.0
+_ROLE_CACHE_AT: dict[tuple[str, str, str], float] = {}
+_ROLE_CACHE_LOCK = threading.Lock()
+
+
+def clear_role_cache() -> None:
+    """Drop cached employee/role resolutions after an employee or role change."""
+    with _ROLE_CACHE_LOCK:
+        _ROLE_CACHE.clear()
+        _ROLE_CACHE_AT.clear()
+
+
+def _cached_actor(key: tuple[str, str, str]) -> tuple[str, str] | None:
+    with _ROLE_CACHE_LOCK:
+        stamped = _ROLE_CACHE_AT.get(key)
+        if stamped is None or (time.monotonic() - stamped) > _ROLE_CACHE_TTL_S:
+            _ROLE_CACHE.pop(key, None)
+            _ROLE_CACHE_AT.pop(key, None)
+            return None
+        return _ROLE_CACHE.get(key)
+
+
+def _remember_actor(key: tuple[str, str, str], value: tuple[str, str]) -> None:
+    with _ROLE_CACHE_LOCK:
+        _ROLE_CACHE[key] = value
+        _ROLE_CACHE_AT[key] = time.monotonic()
+
+
 def _apply_rls_session(conn: Connection) -> None:
     """Stamp the acting user's role onto this transaction for RLS policies."""
     if not IS_POSTGRES:
@@ -6480,9 +6559,32 @@ def _apply_rls_session(conn: Connection) -> None:
     role_name = get_acting_role_name() or "system"
     employee_id = get_acting_employee_id()
     user = (get_acting_user() or "").strip()
+
+    # The signed-in user's role does not change between clicks, so resolving it
+    # on every connection checkout cost three extra round trips per query.
+    cache_key = (employee_id, user, role_name)
+    cached = _cached_actor(cache_key)
+    if cached is not None:
+        try:
+            _exec(
+                conn,
+                "SELECT set_config('nualco.role_name', ?, true), "
+                "set_config('nualco.employee_id', ?, true)",
+                cached,
+            )
+            return
+        except Exception:
+            _stamp_denied(conn)
+            raise
+
     try:
-        _exec(conn, "SELECT set_config('nualco.role_name', 'system', true)")
-        _exec(conn, "SELECT set_config('nualco.employee_id', '', true)")
+        # Bootstrap as 'system' so the lookup below can read employees/roles
+        # even once RLS is actually enforced.
+        _exec(
+            conn,
+            "SELECT set_config('nualco.role_name', 'system', true), "
+            "set_config('nualco.employee_id', '', true)",
+        )
         if employee_id:
             row = (
                 _exec(
@@ -6541,18 +6643,30 @@ def _apply_rls_session(conn: Connection) -> None:
                 )
                 if acc and acc.get("Access"):
                     role_name = str(acc["Access"])
-        _exec(conn, "SELECT set_config('nualco.role_name', ?, true)", (role_name,))
-        _exec(conn, "SELECT set_config('nualco.employee_id', ?, true)", (employee_id,))
+        _exec(
+            conn,
+            "SELECT set_config('nualco.role_name', ?, true), "
+            "set_config('nualco.employee_id', ?, true)",
+            (role_name, employee_id),
+        )
+        _remember_actor(cache_key, (role_name, employee_id))
     except Exception:
         # Fail closed. Swallowing this would leave the transaction stamped with
         # whatever role was set last, and the fallback used to be the
         # privileged 'system' role, so a lookup error granted full access.
-        try:
-            _exec(conn, "SELECT set_config('nualco.role_name', 'denied', true)")
-            _exec(conn, "SELECT set_config('nualco.employee_id', '', true)")
-        except Exception:
-            pass
+        _stamp_denied(conn)
         raise
+
+
+def _stamp_denied(conn: Connection) -> None:
+    try:
+        _exec(
+            conn,
+            "SELECT set_config('nualco.role_name', 'denied', true), "
+            "set_config('nualco.employee_id', '', true)",
+        )
+    except Exception:
+        pass
 
 
 def _ensure_row_level_security(conn: Connection) -> None:
@@ -6795,20 +6909,54 @@ def _ensure_inventory_guards(conn: Connection) -> None:
     )
 
 
+_MIGRATIONS_RUN: set[str] = set()
+_MIGRATIONS_LOCK = threading.RLock()
+
+
+def _run_once(key: str, migrate: Callable[[], None]) -> None:
+    """Run an idempotent migration once per process.
+
+    These are cheap in SQL terms but chatty: each one issues CREATE TABLE IF
+    NOT EXISTS, ALTER TABLE, and information_schema lookups. Read paths call
+    them on every invocation, so a single report was replaying ~100 statements
+    of schema setup before it fetched any data.
+    """
+    if key in _MIGRATIONS_RUN:
+        return
+    with _MIGRATIONS_LOCK:
+        if key in _MIGRATIONS_RUN:
+            return
+        migrate()
+        _MIGRATIONS_RUN.add(key)
+
+
+def reset_migration_guard() -> None:
+    """Force the next call to re-run schema setup (after a schema change)."""
+    with _MIGRATIONS_LOCK:
+        _MIGRATIONS_RUN.clear()
+    _TABLE_COLUMNS.clear()
+
+
 def _ensure_packing_list_ready() -> None:
-    with get_connection() as conn:
-        _ensure_packing_list(conn)
-        _ensure_company_profile(conn)
-        _ensure_employees(conn)
-        _ensure_inventory_guards(conn)
-        _ensure_row_level_security(conn)
+    def _migrate() -> None:
+        with get_connection() as conn:
+            _ensure_packing_list(conn)
+            _ensure_company_profile(conn)
+            _ensure_employees(conn)
+            _ensure_inventory_guards(conn)
+            _ensure_row_level_security(conn)
+
+    _run_once("packing_list_ready", _migrate)
 
 
 def _ensure_company_ready() -> None:
-    with get_connection() as conn:
-        _ensure_company_profile(conn)
-        _ensure_employees(conn)
-        _ensure_row_level_security(conn)
+    def _migrate() -> None:
+        with get_connection() as conn:
+            _ensure_company_profile(conn)
+            _ensure_employees(conn)
+            _ensure_row_level_security(conn)
+
+    _run_once("company_ready", _migrate)
 
 
 def list_packing_po_numbers() -> list[str]:
@@ -8060,6 +8208,17 @@ def get_test_certificate_print_payload(
     inspection: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Assemble letterhead, header fields, spec, heats, and inspection for print."""
+    # One transaction for the whole payload. These reads used to open a
+    # separate transaction each, re-stamping the RLS session every time.
+    with shared_connection():
+        return _test_certificate_payload(packing_list_id, lines, inspection)
+
+
+def _test_certificate_payload(
+    packing_list_id: int,
+    lines: list[dict[str, Any]] | None,
+    inspection: list[dict[str, Any]] | None,
+) -> dict[str, Any]:
     header = get_packing_list(packing_list_id)
     if not header:
         raise ValueError(f"Packing list {packing_list_id} was not found.")
@@ -8077,6 +8236,17 @@ def get_test_certificate_print_payload(
         alloy.get("Colour_code") or header.get("Colour_code") or ""
     ).strip()
     spec_rows = list_certificate_spec_rows(int(header["Alloy_id"]))
+    # Collect every batch the certificate references, then fetch all of their
+    # chemistry in one query instead of one query per heat line.
+    wanted: list[str] = []
+    for line in printed:
+        for src in line.get("sources") or []:
+            bid = str(src.get("Batch_ID") or "").strip()
+            if bid:
+                wanted.append(bid)
+                break
+    chemistry = get_batch_chemistry_bulk(wanted)
+
     heats: list[dict[str, Any]] = []
     for line in printed:
         sources = line.get("sources") or []
@@ -8086,7 +8256,7 @@ def get_test_certificate_print_payload(
             bid = str(src.get("Batch_ID") or "").strip()
             if bid:
                 batch_id = batch_id or bid
-                for chem in get_batch_chemistry(bid):
+                for chem in chemistry.get(bid, []):
                     symbol = str(chem.get("Element_symbol") or "").strip().upper()
                     if symbol and symbol not in chem_by_symbol:
                         chem_by_symbol[symbol] = chem.get("Percentage")
@@ -8362,6 +8532,11 @@ def _spec_deviation_reason(
 
 def list_packing_list_chemistry_vs_spec(packing_list_id: int) -> list[dict[str, Any]]:
     """Compare each packed batch's chemistry to the packing-list alloy spec."""
+    with shared_connection():
+        return _packing_list_chemistry_vs_spec(packing_list_id)
+
+
+def _packing_list_chemistry_vs_spec(packing_list_id: int) -> list[dict[str, Any]]:
     _ensure_packing_list_ready()
     header = get_packing_list(packing_list_id)
     if not header:
@@ -8388,14 +8563,18 @@ def list_packing_list_chemistry_vs_spec(packing_list_id: int) -> list[dict[str, 
     )
     if not spec_rows:
         return []
+    packed = header.get("batches") or []
+    chemistry = get_batch_chemistry_bulk(
+        str(b.get("Batch_ID") or "").strip() for b in packed
+    )
     out: list[dict[str, Any]] = []
-    for batch in header.get("batches") or []:
+    for batch in packed:
         bid = str(batch.get("Batch_ID") or "").strip()
         if not bid:
             continue
         chem = {
             str(row.get("Element_symbol") or "").strip(): row
-            for row in get_batch_chemistry(bid)
+            for row in chemistry.get(bid, [])
             if str(row.get("Element_symbol") or "").strip()
         }
         for spec in spec_rows:
@@ -9555,6 +9734,33 @@ def get_batch_chemistry(batch_id: str) -> list[dict[str, Any]]:
         """,
         (batch_id,),
     )
+
+
+def get_batch_chemistry_bulk(batch_ids: Iterable[str]) -> dict[str, list[dict[str, Any]]]:
+    """Chemistry for several batches in one query, keyed by Batch_ID.
+
+    Reports used to call get_batch_chemistry() once per heat line, and each of
+    those was its own transaction.
+    """
+    ids = sorted({str(b).strip() for b in batch_ids if str(b).strip()})
+    if not ids:
+        return {}
+    rows = fetch_all(
+        """
+        SELECT s.Batch_ID AS "Batch_ID",
+               s.Element_symbol AS "Element_symbol", s.Percentage AS "Percentage",
+               COALESCE(_el.Serial_no, 9999) AS "Serial_no"
+        FROM Batch_Chemical_Composition s
+        LEFT JOIN Element_Master _el ON _el.Element_Symbol = s.Element_symbol
+        WHERE s.Batch_ID = ANY(?)
+        ORDER BY s.Batch_ID, COALESCE(_el.Serial_no, 9999), s.Element_symbol
+        """,
+        (ids,),
+    )
+    grouped: dict[str, list[dict[str, Any]]] = {bid: [] for bid in ids}
+    for row in rows:
+        grouped.setdefault(str(row["Batch_ID"]), []).append(row)
+    return grouped
 
 
 def list_batches() -> list[dict[str, Any]]:
