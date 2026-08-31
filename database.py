@@ -146,9 +146,9 @@ def _supabase_pooler_candidate(url: str, ref: str, region: str, idx: int, port: 
 
 
 def _supabase_pooler_url(url: str, ref: str, direct_host: str, port: int = 5432) -> str:
-    """Session-mode IPv4 pooler URL (cluster aws-0 until adopt_supabase_pooler)."""
+    """Session-mode IPv4 pooler URL (aws-1 first; this project's tenant is not on aws-0)."""
     region = _supabase_pooler_region(direct_host)
-    return _supabase_pooler_candidate(url, ref, region, 0, port)
+    return _supabase_pooler_candidate(url, ref, region, 1, port)
 
 
 def _discover_supabase_pooler(url: str) -> str | None:
@@ -201,9 +201,16 @@ def _rewrite_supabase_ipv4(url: str) -> str:
     if "pooler.supabase.com" in host:
         ref = _supabase_ref_from_url(quoted)
         user = parsed.username or "postgres"
+        match_idx = re.match(r"^aws-(\d+)-([a-z0-9-]+)\.pooler\.supabase\.com$", host)
+        idx = int(match_idx.group(1)) if match_idx else 1
+        region = (
+            match_idx.group(2)
+            if match_idx
+            else _supabase_pooler_region(f"db.{ref}.supabase.co" if ref else host)
+        )
         if ref and "." not in user:
             return _supabase_pooler_candidate(
-                quoted, ref, _supabase_pooler_region(f"db.{ref}.supabase.co"), 0, parsed.port or 5432
+                quoted, ref, region, idx, parsed.port or 5432
             )
         return quoted
     match = re.match(r"^db\.([a-z0-9]+)\.supabase\.co$", host)
@@ -454,9 +461,9 @@ def _rebind_postgres_engine(url: str) -> None:
 
 
 def adopt_supabase_pooler() -> bool:
-    """On Streamlit Cloud, find the pooler cluster that has this project."""
+    """Find the pooler cluster that has this project when the current URL cannot log in."""
     global _URL
-    if os.name == "nt" or not _URL:
+    if not _URL:
         return False
     host = (urlparse(_URL).hostname or "").lower()
     if "supabase" not in host:
