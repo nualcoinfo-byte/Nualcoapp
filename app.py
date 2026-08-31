@@ -16,6 +16,10 @@ from pathlib import Path
 import pandas as pd
 import streamlit as st
 
+# Bumped whenever the database wiring changes, so the sidebar can prove which
+# copy of the code a running server actually loaded.
+APP_BUILD = "2026-08-31-supabase-only"
+
 LOGO_PATH = Path(__file__).resolve().parent / "assets" / "nualco_logo.png"
 ISO_LOGO_PATH = Path(__file__).resolve().parent / "assets" / "iso_9001_2015.png"
 _BRAND_ORANGE = "#F15A22"
@@ -246,7 +250,7 @@ def _sidebar_db_line() -> str:
                 db._rebind_postgres_engine(url)
             except Exception:
                 pass
-    return f"**DB:** `{db.DB_LABEL}`"
+    return f"**DB:** `{db.DB_LABEL}`  \n`build {APP_BUILD}`"
 
 
 def df_from_rows(rows) -> pd.DataFrame:
