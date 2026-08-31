@@ -25,7 +25,7 @@ from contextlib import contextmanager
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Callable, Generator, Iterable, Optional, TypeVar
-from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
+from urllib.parse import parse_qsl, quote, unquote, urlencode, urlparse, urlunparse
 
 from sqlalchemy import Connection, CursorResult, MetaData, Table, create_engine, select
 from sqlalchemy.exc import OperationalError
@@ -43,9 +43,24 @@ def _force_sqlite() -> bool:
     }
 
 
+def _quote_pg_password(url: str) -> str:
+    """Encode reserved characters in the password using the last '@' as host."""
+    if "://" not in url:
+        return url
+    scheme, _, rest = url.partition("://")
+    if rest.count("@") < 2:
+        return url
+    creds, _, hostpart = rest.rpartition("@")
+    if ":" not in creds:
+        return url
+    user, _, password = creds.partition(":")
+    encoded = quote(unquote(password), safe="")
+    return f"{scheme}://{user}:{encoded}@{hostpart}"
+
+
 def _prepare_postgres_url(url: str) -> str:
     """Strip options that hang Windows libpq, and disable GSS encryption."""
-    parsed = urlparse(url)
+    parsed = urlparse(_quote_pg_password(url))
     query = dict(parse_qsl(parsed.query, keep_blank_values=True))
     query.pop("channel_binding", None)
     query["sslmode"] = query.get("sslmode") or "require"
@@ -62,6 +77,11 @@ def _prepare_postgres_url(url: str) -> str:
     )
 
 
+def _is_neon_pooler_url(url: str) -> bool:
+    host = (urlparse(_quote_pg_password(url)).hostname or "").lower()
+    return "neon.tech" in host and "-pooler." in host
+
+
 def _database_url() -> str | None:
     if _force_sqlite():
         return None
@@ -72,20 +92,31 @@ def _database_url() -> str | None:
         text = str(value).strip().strip('"').strip("'")
         return text or None
 
-    unpooled: list[str] = []
-    pooled: list[str] = []
+    primary: str | None = None
+    unpooled: str | None = None
 
-    def _consider(value: str | None) -> None:
+    def _take_primary(value: str | None) -> None:
+        nonlocal primary
         url = _clean(value)
-        if not url:
-            return
-        if "-pooler" in url:
-            pooled.append(url)
-        else:
-            unpooled.append(url)
+        if url:
+            primary = url
 
-    _consider(os.environ.get("DATABASE_URL_UNPOOLED"))
-    _consider(os.environ.get("DATABASE_URL"))
+    def _take_unpooled(value: str | None) -> None:
+        nonlocal unpooled
+        url = _clean(value)
+        if url:
+            unpooled = url
+
+    def _take_secret_key(secrets: Any, key: str) -> None:
+        if key not in secrets:
+            return
+        if key.lower() in {"database_url_unpooled"}:
+            _take_unpooled(secrets[key])
+        else:
+            _take_primary(secrets[key])
+
+    _take_unpooled(os.environ.get("DATABASE_URL_UNPOOLED"))
+    _take_primary(os.environ.get("DATABASE_URL"))
 
     # Streamlit Cloud / local .streamlit/secrets.toml
     # Only touch Streamlit if it is already loaded; importing it outside
@@ -95,14 +126,6 @@ def _database_url() -> str | None:
             import streamlit as st  # type: ignore
 
             secrets = st.secrets
-            for key in (
-                "DATABASE_URL_UNPOOLED",
-                "database_url_unpooled",
-                "DATABASE_URL",
-                "database_url",
-            ):
-                if key in secrets:
-                    _consider(secrets[key])
             for section in ("postgres", "neon", "db"):
                 if section not in secrets:
                     continue
@@ -116,9 +139,16 @@ def _database_url() -> str | None:
                     "uri",
                 ):
                     try:
-                        _consider(block[key])
+                        _take_secret_key(block, key)
                     except Exception:
                         pass
+            for key in (
+                "DATABASE_URL_UNPOOLED",
+                "database_url_unpooled",
+                "DATABASE_URL",
+                "database_url",
+            ):
+                _take_secret_key(secrets, key)
         except Exception:
             pass
 
@@ -128,15 +158,19 @@ def _database_url() -> str | None:
             if not line or line.startswith("#") or "=" not in line:
                 continue
             key, _, raw = line.partition("=")
-            if key.strip() in {
-                "DATABASE_URL_UNPOOLED",
-                "DATABASE_URL",
-            }:
-                _consider(raw)
+            name = key.strip()
+            if name == "DATABASE_URL_UNPOOLED":
+                _take_unpooled(raw)
+            elif name == "DATABASE_URL":
+                _take_primary(raw)
 
-    # Streamlit is a long-running process: prefer the direct Neon endpoint.
-    # The pooler URL often fails after idle with "server closed unexpectedly".
-    chosen = unpooled[0] if unpooled else (pooled[0] if pooled else None)
+    # DATABASE_URL is the app's chosen database. The Neon unpooled URL is
+    # only a substitute when DATABASE_URL is the Neon pooler, which drops
+    # idle Streamlit connections.
+    if primary and (not _is_neon_pooler_url(primary) or not unpooled):
+        chosen = primary
+    else:
+        chosen = unpooled or primary
     return _prepare_postgres_url(chosen) if chosen else None
 
 

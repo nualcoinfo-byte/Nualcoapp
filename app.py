@@ -32,10 +32,14 @@ st.set_page_config(
 # database module, which binds SQLAlchemy's engine at import time.
 if st.session_state.get("use_sqlite"):
     os.environ["NUALCO_FORCE_SQLITE"] = "1"
-elif not os.environ.get("DATABASE_URL"):
+else:
     try:
         if "DATABASE_URL" in st.secrets:
             os.environ["DATABASE_URL"] = str(st.secrets["DATABASE_URL"]).strip().strip('"').strip("'")
+            db_url = os.environ["DATABASE_URL"]
+            # A leftover Neon DATABASE_URL_UNPOOLED must not override Supabase.
+            if "neon.tech" not in db_url.lower() and "DATABASE_URL_UNPOOLED" in os.environ:
+                os.environ.pop("DATABASE_URL_UNPOOLED", None)
     except Exception:
         pass
 
@@ -1548,10 +1552,10 @@ if st.session_state.get("use_sqlite") or os.environ.get("NUALCO_FORCE_SQLITE"):
         st.rerun()
 elif not db.IS_POSTGRES:
     st.sidebar.error(
-        "Not connected to Neon. In Streamlit Cloud go to "
+        "Not connected to the database. In Streamlit Cloud go to "
         "**Manage app → Settings → Secrets** and set:\n\n"
         '```\nDATABASE_URL = "postgresql://..."\n```\n\n'
-        "Then reboot the app."
+        "Remove any leftover `DATABASE_URL_UNPOOLED` Neon URL, then reboot the app."
     )
 
 
