@@ -1539,12 +1539,12 @@ st.sidebar.markdown(
 if st.session_state.get("use_sqlite") or os.environ.get("NUALCO_FORCE_SQLITE"):
     st.sidebar.warning(
         "Offline SQLite mode. Rows you save stay on this PC and are not "
-        "written to Neon."
+        "written to the shared database."
     )
     neon_err = st.session_state.get("_neon_init_error")
     if neon_err:
-        st.sidebar.caption(f"Neon init error: {neon_err}")
-    if st.sidebar.button("Reconnect to Neon"):
+        st.sidebar.caption(f"Database init error: {neon_err}")
+    if st.sidebar.button("Reconnect to database"):
         st.session_state.pop("use_sqlite", None)
         st.session_state.pop("_neon_init_error", None)
         os.environ.pop("NUALCO_FORCE_SQLITE", None)

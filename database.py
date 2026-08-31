@@ -17,6 +17,7 @@ dialects support:
 from __future__ import annotations
 
 import os
+import re
 import socket
 import struct
 import sys
@@ -56,6 +57,58 @@ def _quote_pg_password(url: str) -> str:
     user, _, password = creds.partition(":")
     encoded = quote(unquote(password), safe="")
     return f"{scheme}://{user}:{encoded}@{hostpart}"
+
+
+def _supabase_pooler_region(direct_host: str) -> str:
+    """Map the IPv6-only db.<ref>.supabase.co host to a pooler region."""
+    try:
+        infos = socket.getaddrinfo(
+            direct_host, 5432, socket.AF_INET6, socket.SOCK_STREAM
+        )
+    except OSError:
+        infos = []
+    for info in infos:
+        ip = str(info[4][0]).lower()
+        if ip.startswith("2406:da1a:"):
+            return "ap-south-1"
+        if ip.startswith("2406:da18:"):
+            return "ap-southeast-1"
+        if ip.startswith("2406:da1c:"):
+            return "ap-southeast-2"
+        if ip.startswith("2600:1f18:") or ip.startswith("2600:1f13:"):
+            return "us-east-1"
+        if ip.startswith("2600:1f14:"):
+            return "us-west-2"
+        if ip.startswith("2a05:d018:"):
+            return "eu-west-1"
+        if ip.startswith("2a05:d01c:"):
+            return "eu-central-1"
+    return "ap-south-1"
+
+
+def _rewrite_supabase_ipv4(url: str) -> str:
+    """Use the IPv4 pooler when the direct Supabase db host is unreachable."""
+    quoted = _quote_pg_password(url)
+    parsed = urlparse(quoted)
+    host = (parsed.hostname or "").lower()
+    match = re.match(r"^db\.([a-z0-9]+)\.supabase\.co$", host)
+    if not match:
+        return quoted
+    if _postgres_ssl_ready(quoted, timeout=2.0):
+        return quoted
+    ref = match.group(1)
+    region = _supabase_pooler_region(host)
+    pooler = f"aws-0-{region}.pooler.supabase.com"
+    user = parsed.username or "postgres"
+    if "." not in user:
+        user = f"{user}.{ref}"
+    password = parsed.password or ""
+    for pooler_port in (6543, 5432):
+        netloc = f"{user}:{password}@{pooler}:{pooler_port}"
+        candidate = urlunparse(parsed._replace(netloc=netloc))
+        if _postgres_ssl_ready(candidate, timeout=2.0):
+            return candidate
+    return quoted
 
 
 def _prepare_postgres_url(url: str) -> str:
@@ -171,6 +224,8 @@ def _database_url() -> str | None:
         chosen = primary
     else:
         chosen = unpooled or primary
+    if chosen:
+        chosen = _rewrite_supabase_ipv4(chosen)
     return _prepare_postgres_url(chosen) if chosen else None
 
 
@@ -189,12 +244,14 @@ def _is_neon_host(url: str) -> bool:
 
 def _postgres_ssl_ready(url: str, timeout: float = 4.0) -> bool:
     """True only if the host answers the Postgres SSLRequest. TCP-open is not enough."""
-    host = urlparse(url).hostname
+    parsed = urlparse(url)
+    host = parsed.hostname
+    port = parsed.port or 5432
     if not host:
         return False
     sock = None
     try:
-        sock = socket.create_connection((host, 5432), timeout=timeout)
+        sock = socket.create_connection((host, port), timeout=timeout)
         sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         sock.settimeout(timeout)
         sock.sendall(struct.pack("!ii", 8, 80877103))
