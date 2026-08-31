@@ -1,6 +1,9 @@
 [server]
 headless = true
-enableCORS = false
+# enableCORS = false made Streamlit send "Access-Control-Allow-Origin: *" and
+# accept a WebSocket from any origin. Add the deployed hostname to
+# corsAllowedOrigins when the Railway domain is known.
+enableCORS = true
 enableXsrfProtection = true
 
 [browser]
