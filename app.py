@@ -1563,7 +1563,10 @@ st.sidebar.markdown(
 )
 if _db_mode == "postgres-error":
     st.sidebar.error(
-        "Could not reach Supabase. The app will retry on the next reload."
+        "Could not reach Supabase. Copy the **Session pooler** URI from "
+        "Supabase → Project Settings → Database → Connect, put it in "
+        "Streamlit **Secrets** as `DATABASE_URL`, then reboot the app. "
+        "Encode `@` in the password as `%40`."
     )
     neon_err = st.session_state.get("_neon_init_error")
     if neon_err:
