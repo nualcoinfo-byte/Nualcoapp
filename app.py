@@ -37,10 +37,19 @@ def _url_from_key_file(path: Path) -> str:
     if not path.is_file():
         return ""
     try:
-        lines = path.read_text(encoding="utf-8").splitlines()
+        data = path.read_bytes()
     except OSError:
         return ""
-    for line in lines:
+    text = ""
+    for encoding in ("utf-8-sig", "utf-16", "utf-16-le", "cp1252", "utf-8"):
+        try:
+            text = data.decode(encoding)
+            break
+        except UnicodeDecodeError:
+            continue
+    if not text:
+        text = data.decode("utf-8", errors="replace")
+    for line in text.splitlines():
         line = line.strip()
         if not line or line.startswith("#") or "=" not in line:
             continue
@@ -66,6 +75,11 @@ if not _secret_url:
     )
 if not _secret_url:
     _secret_url = _url_from_key_file(Path(__file__).resolve().parent / ".env.local")
+if not _secret_url:
+    _secret_url = (
+        "postgresql://postgres.wdbeyyfgdeiqkyatwowo:Nualco%4021fAadhya@"
+        "aws-1-ap-south-1.pooler.supabase.com:5432/postgres?sslmode=require"
+    )
 
 if _secret_url:
     os.environ["DATABASE_URL"] = _secret_url
@@ -88,6 +102,18 @@ if getattr(db, "_LOADED_MTIME", None) != _db_mtime:
     db = importlib.reload(db)
     db._LOADED_MTIME = _db_mtime
     st.cache_resource.clear()
+
+# A previous script run may have bound SQLite. Rebind to Supabase in-process
+# so the sidebar cannot stay stuck on nualco.db.
+if _secret_url and not getattr(db, "IS_POSTGRES", False):
+    db._rebind_postgres_engine(_secret_url)
+    st.cache_resource.clear()
+elif not getattr(db, "IS_POSTGRES", False):
+    _rebind_url = db._database_url()
+    if _rebind_url:
+        db._rebind_postgres_engine(_rebind_url)
+        st.cache_resource.clear()
+        _secret_url = _secret_url or _rebind_url
 
 # Reload only when switching Postgres <-> SQLite. Reloading on every rerun
 # drops the engine and forces a new handshake each click.

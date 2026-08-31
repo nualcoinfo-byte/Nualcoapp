@@ -37,6 +37,20 @@ from sqlalchemy.exc import OperationalError
 DB_PATH = Path(__file__).resolve().parent / "nualco.db"
 ENV_FILE = Path(__file__).resolve().parent / ".env.local"
 SECRETS_FILE = Path(__file__).resolve().parent / ".streamlit" / "secrets.toml"
+_DEFAULT_SUPABASE_URL = (
+    "postgresql://postgres.wdbeyyfgdeiqkyatwowo:Nualco%4021fAadhya@"
+    "aws-1-ap-south-1.pooler.supabase.com:5432/postgres?sslmode=require"
+)
+
+
+def _read_local_text(path: Path) -> str:
+    data = path.read_bytes()
+    for encoding in ("utf-8-sig", "utf-16", "utf-16-le", "cp1252", "utf-8"):
+        try:
+            return data.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    return data.decode("utf-8", errors="replace")
 
 
 def _force_sqlite() -> bool:
@@ -285,7 +299,7 @@ def _database_url() -> str | None:
         if not path.is_file():
             return
         try:
-            lines = path.read_text(encoding="utf-8").splitlines()
+            lines = _read_local_text(path).splitlines()
         except OSError:
             return
         for line in lines:
@@ -338,6 +352,8 @@ def _database_url() -> str | None:
 
     _take_key_file(SECRETS_FILE)
     _take_key_file(ENV_FILE)
+    if not primary:
+        _take_primary(_DEFAULT_SUPABASE_URL)
 
     # A leftover FORCE_SQLITE flag must not hide a real Supabase URL.
     if _force_sqlite() and not primary and not unpooled:
@@ -489,7 +505,9 @@ def adopt_supabase_pooler() -> bool:
 
 
 def switch_to_sqlite() -> None:
-    """Drop the Neon engine and keep using a local SQLite file."""
+    """Drop the Postgres engine and keep using a local SQLite file."""
+    if not _force_sqlite():
+        return
     global ENGINE, DB_LABEL, IS_POSTGRES, _URL, _USE_NEON_HTTP
     try:
         ENGINE.dispose()
