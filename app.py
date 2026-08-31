@@ -197,11 +197,9 @@ def bootstrap() -> str:
                         pass
             # A configured Supabase/Postgres URL must not silently become nualco.db
             # on local `streamlit run`. Show a retry error instead.
-            if _on_streamlit_cloud() or _secret_url:
-                return "postgres-error"
-            db.switch_to_sqlite()
-            db.init_db()
-            return "sqlite"
+            return "postgres-error"
+    if _secret_url:
+        return "postgres-error"
     db.init_db()
     return "sqlite"
 
