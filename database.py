@@ -105,7 +105,6 @@ def _pg_login_status(url: str, timeout: int = 8) -> str:
             dbname=(parsed.path or "/postgres").lstrip("/") or "postgres",
             sslmode="require",
             connect_timeout=timeout,
-            gssencmode="disable",
         )
         conn.close()
         return "ok"
@@ -120,45 +119,69 @@ def _pg_login_status(url: str, timeout: int = 8) -> str:
         return "error"
 
 
-def _supabase_pooler_url(url: str, ref: str, direct_host: str, port: int = 6543) -> str:
-    """IPv4 pooler URL. Probe aws-0..aws-3; new projects are often not on aws-0."""
+def _supabase_ref_from_url(url: str) -> str | None:
     parsed = urlparse(_quote_pg_password(url))
-    detected = _supabase_pooler_region(direct_host)
+    host = (parsed.hostname or "").lower()
+    match = re.match(r"^db\.([a-z0-9]+)\.supabase\.co$", host)
+    if match:
+        return match.group(1)
+    user = parsed.username or ""
+    if user.startswith("postgres.") and user.count(".") == 1:
+        return user.split(".", 1)[1]
+    return None
+
+
+def _supabase_pooler_candidate(url: str, ref: str, region: str, idx: int, port: int) -> str:
+    parsed = urlparse(_quote_pg_password(url))
     user = parsed.username or "postgres"
     if "." not in user:
         user = f"{user}.{ref}"
     password = quote(parsed.password or "", safe="")
+    pooler = f"aws-{idx}-{region}.pooler.supabase.com"
+    netloc = f"{user}:{password}@{pooler}:{port}"
+    return urlunparse(parsed._replace(netloc=netloc))
+
+
+def _supabase_pooler_url(url: str, ref: str, direct_host: str, port: int = 5432) -> str:
+    """Session-mode IPv4 pooler URL (cluster aws-0 until adopt_supabase_pooler)."""
+    region = _supabase_pooler_region(direct_host)
+    return _supabase_pooler_candidate(url, ref, region, 0, port)
+
+
+def _discover_supabase_pooler(url: str) -> str | None:
+    """Try aws-0..aws-5 in likely regions until the tenant is accepted."""
+    ref = _supabase_ref_from_url(url)
+    if not ref:
+        return None
+    parsed = urlparse(_quote_pg_password(url))
+    host = (parsed.hostname or "").lower()
+    match = re.match(r"^aws-\d+-([a-z0-9-]+)\.pooler\.supabase\.com$", host)
+    detected = match.group(1) if match else _supabase_pooler_region(f"db.{ref}.supabase.co")
     regions = [detected]
-    for extra in ("ap-south-1", "ap-southeast-1", "ap-south-2", "us-east-1"):
+    for extra in (
+        "ap-south-1",
+        "ap-southeast-1",
+        "ap-south-2",
+        "ap-southeast-2",
+        "us-east-1",
+        "us-west-2",
+        "eu-west-1",
+        "eu-central-1",
+    ):
         if extra not in regions:
             regions.append(extra)
-
-    def _make(idx: int, region: str, pooler_port: int) -> str:
-        pooler = f"aws-{idx}-{region}.pooler.supabase.com"
-        netloc = f"{user}:{password}@{pooler}:{pooler_port}"
-        return urlunparse(parsed._replace(netloc=netloc))
-
-    last = _make(0, detected, port)
-    reached_pooler = False
     for region in regions:
-        for idx in (0, 1, 2, 3):
+        for idx in range(6):
             host = f"aws-{idx}-{region}.pooler.supabase.com"
             try:
-                socket.getaddrinfo(host, 6543, socket.AF_INET, socket.SOCK_STREAM)
+                socket.getaddrinfo(host, 5432, socket.AF_INET, socket.SOCK_STREAM)
             except OSError:
                 continue
-            for pooler_port in (6543, 5432):
-                candidate = _make(idx, region, pooler_port)
-                last = candidate
-                status = _pg_login_status(candidate, timeout=6)
-                if status == "ok":
+            for pooler_port in (5432, 6543):
+                candidate = _supabase_pooler_candidate(url, ref, region, idx, pooler_port)
+                if _pg_login_status(candidate, timeout=5) == "ok":
                     return candidate
-                if status == "wrong_tenant":
-                    reached_pooler = True
-                    continue
-                if status == "timeout" and not reached_pooler and os.name == "nt":
-                    return last
-    return last
+    return None
 
 
 def _rewrite_supabase_ipv4(url: str) -> str:
@@ -167,6 +190,12 @@ def _rewrite_supabase_ipv4(url: str) -> str:
     parsed = urlparse(quoted)
     host = (parsed.hostname or "").lower()
     if "pooler.supabase.com" in host:
+        ref = _supabase_ref_from_url(quoted)
+        user = parsed.username or "postgres"
+        if ref and "." not in user:
+            return _supabase_pooler_candidate(
+                quoted, ref, _supabase_pooler_region(f"db.{ref}.supabase.co"), 0, parsed.port or 5432
+            )
         return quoted
     match = re.match(r"^db\.([a-z0-9]+)\.supabase\.co$", host)
     if not match:
@@ -392,6 +421,44 @@ IS_POSTGRES = ENGINE.dialect.name == "postgresql"
 _T = TypeVar("_T")
 _CONNECT_RETRIES = 1
 _CONNECT_BACKOFF_S = 1.5
+
+
+def _rebind_postgres_engine(url: str) -> None:
+    global ENGINE, DB_LABEL, IS_POSTGRES, _URL, _USE_NEON_HTTP
+    prepared = _prepare_postgres_url(url)
+    try:
+        ENGINE.dispose()
+    except Exception:
+        pass
+    _URL = prepared
+    _USE_NEON_HTTP = False
+    ENGINE = create_engine(
+        prepared,
+        pool_pre_ping=True,
+        pool_recycle=280,
+        pool_size=5,
+        max_overflow=5,
+        connect_args=_PG_CONNECT_ARGS,
+    )
+    DB_LABEL = _postgres_label(prepared)
+    IS_POSTGRES = True
+
+
+def adopt_supabase_pooler() -> bool:
+    """On Streamlit Cloud, find the pooler cluster that has this project."""
+    global _URL
+    if os.name == "nt" or not _URL:
+        return False
+    host = (urlparse(_URL).hostname or "").lower()
+    if "supabase" not in host:
+        return False
+    if _pg_login_status(_URL, timeout=8) == "ok":
+        return True
+    discovered = _discover_supabase_pooler(_URL)
+    if not discovered:
+        return False
+    _rebind_postgres_engine(discovered)
+    return True
 
 
 def switch_to_sqlite() -> None:

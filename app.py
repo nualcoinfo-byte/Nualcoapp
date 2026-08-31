@@ -140,6 +140,7 @@ def bootstrap() -> str:
     """Open the database. Full init_db() is skipped on Postgres (it can hang)."""
     if db.IS_POSTGRES:
         try:
+            db.adopt_supabase_pooler()
             _init_postgres()
             st.session_state.pop("_neon_init_error", None)
             return "postgres"
@@ -149,7 +150,19 @@ def bootstrap() -> str:
                 _init_postgres.clear()
             except Exception:
                 pass
-            # Community Cloud has no useful local SQLite. Keep retrying Postgres.
+            text = str(exc).lower()
+            if "tenant" in text or "enotfound" in text or "could not connect" in text:
+                try:
+                    if db.adopt_supabase_pooler():
+                        _init_postgres()
+                        st.session_state.pop("_neon_init_error", None)
+                        return "postgres"
+                except Exception as exc2:
+                    st.session_state["_neon_init_error"] = str(exc2)
+                    try:
+                        _init_postgres.clear()
+                    except Exception:
+                        pass
             if _on_streamlit_cloud():
                 return "postgres-error"
             db.switch_to_sqlite()
@@ -1563,10 +1576,9 @@ st.sidebar.markdown(
 )
 if _db_mode == "postgres-error":
     st.sidebar.error(
-        "Could not reach Supabase. Copy the **Session pooler** URI from "
-        "Supabase → Project Settings → Database → Connect, put it in "
-        "Streamlit **Secrets** as `DATABASE_URL`, then reboot the app. "
-        "Encode `@` in the password as `%40`."
+        "Could not reach Supabase yet. Click **Retry**, or reboot the app "
+        "from Manage app. Keep `DATABASE_URL` as your Supabase URI "
+        "(password `@` encoded as `%40`)."
     )
     neon_err = st.session_state.get("_neon_init_error")
     if neon_err:
