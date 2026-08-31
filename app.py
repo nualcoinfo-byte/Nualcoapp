@@ -135,9 +135,8 @@ def _on_streamlit_cloud() -> bool:
 
 @st.cache_resource
 def _init_postgres() -> bool:
-    """Handshake once per process. Failures are cleared by the caller."""
-    db._ensure_packing_list_ready()
-    db._ensure_company_ready()
+    """Read-only handshake once per process; deployment migrations own DDL."""
+    db.verify_schema_ready()
     return True
 
 
@@ -188,6 +187,21 @@ def df_from_rows(rows) -> pd.DataFrame:
     if not rows:
         return pd.DataFrame()
     return pd.DataFrame([dict(r) for r in rows])
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def cached_raw_materials() -> list[str]:
+    return db.list_raw_materials()
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def cached_alloys() -> list[dict]:
+    return db.list_alloys()
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def cached_active_trolleys() -> list[dict]:
+    return db.list_trolleys(active_only=True)
 
 
 def _show_db_connection_error(exc: BaseException) -> None:
@@ -2666,10 +2680,10 @@ if PAGE == "Dashboard":
     today = date.today()
     try:
         supply_rows = db.list_po_supply_status()
-        batches = db.list_batches()
-        materials = db.list_raw_materials()
-        lots = db.list_inventory_lots()
-        alloys = db.list_alloys()
+        batches = db.list_batches(limit=100)
+        materials = cached_raw_materials()
+        lots = db.list_inventory_lots(limit=250)
+        alloys = cached_alloys()
         oil_stock = db.get_furnace_oil_stock()
         elec_month = db.electricity_month_totals(today.year, today.month)
     except Exception as exc:
@@ -3358,7 +3372,7 @@ elif PAGE == "Production Batch & Chemistry":
         + (f" ({a['Customer_name']})" if a["Customer_name"] else ""): a["Alloy_id"]
         for a in alloys
     }
-    materials = db.list_raw_materials()
+    materials = cached_raw_materials()
 
     if not furnaces:
         st.error("Define at least one furnace under **Furnaces**.")
@@ -3675,7 +3689,7 @@ elif PAGE == "Production Batch & Chemistry":
             st.caption("Saved charge lines")
             show_dataframe(df_from_rows(saved_charges))
 
-        trolleys = db.list_trolleys(active_only=True)
+        trolleys = cached_active_trolleys()
         trolley_by_name = {t["Trolley_name"]: float(t["Weight"] or 0) for t in trolleys}
         trolley_colour_by_name = {
             t["Trolley_name"]: (t.get("Colour") or "").strip() or None for t in trolleys
@@ -3713,6 +3727,11 @@ elif PAGE == "Production Batch & Chemistry":
         if not trolleys:
             st.error("Define at least one active trolley under **Trolleys**.")
 
+        charge_lots_by_material: dict[str, list[dict]] = {}
+        for available_lot in db.list_inventory_lots(limit=2000):
+            material_name = str(available_lot.get("Raw_Material_Name") or "")
+            charge_lots_by_material.setdefault(material_name, []).append(available_lot)
+
         charge_inputs: list[dict] = []
         for idx, line in enumerate(furnace_charge_lines):
             st.markdown(f"**Charge line {idx + 1}**")
@@ -3723,7 +3742,7 @@ elif PAGE == "Production Batch & Chemistry":
                     options=[""] + materials,
                     key=_pk(f"mat_{idx}"),
                 )
-            lots = db.list_inventory_lots(material=mat or None) if mat else []
+            lots = charge_lots_by_material.get(mat, []) if mat else []
             lot_opts = {}
             for lot in lots:
                 rem = float(lot.get("Remaining_Weight") or 0)
@@ -5048,11 +5067,6 @@ elif PAGE == "Finished Goods Inventory":
         f"**{db.ALLOY_PIECE_KG_MIN:g}–{db.ALLOY_PIECE_KG_MAX:g} kg** and show in red "
         "if outside that range so you can check the piece count."
     )
-    try:
-        db.backfill_finished_goods_from_output()
-    except Exception as exc:
-        st.warning(f"Could not refresh finished goods from batch output: {exc}")
-
     all_fg = db.list_finished_goods()
     available_n = sum(
         1 for r in all_fg if r.get("Finished_Goods_Status") == db.FG_STATUS_AVAILABLE
@@ -5106,11 +5120,6 @@ elif PAGE == "Packing List":
         f"product alloy pieces are **{db.ALLOY_PIECE_KG_MIN:g}–{db.ALLOY_PIECE_KG_MAX:g} kg** "
         "and show in red if outside that range."
     )
-    try:
-        db.backfill_finished_goods_from_output()
-    except Exception as exc:
-        st.warning(f"Could not refresh finished goods from batch output: {exc}")
-
     def _clear_packing_form() -> None:
         keep = {"pl_load_pick"}
         for key in list(st.session_state.keys()):
@@ -7035,7 +7044,7 @@ elif PAGE == "Alloys":
             st.session_state.pop("alloy_full_specs", None)
             st.success(f"Created alloy **{aname}** (ID {aid}).")
     st.subheader("Alloys")
-    show_dataframe(df_from_rows(db.list_alloys()))
+    show_dataframe(df_from_rows(cached_alloys()))
 
     aid_view = st.number_input("View specs for Alloy ID", min_value=0, step=1, value=0)
     if aid_view > 0:
@@ -7258,7 +7267,7 @@ elif PAGE == "Purchase Orders":
         cust_code = cust["Cust_code"] if cust else None
         alloys = [
             a
-            for a in db.list_alloys()
+            for a in cached_alloys()
             if cust_code and a.get("Cust_code") == cust_code
         ]
         alloy_opts = {
@@ -7736,8 +7745,8 @@ elif PAGE == "Bill of Materials":
         f"{c['Cust_code']} — {c['Customer_name']}": c["Cust_code"]
         for c in db.list_customer_codes()
     }
-    materials = db.list_raw_materials()
-    alloys = [a["Alloy_name"] for a in db.list_alloys()]
+    materials = cached_raw_materials()
+    alloys = [a["Alloy_name"] for a in cached_alloys()]
 
     with st.form("bom_form", clear_on_submit=True):
         b1, b2 = st.columns(2)
@@ -7806,7 +7815,36 @@ elif PAGE == "Data Browser":
     if state_token not in st.session_state:
         st.session_state[state_token] = 0
 
-    rows = db.load_editable_table(table_key, order_by=meta["order_by"])
+    with t2:
+        search = st.text_input(
+            "Search",
+            placeholder="Search in the database…",
+            key=f"search_{table_key}_{st.session_state[state_token]}",
+        )
+    with t3:
+        page_size = st.selectbox(
+            "Rows/page",
+            [25, 50, 100, 250],
+            index=1,
+            key=f"page_size_{table_key}",
+        )
+    total_rows = db.count_editable_table(table_key, search=search)
+    page_count = max(1, (total_rows + page_size - 1) // page_size)
+    page_number = st.number_input(
+        "Page",
+        min_value=1,
+        max_value=page_count,
+        value=1,
+        step=1,
+        key=f"page_{table_key}_{st.session_state[state_token]}",
+    )
+    rows = db.load_editable_table(
+        table_key,
+        order_by=meta["order_by"],
+        search=search,
+        limit=page_size,
+        offset=(int(page_number) - 1) * page_size,
+    )
     full_df = df_from_rows(rows)
     if table_key == "raw_material_spec" and not full_df.empty:
         sym_col = next(
@@ -7822,14 +7860,9 @@ elif PAGE == "Data Browser":
             ].copy()
     full_df = format_df_dates(full_df)
 
-    with t2:
-        search = st.text_input(
-            "Search",
-            placeholder="Filter any column…",
-            key=f"search_{table_key}_{st.session_state[state_token]}",
-        )
-    with t3:
-        st.metric("Rows", len(full_df))
+    st.caption(
+        f"Page {int(page_number)} of {page_count} · {total_rows:,} matching rows"
+    )
 
     if full_df.empty:
         st.info(f"No rows in **{chosen_label}** yet.")
@@ -7876,16 +7909,8 @@ elif PAGE == "Data Browser":
                     if picked:
                         filter_df = filter_df[filter_df[col].astype(str).isin(picked)]
 
-        if search.strip():
-            q = search.strip().lower()
-            mask = filter_df.apply(
-                lambda r: any(q in str(v).lower() for v in r.values if v is not None),
-                axis=1,
-            )
-            filter_df = filter_df[mask]
-
         st.caption(
-            f"Showing **{len(filter_df)}** of **{len(full_df)}** rows. "
+            f"Showing **{len(filter_df)}** rows on this page. "
             f"Locked key column(s): `{', '.join(pk_cols)}`."
             + (" New rows: use the dedicated entry pages for auto-IDs." if identity_cols else "")
         )
