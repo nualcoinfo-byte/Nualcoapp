@@ -115,7 +115,7 @@ def _pg_login_status(url: str, timeout: int = 8) -> str:
         if "timeout" in text or "timed out" in text:
             return "timeout"
         if "password" in text or "authentication" in text:
-            return "ok"
+            return "wrong_password"
         return "error"
 
 
@@ -135,7 +135,7 @@ def _supabase_pooler_candidate(url: str, ref: str, region: str, idx: int, port: 
     parsed = urlparse(_quote_pg_password(url))
     user = parsed.username or "postgres"
     if "." not in user:
-        user = f"{user}.{ref}"
+        user = f"postgres.{ref}"
     password = quote(parsed.password or "", safe="")
     pooler = f"aws-{idx}-{region}.pooler.supabase.com"
     netloc = f"{user}:{password}@{pooler}:{port}"
@@ -178,9 +178,15 @@ def _discover_supabase_pooler(url: str) -> str | None:
             except OSError:
                 continue
             for pooler_port in (5432, 6543):
-                candidate = _supabase_pooler_candidate(url, ref, region, idx, pooler_port)
-                if _pg_login_status(candidate, timeout=5) == "ok":
-                    return candidate
+                for user_mode in ("ref", "plain"):
+                    candidate = _supabase_pooler_candidate(url, ref, region, idx, pooler_port)
+                    if user_mode == "plain":
+                        parsed_c = urlparse(_quote_pg_password(candidate))
+                        password = quote(parsed_c.password or "", safe="")
+                        netloc = f"postgres:{password}@{parsed_c.hostname}:{pooler_port}"
+                        candidate = urlunparse(parsed_c._replace(netloc=netloc))
+                    if _pg_login_status(candidate, timeout=5) == "ok":
+                        return candidate
     return None
 
 
