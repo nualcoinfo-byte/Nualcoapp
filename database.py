@@ -5571,7 +5571,7 @@ def _insert_charge_lines(conn: Connection, batch_id: str, inputs: list[dict[str,
         WHERE Lot_id IN ({placeholders})
         ORDER BY Lot_id{lock_clause}
         """,
-        lot_ids,
+        tuple(lot_ids),
     ).mappings().all()
     balances = {int(row["Lot_id"]): float(row["Remaining_Weight"] or 0) for row in rows}
     for lot_id, weight in needed.items():
@@ -10262,8 +10262,8 @@ def rebuild_furnace_oil_inventory(
             .first()
         )
         carried = _oil_qty(prior.get("Closing_qty") if prior else 0)
-    purchases = list(_exec(conn, purchase_sql, params).mappings())
-    consumed = list(_exec(conn, consumption_sql, params).mappings())
+    purchases = list(_exec(conn, purchase_sql, tuple(params)).mappings())
+    consumed = list(_exec(conn, consumption_sql, tuple(params)).mappings())
     days: dict[str, dict[str, float]] = {}
 
     def _day(key: str) -> dict[str, float]:
