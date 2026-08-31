@@ -1,0 +1,11 @@
+{
+  "name": "Nualco Alloy Tracker",
+  "install": "sudo apt-get update && sudo apt-get install -y python3.12-venv && python3 -m venv .venv && .venv/bin/pip install --upgrade pip && .venv/bin/pip install -r requirements.txt",
+  "terminals": [
+    {
+      "name": "streamlit",
+      "command": ".venv/bin/streamlit run app.py --server.address 0.0.0.0 --server.port 8501 --server.headless true --server.fileWatcherType none --browser.gatherUsageStats false"
+    }
+  ],
+  "ports": [8501]
+}
