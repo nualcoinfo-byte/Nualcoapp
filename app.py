@@ -18,7 +18,7 @@ import streamlit as st
 
 # Bumped whenever the database wiring changes, so the sidebar can prove which
 # copy of the code a running server actually loaded.
-APP_BUILD = "2026-09-01-tc-print-questions"
+APP_BUILD = "2026-09-01-tc-print-label"
 
 LOGO_PATH = Path(__file__).resolve().parent / "assets" / "nualco_logo.png"
 ISO_LOGO_PATH = Path(__file__).resolve().parent / "assets" / "iso_9001_2015.png"
@@ -5979,7 +5979,7 @@ elif PAGE == "Test Certificate":
     )
     answer_choices = ["", *db.SAMPLE_OK_STATUS]
     inspection_rows: list[dict] = []
-    h_print, h_q, h_ans, h_ok = st.columns([0.7, 5.0, 2.2, 1.6])
+    h_print, h_q, h_ans, h_ok = st.columns([1.4, 4.4, 2.1, 1.6])
     h_print.markdown("**Print**")
     h_q.markdown("**Question**")
     h_ans.markdown("**Answer**")
@@ -5988,13 +5988,12 @@ elif PAGE == "Test Certificate":
         qno = int(row.get("Question_no") or 0)
         text = str(row.get("Question_text") or "")
         saved_answer = str(row.get("Answer") or "").strip()
-        c_print, q_col, a_col, v_col = st.columns([0.7, 5.0, 2.2, 1.6])
+        c_print, q_col, a_col, v_col = st.columns([1.4, 4.4, 2.1, 1.6])
         include_in_print = c_print.checkbox(
-            f"Print question {qno}",
+            "Print",
             value=bool(row.get("Include_in_print", 1)),
             key=f"tc_insp_print_{packing_list_id}_{qno}",
             disabled=insp_locked,
-            label_visibility="collapsed",
         )
         q_col.markdown(f"**{qno}.** {text}")
         answer = a_col.selectbox(
