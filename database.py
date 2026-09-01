@@ -1094,6 +1094,7 @@ CREATE TABLE IF NOT EXISTS Raw_Material_Purchase (
     Invoice_Document_name TEXT,
     Invoice_Document_type TEXT,
     Vehicle_photo {blob},
+    Weighment_slip_photo {blob},
     Last_updated_by TEXT,
     Last_updated_datetime TEXT
 );
@@ -2090,6 +2091,16 @@ def _ensure_raw_material_purchase_header(conn: Connection) -> None:
                 REFERENCES raw_material_purchase (purchase_id)
                 """
             )
+    _ensure_columns(
+        conn,
+        "Raw_Material_Purchase",
+        [
+            (
+                "Weighment_slip_photo",
+                "BYTEA" if IS_POSTGRES else "BLOB",
+            ),
+        ],
+    )
 
 
 def _sidestream_rm_name_on_conn(conn: Connection, alloy_id: int) -> str:
@@ -4858,6 +4869,7 @@ def add_raw_material_purchase(
     invoice_document_name: Optional[str] = None,
     invoice_document_type: Optional[str] = None,
     vehicle_photo: Optional[bytes] = None,
+    weighment_slip_photo: Optional[bytes] = None,
 ) -> int:
     """Create a vendor-invoice header that inventory lots can attach to."""
     if invoice_document and invoice_document_name:
@@ -4870,8 +4882,9 @@ def add_raw_material_purchase(
             INSERT INTO Raw_Material_Purchase
                 (Vendor_code, Supplier_Invoice, Supplier_invoice_date, Received_date,
                  Invoice_Document, Invoice_Document_name, Invoice_Document_type,
-                 Vehicle_photo, Last_updated_by, Last_updated_datetime)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 Vehicle_photo, Weighment_slip_photo,
+                 Last_updated_by, Last_updated_datetime)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             RETURNING Purchase_id
             """,
             (
@@ -4883,6 +4896,7 @@ def add_raw_material_purchase(
                 invoice_document_name,
                 invoice_document_type,
                 vehicle_photo,
+                weighment_slip_photo,
                 by_val,
                 dt_val,
             ),
@@ -4935,6 +4949,7 @@ def save_raw_material_invoice(
     invoice_document_name: Optional[str] = None,
     invoice_document_type: Optional[str] = None,
     vehicle_photo: Optional[bytes] = None,
+    weighment_slip_photo: Optional[bytes] = None,
 ) -> tuple[int, list[int]]:
     """Save one vendor invoice and its lots in a single transaction."""
     if not lines:
@@ -4949,8 +4964,9 @@ def save_raw_material_invoice(
             INSERT INTO Raw_Material_Purchase
                 (Vendor_code, Supplier_Invoice, Supplier_invoice_date, Received_date,
                  Invoice_Document, Invoice_Document_name, Invoice_Document_type,
-                 Vehicle_photo, Last_updated_by, Last_updated_datetime)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 Vehicle_photo, Weighment_slip_photo,
+                 Last_updated_by, Last_updated_datetime)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             RETURNING Purchase_id
             """,
             (
@@ -4962,6 +4978,7 @@ def save_raw_material_invoice(
                 invoice_document_name,
                 invoice_document_type,
                 vehicle_photo,
+                weighment_slip_photo,
                 by_val,
                 dt_val,
             ),
@@ -5057,6 +5074,20 @@ def get_inventory_vehicle_photo(lot_id: int) -> Optional[bytes]:
         (lot_id,),
     )
     data = (row or {}).get("Vehicle_photo")
+    return data if data else None
+
+
+def get_inventory_weighment_slip_photo(lot_id: int) -> Optional[bytes]:
+    row = fetch_one(
+        """
+        SELECT p.Weighment_slip_photo AS "Weighment_slip_photo"
+        FROM Raw_Material_Inventory i
+        JOIN Raw_Material_Purchase p ON p.Purchase_id = i.Purchase_id
+        WHERE i.Lot_id = ?
+        """,
+        (lot_id,),
+    )
+    data = (row or {}).get("Weighment_slip_photo")
     return data if data else None
 
 
@@ -7307,6 +7338,19 @@ def _ensure_packing_list_ready() -> None:
             _ensure_employees(conn)
             _ensure_inventory_guards(conn)
             _ensure_row_level_security(conn)
+            # Live Postgres skips init_db(); purchase-header columns such as
+            # Weighment_slip_photo must be ensured on this path or they never land.
+            _ensure_raw_material_purchase_header(conn)
+            _ensure_columns(
+                conn,
+                "Raw_Material_Purchase",
+                [
+                    (
+                        "Weighment_slip_photo",
+                        "BYTEA" if IS_POSTGRES else "BLOB",
+                    ),
+                ],
+            )
         _stamp_schema_applied()
 
     _run_once("packing_list_ready", _migrate)

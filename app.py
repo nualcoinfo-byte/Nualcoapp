@@ -18,7 +18,7 @@ import streamlit as st
 
 # Bumped whenever the database wiring changes, so the sidebar can prove which
 # copy of the code a running server actually loaded.
-APP_BUILD = "2026-09-01-tc-print-label"
+APP_BUILD = "2026-09-01-weighment-slip-photo"
 
 LOGO_PATH = Path(__file__).resolve().parent / "assets" / "nualco_logo.png"
 ISO_LOGO_PATH = Path(__file__).resolve().parent / "assets" / "iso_9001_2015.png"
@@ -3039,14 +3039,25 @@ elif PAGE == "Raw Material Logging":
             key="rm_log_invoice_doc",
         )
 
+    vp_col, slip_col = st.columns(2)
     vp_open_key = "rm_log_vphoto_open"
-    if st.button(
-        "📷 Vehicle photo",
-        key="rm_log_vphoto_btn",
-        help="Photo of the delivery vehicle. Saved once on this invoice.",
-    ):
-        st.session_state[vp_open_key] = not bool(st.session_state.get(vp_open_key))
-        st.rerun()
+    slip_open_key = "rm_log_sphoto_open"
+    with vp_col:
+        if st.button(
+            "📷 Vehicle photo",
+            key="rm_log_vphoto_btn",
+            help="Photo of the delivery vehicle. Saved once on this invoice.",
+        ):
+            st.session_state[vp_open_key] = not bool(st.session_state.get(vp_open_key))
+            st.rerun()
+    with slip_col:
+        if st.button(
+            "📷 Weighment slip photo",
+            key="rm_log_sphoto_btn",
+            help="Photo of the weighment slip. Saved once on this invoice.",
+        ):
+            st.session_state[slip_open_key] = not bool(st.session_state.get(slip_open_key))
+            st.rerun()
     vehicle_photo_bytes: bytes | None = None
     if st.session_state.get(vp_open_key):
         st.caption("Capture the vehicle with camera or pick a photo from the gallery.")
@@ -3069,6 +3080,28 @@ elif PAGE == "Raw Material Logging":
         vehicle_photo_bytes = st.session_state.get("rm_log_vphoto_bytes")
         if vehicle_photo_bytes:
             st.caption("Vehicle photo attached.")
+    weighment_slip_photo_bytes: bytes | None = None
+    if st.session_state.get(slip_open_key):
+        st.caption("Capture the weighment slip with camera or pick a photo from the gallery.")
+        sp_cam = st.camera_input(
+            "Weighment slip camera",
+            key="rm_log_sphoto_cam",
+            help="Uses the phone camera when available.",
+        )
+        sp_file = st.file_uploader(
+            "Weighment slip gallery / files",
+            type=["png", "jpg", "jpeg", "webp"],
+            key="rm_log_sphoto_file",
+            help="Choose an existing weighment-slip photo from the device gallery.",
+        )
+        weighment_slip_photo_bytes = photo_bytes(sp_cam) or photo_bytes(sp_file)
+        if weighment_slip_photo_bytes:
+            st.session_state["rm_log_sphoto_bytes"] = weighment_slip_photo_bytes
+            st.success("Weighment slip photo ready to save with this invoice.")
+    else:
+        weighment_slip_photo_bytes = st.session_state.get("rm_log_sphoto_bytes")
+        if weighment_slip_photo_bytes:
+            st.caption("Weighment slip photo attached.")
 
     st.markdown("#### Raw materials on this invoice")
     st.caption(
@@ -3202,6 +3235,7 @@ elif PAGE == "Raw Material Logging":
                     invoice_document_name=doc_name,
                     invoice_document_type=doc_type,
                     vehicle_photo=vehicle_photo_bytes,
+                    weighment_slip_photo=weighment_slip_photo_bytes,
                 )
                 names = ", ".join(ln["name"] for ln in complete)
                 st.success(
@@ -3215,6 +3249,8 @@ elif PAGE == "Raw Material Logging":
                 st.session_state.rm_log_token = int(line_token) + 1
                 st.session_state.pop("rm_log_vphoto_bytes", None)
                 st.session_state.pop("rm_log_vphoto_open", None)
+                st.session_state.pop("rm_log_sphoto_bytes", None)
+                st.session_state.pop("rm_log_sphoto_open", None)
                 st.cache_data.clear()
                 st.rerun()
             except Exception as exc:
@@ -3252,7 +3288,9 @@ elif PAGE == "Raw Material Inventory":
                    i.Raw_Material_Status AS "Raw_Material_Status",
                    p.Invoice_Document_name AS "Invoice_Document_name",
                    CASE WHEN p.Vehicle_photo IS NULL THEN NULL ELSE 'Yes' END
-                       AS "Vehicle_photo"
+                       AS "Vehicle_photo",
+                   CASE WHEN p.Weighment_slip_photo IS NULL THEN NULL ELSE 'Yes' END
+                       AS "Weighment_slip_photo"
             FROM Raw_Material_Inventory i
             LEFT JOIN Raw_Material_Purchase p ON p.Purchase_id = i.Purchase_id
             LEFT JOIN Vendor_Master v ON v.Vendor_code = p.Vendor_code
@@ -3283,6 +3321,10 @@ elif PAGE == "Raw Material Inventory":
         if vehicle_photo:
             st.markdown("**Vehicle photo**")
             st.image(vehicle_photo)
+        slip_photo = db.get_inventory_weighment_slip_photo(int(lot_pick))
+        if slip_photo:
+            st.markdown("**Weighment slip photo**")
+            st.image(slip_photo)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -8192,7 +8234,7 @@ elif PAGE == "Masters Overview":
             | 3 | Element_Master | 36 chemistry elements (seeded) |
             | 4 | Raw_Material_Master | Material grades |
             | 5 | Raw_Material_Spec | Grade chemistry (child of Raw_Material_Master) |
-            | 6 | Raw_Material_Purchase | Vendor invoices / receipts (document + vehicle photo) |
+            | 6 | Raw_Material_Purchase | Vendor invoices / receipts (document, vehicle photo, weighment slip photo) |
             | 7 | Raw_Material_Inventory | Lots / remaining stock (child of purchase) |
             | 8 | Alloy_Master | Alloys |
             | 9 | Alloy_Master_spec | Alloy min/max % |
