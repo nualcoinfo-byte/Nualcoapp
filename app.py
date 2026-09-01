@@ -18,7 +18,7 @@ import streamlit as st
 
 # Bumped whenever the database wiring changes, so the sidebar can prove which
 # copy of the code a running server actually loaded.
-APP_BUILD = "2026-08-31-supabase-only"
+APP_BUILD = "2026-09-01-tc-print-questions"
 
 LOGO_PATH = Path(__file__).resolve().parent / "assets" / "nualco_logo.png"
 ISO_LOGO_PATH = Path(__file__).resolve().parent / "assets" / "iso_9001_2015.png"
@@ -2291,7 +2291,19 @@ def _certificate_pdf_bytes(payload: dict) -> bytes:
     pdf.cell(s_w, 6, "STATUS", border=1, align="C", fill=True)
     pdf.cell(v_w, 6, "VERIFY", border=1, align="C", fill=True, new_x="LMARGIN", new_y="NEXT")
     insp_h = 5.3
-    for row in inspection:
+    printed_inspection = list(inspection)
+    if not printed_inspection:
+        y1 = pdf.get_y()
+        pdf.set_font("Helvetica", "", 7)
+        pdf.rect(left, y1, page_w, insp_h)
+        pdf.set_xy(left, y1)
+        pdf.cell(
+            page_w,
+            insp_h,
+            "No visual inspection questions selected for print.",
+        )
+        pdf.set_y(y1 + insp_h)
+    for row in printed_inspection:
         y1 = pdf.get_y()
         answer = str(row.get("Answer") or "").strip()
         status = "Ok" if answer.upper() == "OK" else (answer or "-")
@@ -2423,6 +2435,11 @@ def _render_certificate_print(
             f"<td class='tc-insp-status'>{esc(status)}</td>"
             f"<td class='tc-insp-verify'>{verify}</td>"
             "</tr>"
+        )
+    if not insp_body:
+        insp_body = (
+            "<tr><td colspan='3' class='tc-empty'>"
+            "No visual inspection questions selected for print.</td></tr>"
         )
     st.markdown(
         f"""
@@ -5825,7 +5842,9 @@ elif PAGE == "Test Certificate":
     st.title("Test Certificate")
     st.caption(
         "Print dispatch weights from a **Verified** packing list. Complete **Visual "
-        "inspection** first (OK / NOT OK and Verified on every item). Merge heats onto "
+        "inspection** first (OK / NOT OK and Verified on every item). Tick **Print** "
+        "next to each serial number to include that question on the certificate. "
+        "Merge heats onto "
         "one printed line and round **up** total kg by at most "
         f"**{db.CERT_WEIGHT_ROUND_MAX_PCT:g}%**. Pieces must stay exact. "
         "**Issue** is the final dispatch step. After that, packed inventory cannot be "
@@ -5946,22 +5965,37 @@ elif PAGE == "Test Certificate":
                 "Question_text": text,
                 "Answer": "",
                 "Verified": 0,
+                "Include_in_print": 1,
             }
             for index, text in enumerate(db.VISUAL_INSPECTION_QUESTIONS, start=1)
         ]
 
     st.markdown("#### Visual inspection")
     st.caption(
-        "Complete every check as **OK** or **NOT OK**, then tick **Verified**. "
-        "All items must be OK and Verified before the test certificate can be generated."
+        "Tick **Print** before a serial number to include that question on the "
+        "test certificate. Only ticked questions are printed. Complete every "
+        "check as **OK** or **NOT OK**, then tick **Verified**. All items must "
+        "be OK and Verified before the test certificate can be generated."
     )
     answer_choices = ["", *db.SAMPLE_OK_STATUS]
     inspection_rows: list[dict] = []
+    h_print, h_q, h_ans, h_ok = st.columns([0.7, 5.0, 2.2, 1.6])
+    h_print.markdown("**Print**")
+    h_q.markdown("**Question**")
+    h_ans.markdown("**Answer**")
+    h_ok.markdown("**Verified**")
     for row in inspection:
         qno = int(row.get("Question_no") or 0)
         text = str(row.get("Question_text") or "")
         saved_answer = str(row.get("Answer") or "").strip()
-        q_col, a_col, v_col = st.columns([5.0, 2.4, 1.8])
+        c_print, q_col, a_col, v_col = st.columns([0.7, 5.0, 2.2, 1.6])
+        include_in_print = c_print.checkbox(
+            f"Print question {qno}",
+            value=bool(row.get("Include_in_print", 1)),
+            key=f"tc_insp_print_{packing_list_id}_{qno}",
+            disabled=insp_locked,
+            label_visibility="collapsed",
+        )
         q_col.markdown(f"**{qno}.** {text}")
         answer = a_col.selectbox(
             f"Answer {qno}",
@@ -5988,6 +6022,7 @@ elif PAGE == "Test Certificate":
                 "Question_text": text,
                 "Answer": str(answer or "").strip(),
                 "Verified": 1 if verified else 0,
+                "Include_in_print": 1 if include_in_print else 0,
             }
         )
     insp_errors = db.visual_inspection_errors(inspection_rows)
@@ -6309,6 +6344,12 @@ elif PAGE == "Test Certificate":
     a1, a2, a3 = st.columns(3)
     with a1:
         if st.button("View / print", key="tc_view_print"):
+            if not insp_locked:
+                try:
+                    db.save_visual_inspection(packing_list_id, inspection_rows)
+                except Exception as exc:
+                    st.error(str(exc))
+                    st.stop()
             st.session_state["tc_show_print"] = True
             st.rerun()
     with a2:
@@ -8166,7 +8207,7 @@ elif PAGE == "Masters Overview":
             | 29 | Packing_list_certificate | Test-certificate header (Draft / Issued / Void); 1:1 with a Verified packing list |
             | 30 | Packing_list_certificate_line | Printed TC lines (may merge heats; weight may round up ≤ 0.15%) |
             | 31 | Packing_list_certificate_source | Maps each printed TC line back to packing_list_batch |
-            | 32 | Packing_list_visual_inspection | OK / NOT OK + Verified checks required before generating a test certificate |
+            | 32 | Packing_list_visual_inspection | OK / NOT OK + Verified checks required before generating a test certificate; Print checkbox selects which questions appear on the certificate |
             | 33 | Company_profile | Our company (issuer) — legal, contact, GST/CIN/MSME, and bank details |
 
             Extra production columns: sample fields, `Production_supervisor`.

@@ -1230,6 +1230,8 @@ CREATE TABLE IF NOT EXISTS Packing_list_visual_inspection (
         CHECK (Answer IS NULL OR Answer IN ('OK', 'NOT OK')),
     Verified INTEGER NOT NULL DEFAULT 0
         CHECK (Verified IN (0, 1)),
+    Include_in_print INTEGER NOT NULL DEFAULT 1
+        CHECK (Include_in_print IN (0, 1)),
     Last_updated_by TEXT,
     Last_updated_datetime TEXT,
     PRIMARY KEY (Packing_list_id, Question_no)
@@ -2776,6 +2778,8 @@ def _ensure_packing_list_certificate(conn: Connection) -> None:
                 CHECK (Answer IS NULL OR Answer IN ('OK', 'NOT OK')),
             Verified INTEGER NOT NULL DEFAULT 0
                 CHECK (Verified IN (0, 1)),
+            Include_in_print INTEGER NOT NULL DEFAULT 1
+                CHECK (Include_in_print IN (0, 1)),
             Last_updated_by TEXT,
             Last_updated_datetime TEXT,
             PRIMARY KEY (Packing_list_id, Question_no)
@@ -2789,6 +2793,7 @@ def _ensure_packing_list_certificate(conn: Connection) -> None:
             ("Question_text", "TEXT"),
             ("Answer", "TEXT"),
             ("Verified", "INTEGER DEFAULT 0"),
+            ("Include_in_print", "INTEGER DEFAULT 1"),
             ("Last_updated_by", "TEXT"),
             ("Last_updated_datetime", "TEXT"),
         ],
@@ -8312,7 +8317,7 @@ def _test_certificate_payload(
         "colour_code": colour or "—",
         "heats": heats,
         "elements": element_rows,
-        "inspection": _normalize_visual_inspection_rows(
+        "inspection": _printed_visual_inspection_rows(
             inspection if inspection is not None else get_visual_inspection(packing_list_id)
         ),
         "analysis_method": CERT_ANALYSIS_METHOD,
@@ -8322,18 +8327,51 @@ def _test_certificate_payload(
     }
 
 
+def _blank_visual_inspection_row(index: int, text: str) -> dict[str, Any]:
+    return {
+        "Question_no": index,
+        "Question_text": text,
+        "Answer": "",
+        "Verified": 0,
+        "Include_in_print": 1,
+    }
+
+
 def _blank_visual_inspection_rows() -> list[dict[str, Any]]:
-    rows = []
-    for index, text in enumerate(VISUAL_INSPECTION_QUESTIONS, start=1):
-        rows.append(
-            {
-                "Question_no": index,
-                "Question_text": text,
-                "Answer": "",
-                "Verified": 0,
-            }
-        )
-    return rows
+    return [
+        _blank_visual_inspection_row(index, text)
+        for index, text in enumerate(VISUAL_INSPECTION_QUESTIONS, start=1)
+    ]
+
+
+def _flag01(value: object, *, default: int = 1) -> int:
+    """Coerce stored 0/1 print flags; missing/blank values keep the default."""
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return 1 if value else 0
+    if isinstance(value, (int, float)):
+        return 0 if int(value) == 0 else 1
+    text = str(value).strip().lower()
+    if text == "":
+        return default
+    if text in {"0", "false", "no", "n", "off"}:
+        return 0
+    if text in {"1", "true", "yes", "y", "on"}:
+        return 1
+    try:
+        return 0 if int(float(text)) == 0 else 1
+    except (TypeError, ValueError):
+        return default
+
+
+def _include_in_print_flag(raw: dict[str, Any]) -> int:
+    """Existing rows without the column stay selected for print."""
+    if "Include_in_print" in raw:
+        return _flag01(raw.get("Include_in_print"), default=1)
+    if "include_in_print" in raw:
+        return _flag01(raw.get("include_in_print"), default=1)
+    return 1
 
 
 def _normalize_visual_inspection_rows(
@@ -8355,21 +8393,23 @@ def _normalize_visual_inspection_rows(
             "Question_text": VISUAL_INSPECTION_QUESTIONS[number - 1],
             "Answer": answer,
             "Verified": 1 if raw.get("Verified") else 0,
+            "Include_in_print": _include_in_print_flag(raw),
         }
     out = []
     for index, text in enumerate(VISUAL_INSPECTION_QUESTIONS, start=1):
-        out.append(
-            by_no.get(
-                index,
-                {
-                    "Question_no": index,
-                    "Question_text": text,
-                    "Answer": "",
-                    "Verified": 0,
-                },
-            )
-        )
+        out.append(by_no.get(index, _blank_visual_inspection_row(index, text)))
     return out
+
+
+def _printed_visual_inspection_rows(
+    rows: list[dict[str, Any]] | None,
+) -> list[dict[str, Any]]:
+    """Questions ticked for the test-certificate printout."""
+    return [
+        row
+        for row in _normalize_visual_inspection_rows(rows)
+        if row.get("Include_in_print")
+    ]
 
 
 def visual_inspection_errors(rows: list[dict[str, Any]] | None) -> list[str]:
@@ -8417,7 +8457,8 @@ def get_visual_inspection(packing_list_id: int) -> list[dict[str, Any]]:
         SELECT Question_no AS "Question_no",
                Question_text AS "Question_text",
                Answer AS "Answer",
-               Verified AS "Verified"
+               Verified AS "Verified",
+               Include_in_print AS "Include_in_print"
         FROM Packing_list_visual_inspection
         WHERE Packing_list_id = ?
         ORDER BY Question_no
@@ -8453,9 +8494,10 @@ def save_visual_inspection(
                 """
                 INSERT INTO Packing_list_visual_inspection (
                     Packing_list_id, Question_no, Question_text,
-                    Answer, Verified, Last_updated_by, Last_updated_datetime
+                    Answer, Verified, Include_in_print,
+                    Last_updated_by, Last_updated_datetime
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     packing_list_id,
@@ -8463,6 +8505,7 @@ def save_visual_inspection(
                     row["Question_text"],
                     row["Answer"] or None,
                     1 if row["Verified"] else 0,
+                    1 if row.get("Include_in_print") else 0,
                     by_val,
                     dt_val,
                 ),
