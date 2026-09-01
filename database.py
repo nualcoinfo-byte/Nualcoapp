@@ -6709,6 +6709,16 @@ def _ensure_row_level_security(conn: Connection) -> None:
 
 def _ensure_packing_list_ready() -> None:
     with get_connection() as conn:
+        _ensure_columns(
+            conn,
+            "Raw_Material_Purchase",
+            [
+                (
+                    "Weighment_slip_photo",
+                    "BYTEA" if IS_POSTGRES else "BLOB",
+                ),
+            ],
+        )
         _ensure_packing_list(conn)
         _ensure_company_profile(conn)
         _ensure_employees(conn)
