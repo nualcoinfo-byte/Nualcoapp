@@ -194,6 +194,9 @@ def _on_streamlit_cloud() -> bool:
 def _init_postgres() -> bool:
     """Handshake once per process. Failures are cleared by the caller."""
     db._ensure_packing_list_ready()
+    # Keeps a live socket in the pool between visits, so a container that has
+    # been idle does not greet the next user with a fresh TLS handshake.
+    db.start_pool_keepalive()
     return True
 
 
@@ -2766,13 +2769,17 @@ if PAGE == "Dashboard":
     )
     today = date.today()
     try:
-        supply_rows = db.list_po_supply_status()
-        batches = db.list_batches()
-        materials = db.list_raw_materials()
-        lots = db.list_inventory_lots()
-        alloys = db.list_alloys()
-        oil_stock = db.get_furnace_oil_stock()
-        elec_month = db.electricity_month_totals(today.year, today.month)
+        # One transaction for the whole dashboard. Opening one per query costs
+        # a BEGIN, an RLS stamp and a COMMIT each, which is three extra round
+        # trips per read when the database is in another region.
+        with db.shared_connection():
+            supply_rows = db.list_po_supply_status()
+            batches = db.list_batches()
+            materials = db.list_raw_materials()
+            lots = db.list_inventory_lots()
+            alloys = db.list_alloys()
+            oil_stock = db.get_furnace_oil_stock()
+            elec_month = db.electricity_month_totals(today.year, today.month)
     except Exception as exc:
         _show_db_connection_error(exc)
         supply_rows, batches, materials, lots, alloys = [], [], [], [], []
@@ -3450,16 +3457,18 @@ elif PAGE == "Production Batch & Chemistry":
         "Browse existing batches under **Production Batches**."
     )
 
-    furnaces = db.list_furnaces()
-    melters = db.list_melters()
-    supervisors = db.list_production_supervisors()
-    alloys = db.list_alloys(include_sidestream=False)
+    # These five master reads open five transactions if left on their own.
+    with db.shared_connection():
+        furnaces = db.list_furnaces()
+        melters = db.list_melters()
+        supervisors = db.list_production_supervisors()
+        alloys = db.list_alloys(include_sidestream=False)
+        materials = db.list_raw_materials()
     alloy_labels = {
         f"{a['Alloy_id']} — {a['Alloy_name']}"
         + (f" ({a['Customer_name']})" if a["Customer_name"] else ""): a["Alloy_id"]
         for a in alloys
     }
-    materials = db.list_raw_materials()
 
     if not furnaces:
         st.error("Define at least one furnace under **Furnaces**.")
@@ -5891,12 +5900,15 @@ elif PAGE == "Test Certificate":
         st.session_state.pop("tc_show_print", None)
         st.session_state.pop("tc_show_void", None)
 
-    header = db.get_packing_list(packing_list_id)
+    # Read the header and the certificate together. Nothing between these two
+    # may call st.stop() or st.rerun(), because either would raise out of the
+    # transaction block.
+    with db.shared_connection():
+        header = db.get_packing_list(packing_list_id)
+        cert = db.get_packing_list_certificate(packing_list_id) if header else None
     if not header:
         st.error("That packing list was not found.")
         st.stop()
-
-    cert = db.get_packing_list_certificate(packing_list_id)
     if st.session_state.get("tc_show_print") and cert:
         if (
             st.session_state.get("tc_loaded_id") != packing_list_id

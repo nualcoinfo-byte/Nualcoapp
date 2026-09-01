@@ -27,6 +27,7 @@ import struct
 import sys
 import threading
 import time
+from collections import OrderedDict
 from contextlib import contextmanager
 from datetime import date, datetime
 from pathlib import Path
@@ -421,28 +422,36 @@ _PG_CONNECT_ARGS = {
     "sslmode": "require",
     "gssencmode": "disable",
 }
+def _pool_kwargs(*, scales_to_zero: bool) -> dict[str, Any]:
+    """Pool settings tuned for a database in another region.
+
+    `pool_pre_ping` is deliberately off. It sends a probe on every checkout,
+    which is a full round trip -- ~200 ms when the database is a region away.
+    `get_connection()` already issues the RLS stamp before handing the
+    connection to the caller, inside its retry loop, so a dead socket is
+    detected and retried there anyway. The ping only duplicated that.
+
+    A compute that suspends when idle has to be recycled before it does;
+    otherwise recycle rarely, because reconnecting means a fresh TLS handshake
+    (several hundred ms, and much worse on a cold pooler).
+    """
+    return {
+        "pool_pre_ping": False,
+        "pool_recycle": 280 if scales_to_zero else 1800,
+        "pool_size": 5,
+        "max_overflow": 5,
+        "connect_args": _PG_CONNECT_ARGS,
+    }
+
+
 if _URL and not _is_neon_host(_URL):
-    ENGINE = create_engine(
-        _URL,
-        pool_pre_ping=True,
-        pool_recycle=280,
-        pool_size=5,
-        max_overflow=5,
-        connect_args=_PG_CONNECT_ARGS,
-    )
+    ENGINE = create_engine(_URL, **_pool_kwargs(scales_to_zero=False))
     DB_LABEL = _postgres_label(_URL)
 elif _URL and _postgres_ssl_ready(_URL):
-    # Neon compute can scale to zero. Recycle before the typical 5-minute
-    # suspend, ping before checkout, and disable GSS (Windows libpq can hang
-    # for minutes on gssencmode=prefer).
-    ENGINE = create_engine(
-        _URL,
-        pool_pre_ping=True,
-        pool_recycle=280,
-        pool_size=5,
-        max_overflow=5,
-        connect_args=_PG_CONNECT_ARGS,
-    )
+    # Neon compute can scale to zero, so recycle before the typical 5-minute
+    # suspend. GSS is disabled because Windows libpq can hang for minutes on
+    # gssencmode=prefer.
+    ENGINE = create_engine(_URL, **_pool_kwargs(scales_to_zero=True))
     DB_LABEL = _postgres_label(_URL)
 elif _URL and _is_neon_host(_URL):
     # Port 5432 often times out on this Windows network (TCP open, SSL never
@@ -476,11 +485,7 @@ def _rebind_postgres_engine(url: str) -> None:
     _USE_NEON_HTTP = False
     ENGINE = create_engine(
         prepared,
-        pool_pre_ping=True,
-        pool_recycle=280,
-        pool_size=5,
-        max_overflow=5,
-        connect_args=_PG_CONNECT_ARGS,
+        **_pool_kwargs(scales_to_zero=_is_neon_host(prepared)),
     )
     DB_LABEL = _postgres_label(prepared)
     IS_POSTGRES = True
@@ -501,6 +506,44 @@ def adopt_supabase_pooler() -> bool:
         return False
     _rebind_postgres_engine(discovered)
     return True
+
+
+_KEEPALIVE_STARTED = False
+_KEEPALIVE_EVERY_S = 240.0
+
+
+def start_pool_keepalive() -> None:
+    """Hold one pooled connection open so an idle app stays warm.
+
+    Opening a fresh connection to a database in another region costs a TCP
+    handshake plus a TLS handshake -- measured at several seconds against a
+    cold pooler. A container that nobody has clicked on for a while would
+    otherwise pay that on the next page view. Touching one connection every
+    few minutes keeps a live socket in the pool, and when it is eventually
+    recycled the replacement is built on this thread instead of in front of a
+    waiting user.
+    """
+    global _KEEPALIVE_STARTED
+    if _KEEPALIVE_STARTED or ENGINE is None or not IS_POSTGRES:
+        return
+    if os.environ.get("NUALCO_DISABLE_KEEPALIVE"):
+        return
+    _KEEPALIVE_STARTED = True
+
+    def _loop() -> None:
+        while True:
+            try:
+                # Straight to the engine: this must not touch the RLS session
+                # or the shared-connection state owned by request threads.
+                with ENGINE.connect() as conn:
+                    conn.exec_driver_sql("SELECT 1")
+            except Exception:
+                pass
+            time.sleep(_KEEPALIVE_EVERY_S)
+
+    threading.Thread(
+        target=_loop, name="nualco-pool-keepalive", daemon=True
+    ).start()
 
 
 def _is_transient_db_error(exc: BaseException) -> bool:
@@ -560,24 +603,51 @@ _ACTIVE_CONN = threading.local()
 
 
 @contextmanager
-def shared_connection() -> Generator[Connection, None, None]:
+def shared_connection() -> Generator[None, None, None]:
     """Run a block of queries on one connection and one transaction.
 
     Every fetch_all/fetch_one/execute normally opens its own transaction, and
     each one re-stamps the RLS session, so a report that issues 40 reads pays
     40 transactions and ~160 extra statements. Wrapping the block here makes
-    the nested calls reuse this connection instead.
+    the nested calls reuse one connection instead.
+
+    Nothing is opened until a nested call actually needs the database, so a
+    block whose reads all come from the cache costs no round trips at all.
     """
-    existing = getattr(_ACTIVE_CONN, "conn", None)
-    if existing is not None:
-        yield existing
+    if getattr(_ACTIVE_CONN, "pending", False) or getattr(_ACTIVE_CONN, "conn", None):
+        yield
         return
-    with get_connection() as conn:
-        _ACTIVE_CONN.conn = conn
-        try:
-            yield conn
-        finally:
-            _ACTIVE_CONN.conn = None
+    _ACTIVE_CONN.pending = True
+    _ACTIVE_CONN.exit = None
+    try:
+        yield
+    except BaseException:
+        _close_shared_connection(failed=True)
+        raise
+    else:
+        _close_shared_connection(failed=False)
+
+
+def _open_shared_connection() -> Connection:
+    """Attach a real transaction to the enclosing shared_connection block."""
+    cm = _connection_cm()
+    conn = cm.__enter__()
+    _ACTIVE_CONN.conn = conn
+    _ACTIVE_CONN.exit = cm.__exit__
+    return conn
+
+
+def _close_shared_connection(*, failed: bool) -> None:
+    exit_fn = getattr(_ACTIVE_CONN, "exit", None)
+    _ACTIVE_CONN.pending = False
+    _ACTIVE_CONN.conn = None
+    _ACTIVE_CONN.exit = None
+    if exit_fn is None:
+        return
+    if failed:
+        exit_fn(*sys.exc_info())
+    else:
+        exit_fn(None, None, None)
 
 
 @contextmanager
@@ -589,6 +659,17 @@ def get_connection() -> Generator[Connection, None, None]:
         # second one. Commit/rollback stays with the outermost block.
         yield joined
         return
+    if getattr(_ACTIVE_CONN, "pending", False):
+        # First query inside a shared_connection block: open it now.
+        yield _open_shared_connection()
+        return
+    with _connection_cm() as conn:
+        yield conn
+
+
+@contextmanager
+def _connection_cm() -> Generator[Connection, None, None]:
+    """Begin a transaction and stamp the acting role onto it."""
     if ENGINE is None:
         raise RuntimeError(NO_DATABASE_URL_MESSAGE)
     delay = _CONNECT_BACKOFF_S
@@ -3363,6 +3444,131 @@ def _rename_column(
 
 # ---------- Generic helpers ----------
 
+_DATA_VERSION = 0
+_DATA_VERSION_LOCK = threading.Lock()
+_READ_CACHE: "OrderedDict[tuple[Any, ...], tuple[int, float, Any]]" = OrderedDict()
+_READ_CACHE_MAX = 256
+# Keeping a very large result would trade a 200 ms round trip for tens of MB
+# in a small container, so oversized answers are fetched fresh each time.
+_READ_CACHE_MAX_ROWS = 4000
+_READ_CACHE_LOCK = threading.Lock()
+_WRITE_PREFIXES = (
+    "INSERT",
+    "UPDATE",
+    "DELETE",
+    "CREATE",
+    "ALTER",
+    "DROP",
+    "TRUNCATE",
+    "GRANT",
+    "REVOKE",
+    "COMMENT",
+    "DO",
+)
+
+
+def data_version() -> int:
+    """Counter bumped by every statement that can change stored data."""
+    return _DATA_VERSION
+
+
+def bump_data_version() -> None:
+    """Drop every memoized read. Called automatically after any write."""
+    global _DATA_VERSION
+    with _DATA_VERSION_LOCK:
+        _DATA_VERSION += 1
+    with _READ_CACHE_LOCK:
+        _READ_CACHE.clear()
+
+
+def _statement_writes(statement: str) -> bool:
+    head = statement.lstrip().lstrip("(").upper()
+    return head.startswith(_WRITE_PREFIXES)
+
+
+def _install_write_watch() -> None:
+    """Invalidate memoized reads from whatever code path issued the write.
+
+    Hooking the engine rather than the helper functions means direct
+    `_exec(conn, "UPDATE ...")` calls are covered too, so a cached read can
+    never outlive the data it was built from.
+    """
+    if ENGINE is None or not IS_POSTGRES:
+        return
+    try:
+        from sqlalchemy import event
+    except Exception:
+        return
+
+    @event.listens_for(ENGINE, "after_cursor_execute")
+    def _after(conn, cursor, statement, params, context, executemany):
+        if _statement_writes(statement):
+            bump_data_version()
+
+
+_install_write_watch()
+
+
+def cached_read(ttl_s: float = 45.0):
+    """Memoize a read-only query until something writes, or the TTL expires.
+
+    Streamlit re-executes the whole script on every click, so a page that
+    reads six tables re-ran those six queries for each interaction. With the
+    database in another region that is seconds of latency for data that has
+    not changed. Any write bumps the data version and clears this, so a save
+    is still visible immediately.
+    """
+
+    def decorate(fn: Callable[..., _T]) -> Callable[..., _T]:
+        def wrapper(*args: Any, **kwargs: Any) -> _T:
+            key = (fn.__qualname__, args, tuple(sorted(kwargs.items())))
+            now = time.monotonic()
+            try:
+                hash(key)
+            except TypeError:
+                return fn(*args, **kwargs)
+            with _READ_CACHE_LOCK:
+                hit = _READ_CACHE.get(key)
+                if (
+                    hit is not None
+                    and hit[0] == _DATA_VERSION
+                    and (now - hit[1]) <= ttl_s
+                ):
+                    _READ_CACHE.move_to_end(key)
+                    return _copy_result(hit[2])
+            value = fn(*args, **kwargs)
+            if isinstance(value, list) and len(value) > _READ_CACHE_MAX_ROWS:
+                return value
+            with _READ_CACHE_LOCK:
+                _READ_CACHE[key] = (_DATA_VERSION, now, _copy_result(value))
+                while len(_READ_CACHE) > _READ_CACHE_MAX:
+                    _READ_CACHE.popitem(last=False)
+            return value
+
+        wrapper.__name__ = fn.__name__
+        wrapper.__qualname__ = fn.__qualname__
+        wrapper.__doc__ = fn.__doc__
+        wrapper.cache_clear = lambda: bump_data_version()  # type: ignore[attr-defined]
+        return wrapper
+
+    return decorate
+
+
+def _copy_result(value: Any) -> Any:
+    """Hand out a private copy so callers can mutate what they receive.
+
+    Callers routinely edit the rows they get back, and some results nest lists
+    of rows inside a header dict, so the copy has to reach those too.
+    """
+    if isinstance(value, list):
+        return [_copy_result(v) for v in value]
+    if isinstance(value, dict):
+        return {k: _copy_result(v) for k, v in value.items()}
+    if isinstance(value, tuple):
+        return tuple(_copy_result(v) for v in value)
+    return value
+
+
 def fetch_all(sql: str, params: Iterable[Any] = ()) -> list[dict[str, Any]]:
     def _run() -> list[dict[str, Any]]:
         with get_connection() as conn:
@@ -3835,6 +4041,7 @@ def save_table_edits(
 
 # ---------- Lookups ----------
 
+@cached_read(ttl_s=120)
 def list_customers(active_only: bool = True) -> list[str]:
     sql = 'SELECT Customer_name AS "Customer_name" FROM Customer_Master'
     if active_only:
@@ -3843,6 +4050,7 @@ def list_customers(active_only: bool = True) -> list[str]:
     return [r["Customer_name"] for r in fetch_all(sql)]
 
 
+@cached_read(ttl_s=120)
 def list_customer_codes(active_only: bool = True) -> list[dict[str, Any]]:
     """Customers with their codes, for code-based FK lookups."""
     sql = 'SELECT Cust_code AS "Cust_code", Customer_name AS "Customer_name" FROM Customer_Master'
@@ -3852,6 +4060,7 @@ def list_customer_codes(active_only: bool = True) -> list[dict[str, Any]]:
     return fetch_all(sql)
 
 
+@cached_read(ttl_s=300)
 def get_customer(cust_code: str) -> Optional[dict[str, Any]]:
     return fetch_one(
         """
@@ -3865,6 +4074,7 @@ def get_customer(cust_code: str) -> Optional[dict[str, Any]]:
     )
 
 
+@cached_read(ttl_s=120)
 def list_vendors(active_only: bool = True) -> list[dict[str, Any]]:
     """Vendors with their auto-generated codes, for code-based FK lookups."""
     sql = 'SELECT Vendor_code AS "Vendor_code", Vendor_name AS "Vendor_name" FROM Vendor_Master'
@@ -3874,6 +4084,7 @@ def list_vendors(active_only: bool = True) -> list[dict[str, Any]]:
     return fetch_all(sql)
 
 
+@cached_read(ttl_s=120)
 def list_suppliers(active_only: bool = True) -> list[str]:
     """Vendor names only; kept for display lookups."""
     return [v["Vendor_name"] for v in list_vendors(active_only)]
@@ -3885,6 +4096,7 @@ BATCH_CHEM_EXTRA_SYMBOLS = ("OE", "OT", "SF")
 RAW_MATERIAL_SPEC_HIDDEN_SYMBOLS = frozenset(BATCH_CHEM_EXTRA_SYMBOLS)
 
 
+@cached_read(ttl_s=300)
 def list_elements(limit: Optional[int] = None) -> list[dict[str, Any]]:
     """Return Element_Master rows ordered by Serial_no.
 
@@ -3907,6 +4119,7 @@ def list_entry_elements() -> list[dict[str, Any]]:
     return list_elements(limit=ENTRY_CHEM_ELEMENT_LIMIT)
 
 
+@cached_read(ttl_s=300)
 def list_batch_chem_elements() -> list[dict[str, Any]]:
     """First 15 Element_Master rows plus OE, OT, and SF (ladle chemistry and alloy specs)."""
     entry = list_entry_elements()
@@ -3930,6 +4143,7 @@ def omit_raw_material_spec_hidden(composition: dict[str, Any]) -> dict[str, Any]
     }
 
 
+@cached_read(ttl_s=300)
 def list_raw_material_spec_elements(*, entry_only: bool = False) -> list[dict[str, Any]]:
     """Elements for Raw_Material_Spec entry and display (never OE, OT, or SF)."""
     source = list_entry_elements() if entry_only else list_elements()
@@ -3950,6 +4164,7 @@ OTHER_SPEC_SERIAL_MIN = 16
 OTHER_SPEC_SERIAL_MAX = 36
 
 
+@cached_read(ttl_s=300)
 def list_other_spec_elements() -> list[dict[str, Any]]:
     """Element_Master rows with Serial_no from 16 through 36 (alloy spec extras)."""
     sql = """
@@ -3985,6 +4200,7 @@ def list_entry_element_symbols() -> list[str]:
     return list_element_symbols(limit=ENTRY_CHEM_ELEMENT_LIMIT)
 
 
+@cached_read(ttl_s=120)
 def list_furnaces(active_only: bool = True) -> list[str]:
     sql = 'SELECT Furnace AS "Furnace" FROM Furnace_Master'
     if active_only:
@@ -3993,6 +4209,7 @@ def list_furnaces(active_only: bool = True) -> list[str]:
     return [r["Furnace"] for r in fetch_all(sql)]
 
 
+@cached_read(ttl_s=120)
 def list_crucibles(
     furnace: Optional[str] = None,
     status: Optional[str] = None,
@@ -4047,6 +4264,7 @@ def _require_single_available(furnace: Optional[str], crucible_no: str) -> None:
         )
 
 
+@cached_read(ttl_s=120)
 def list_melters(active_only: bool = True) -> list[str]:
     sql = 'SELECT Melter_Name AS "Melter_Name" FROM Melter_Master'
     if active_only:
@@ -4055,6 +4273,7 @@ def list_melters(active_only: bool = True) -> list[str]:
     return [r["Melter_Name"] for r in fetch_all(sql)]
 
 
+@cached_read(ttl_s=120)
 def list_production_supervisors(active_only: bool = True) -> list[str]:
     sql = (
         'SELECT Production_supervisor AS "Production_supervisor" '
@@ -4066,6 +4285,7 @@ def list_production_supervisors(active_only: bool = True) -> list[str]:
     return [r["Production_supervisor"] for r in fetch_all(sql)]
 
 
+@cached_read(ttl_s=120)
 def list_trolleys(active_only: bool = True) -> list[dict[str, Any]]:
     sql = """
         SELECT Trolley_name AS "Trolley_name", Colour AS "Colour",
@@ -4078,6 +4298,7 @@ def list_trolleys(active_only: bool = True) -> list[dict[str, Any]]:
     return fetch_all(sql)
 
 
+@cached_read(ttl_s=300)
 def list_states(active_only: bool = True) -> list[str]:
     sql = 'SELECT DISTINCT State AS "State" FROM State_City_Master'
     if active_only:
@@ -4086,6 +4307,7 @@ def list_states(active_only: bool = True) -> list[str]:
     return [r["State"] for r in fetch_all(sql)]
 
 
+@cached_read(ttl_s=300)
 def list_cities(state: Optional[str] = None, active_only: bool = True) -> list[str]:
     sql = 'SELECT City AS "City" FROM State_City_Master WHERE 1=1'
     params: list[Any] = []
@@ -4098,6 +4320,7 @@ def list_cities(state: Optional[str] = None, active_only: bool = True) -> list[s
     return [r["City"] for r in fetch_all(sql, params)]
 
 
+@cached_read(ttl_s=300)
 def list_isri_codes() -> list[dict[str, Any]]:
     return fetch_all(
         """
@@ -4107,6 +4330,7 @@ def list_isri_codes() -> list[dict[str, Any]]:
     )
 
 
+@cached_read(ttl_s=120)
 def list_raw_materials(active_only: bool = True) -> list[str]:
     sql = 'SELECT DISTINCT Raw_Material_Name AS "Raw_Material_Name" FROM Raw_Material_Master'
     if active_only:
@@ -4132,6 +4356,7 @@ def find_raw_material_name(name: str) -> Optional[str]:
     return str(stored) if stored not in (None, "") else None
 
 
+@cached_read(ttl_s=120)
 def get_raw_material_master(name: str) -> Optional[dict[str, Any]]:
     """Latest Raw_Material_Master row for a name (case-insensitive)."""
     stored = find_raw_material_name(name)
@@ -4195,6 +4420,7 @@ def _raw_material_spec_parent(
     return stored, _as_effective_date(latest.get("Effective_date"))
 
 
+@cached_read(ttl_s=120)
 def get_raw_material_master_spec(
     name: str, effective_date: Optional[str] = None
 ) -> dict[str, float]:
@@ -4261,6 +4487,7 @@ def set_raw_material_master_spec(
             )
 
 
+@cached_read(ttl_s=120)
 def list_raw_material_master() -> list[dict[str, Any]]:
     """All raw-material grades, excluding the Photo blob."""
     return fetch_all(
@@ -4304,6 +4531,7 @@ def list_lots_for_material(material: str) -> list[dict[str, Any]]:
     )
 
 
+@cached_read(ttl_s=120)
 def list_alloys(*, include_sidestream: bool = True) -> list[dict[str, Any]]:
     sql = """
         SELECT a.Alloy_id AS "Alloy_id", a.Alloy_name AS "Alloy_name",
@@ -4325,6 +4553,7 @@ def list_alloys(*, include_sidestream: bool = True) -> list[dict[str, Any]]:
     return fetch_all(sql, params)
 
 
+@cached_read(ttl_s=300)
 def get_alloy(alloy_id: object) -> Optional[dict[str, Any]]:
     try:
         aid = int(alloy_id)
@@ -4344,6 +4573,7 @@ def get_alloy(alloy_id: object) -> Optional[dict[str, Any]]:
     )
 
 
+@cached_read(ttl_s=300)
 def get_alloy_specs(alloy_id: int) -> dict[str, dict[str, Any]]:
     """Min/max % from Alloy_Master_spec keyed by Element_symbol."""
     rows = fetch_all(
@@ -4361,6 +4591,7 @@ def get_alloy_specs(alloy_id: int) -> dict[str, dict[str, Any]]:
     return {str(r["Element_symbol"]): r for r in rows}
 
 
+@cached_read(ttl_s=120)
 def list_inventory_lots(
     material: Optional[str] = None, ready_only: bool = False
 ) -> list[dict[str, Any]]:
@@ -4401,6 +4632,7 @@ def _company_select_sql() -> str:
     return "SELECT " + ", ".join(parts) + " FROM Company_profile WHERE Company_id = ?"
 
 
+@cached_read(ttl_s=300)
 def get_company_profile() -> dict[str, Any]:
     _ensure_company_ready()
     row = fetch_one(_company_select_sql(), (COMPANY_PROFILE_ID,))
@@ -4849,6 +5081,7 @@ def set_lot_chemistry(material: str, lot_id: int, composition: dict[str, float])
     set_raw_material_master_spec(material, composition)
 
 
+@cached_read(ttl_s=120)
 def get_lot_chemistry(lot_id: int) -> dict[str, float]:
     """Grade specification for the material on this inventory lot."""
     row = fetch_one(
@@ -5059,6 +5292,16 @@ def is_admin_user(name: str | None = None) -> bool:
     if not user:
         return False
     emp_id = get_acting_employee_id() if name is None else ""
+    return _is_admin_lookup(user, emp_id)
+
+
+@cached_read(ttl_s=120)
+def _is_admin_lookup(user: str, emp_id: str) -> bool:
+    """The database half of is_admin_user().
+
+    This runs before every page renders, so leaving it uncached cost two or
+    three round trips on every single click.
+    """
     try:
         if emp_id:
             row = fetch_one(
@@ -5475,6 +5718,7 @@ def preview_next_production_batch_id(
     return build_production_batch_id(furnace, production_date, shift, melt_no)
 
 
+@cached_read(ttl_s=120)
 def list_furnace_batches(furnace: str) -> list[dict[str, Any]]:
     """Batch_ID and Heat_no for one furnace, newest production date first."""
     return fetch_all(
@@ -5880,6 +6124,7 @@ def add_finished_goods_bundle(
         return int(row[0])
 
 
+@cached_read(ttl_s=120)
 def list_finished_goods(
     batch_id: Optional[str] = None,
     status: Optional[str] = None,
@@ -6280,6 +6525,7 @@ LEFT JOIN roles r ON r.role_id = e.role_id
 """
 
 
+@cached_read(ttl_s=120)
 def list_roles() -> list[dict[str, Any]]:
     return fetch_all(
         """
@@ -6290,6 +6536,7 @@ def list_roles() -> list[dict[str, Any]]:
     )
 
 
+@cached_read(ttl_s=120)
 def list_employees(*, include_inactive: bool = True) -> list[dict[str, Any]]:
     sql = _EMPLOYEE_SELECT
     if not include_inactive:
@@ -6305,6 +6552,7 @@ def get_employee(employee_id: str) -> Optional[dict[str, Any]]:
     )
 
 
+@cached_read(ttl_s=120)
 def list_admin_employees() -> list[dict[str, Any]]:
     return [
         row
@@ -6313,6 +6561,7 @@ def list_admin_employees() -> list[dict[str, Any]]:
     ]
 
 
+@cached_read(ttl_s=120)
 def any_employee_has_password() -> bool:
     row = fetch_one(
         """
@@ -6400,6 +6649,7 @@ def bootstrap_first_admin_password(employee_id: str, password: str) -> dict[str,
     return ready
 
 
+@cached_read(ttl_s=120)
 def nav_section_keys_for_role(role_id: object, role_name: object = None) -> list[str]:
     if role_is_admin(role_name, role_id):
         return list(ALL_NAV_SECTION_KEYS)
@@ -6427,6 +6677,7 @@ def nav_section_keys_for_role(role_id: object, role_name: object = None) -> list
     return list(default_sections_for_role(role_id, role_name))
 
 
+@cached_read(ttl_s=120)
 def list_role_permissions() -> dict[int, list[str]]:
     granted: dict[int, list[str]] = {}
     for row in fetch_all(
@@ -6916,6 +7167,108 @@ def _ensure_inventory_guards(conn: Connection) -> None:
 
 _MIGRATIONS_RUN: set[str] = set()
 _MIGRATIONS_LOCK = threading.RLock()
+_SCHEMA_STATE_TABLE = "Nualco_schema_state"
+_SCHEMA_FINGERPRINT: str | None = None
+_SCHEMA_VERIFIED = False
+
+
+def _schema_fingerprint() -> str:
+    """Hash the source of every helper that emits DDL.
+
+    The migrations are idempotent but chatty: replaying them costs ~40 round
+    trips, which is seconds when the database is in another region. Recording
+    this hash lets a already-migrated database be recognised in one query.
+    Because the hash is derived from the code itself, editing any schema
+    helper invalidates it automatically -- there is no version to remember to
+    bump.
+    """
+    global _SCHEMA_FINGERPRINT
+    if _SCHEMA_FINGERPRINT is not None:
+        return _SCHEMA_FINGERPRINT
+    import inspect
+
+    module = sys.modules[__name__]
+    parts: list[str] = [_SCHEMA_SHARED]
+    for name in sorted(dir(module)):
+        if not (
+            name.startswith("_ensure")
+            or name.startswith("_backfill")
+            or name.startswith("_migrate")
+        ):
+            continue
+        member = getattr(module, name, None)
+        if not callable(member):
+            continue
+        try:
+            parts.append(inspect.getsource(member))
+        except (OSError, TypeError):
+            parts.append(name)
+    digest = hashlib.sha256("\n".join(parts).encode("utf-8")).hexdigest()
+    _SCHEMA_FINGERPRINT = f"{'pg' if IS_POSTGRES else 'sqlite'}-{digest[:32]}"
+    return _SCHEMA_FINGERPRINT
+
+
+def _read_schema_fingerprint(conn: Connection) -> str | None:
+    """Recorded fingerprint, or None when the schema has never been stamped."""
+    _exec(
+        conn,
+        f"""
+        CREATE TABLE IF NOT EXISTS {_SCHEMA_STATE_TABLE} (
+            Id INTEGER PRIMARY KEY,
+            Fingerprint TEXT NOT NULL,
+            Applied_at TEXT
+        )
+        """,
+    )
+    row = (
+        _exec(
+            conn,
+            f'SELECT Fingerprint AS "Fingerprint" FROM {_SCHEMA_STATE_TABLE} WHERE Id = 1',
+        )
+        .mappings()
+        .first()
+    )
+    return str(row["Fingerprint"]) if row and row.get("Fingerprint") else None
+
+
+def _write_schema_fingerprint(conn: Connection, fingerprint: str) -> None:
+    _exec(
+        conn,
+        f"""
+        INSERT INTO {_SCHEMA_STATE_TABLE} (Id, Fingerprint, Applied_at)
+        VALUES (1, ?, ?)
+        ON CONFLICT (Id) DO UPDATE
+            SET Fingerprint = excluded.Fingerprint,
+                Applied_at = excluded.Applied_at
+        """,
+        (fingerprint, datetime.now().isoformat(timespec="seconds")),
+    )
+
+
+def _schema_already_applied() -> bool:
+    """True when this database was last migrated by exactly this code."""
+    global _SCHEMA_VERIFIED
+    if _SCHEMA_VERIFIED:
+        return True
+    try:
+        with get_connection() as conn:
+            if _read_schema_fingerprint(conn) == _schema_fingerprint():
+                _SCHEMA_VERIFIED = True
+                return True
+    except Exception:
+        # Never let the fast path block startup; fall back to full migration.
+        return False
+    return False
+
+
+def _stamp_schema_applied() -> None:
+    global _SCHEMA_VERIFIED
+    try:
+        with get_connection() as conn:
+            _write_schema_fingerprint(conn, _schema_fingerprint())
+        _SCHEMA_VERIFIED = True
+    except Exception:
+        pass
 
 
 def _run_once(key: str, migrate: Callable[[], None]) -> None:
@@ -6937,25 +7290,32 @@ def _run_once(key: str, migrate: Callable[[], None]) -> None:
 
 def reset_migration_guard() -> None:
     """Force the next call to re-run schema setup (after a schema change)."""
+    global _SCHEMA_VERIFIED
     with _MIGRATIONS_LOCK:
         _MIGRATIONS_RUN.clear()
     _TABLE_COLUMNS.clear()
+    _SCHEMA_VERIFIED = False
 
 
 def _ensure_packing_list_ready() -> None:
     def _migrate() -> None:
+        if _schema_already_applied():
+            return
         with get_connection() as conn:
             _ensure_packing_list(conn)
             _ensure_company_profile(conn)
             _ensure_employees(conn)
             _ensure_inventory_guards(conn)
             _ensure_row_level_security(conn)
+        _stamp_schema_applied()
 
     _run_once("packing_list_ready", _migrate)
 
 
 def _ensure_company_ready() -> None:
     def _migrate() -> None:
+        if _schema_already_applied():
+            return
         with get_connection() as conn:
             _ensure_company_profile(conn)
             _ensure_employees(conn)
@@ -6964,6 +7324,7 @@ def _ensure_company_ready() -> None:
     _run_once("company_ready", _migrate)
 
 
+@cached_read(ttl_s=120)
 def list_packing_po_numbers() -> list[str]:
     rows = fetch_all(
         """
@@ -6976,6 +7337,7 @@ def list_packing_po_numbers() -> list[str]:
     return [str(r["Customer_PO_No"]) for r in rows if r.get("Customer_PO_No")]
 
 
+@cached_read(ttl_s=120)
 def list_packing_po_customers(po_no: str) -> list[dict[str, Any]]:
     """Customers on a PO, names taken from Customer_Master when possible."""
     return fetch_all(
@@ -6992,6 +7354,7 @@ def list_packing_po_customers(po_no: str) -> list[dict[str, Any]]:
     )
 
 
+@cached_read(ttl_s=120)
 def list_packing_po_alloys(
     po_no: str, cust_code: Optional[str] = None
 ) -> list[dict[str, Any]]:
@@ -7045,6 +7408,7 @@ def _alloy_matches_target(
     return False
 
 
+@cached_read(ttl_s=120)
 def list_packing_batch_candidates(
     alloy_id: int,
     *,
@@ -7187,6 +7551,7 @@ def list_dispatchable_batches(
     return eligible
 
 
+@cached_read(ttl_s=120)
 def list_packing_lists() -> list[dict[str, Any]]:
     _ensure_packing_list_ready()
     return fetch_all(
@@ -7218,6 +7583,7 @@ def list_packing_lists() -> list[dict[str, Any]]:
     )
 
 
+@cached_read(ttl_s=120)
 def get_packing_list(packing_list_id: int) -> Optional[dict[str, Any]]:
     _ensure_packing_list_ready()
     header = fetch_one(
@@ -7996,6 +8362,7 @@ def _replace_certificate_lines_on_conn(
             )
 
 
+@cached_read(ttl_s=120)
 def list_packing_lists_for_certificate() -> list[dict[str, Any]]:
     """Verified packing lists with current certificate status, if any."""
     _ensure_packing_list_ready()
@@ -8025,6 +8392,7 @@ def list_packing_lists_for_certificate() -> list[dict[str, Any]]:
     )
 
 
+@cached_read(ttl_s=120)
 def get_packing_list_certificate(
     packing_list_id: int,
 ) -> Optional[dict[str, Any]]:
@@ -8149,6 +8517,7 @@ def format_alloy_spec_percent(min_percent: object, max_percent: object) -> str:
     return f"{_format_cert_number(low)} - {_format_cert_number(high)}"
 
 
+@cached_read(ttl_s=300)
 def list_certificate_spec_rows(alloy_id: int) -> list[dict[str, Any]]:
     """Alloy spec elements for the test certificate, plus Aluminium remainder."""
     rows = fetch_all(
@@ -8490,6 +8859,7 @@ def visual_inspection_errors(rows: list[dict[str, Any]] | None) -> list[str]:
     return errors
 
 
+@cached_read(ttl_s=120)
 def get_visual_inspection(packing_list_id: int) -> list[dict[str, Any]]:
     _ensure_packing_list_ready()
     saved = fetch_all(
@@ -8613,6 +8983,7 @@ def _spec_deviation_reason(
     return "; ".join(parts)
 
 
+@cached_read(ttl_s=120)
 def list_packing_list_chemistry_vs_spec(packing_list_id: int) -> list[dict[str, Any]]:
     """Compare each packed batch's chemistry to the packing-list alloy spec."""
     with shared_connection():
@@ -9077,6 +9448,7 @@ def cancel_packing_list(packing_list_id: int) -> dict[str, Any]:
     return updated
 
 
+@cached_read(ttl_s=120)
 def list_issued_certificates() -> list[dict[str, Any]]:
     """Issued test certificates for the Admin cancel page."""
     _ensure_packing_list_ready()
@@ -9166,6 +9538,7 @@ _BATCH_COLUMNS = """
 """
 
 
+@cached_read(ttl_s=120)
 def get_batch(batch_id: str) -> Optional[dict[str, Any]]:
     return fetch_one(
         f"SELECT {_BATCH_COLUMNS} FROM Production_batch WHERE Batch_ID = ?",
@@ -9173,6 +9546,7 @@ def get_batch(batch_id: str) -> Optional[dict[str, Any]]:
     )
 
 
+@cached_read(ttl_s=120)
 def get_batch_inputs(batch_id: str) -> list[dict[str, Any]]:
     return fetch_all(
         """
@@ -9230,6 +9604,7 @@ def allowed_batch_output_alloy_ids(batch_alloy_id: Optional[int]) -> set[int]:
     return allowed
 
 
+@cached_read(ttl_s=120)
 def list_batch_output_alloys(batch_alloy_id: Optional[int]) -> list[dict[str, Any]]:
     """Product alloy (if any) plus Broken Ingot / Furnace Empty / Not Ok Ingot."""
     ids: list[int] = []
@@ -9533,6 +9908,7 @@ def refresh_outputs_missing_conversion_rate() -> int:
     return len(rows)
 
 
+@cached_read(ttl_s=120)
 def get_batch_outputs(
     batch_id: str, *, include_photos: bool = False
 ) -> list[dict[str, Any]]:
@@ -9564,6 +9940,7 @@ def get_batch_outputs(
     )
 
 
+@cached_read(ttl_s=120)
 def list_all_batch_outputs(limit: int = 200) -> list[dict[str, Any]]:
     return fetch_all(
         """
@@ -9805,6 +10182,7 @@ def _sync_sidestream_inventory(conn: Connection, batch_id: str) -> None:
         )
 
 
+@cached_read(ttl_s=120)
 def get_batch_chemistry(batch_id: str) -> list[dict[str, Any]]:
     return fetch_all(
         """
@@ -9846,6 +10224,7 @@ def get_batch_chemistry_bulk(batch_ids: Iterable[str]) -> dict[str, list[dict[st
     return grouped
 
 
+@cached_read(ttl_s=120)
 def list_batches() -> list[dict[str, Any]]:
     return fetch_all(
         """
@@ -9892,6 +10271,7 @@ def calc_yield(input_weight: float, output_weight: float) -> dict[str, float]:
 PO_DOCUMENT_EXTENSIONS = (".pdf", ".doc", ".docx", ".xls", ".xlsx")
 
 
+@cached_read(ttl_s=120)
 def list_purchase_orders() -> list[dict[str, Any]]:
     return fetch_all(
         """
@@ -9925,6 +10305,7 @@ def list_purchase_orders() -> list[dict[str, Any]]:
     )
 
 
+@cached_read(ttl_s=120)
 def list_po_supply_status() -> list[dict[str, Any]]:
     """Open-order kg, verified dispatch, packing-in-progress, and FG on hand."""
     return fetch_all(
@@ -10324,6 +10705,7 @@ def _furnace_oil_stock_on_conn(conn: Connection) -> float:
         return 0.0
 
 
+@cached_read(ttl_s=120)
 def get_furnace_oil_stock() -> float:
     row = fetch_one(_FURNACE_OIL_STOCK_SQL)
     if not row:
@@ -10334,6 +10716,7 @@ def get_furnace_oil_stock() -> float:
         return 0.0
 
 
+@cached_read(ttl_s=120)
 def list_furnace_oil_purchases(limit: int = 50) -> list[dict[str, Any]]:
     return fetch_all(
         """
@@ -10360,6 +10743,7 @@ def list_furnace_oil_purchases(limit: int = 50) -> list[dict[str, Any]]:
     )
 
 
+@cached_read(ttl_s=120)
 def list_furnace_oil_consumption(limit: int = 50) -> list[dict[str, Any]]:
     return fetch_all(
         """
@@ -10374,6 +10758,7 @@ def list_furnace_oil_consumption(limit: int = 50) -> list[dict[str, Any]]:
     )
 
 
+@cached_read(ttl_s=120)
 def list_furnace_oil_inventory(limit: int = 90) -> list[dict[str, Any]]:
     return fetch_all(
         """
@@ -10573,6 +10958,7 @@ def normalize_electricity_line(line: Optional[str]) -> str:
     raise ValueError("Select EB Line 1 or EB Line 2.")
 
 
+@cached_read(ttl_s=120)
 def get_electricity_consumption(
     consumption_date: str, line: str
 ) -> Optional[dict[str, Any]]:
@@ -10595,6 +10981,7 @@ def get_electricity_consumption(
     )
 
 
+@cached_read(ttl_s=120)
 def get_previous_electricity_closing(
     consumption_date: str, line: str
 ) -> Optional[float]:
@@ -10621,6 +11008,7 @@ def get_previous_electricity_closing(
         return None
 
 
+@cached_read(ttl_s=120)
 def list_electricity_consumption(
     limit: int = 60, line: Optional[str] = None
 ) -> list[dict[str, Any]]:
@@ -10642,6 +11030,7 @@ def list_electricity_consumption(
     return fetch_all(sql, tuple(params))
 
 
+@cached_read(ttl_s=120)
 def electricity_month_totals(
     year: int, month: int, line: Optional[str] = None
 ) -> dict[str, Any]:
@@ -10762,6 +11151,7 @@ def _as_rate_4(value: Any, label: str) -> float:
     return rounded
 
 
+@cached_read(ttl_s=120)
 def list_cost_of_conversion(limit: int = 120) -> list[dict[str, Any]]:
     return fetch_all(
         """
@@ -10782,6 +11172,7 @@ def list_cost_of_conversion(limit: int = 120) -> list[dict[str, Any]]:
     )
 
 
+@cached_read(ttl_s=120)
 def get_cost_of_conversion(expense_month: str | date) -> Optional[dict[str, Any]]:
     month = _month_start_iso(expense_month)
     return fetch_one(
