@@ -6,6 +6,8 @@
 nualco.db
 .env
 .env.local
+# Never bake a credential into an image layer.
+.streamlit/secrets.toml
 __pycache__
 *.pyc
 .neon

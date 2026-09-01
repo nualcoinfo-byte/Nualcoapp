@@ -16,6 +16,10 @@ from pathlib import Path
 import pandas as pd
 import streamlit as st
 
+# Bumped whenever the database wiring changes, so the sidebar can prove which
+# copy of the code a running server actually loaded.
+APP_BUILD = "2026-09-01-weighment-slip-photo"
+
 LOGO_PATH = Path(__file__).resolve().parent / "assets" / "nualco_logo.png"
 ISO_LOGO_PATH = Path(__file__).resolve().parent / "assets" / "iso_9001_2015.png"
 _BRAND_ORANGE = "#F15A22"
@@ -28,22 +32,59 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# Inject Streamlit Cloud secrets into the environment BEFORE importing the
-# database module, which binds SQLAlchemy's engine at import time.
+def _clean_database_url(value: object) -> str:
+    return str(value or "").strip().strip('"').strip("'")
+
+
+def _url_from_key_file(path: Path) -> str:
+    """Read DATABASE_URL from a local key=value file next to the app."""
+    if not path.is_file():
+        return ""
+    try:
+        data = path.read_bytes()
+    except OSError:
+        return ""
+    text = ""
+    for encoding in ("utf-8-sig", "utf-16", "utf-16-le", "cp1252", "utf-8"):
+        try:
+            text = data.decode(encoding)
+            break
+        except UnicodeDecodeError:
+            continue
+    if not text:
+        text = data.decode("utf-8", errors="replace")
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, raw = line.partition("=")
+        if key.strip() in {"DATABASE_URL", "database_url"}:
+            return _clean_database_url(raw)
+    return ""
+
+
+# Inject Streamlit secrets / local files into the environment BEFORE importing
+# the database module, which binds SQLAlchemy's engine at import time.
 _secret_url = ""
 try:
     if "DATABASE_URL" in st.secrets:
-        _secret_url = str(st.secrets["DATABASE_URL"]).strip().strip('"').strip("'")
-        os.environ["DATABASE_URL"] = _secret_url
-        # A leftover Neon DATABASE_URL_UNPOOLED must not override Supabase.
-        if "neon.tech" not in _secret_url.lower() and "DATABASE_URL_UNPOOLED" in os.environ:
-            os.environ.pop("DATABASE_URL_UNPOOLED", None)
+        _secret_url = _clean_database_url(st.secrets["DATABASE_URL"])
 except Exception:
     pass
+if not _secret_url:
+    _secret_url = _clean_database_url(os.environ.get("DATABASE_URL"))
+if not _secret_url:
+    _secret_url = _url_from_key_file(
+        Path(__file__).resolve().parent / ".streamlit" / "secrets.toml"
+    )
+if not _secret_url:
+    _secret_url = _url_from_key_file(Path(__file__).resolve().parent / ".env.local")
 
-# A previous SQLite fallback must not lock the session when a Postgres URL
-# is configured. Streamlit Cloud keeps session_state across reruns.
-if _secret_url or os.environ.get("DATABASE_URL"):
+if _secret_url:
+    os.environ["DATABASE_URL"] = _secret_url
+    # A leftover Neon DATABASE_URL_UNPOOLED must not override Supabase.
+    if "neon.tech" not in _secret_url.lower() and "DATABASE_URL_UNPOOLED" in os.environ:
+        os.environ.pop("DATABASE_URL_UNPOOLED", None)
     os.environ.pop("NUALCO_FORCE_SQLITE", None)
     st.session_state.pop("use_sqlite", None)
     st.session_state.pop("_offline_sqlite", None)
@@ -57,13 +98,29 @@ import importlib
 # file on disk is newer than the copy currently loaded in this process.
 _db_mtime = Path(db.__file__).resolve().stat().st_mtime
 if getattr(db, "_LOADED_MTIME", None) != _db_mtime:
+    # Reloading rebinds a brand new engine, so release the old pool first
+    # instead of abandoning its checked-in connections on the server.
+    _old_engine = getattr(db, "ENGINE", None)
+    if _old_engine is not None:
+        try:
+            _old_engine.dispose()
+        except Exception:
+            pass
     db = importlib.reload(db)
     db._LOADED_MTIME = _db_mtime
     st.cache_resource.clear()
 
-# Reload only when switching Neon <-> SQLite. Reloading on every rerun
+# A previous script run in this process may have left the engine unbound.
+if not getattr(db, "IS_POSTGRES", False):
+    _rebind_url = _secret_url or db._database_url()
+    if _rebind_url:
+        db._rebind_postgres_engine(_rebind_url)
+        st.cache_resource.clear()
+        _secret_url = _secret_url or _rebind_url
+
+# Reload only when switching Postgres <-> SQLite. Reloading on every rerun
 # drops the engine and forces a new handshake each click.
-_want_sqlite = bool(st.session_state.get("use_sqlite"))
+_want_sqlite = bool(st.session_state.get("use_sqlite")) and not _secret_url
 if _want_sqlite:
     if getattr(db, "IS_POSTGRES", False):
         os.environ["NUALCO_FORCE_SQLITE"] = "1"
@@ -137,12 +194,23 @@ def _on_streamlit_cloud() -> bool:
 def _init_postgres() -> bool:
     """Handshake once per process. Failures are cleared by the caller."""
     db._ensure_packing_list_ready()
-    db._ensure_company_ready()
+    # Keeps a live socket in the pool between visits, so a container that has
+    # been idle does not greet the next user with a fresh TLS handshake.
+    db.start_pool_keepalive()
     return True
 
 
 def bootstrap() -> str:
     """Open the database. Full init_db() is skipped on Postgres (it can hang)."""
+    if not db.IS_POSTGRES:
+        if not _secret_url:
+            st.session_state["_neon_init_error"] = db.NO_DATABASE_URL_MESSAGE
+            return "unconfigured"
+        try:
+            db._rebind_postgres_engine(_secret_url)
+        except Exception as exc:
+            st.session_state["_neon_init_error"] = str(exc)
+            return "postgres-error"
     if db.IS_POSTGRES:
         try:
             db.adopt_supabase_pooler()
@@ -168,26 +236,45 @@ def bootstrap() -> str:
                         _init_postgres.clear()
                     except Exception:
                         pass
-            if _on_streamlit_cloud():
-                return "postgres-error"
-            db.switch_to_sqlite()
-            db.init_db()
-            return "sqlite"
-    db.init_db()
-    return "sqlite"
+            return "postgres-error"
+    return "postgres-error"
 
 
 _db_mode = bootstrap()
-if _db_mode == "sqlite":
-    st.session_state["use_sqlite"] = True
-    st.session_state["_offline_sqlite"] = True
-    os.environ["NUALCO_FORCE_SQLITE"] = "1"
+if _db_mode == "unconfigured":
+    st.error(db.NO_DATABASE_URL_MESSAGE)
+    st.stop()
+
+
+def _sidebar_db_line() -> str:
+    """Show the live engine label, rebinding if the engine came loose."""
+    if not db.IS_POSTGRES and _secret_url:
+        try:
+            db._rebind_postgres_engine(_secret_url)
+        except Exception:
+            pass
+    return f"**DB:** `{db.DB_LABEL}`  \n`build {APP_BUILD}`"
 
 
 def df_from_rows(rows) -> pd.DataFrame:
     if not rows:
         return pd.DataFrame()
     return pd.DataFrame([dict(r) for r in rows])
+
+
+# Streamlit reruns the whole script on every interaction, so anything expensive
+# called at render time runs again on each click. These are bounded so the
+# caches cannot grow without limit, and the existing st.cache_data.clear()
+# calls after saves drop them.
+@st.cache_data(ttl=600, max_entries=1, show_spinner=False)
+def _refresh_finished_goods() -> int:
+    """Reconcile finished goods from batch output. Walks every completed batch."""
+    return db.backfill_finished_goods_from_output()
+
+
+@st.cache_data(ttl=120, max_entries=32, show_spinner=False)
+def _spec_comparison(packing_list_id: int) -> list[dict]:
+    return db.list_packing_list_chemistry_vs_spec(packing_list_id)
 
 
 def _show_db_connection_error(exc: BaseException) -> None:
@@ -1633,7 +1720,7 @@ if not auth_employee:
         _render_login()
     except Exception as exc:
         st.error(f"Could not load the login page: {exc}")
-    st.sidebar.markdown(f"**DB:** `{db.DB_LABEL}`")
+    st.sidebar.markdown(_sidebar_db_line())
     st.stop()
 
 _apply_logged_in_actor(auth_employee)
@@ -1686,7 +1773,7 @@ if PAGE not in allowed_pages:
 
 st.sidebar.markdown(
     f"**Yield target:** {db.YIELD_TARGET_PCT:.0f}%  \n"
-    f"**DB:** `{db.DB_LABEL}`"
+    + _sidebar_db_line()
 )
 if _db_mode == "postgres-error":
     st.sidebar.error(
@@ -2207,7 +2294,19 @@ def _certificate_pdf_bytes(payload: dict) -> bytes:
     pdf.cell(s_w, 6, "STATUS", border=1, align="C", fill=True)
     pdf.cell(v_w, 6, "VERIFY", border=1, align="C", fill=True, new_x="LMARGIN", new_y="NEXT")
     insp_h = 5.3
-    for row in inspection:
+    printed_inspection = list(inspection)
+    if not printed_inspection:
+        y1 = pdf.get_y()
+        pdf.set_font("Helvetica", "", 7)
+        pdf.rect(left, y1, page_w, insp_h)
+        pdf.set_xy(left, y1)
+        pdf.cell(
+            page_w,
+            insp_h,
+            "No visual inspection questions selected for print.",
+        )
+        pdf.set_y(y1 + insp_h)
+    for row in printed_inspection:
         y1 = pdf.get_y()
         answer = str(row.get("Answer") or "").strip()
         status = "Ok" if answer.upper() == "OK" else (answer or "-")
@@ -2339,6 +2438,11 @@ def _render_certificate_print(
             f"<td class='tc-insp-status'>{esc(status)}</td>"
             f"<td class='tc-insp-verify'>{verify}</td>"
             "</tr>"
+        )
+    if not insp_body:
+        insp_body = (
+            "<tr><td colspan='3' class='tc-empty'>"
+            "No visual inspection questions selected for print.</td></tr>"
         )
     st.markdown(
         f"""
@@ -2508,7 +2612,7 @@ def _render_tc_spec_and_deviation(packing_list_id: int, *, locked: bool) -> tupl
         "An element is out of specification when its percentage is at or below min, "
         "or at or above max."
     )
-    comparison = db.list_packing_list_chemistry_vs_spec(packing_list_id)
+    comparison = _spec_comparison(packing_list_id)
     deviations = [row for row in comparison if row.get("Out_of_spec")]
     has_letter = db.has_packing_list_deviation_letter(packing_list_id)
     if not comparison:
@@ -2665,13 +2769,17 @@ if PAGE == "Dashboard":
     )
     today = date.today()
     try:
-        supply_rows = db.list_po_supply_status()
-        batches = db.list_batches()
-        materials = db.list_raw_materials()
-        lots = db.list_inventory_lots()
-        alloys = db.list_alloys()
-        oil_stock = db.get_furnace_oil_stock()
-        elec_month = db.electricity_month_totals(today.year, today.month)
+        # One transaction for the whole dashboard. Opening one per query costs
+        # a BEGIN, an RLS stamp and a COMMIT each, which is three extra round
+        # trips per read when the database is in another region.
+        with db.shared_connection():
+            supply_rows = db.list_po_supply_status()
+            batches = db.list_batches()
+            materials = db.list_raw_materials()
+            lots = db.list_inventory_lots()
+            alloys = db.list_alloys()
+            oil_stock = db.get_furnace_oil_stock()
+            elec_month = db.electricity_month_totals(today.year, today.month)
     except Exception as exc:
         _show_db_connection_error(exc)
         supply_rows, batches, materials, lots, alloys = [], [], [], [], []
@@ -2931,14 +3039,25 @@ elif PAGE == "Raw Material Logging":
             key="rm_log_invoice_doc",
         )
 
+    vp_col, slip_col = st.columns(2)
     vp_open_key = "rm_log_vphoto_open"
-    if st.button(
-        "📷 Vehicle photo",
-        key="rm_log_vphoto_btn",
-        help="Photo of the delivery vehicle. Saved once on this invoice.",
-    ):
-        st.session_state[vp_open_key] = not bool(st.session_state.get(vp_open_key))
-        st.rerun()
+    slip_open_key = "rm_log_sphoto_open"
+    with vp_col:
+        if st.button(
+            "📷 Vehicle photo",
+            key="rm_log_vphoto_btn",
+            help="Photo of the delivery vehicle. Saved once on this invoice.",
+        ):
+            st.session_state[vp_open_key] = not bool(st.session_state.get(vp_open_key))
+            st.rerun()
+    with slip_col:
+        if st.button(
+            "📷 Weighment slip photo",
+            key="rm_log_sphoto_btn",
+            help="Photo of the weighment slip. Saved once on this invoice.",
+        ):
+            st.session_state[slip_open_key] = not bool(st.session_state.get(slip_open_key))
+            st.rerun()
     vehicle_photo_bytes: bytes | None = None
     if st.session_state.get(vp_open_key):
         st.caption("Capture the vehicle with camera or pick a photo from the gallery.")
@@ -2961,6 +3080,28 @@ elif PAGE == "Raw Material Logging":
         vehicle_photo_bytes = st.session_state.get("rm_log_vphoto_bytes")
         if vehicle_photo_bytes:
             st.caption("Vehicle photo attached.")
+    weighment_slip_photo_bytes: bytes | None = None
+    if st.session_state.get(slip_open_key):
+        st.caption("Capture the weighment slip with camera or pick a photo from the gallery.")
+        sp_cam = st.camera_input(
+            "Weighment slip camera",
+            key="rm_log_sphoto_cam",
+            help="Uses the phone camera when available.",
+        )
+        sp_file = st.file_uploader(
+            "Weighment slip gallery / files",
+            type=["png", "jpg", "jpeg", "webp"],
+            key="rm_log_sphoto_file",
+            help="Choose an existing weighment-slip photo from the device gallery.",
+        )
+        weighment_slip_photo_bytes = photo_bytes(sp_cam) or photo_bytes(sp_file)
+        if weighment_slip_photo_bytes:
+            st.session_state["rm_log_sphoto_bytes"] = weighment_slip_photo_bytes
+            st.success("Weighment slip photo ready to save with this invoice.")
+    else:
+        weighment_slip_photo_bytes = st.session_state.get("rm_log_sphoto_bytes")
+        if weighment_slip_photo_bytes:
+            st.caption("Weighment slip photo attached.")
 
     st.markdown("#### Raw materials on this invoice")
     st.caption(
@@ -3094,6 +3235,7 @@ elif PAGE == "Raw Material Logging":
                     invoice_document_name=doc_name,
                     invoice_document_type=doc_type,
                     vehicle_photo=vehicle_photo_bytes,
+                    weighment_slip_photo=weighment_slip_photo_bytes,
                 )
                 names = ", ".join(ln["name"] for ln in complete)
                 st.success(
@@ -3107,6 +3249,8 @@ elif PAGE == "Raw Material Logging":
                 st.session_state.rm_log_token = int(line_token) + 1
                 st.session_state.pop("rm_log_vphoto_bytes", None)
                 st.session_state.pop("rm_log_vphoto_open", None)
+                st.session_state.pop("rm_log_sphoto_bytes", None)
+                st.session_state.pop("rm_log_sphoto_open", None)
                 st.cache_data.clear()
                 st.rerun()
             except Exception as exc:
@@ -3144,7 +3288,9 @@ elif PAGE == "Raw Material Inventory":
                    i.Raw_Material_Status AS "Raw_Material_Status",
                    p.Invoice_Document_name AS "Invoice_Document_name",
                    CASE WHEN p.Vehicle_photo IS NULL THEN NULL ELSE 'Yes' END
-                       AS "Vehicle_photo"
+                       AS "Vehicle_photo",
+                   CASE WHEN p.Weighment_slip_photo IS NULL THEN NULL ELSE 'Yes' END
+                       AS "Weighment_slip_photo"
             FROM Raw_Material_Inventory i
             LEFT JOIN Raw_Material_Purchase p ON p.Purchase_id = i.Purchase_id
             LEFT JOIN Vendor_Master v ON v.Vendor_code = p.Vendor_code
@@ -3175,6 +3321,10 @@ elif PAGE == "Raw Material Inventory":
         if vehicle_photo:
             st.markdown("**Vehicle photo**")
             st.image(vehicle_photo)
+        slip_photo = db.get_inventory_weighment_slip_photo(int(lot_pick))
+        if slip_photo:
+            st.markdown("**Weighment slip photo**")
+            st.image(slip_photo)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -3349,16 +3499,18 @@ elif PAGE == "Production Batch & Chemistry":
         "Browse existing batches under **Production Batches**."
     )
 
-    furnaces = db.list_furnaces()
-    melters = db.list_melters()
-    supervisors = db.list_production_supervisors()
-    alloys = db.list_alloys(include_sidestream=False)
+    # These five master reads open five transactions if left on their own.
+    with db.shared_connection():
+        furnaces = db.list_furnaces()
+        melters = db.list_melters()
+        supervisors = db.list_production_supervisors()
+        alloys = db.list_alloys(include_sidestream=False)
+        materials = db.list_raw_materials()
     alloy_labels = {
         f"{a['Alloy_id']} — {a['Alloy_name']}"
         + (f" ({a['Customer_name']})" if a["Customer_name"] else ""): a["Alloy_id"]
         for a in alloys
     }
-    materials = db.list_raw_materials()
 
     if not furnaces:
         st.error("Define at least one furnace under **Furnaces**.")
@@ -5049,7 +5201,7 @@ elif PAGE == "Finished Goods Inventory":
         "if outside that range so you can check the piece count."
     )
     try:
-        db.backfill_finished_goods_from_output()
+        _refresh_finished_goods()
     except Exception as exc:
         st.warning(f"Could not refresh finished goods from batch output: {exc}")
 
@@ -5107,7 +5259,7 @@ elif PAGE == "Packing List":
         "and show in red if outside that range."
     )
     try:
-        db.backfill_finished_goods_from_output()
+        _refresh_finished_goods()
     except Exception as exc:
         st.warning(f"Could not refresh finished goods from batch output: {exc}")
 
@@ -5741,7 +5893,9 @@ elif PAGE == "Test Certificate":
     st.title("Test Certificate")
     st.caption(
         "Print dispatch weights from a **Verified** packing list. Complete **Visual "
-        "inspection** first (OK / NOT OK and Verified on every item). Merge heats onto "
+        "inspection** first (OK / NOT OK and Verified on every item). Tick **Print** "
+        "next to each serial number to include that question on the certificate. "
+        "Merge heats onto "
         "one printed line and round **up** total kg by at most "
         f"**{db.CERT_WEIGHT_ROUND_MAX_PCT:g}%**. Pieces must stay exact. "
         "**Issue** is the final dispatch step. After that, packed inventory cannot be "
@@ -5788,12 +5942,15 @@ elif PAGE == "Test Certificate":
         st.session_state.pop("tc_show_print", None)
         st.session_state.pop("tc_show_void", None)
 
-    header = db.get_packing_list(packing_list_id)
+    # Read the header and the certificate together. Nothing between these two
+    # may call st.stop() or st.rerun(), because either would raise out of the
+    # transaction block.
+    with db.shared_connection():
+        header = db.get_packing_list(packing_list_id)
+        cert = db.get_packing_list_certificate(packing_list_id) if header else None
     if not header:
         st.error("That packing list was not found.")
         st.stop()
-
-    cert = db.get_packing_list_certificate(packing_list_id)
     if st.session_state.get("tc_show_print") and cert:
         if (
             st.session_state.get("tc_loaded_id") != packing_list_id
@@ -5862,22 +6019,36 @@ elif PAGE == "Test Certificate":
                 "Question_text": text,
                 "Answer": "",
                 "Verified": 0,
+                "Include_in_print": 1,
             }
             for index, text in enumerate(db.VISUAL_INSPECTION_QUESTIONS, start=1)
         ]
 
     st.markdown("#### Visual inspection")
     st.caption(
-        "Complete every check as **OK** or **NOT OK**, then tick **Verified**. "
-        "All items must be OK and Verified before the test certificate can be generated."
+        "Tick **Print** before a serial number to include that question on the "
+        "test certificate. Only ticked questions are printed. Complete every "
+        "check as **OK** or **NOT OK**, then tick **Verified**. All items must "
+        "be OK and Verified before the test certificate can be generated."
     )
     answer_choices = ["", *db.SAMPLE_OK_STATUS]
     inspection_rows: list[dict] = []
+    h_print, h_q, h_ans, h_ok = st.columns([1.4, 4.4, 2.1, 1.6])
+    h_print.markdown("**Print**")
+    h_q.markdown("**Question**")
+    h_ans.markdown("**Answer**")
+    h_ok.markdown("**Verified**")
     for row in inspection:
         qno = int(row.get("Question_no") or 0)
         text = str(row.get("Question_text") or "")
         saved_answer = str(row.get("Answer") or "").strip()
-        q_col, a_col, v_col = st.columns([5.0, 2.4, 1.8])
+        c_print, q_col, a_col, v_col = st.columns([1.4, 4.4, 2.1, 1.6])
+        include_in_print = c_print.checkbox(
+            "Print",
+            value=bool(row.get("Include_in_print", 1)),
+            key=f"tc_insp_print_{packing_list_id}_{qno}",
+            disabled=insp_locked,
+        )
         q_col.markdown(f"**{qno}.** {text}")
         answer = a_col.selectbox(
             f"Answer {qno}",
@@ -5904,6 +6075,7 @@ elif PAGE == "Test Certificate":
                 "Question_text": text,
                 "Answer": str(answer or "").strip(),
                 "Verified": 1 if verified else 0,
+                "Include_in_print": 1 if include_in_print else 0,
             }
         )
     insp_errors = db.visual_inspection_errors(inspection_rows)
@@ -6225,6 +6397,12 @@ elif PAGE == "Test Certificate":
     a1, a2, a3 = st.columns(3)
     with a1:
         if st.button("View / print", key="tc_view_print"):
+            if not insp_locked:
+                try:
+                    db.save_visual_inspection(packing_list_id, inspection_rows)
+                except Exception as exc:
+                    st.error(str(exc))
+                    st.stop()
             st.session_state["tc_show_print"] = True
             st.rerun()
     with a2:
@@ -8056,7 +8234,7 @@ elif PAGE == "Masters Overview":
             | 3 | Element_Master | 36 chemistry elements (seeded) |
             | 4 | Raw_Material_Master | Material grades |
             | 5 | Raw_Material_Spec | Grade chemistry (child of Raw_Material_Master) |
-            | 6 | Raw_Material_Purchase | Vendor invoices / receipts (document + vehicle photo) |
+            | 6 | Raw_Material_Purchase | Vendor invoices / receipts (document, vehicle photo, weighment slip photo) |
             | 7 | Raw_Material_Inventory | Lots / remaining stock (child of purchase) |
             | 8 | Alloy_Master | Alloys |
             | 9 | Alloy_Master_spec | Alloy min/max % |
@@ -8082,7 +8260,7 @@ elif PAGE == "Masters Overview":
             | 29 | Packing_list_certificate | Test-certificate header (Draft / Issued / Void); 1:1 with a Verified packing list |
             | 30 | Packing_list_certificate_line | Printed TC lines (may merge heats; weight may round up ≤ 0.15%) |
             | 31 | Packing_list_certificate_source | Maps each printed TC line back to packing_list_batch |
-            | 32 | Packing_list_visual_inspection | OK / NOT OK + Verified checks required before generating a test certificate |
+            | 32 | Packing_list_visual_inspection | OK / NOT OK + Verified checks required before generating a test certificate; Print checkbox selects which questions appear on the certificate |
             | 33 | Company_profile | Our company (issuer) — legal, contact, GST/CIN/MSME, and bank details |
 
             Extra production columns: sample fields, `Production_supervisor`.

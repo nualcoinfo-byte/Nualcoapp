@@ -1,11 +1,12 @@
 """
 Database layer for Nualco Aluminum Alloy Manufacturing Tracker.
 
-Runs on Postgres when DATABASE_URL is available (from the environment or
-.env.local), otherwise falls back to the local SQLite file. Native Postgres
-on port 5432 is preferred; if that path is blocked and the host is Neon,
-queries go over Neon's HTTPS SQL endpoint instead. All SQL is written in the portable subset both
-dialects support:
+Runs on Postgres, using DATABASE_URL from the environment, Streamlit secrets,
+`.streamlit/secrets.toml`, or `.env.local`. Without one the engine stays unbound
+and every query raises, rather than silently opening a local SQLite file that
+looks like the shared database. If the host is Neon and port 5432 is blocked,
+queries go over Neon's HTTPS SQL endpoint instead. All SQL is written in the
+portable subset both dialects support:
 
 - placeholders use `?` and are translated to `%s` for Postgres
 - upserts use `ON CONFLICT` (supported by both Postgres and SQLite 3.24+)
@@ -24,7 +25,9 @@ import secrets
 import socket
 import struct
 import sys
+import threading
 import time
+from collections import OrderedDict
 from contextlib import contextmanager
 from datetime import date, datetime
 from pathlib import Path
@@ -36,6 +39,23 @@ from sqlalchemy.exc import OperationalError
 
 DB_PATH = Path(__file__).resolve().parent / "nualco.db"
 ENV_FILE = Path(__file__).resolve().parent / ".env.local"
+SECRETS_FILE = Path(__file__).resolve().parent / ".streamlit" / "secrets.toml"
+
+NO_DATABASE_URL_MESSAGE = (
+    "No DATABASE_URL is configured. Set it as an environment variable, or copy "
+    "`.streamlit/secrets.toml.example` to `.streamlit/secrets.toml` and put the "
+    "Supabase connection string there. Never commit that file."
+)
+
+
+def _read_local_text(path: Path) -> str:
+    data = path.read_bytes()
+    for encoding in ("utf-8-sig", "utf-16", "utf-16-le", "cp1252", "utf-8"):
+        try:
+            return data.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    return data.decode("utf-8", errors="replace")
 
 
 def _force_sqlite() -> bool:
@@ -251,9 +271,6 @@ def _is_neon_pooler_url(url: str) -> bool:
 
 
 def _database_url() -> str | None:
-    if _force_sqlite():
-        return None
-
     def _clean(value: str | None) -> str | None:
         if not value:
             return None
@@ -282,6 +299,24 @@ def _database_url() -> str | None:
             _take_unpooled(secrets[key])
         else:
             _take_primary(secrets[key])
+
+    def _take_key_file(path: Path) -> None:
+        if not path.is_file():
+            return
+        try:
+            lines = _read_local_text(path).splitlines()
+        except OSError:
+            return
+        for line in lines:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, raw = line.partition("=")
+            name = key.strip()
+            if name in {"DATABASE_URL_UNPOOLED", "database_url_unpooled"}:
+                _take_unpooled(raw)
+            elif name in {"DATABASE_URL", "database_url"}:
+                _take_primary(raw)
 
     _take_unpooled(os.environ.get("DATABASE_URL_UNPOOLED"))
     _take_primary(os.environ.get("DATABASE_URL"))
@@ -320,17 +355,12 @@ def _database_url() -> str | None:
         except Exception:
             pass
 
-    if ENV_FILE.exists():
-        for line in ENV_FILE.read_text().splitlines():
-            line = line.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            key, _, raw = line.partition("=")
-            name = key.strip()
-            if name == "DATABASE_URL_UNPOOLED":
-                _take_unpooled(raw)
-            elif name == "DATABASE_URL":
-                _take_primary(raw)
+    _take_key_file(SECRETS_FILE)
+    _take_key_file(ENV_FILE)
+
+    # A leftover FORCE_SQLITE flag must not hide a real Supabase URL.
+    if _force_sqlite() and not primary and not unpooled:
+        return None
 
     # DATABASE_URL is the app's chosen database. The Neon unpooled URL is
     # only a substitute when DATABASE_URL is the Neon pooler, which drops
@@ -392,28 +422,36 @@ _PG_CONNECT_ARGS = {
     "sslmode": "require",
     "gssencmode": "disable",
 }
+def _pool_kwargs(*, scales_to_zero: bool) -> dict[str, Any]:
+    """Pool settings tuned for a database in another region.
+
+    `pool_pre_ping` is deliberately off. It sends a probe on every checkout,
+    which is a full round trip -- ~200 ms when the database is a region away.
+    `get_connection()` already issues the RLS stamp before handing the
+    connection to the caller, inside its retry loop, so a dead socket is
+    detected and retried there anyway. The ping only duplicated that.
+
+    A compute that suspends when idle has to be recycled before it does;
+    otherwise recycle rarely, because reconnecting means a fresh TLS handshake
+    (several hundred ms, and much worse on a cold pooler).
+    """
+    return {
+        "pool_pre_ping": False,
+        "pool_recycle": 280 if scales_to_zero else 1800,
+        "pool_size": 5,
+        "max_overflow": 5,
+        "connect_args": _PG_CONNECT_ARGS,
+    }
+
+
 if _URL and not _is_neon_host(_URL):
-    ENGINE = create_engine(
-        _URL,
-        pool_pre_ping=True,
-        pool_recycle=280,
-        pool_size=5,
-        max_overflow=5,
-        connect_args=_PG_CONNECT_ARGS,
-    )
+    ENGINE = create_engine(_URL, **_pool_kwargs(scales_to_zero=False))
     DB_LABEL = _postgres_label(_URL)
 elif _URL and _postgres_ssl_ready(_URL):
-    # Neon compute can scale to zero. Recycle before the typical 5-minute
-    # suspend, ping before checkout, and disable GSS (Windows libpq can hang
-    # for minutes on gssencmode=prefer).
-    ENGINE = create_engine(
-        _URL,
-        pool_pre_ping=True,
-        pool_recycle=280,
-        pool_size=5,
-        max_overflow=5,
-        connect_args=_PG_CONNECT_ARGS,
-    )
+    # Neon compute can scale to zero, so recycle before the typical 5-minute
+    # suspend. GSS is disabled because Windows libpq can hang for minutes on
+    # gssencmode=prefer.
+    ENGINE = create_engine(_URL, **_pool_kwargs(scales_to_zero=True))
     DB_LABEL = _postgres_label(_URL)
 elif _URL and _is_neon_host(_URL):
     # Port 5432 often times out on this Windows network (TCP open, SSL never
@@ -424,18 +462,15 @@ elif _URL and _is_neon_host(_URL):
     ENGINE = HttpEngine(_URL)
     DB_LABEL = _postgres_label(_URL)
 else:
-    # check_same_thread=False because Streamlit reruns scripts on worker
-    # threads, so connections cross thread boundaries.
-    ENGINE = create_engine(
-        f"sqlite:///{DB_PATH}",
-        connect_args={"check_same_thread": False},
-    )
-    DB_LABEL = DB_PATH.name
+    # No credential available. Stay unbound rather than silently opening a
+    # local SQLite file that looks like the shared database.
+    ENGINE = None
+    DB_LABEL = "not configured"
 
-IS_POSTGRES = ENGINE.dialect.name == "postgresql"
+IS_POSTGRES = bool(ENGINE is not None and ENGINE.dialect.name == "postgresql")
 
 _T = TypeVar("_T")
-_CONNECT_RETRIES = 1
+_CONNECT_RETRIES = 3
 _CONNECT_BACKOFF_S = 1.5
 
 
@@ -450,11 +485,7 @@ def _rebind_postgres_engine(url: str) -> None:
     _USE_NEON_HTTP = False
     ENGINE = create_engine(
         prepared,
-        pool_pre_ping=True,
-        pool_recycle=280,
-        pool_size=5,
-        max_overflow=5,
-        connect_args=_PG_CONNECT_ARGS,
+        **_pool_kwargs(scales_to_zero=_is_neon_host(prepared)),
     )
     DB_LABEL = _postgres_label(prepared)
     IS_POSTGRES = True
@@ -477,21 +508,42 @@ def adopt_supabase_pooler() -> bool:
     return True
 
 
-def switch_to_sqlite() -> None:
-    """Drop the Neon engine and keep using a local SQLite file."""
-    global ENGINE, DB_LABEL, IS_POSTGRES, _URL, _USE_NEON_HTTP
-    try:
-        ENGINE.dispose()
-    except Exception:
-        pass
-    _URL = None
-    _USE_NEON_HTTP = False
-    ENGINE = create_engine(
-        f"sqlite:///{DB_PATH}",
-        connect_args={"check_same_thread": False},
-    )
-    DB_LABEL = DB_PATH.name
-    IS_POSTGRES = False
+_KEEPALIVE_STARTED = False
+_KEEPALIVE_EVERY_S = 240.0
+
+
+def start_pool_keepalive() -> None:
+    """Hold one pooled connection open so an idle app stays warm.
+
+    Opening a fresh connection to a database in another region costs a TCP
+    handshake plus a TLS handshake -- measured at several seconds against a
+    cold pooler. A container that nobody has clicked on for a while would
+    otherwise pay that on the next page view. Touching one connection every
+    few minutes keeps a live socket in the pool, and when it is eventually
+    recycled the replacement is built on this thread instead of in front of a
+    waiting user.
+    """
+    global _KEEPALIVE_STARTED
+    if _KEEPALIVE_STARTED or ENGINE is None or not IS_POSTGRES:
+        return
+    if os.environ.get("NUALCO_DISABLE_KEEPALIVE"):
+        return
+    _KEEPALIVE_STARTED = True
+
+    def _loop() -> None:
+        while True:
+            try:
+                # Straight to the engine: this must not touch the RLS session
+                # or the shared-connection state owned by request threads.
+                with ENGINE.connect() as conn:
+                    conn.exec_driver_sql("SELECT 1")
+            except Exception:
+                pass
+            time.sleep(_KEEPALIVE_EVERY_S)
+
+    threading.Thread(
+        target=_loop, name="nualco-pool-keepalive", daemon=True
+    ).start()
 
 
 def _is_transient_db_error(exc: BaseException) -> bool:
@@ -547,9 +599,79 @@ def _exec(conn: Connection, sql: str, params: Any = None) -> CursorResult:
     return conn.exec_driver_sql(q, params)
 
 
+_ACTIVE_CONN = threading.local()
+
+
+@contextmanager
+def shared_connection() -> Generator[None, None, None]:
+    """Run a block of queries on one connection and one transaction.
+
+    Every fetch_all/fetch_one/execute normally opens its own transaction, and
+    each one re-stamps the RLS session, so a report that issues 40 reads pays
+    40 transactions and ~160 extra statements. Wrapping the block here makes
+    the nested calls reuse one connection instead.
+
+    Nothing is opened until a nested call actually needs the database, so a
+    block whose reads all come from the cache costs no round trips at all.
+    """
+    if getattr(_ACTIVE_CONN, "pending", False) or getattr(_ACTIVE_CONN, "conn", None):
+        yield
+        return
+    _ACTIVE_CONN.pending = True
+    _ACTIVE_CONN.exit = None
+    try:
+        yield
+    except BaseException:
+        _close_shared_connection(failed=True)
+        raise
+    else:
+        _close_shared_connection(failed=False)
+
+
+def _open_shared_connection() -> Connection:
+    """Attach a real transaction to the enclosing shared_connection block."""
+    cm = _connection_cm()
+    conn = cm.__enter__()
+    _ACTIVE_CONN.conn = conn
+    _ACTIVE_CONN.exit = cm.__exit__
+    return conn
+
+
+def _close_shared_connection(*, failed: bool) -> None:
+    exit_fn = getattr(_ACTIVE_CONN, "exit", None)
+    _ACTIVE_CONN.pending = False
+    _ACTIVE_CONN.conn = None
+    _ACTIVE_CONN.exit = None
+    if exit_fn is None:
+        return
+    if failed:
+        exit_fn(*sys.exc_info())
+    else:
+        exit_fn(None, None, None)
+
+
 @contextmanager
 def get_connection() -> Generator[Connection, None, None]:
     """Open a connection wrapped in a transaction (commit/rollback on exit)."""
+    joined = getattr(_ACTIVE_CONN, "conn", None)
+    if joined is not None:
+        # Inside shared_connection(): join that transaction rather than open a
+        # second one. Commit/rollback stays with the outermost block.
+        yield joined
+        return
+    if getattr(_ACTIVE_CONN, "pending", False):
+        # First query inside a shared_connection block: open it now.
+        yield _open_shared_connection()
+        return
+    with _connection_cm() as conn:
+        yield conn
+
+
+@contextmanager
+def _connection_cm() -> Generator[Connection, None, None]:
+    """Begin a transaction and stamp the acting role onto it."""
+    if ENGINE is None:
+        raise RuntimeError(NO_DATABASE_URL_MESSAGE)
     delay = _CONNECT_BACKOFF_S
     for attempt in range(_CONNECT_RETRIES):
         cm = None
@@ -557,17 +679,21 @@ def get_connection() -> Generator[Connection, None, None]:
             cm = ENGINE.begin()
             conn = cm.__enter__()
             _apply_rls_session(conn)
-        except OperationalError as exc:
+        except BaseException as exc:
+            # Any failure before the caller gets the connection must still
+            # return it to the pool, or the pool bleeds a slot per failure.
             if cm is not None:
                 try:
                     cm.__exit__(type(exc), exc, exc.__traceback__)
                 except Exception:
                     pass
-            if (
-                not IS_POSTGRES
-                or not _is_transient_db_error(exc)
-                or attempt == _CONNECT_RETRIES - 1
-            ):
+            retryable = (
+                isinstance(exc, OperationalError)
+                and IS_POSTGRES
+                and _is_transient_db_error(exc)
+                and attempt < _CONNECT_RETRIES - 1
+            )
+            if not retryable:
                 raise
             try:
                 ENGINE.dispose()
@@ -968,6 +1094,7 @@ CREATE TABLE IF NOT EXISTS Raw_Material_Purchase (
     Invoice_Document_name TEXT,
     Invoice_Document_type TEXT,
     Vehicle_photo {blob},
+    Weighment_slip_photo {blob},
     Last_updated_by TEXT,
     Last_updated_datetime TEXT
 );
@@ -1185,6 +1312,8 @@ CREATE TABLE IF NOT EXISTS Packing_list_visual_inspection (
         CHECK (Answer IS NULL OR Answer IN ('OK', 'NOT OK')),
     Verified INTEGER NOT NULL DEFAULT 0
         CHECK (Verified IN (0, 1)),
+    Include_in_print INTEGER NOT NULL DEFAULT 1
+        CHECK (Include_in_print IN (0, 1)),
     Last_updated_by TEXT,
     Last_updated_datetime TEXT,
     PRIMARY KEY (Packing_list_id, Question_no)
@@ -1962,6 +2091,16 @@ def _ensure_raw_material_purchase_header(conn: Connection) -> None:
                 REFERENCES raw_material_purchase (purchase_id)
                 """
             )
+    _ensure_columns(
+        conn,
+        "Raw_Material_Purchase",
+        [
+            (
+                "Weighment_slip_photo",
+                "BYTEA" if IS_POSTGRES else "BLOB",
+            ),
+        ],
+    )
 
 
 def _sidestream_rm_name_on_conn(conn: Connection, alloy_id: int) -> str:
@@ -2731,6 +2870,8 @@ def _ensure_packing_list_certificate(conn: Connection) -> None:
                 CHECK (Answer IS NULL OR Answer IN ('OK', 'NOT OK')),
             Verified INTEGER NOT NULL DEFAULT 0
                 CHECK (Verified IN (0, 1)),
+            Include_in_print INTEGER NOT NULL DEFAULT 1
+                CHECK (Include_in_print IN (0, 1)),
             Last_updated_by TEXT,
             Last_updated_datetime TEXT,
             PRIMARY KEY (Packing_list_id, Question_no)
@@ -2744,6 +2885,7 @@ def _ensure_packing_list_certificate(conn: Connection) -> None:
             ("Question_text", "TEXT"),
             ("Answer", "TEXT"),
             ("Verified", "INTEGER DEFAULT 0"),
+            ("Include_in_print", "INTEGER DEFAULT 1"),
             ("Last_updated_by", "TEXT"),
             ("Last_updated_datetime", "TEXT"),
         ],
@@ -3224,22 +3366,29 @@ def _ensure_finished_goods_release_trigger(conn: Connection) -> None:
     )
 
 
+_TABLE_COLUMNS: dict[str, set[str]] = {}
+
+
 def _ensure_columns(conn: Connection, table: str, columns: list[tuple[str, str]]) -> None:
     if IS_POSTGRES:
         physical = table.lower()
-        rows = _exec(
-            conn,
-            """
-            SELECT column_name AS name
-            FROM information_schema.columns
-            WHERE table_schema = 'public' AND table_name = ?
-            """,
-            (physical,),
-        ).mappings()
-        existing = {row["name"] for row in rows}
+        existing = _TABLE_COLUMNS.get(physical)
+        if existing is None:
+            rows = _exec(
+                conn,
+                """
+                SELECT column_name AS name
+                FROM information_schema.columns
+                WHERE table_schema = 'public' AND table_name = ?
+                """,
+                (physical,),
+            ).mappings()
+            existing = {row["name"] for row in rows}
+            _TABLE_COLUMNS[physical] = existing
         for name, typedef in columns:
             if name.lower() not in existing:
                 _exec(conn, f"ALTER TABLE {table} ADD COLUMN {name} {typedef}")
+                existing.add(name.lower())
     else:
         existing = {
             row["name"] for row in _exec(conn, f"PRAGMA table_info({table})").mappings()
@@ -3306,6 +3455,131 @@ def _rename_column(
 
 # ---------- Generic helpers ----------
 
+_DATA_VERSION = 0
+_DATA_VERSION_LOCK = threading.Lock()
+_READ_CACHE: "OrderedDict[tuple[Any, ...], tuple[int, float, Any]]" = OrderedDict()
+_READ_CACHE_MAX = 256
+# Keeping a very large result would trade a 200 ms round trip for tens of MB
+# in a small container, so oversized answers are fetched fresh each time.
+_READ_CACHE_MAX_ROWS = 4000
+_READ_CACHE_LOCK = threading.Lock()
+_WRITE_PREFIXES = (
+    "INSERT",
+    "UPDATE",
+    "DELETE",
+    "CREATE",
+    "ALTER",
+    "DROP",
+    "TRUNCATE",
+    "GRANT",
+    "REVOKE",
+    "COMMENT",
+    "DO",
+)
+
+
+def data_version() -> int:
+    """Counter bumped by every statement that can change stored data."""
+    return _DATA_VERSION
+
+
+def bump_data_version() -> None:
+    """Drop every memoized read. Called automatically after any write."""
+    global _DATA_VERSION
+    with _DATA_VERSION_LOCK:
+        _DATA_VERSION += 1
+    with _READ_CACHE_LOCK:
+        _READ_CACHE.clear()
+
+
+def _statement_writes(statement: str) -> bool:
+    head = statement.lstrip().lstrip("(").upper()
+    return head.startswith(_WRITE_PREFIXES)
+
+
+def _install_write_watch() -> None:
+    """Invalidate memoized reads from whatever code path issued the write.
+
+    Hooking the engine rather than the helper functions means direct
+    `_exec(conn, "UPDATE ...")` calls are covered too, so a cached read can
+    never outlive the data it was built from.
+    """
+    if ENGINE is None or not IS_POSTGRES:
+        return
+    try:
+        from sqlalchemy import event
+    except Exception:
+        return
+
+    @event.listens_for(ENGINE, "after_cursor_execute")
+    def _after(conn, cursor, statement, params, context, executemany):
+        if _statement_writes(statement):
+            bump_data_version()
+
+
+_install_write_watch()
+
+
+def cached_read(ttl_s: float = 45.0):
+    """Memoize a read-only query until something writes, or the TTL expires.
+
+    Streamlit re-executes the whole script on every click, so a page that
+    reads six tables re-ran those six queries for each interaction. With the
+    database in another region that is seconds of latency for data that has
+    not changed. Any write bumps the data version and clears this, so a save
+    is still visible immediately.
+    """
+
+    def decorate(fn: Callable[..., _T]) -> Callable[..., _T]:
+        def wrapper(*args: Any, **kwargs: Any) -> _T:
+            key = (fn.__qualname__, args, tuple(sorted(kwargs.items())))
+            now = time.monotonic()
+            try:
+                hash(key)
+            except TypeError:
+                return fn(*args, **kwargs)
+            with _READ_CACHE_LOCK:
+                hit = _READ_CACHE.get(key)
+                if (
+                    hit is not None
+                    and hit[0] == _DATA_VERSION
+                    and (now - hit[1]) <= ttl_s
+                ):
+                    _READ_CACHE.move_to_end(key)
+                    return _copy_result(hit[2])
+            value = fn(*args, **kwargs)
+            if isinstance(value, list) and len(value) > _READ_CACHE_MAX_ROWS:
+                return value
+            with _READ_CACHE_LOCK:
+                _READ_CACHE[key] = (_DATA_VERSION, now, _copy_result(value))
+                while len(_READ_CACHE) > _READ_CACHE_MAX:
+                    _READ_CACHE.popitem(last=False)
+            return value
+
+        wrapper.__name__ = fn.__name__
+        wrapper.__qualname__ = fn.__qualname__
+        wrapper.__doc__ = fn.__doc__
+        wrapper.cache_clear = lambda: bump_data_version()  # type: ignore[attr-defined]
+        return wrapper
+
+    return decorate
+
+
+def _copy_result(value: Any) -> Any:
+    """Hand out a private copy so callers can mutate what they receive.
+
+    Callers routinely edit the rows they get back, and some results nest lists
+    of rows inside a header dict, so the copy has to reach those too.
+    """
+    if isinstance(value, list):
+        return [_copy_result(v) for v in value]
+    if isinstance(value, dict):
+        return {k: _copy_result(v) for k, v in value.items()}
+    if isinstance(value, tuple):
+        return tuple(_copy_result(v) for v in value)
+    return value
+
+
 def fetch_all(sql: str, params: Iterable[Any] = ()) -> list[dict[str, Any]]:
     def _run() -> list[dict[str, Any]]:
         with get_connection() as conn:
@@ -3333,6 +3607,14 @@ def execute_many(sql: str, seq: list[tuple[Any, ...]]) -> None:
         _exec(conn, sql, seq)
 
 
+def _is_binary_column(column: Any) -> bool:
+    try:
+        name = type(column.type).__name__.upper()
+    except Exception:
+        return False
+    return "BYTEA" in name or "BLOB" in name or "BINARY" in name
+
+
 def get_all_records(table_name: str, order_by: str | None = None) -> list[dict[str, Any]]:
     """Return all records from the given table as a list of dicts.
 
@@ -3351,7 +3633,11 @@ def get_all_records(table_name: str, order_by: str | None = None) -> list[dict[s
             with ENGINE.connect() as conn:
                 return [dict(r) for r in _exec(conn, sql).mappings()]
         table = Table(table_name, MetaData(), autoload_with=ENGINE)
-        stmt = select(table)
+        # Project columns explicitly and skip binary ones. select(table) would
+        # pull every BYTEA for every row; purchase_order alone holds ~578 KB of
+        # document per row, so a whole-table read would be tens of megabytes.
+        wanted = [c for c in table.columns if not _is_binary_column(c)]
+        stmt = select(*wanted) if wanted else select(table)
         if order_by is not None:
             stmt = stmt.order_by(table.c[order_by])
         with ENGINE.connect() as conn:
@@ -3766,6 +4052,7 @@ def save_table_edits(
 
 # ---------- Lookups ----------
 
+@cached_read(ttl_s=120)
 def list_customers(active_only: bool = True) -> list[str]:
     sql = 'SELECT Customer_name AS "Customer_name" FROM Customer_Master'
     if active_only:
@@ -3774,6 +4061,7 @@ def list_customers(active_only: bool = True) -> list[str]:
     return [r["Customer_name"] for r in fetch_all(sql)]
 
 
+@cached_read(ttl_s=120)
 def list_customer_codes(active_only: bool = True) -> list[dict[str, Any]]:
     """Customers with their codes, for code-based FK lookups."""
     sql = 'SELECT Cust_code AS "Cust_code", Customer_name AS "Customer_name" FROM Customer_Master'
@@ -3783,6 +4071,7 @@ def list_customer_codes(active_only: bool = True) -> list[dict[str, Any]]:
     return fetch_all(sql)
 
 
+@cached_read(ttl_s=300)
 def get_customer(cust_code: str) -> Optional[dict[str, Any]]:
     return fetch_one(
         """
@@ -3796,6 +4085,7 @@ def get_customer(cust_code: str) -> Optional[dict[str, Any]]:
     )
 
 
+@cached_read(ttl_s=120)
 def list_vendors(active_only: bool = True) -> list[dict[str, Any]]:
     """Vendors with their auto-generated codes, for code-based FK lookups."""
     sql = 'SELECT Vendor_code AS "Vendor_code", Vendor_name AS "Vendor_name" FROM Vendor_Master'
@@ -3805,6 +4095,7 @@ def list_vendors(active_only: bool = True) -> list[dict[str, Any]]:
     return fetch_all(sql)
 
 
+@cached_read(ttl_s=120)
 def list_suppliers(active_only: bool = True) -> list[str]:
     """Vendor names only; kept for display lookups."""
     return [v["Vendor_name"] for v in list_vendors(active_only)]
@@ -3816,6 +4107,7 @@ BATCH_CHEM_EXTRA_SYMBOLS = ("OE", "OT", "SF")
 RAW_MATERIAL_SPEC_HIDDEN_SYMBOLS = frozenset(BATCH_CHEM_EXTRA_SYMBOLS)
 
 
+@cached_read(ttl_s=300)
 def list_elements(limit: Optional[int] = None) -> list[dict[str, Any]]:
     """Return Element_Master rows ordered by Serial_no.
 
@@ -3838,6 +4130,7 @@ def list_entry_elements() -> list[dict[str, Any]]:
     return list_elements(limit=ENTRY_CHEM_ELEMENT_LIMIT)
 
 
+@cached_read(ttl_s=300)
 def list_batch_chem_elements() -> list[dict[str, Any]]:
     """First 15 Element_Master rows plus OE, OT, and SF (ladle chemistry and alloy specs)."""
     entry = list_entry_elements()
@@ -3861,6 +4154,7 @@ def omit_raw_material_spec_hidden(composition: dict[str, Any]) -> dict[str, Any]
     }
 
 
+@cached_read(ttl_s=300)
 def list_raw_material_spec_elements(*, entry_only: bool = False) -> list[dict[str, Any]]:
     """Elements for Raw_Material_Spec entry and display (never OE, OT, or SF)."""
     source = list_entry_elements() if entry_only else list_elements()
@@ -3881,6 +4175,7 @@ OTHER_SPEC_SERIAL_MIN = 16
 OTHER_SPEC_SERIAL_MAX = 36
 
 
+@cached_read(ttl_s=300)
 def list_other_spec_elements() -> list[dict[str, Any]]:
     """Element_Master rows with Serial_no from 16 through 36 (alloy spec extras)."""
     sql = """
@@ -3916,6 +4211,7 @@ def list_entry_element_symbols() -> list[str]:
     return list_element_symbols(limit=ENTRY_CHEM_ELEMENT_LIMIT)
 
 
+@cached_read(ttl_s=120)
 def list_furnaces(active_only: bool = True) -> list[str]:
     sql = 'SELECT Furnace AS "Furnace" FROM Furnace_Master'
     if active_only:
@@ -3924,6 +4220,7 @@ def list_furnaces(active_only: bool = True) -> list[str]:
     return [r["Furnace"] for r in fetch_all(sql)]
 
 
+@cached_read(ttl_s=120)
 def list_crucibles(
     furnace: Optional[str] = None,
     status: Optional[str] = None,
@@ -3978,6 +4275,7 @@ def _require_single_available(furnace: Optional[str], crucible_no: str) -> None:
         )
 
 
+@cached_read(ttl_s=120)
 def list_melters(active_only: bool = True) -> list[str]:
     sql = 'SELECT Melter_Name AS "Melter_Name" FROM Melter_Master'
     if active_only:
@@ -3986,6 +4284,7 @@ def list_melters(active_only: bool = True) -> list[str]:
     return [r["Melter_Name"] for r in fetch_all(sql)]
 
 
+@cached_read(ttl_s=120)
 def list_production_supervisors(active_only: bool = True) -> list[str]:
     sql = (
         'SELECT Production_supervisor AS "Production_supervisor" '
@@ -3997,6 +4296,7 @@ def list_production_supervisors(active_only: bool = True) -> list[str]:
     return [r["Production_supervisor"] for r in fetch_all(sql)]
 
 
+@cached_read(ttl_s=120)
 def list_trolleys(active_only: bool = True) -> list[dict[str, Any]]:
     sql = """
         SELECT Trolley_name AS "Trolley_name", Colour AS "Colour",
@@ -4009,6 +4309,7 @@ def list_trolleys(active_only: bool = True) -> list[dict[str, Any]]:
     return fetch_all(sql)
 
 
+@cached_read(ttl_s=300)
 def list_states(active_only: bool = True) -> list[str]:
     sql = 'SELECT DISTINCT State AS "State" FROM State_City_Master'
     if active_only:
@@ -4017,6 +4318,7 @@ def list_states(active_only: bool = True) -> list[str]:
     return [r["State"] for r in fetch_all(sql)]
 
 
+@cached_read(ttl_s=300)
 def list_cities(state: Optional[str] = None, active_only: bool = True) -> list[str]:
     sql = 'SELECT City AS "City" FROM State_City_Master WHERE 1=1'
     params: list[Any] = []
@@ -4029,6 +4331,7 @@ def list_cities(state: Optional[str] = None, active_only: bool = True) -> list[s
     return [r["City"] for r in fetch_all(sql, params)]
 
 
+@cached_read(ttl_s=300)
 def list_isri_codes() -> list[dict[str, Any]]:
     return fetch_all(
         """
@@ -4038,6 +4341,7 @@ def list_isri_codes() -> list[dict[str, Any]]:
     )
 
 
+@cached_read(ttl_s=120)
 def list_raw_materials(active_only: bool = True) -> list[str]:
     sql = 'SELECT DISTINCT Raw_Material_Name AS "Raw_Material_Name" FROM Raw_Material_Master'
     if active_only:
@@ -4063,6 +4367,7 @@ def find_raw_material_name(name: str) -> Optional[str]:
     return str(stored) if stored not in (None, "") else None
 
 
+@cached_read(ttl_s=120)
 def get_raw_material_master(name: str) -> Optional[dict[str, Any]]:
     """Latest Raw_Material_Master row for a name (case-insensitive)."""
     stored = find_raw_material_name(name)
@@ -4126,6 +4431,7 @@ def _raw_material_spec_parent(
     return stored, _as_effective_date(latest.get("Effective_date"))
 
 
+@cached_read(ttl_s=120)
 def get_raw_material_master_spec(
     name: str, effective_date: Optional[str] = None
 ) -> dict[str, float]:
@@ -4192,6 +4498,7 @@ def set_raw_material_master_spec(
             )
 
 
+@cached_read(ttl_s=120)
 def list_raw_material_master() -> list[dict[str, Any]]:
     """All raw-material grades, excluding the Photo blob."""
     return fetch_all(
@@ -4235,6 +4542,7 @@ def list_lots_for_material(material: str) -> list[dict[str, Any]]:
     )
 
 
+@cached_read(ttl_s=120)
 def list_alloys(*, include_sidestream: bool = True) -> list[dict[str, Any]]:
     sql = """
         SELECT a.Alloy_id AS "Alloy_id", a.Alloy_name AS "Alloy_name",
@@ -4256,6 +4564,7 @@ def list_alloys(*, include_sidestream: bool = True) -> list[dict[str, Any]]:
     return fetch_all(sql, params)
 
 
+@cached_read(ttl_s=300)
 def get_alloy(alloy_id: object) -> Optional[dict[str, Any]]:
     try:
         aid = int(alloy_id)
@@ -4275,6 +4584,7 @@ def get_alloy(alloy_id: object) -> Optional[dict[str, Any]]:
     )
 
 
+@cached_read(ttl_s=300)
 def get_alloy_specs(alloy_id: int) -> dict[str, dict[str, Any]]:
     """Min/max % from Alloy_Master_spec keyed by Element_symbol."""
     rows = fetch_all(
@@ -4292,6 +4602,7 @@ def get_alloy_specs(alloy_id: int) -> dict[str, dict[str, Any]]:
     return {str(r["Element_symbol"]): r for r in rows}
 
 
+@cached_read(ttl_s=120)
 def list_inventory_lots(
     material: Optional[str] = None, ready_only: bool = False
 ) -> list[dict[str, Any]]:
@@ -4332,6 +4643,7 @@ def _company_select_sql() -> str:
     return "SELECT " + ", ".join(parts) + " FROM Company_profile WHERE Company_id = ?"
 
 
+@cached_read(ttl_s=300)
 def get_company_profile() -> dict[str, Any]:
     _ensure_company_ready()
     row = fetch_one(_company_select_sql(), (COMPANY_PROFILE_ID,))
@@ -4557,6 +4869,7 @@ def add_raw_material_purchase(
     invoice_document_name: Optional[str] = None,
     invoice_document_type: Optional[str] = None,
     vehicle_photo: Optional[bytes] = None,
+    weighment_slip_photo: Optional[bytes] = None,
 ) -> int:
     """Create a vendor-invoice header that inventory lots can attach to."""
     if invoice_document and invoice_document_name:
@@ -4569,8 +4882,9 @@ def add_raw_material_purchase(
             INSERT INTO Raw_Material_Purchase
                 (Vendor_code, Supplier_Invoice, Supplier_invoice_date, Received_date,
                  Invoice_Document, Invoice_Document_name, Invoice_Document_type,
-                 Vehicle_photo, Last_updated_by, Last_updated_datetime)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 Vehicle_photo, Weighment_slip_photo,
+                 Last_updated_by, Last_updated_datetime)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             RETURNING Purchase_id
             """,
             (
@@ -4582,6 +4896,7 @@ def add_raw_material_purchase(
                 invoice_document_name,
                 invoice_document_type,
                 vehicle_photo,
+                weighment_slip_photo,
                 by_val,
                 dt_val,
             ),
@@ -4634,6 +4949,7 @@ def save_raw_material_invoice(
     invoice_document_name: Optional[str] = None,
     invoice_document_type: Optional[str] = None,
     vehicle_photo: Optional[bytes] = None,
+    weighment_slip_photo: Optional[bytes] = None,
 ) -> tuple[int, list[int]]:
     """Save one vendor invoice and its lots in a single transaction."""
     if not lines:
@@ -4648,8 +4964,9 @@ def save_raw_material_invoice(
             INSERT INTO Raw_Material_Purchase
                 (Vendor_code, Supplier_Invoice, Supplier_invoice_date, Received_date,
                  Invoice_Document, Invoice_Document_name, Invoice_Document_type,
-                 Vehicle_photo, Last_updated_by, Last_updated_datetime)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 Vehicle_photo, Weighment_slip_photo,
+                 Last_updated_by, Last_updated_datetime)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             RETURNING Purchase_id
             """,
             (
@@ -4661,6 +4978,7 @@ def save_raw_material_invoice(
                 invoice_document_name,
                 invoice_document_type,
                 vehicle_photo,
+                weighment_slip_photo,
                 by_val,
                 dt_val,
             ),
@@ -4745,6 +5063,13 @@ def save_inventory_invoice_document(
     )
 
 
+def _blob_bytes(data: Any) -> Optional[bytes]:
+    """Postgres BYTEA arrives as memoryview; Streamlit image() needs bytes."""
+    if not data:
+        return None
+    return data if isinstance(data, bytes) else bytes(data)
+
+
 def get_inventory_vehicle_photo(lot_id: int) -> Optional[bytes]:
     row = fetch_one(
         """
@@ -4755,8 +5080,20 @@ def get_inventory_vehicle_photo(lot_id: int) -> Optional[bytes]:
         """,
         (lot_id,),
     )
-    data = (row or {}).get("Vehicle_photo")
-    return data if data else None
+    return _blob_bytes((row or {}).get("Vehicle_photo"))
+
+
+def get_inventory_weighment_slip_photo(lot_id: int) -> Optional[bytes]:
+    row = fetch_one(
+        """
+        SELECT p.Weighment_slip_photo AS "Weighment_slip_photo"
+        FROM Raw_Material_Inventory i
+        JOIN Raw_Material_Purchase p ON p.Purchase_id = i.Purchase_id
+        WHERE i.Lot_id = ?
+        """,
+        (lot_id,),
+    )
+    return _blob_bytes((row or {}).get("Weighment_slip_photo"))
 
 
 def get_inventory_invoice_document(lot_id: int) -> Optional[dict[str, Any]]:
@@ -4780,6 +5117,7 @@ def set_lot_chemistry(material: str, lot_id: int, composition: dict[str, float])
     set_raw_material_master_spec(material, composition)
 
 
+@cached_read(ttl_s=120)
 def get_lot_chemistry(lot_id: int) -> dict[str, float]:
     """Grade specification for the material on this inventory lot."""
     row = fetch_one(
@@ -4990,6 +5328,16 @@ def is_admin_user(name: str | None = None) -> bool:
     if not user:
         return False
     emp_id = get_acting_employee_id() if name is None else ""
+    return _is_admin_lookup(user, emp_id)
+
+
+@cached_read(ttl_s=120)
+def _is_admin_lookup(user: str, emp_id: str) -> bool:
+    """The database half of is_admin_user().
+
+    This runs before every page renders, so leaving it uncached cost two or
+    three round trips on every single click.
+    """
     try:
         if emp_id:
             row = fetch_one(
@@ -5231,10 +5579,19 @@ def _heat_no_prefix_on_conn(
 
 
 def _next_heat_no_on_conn(
-    conn: Connection, furnace: str, production_date: object
+    conn: Connection, furnace: str, production_date: object, *, reserve: bool = False
 ) -> str:
     """Next YY-furnace+month-code+counter for this furnace and production month."""
     prefix = _heat_no_prefix_on_conn(conn, furnace, production_date)
+    if reserve and IS_POSTGRES:
+        # Serialize allocation per furnace for the rest of this transaction, so
+        # two concurrent creates cannot read the same maximum counter. Preview
+        # callers skip this: they must not block a real create.
+        _exec(
+            conn,
+            "SELECT pg_advisory_xact_lock(hashtext(?))",
+            (f"nualco:heat_no:{prefix}",),
+        )
     rows = _exec(
         conn,
         'SELECT Heat_no AS "Heat_no" FROM Production_batch WHERE Furnace = ?',
@@ -5397,6 +5754,7 @@ def preview_next_production_batch_id(
     return build_production_batch_id(furnace, production_date, shift, melt_no)
 
 
+@cached_read(ttl_s=120)
 def list_furnace_batches(furnace: str) -> list[dict[str, Any]]:
     """Batch_ID and Heat_no for one furnace, newest production date first."""
     return fetch_all(
@@ -5430,29 +5788,42 @@ def make_batch_id(
 
 def _insert_charge_lines(conn: Connection, batch_id: str, inputs: list[dict[str, Any]]) -> None:
     for item in inputs:
-        lot = _exec(
-            conn,
-            'SELECT Remaining_Weight AS "Remaining_Weight" '
-            "FROM Raw_Material_Inventory WHERE Lot_id = ?",
-            (item["Lot_id"],),
-        ).mappings().first()
-        if not lot:
-            raise ValueError(f"Lot {item['Lot_id']} not found.")
-        remaining = float(lot["Remaining_Weight"] or 0)
         w = float(item["Weight"])
-        if w > remaining + 1e-9:
+        # Check and decrement in one statement. Reading the balance first and
+        # comparing in Python lets two concurrent charges from the same lot
+        # both pass the check and drive Remaining_Weight negative.
+        claimed = (
+            _exec(
+                conn,
+                """
+                UPDATE Raw_Material_Inventory
+                SET Remaining_Weight = Remaining_Weight - ?
+                WHERE Lot_id = ?
+                  AND Remaining_Weight >= ?
+                RETURNING Remaining_Weight AS "Remaining_Weight"
+                """,
+                (w, item["Lot_id"], w - 1e-9),
+            )
+            .mappings()
+            .first()
+        )
+        if not claimed:
+            lot = (
+                _exec(
+                    conn,
+                    'SELECT Remaining_Weight AS "Remaining_Weight" '
+                    "FROM Raw_Material_Inventory WHERE Lot_id = ?",
+                    (item["Lot_id"],),
+                )
+                .mappings()
+                .first()
+            )
+            if not lot:
+                raise ValueError(f"Lot {item['Lot_id']} not found.")
+            remaining = float(lot["Remaining_Weight"] or 0)
             raise ValueError(
                 f"Insufficient stock on Lot {item['Lot_id']}: need {w}, have {remaining}."
             )
-        _exec(
-            conn,
-            """
-            UPDATE Raw_Material_Inventory
-            SET Remaining_Weight = Remaining_Weight - ?
-            WHERE Lot_id = ?
-            """,
-            (w, item["Lot_id"]),
-        )
         _exec(
             conn,
             """
@@ -5564,7 +5935,9 @@ def create_batch(
         batch_id = _require_unique_production_batch_identity(
             conn, furnace, production_date, shift, melt_no
         )
-        generated_heat = _next_heat_no_on_conn(conn, furnace, production_date)
+        generated_heat = _next_heat_no_on_conn(
+            conn, furnace, production_date, reserve=True
+        )
         heat_no = str(heat_no).strip() if heat_no not in (None, "") else generated_heat
         _exec(
             conn,
@@ -5787,6 +6160,7 @@ def add_finished_goods_bundle(
         return int(row[0])
 
 
+@cached_read(ttl_s=120)
 def list_finished_goods(
     batch_id: Optional[str] = None,
     status: Optional[str] = None,
@@ -6187,6 +6561,7 @@ LEFT JOIN roles r ON r.role_id = e.role_id
 """
 
 
+@cached_read(ttl_s=120)
 def list_roles() -> list[dict[str, Any]]:
     return fetch_all(
         """
@@ -6197,6 +6572,7 @@ def list_roles() -> list[dict[str, Any]]:
     )
 
 
+@cached_read(ttl_s=120)
 def list_employees(*, include_inactive: bool = True) -> list[dict[str, Any]]:
     sql = _EMPLOYEE_SELECT
     if not include_inactive:
@@ -6212,6 +6588,7 @@ def get_employee(employee_id: str) -> Optional[dict[str, Any]]:
     )
 
 
+@cached_read(ttl_s=120)
 def list_admin_employees() -> list[dict[str, Any]]:
     return [
         row
@@ -6220,6 +6597,7 @@ def list_admin_employees() -> list[dict[str, Any]]:
     ]
 
 
+@cached_read(ttl_s=120)
 def any_employee_has_password() -> bool:
     row = fetch_one(
         """
@@ -6307,6 +6685,7 @@ def bootstrap_first_admin_password(employee_id: str, password: str) -> dict[str,
     return ready
 
 
+@cached_read(ttl_s=120)
 def nav_section_keys_for_role(role_id: object, role_name: object = None) -> list[str]:
     if role_is_admin(role_name, role_id):
         return list(ALL_NAV_SECTION_KEYS)
@@ -6334,6 +6713,7 @@ def nav_section_keys_for_role(role_id: object, role_name: object = None) -> list
     return list(default_sections_for_role(role_id, role_name))
 
 
+@cached_read(ttl_s=120)
 def list_role_permissions() -> dict[int, list[str]]:
     granted: dict[int, list[str]] = {}
     for row in fetch_all(
@@ -6435,6 +6815,35 @@ def _sql_literal(value: str) -> str:
     return "'" + value.replace("'", "''") + "'"
 
 
+_ROLE_CACHE: dict[tuple[str, str, str], tuple[str, str]] = {}
+_ROLE_CACHE_TTL_S = 120.0
+_ROLE_CACHE_AT: dict[tuple[str, str, str], float] = {}
+_ROLE_CACHE_LOCK = threading.Lock()
+
+
+def clear_role_cache() -> None:
+    """Drop cached employee/role resolutions after an employee or role change."""
+    with _ROLE_CACHE_LOCK:
+        _ROLE_CACHE.clear()
+        _ROLE_CACHE_AT.clear()
+
+
+def _cached_actor(key: tuple[str, str, str]) -> tuple[str, str] | None:
+    with _ROLE_CACHE_LOCK:
+        stamped = _ROLE_CACHE_AT.get(key)
+        if stamped is None or (time.monotonic() - stamped) > _ROLE_CACHE_TTL_S:
+            _ROLE_CACHE.pop(key, None)
+            _ROLE_CACHE_AT.pop(key, None)
+            return None
+        return _ROLE_CACHE.get(key)
+
+
+def _remember_actor(key: tuple[str, str, str], value: tuple[str, str]) -> None:
+    with _ROLE_CACHE_LOCK:
+        _ROLE_CACHE[key] = value
+        _ROLE_CACHE_AT[key] = time.monotonic()
+
+
 def _apply_rls_session(conn: Connection) -> None:
     """Stamp the acting user's role onto this transaction for RLS policies."""
     if not IS_POSTGRES:
@@ -6442,9 +6851,32 @@ def _apply_rls_session(conn: Connection) -> None:
     role_name = get_acting_role_name() or "system"
     employee_id = get_acting_employee_id()
     user = (get_acting_user() or "").strip()
+
+    # The signed-in user's role does not change between clicks, so resolving it
+    # on every connection checkout cost three extra round trips per query.
+    cache_key = (employee_id, user, role_name)
+    cached = _cached_actor(cache_key)
+    if cached is not None:
+        try:
+            _exec(
+                conn,
+                "SELECT set_config('nualco.role_name', ?, true), "
+                "set_config('nualco.employee_id', ?, true)",
+                cached,
+            )
+            return
+        except Exception:
+            _stamp_denied(conn)
+            raise
+
     try:
-        _exec(conn, "SELECT set_config('nualco.role_name', 'system', true)")
-        _exec(conn, "SELECT set_config('nualco.employee_id', '', true)")
+        # Bootstrap as 'system' so the lookup below can read employees/roles
+        # even once RLS is actually enforced.
+        _exec(
+            conn,
+            "SELECT set_config('nualco.role_name', 'system', true), "
+            "set_config('nualco.employee_id', '', true)",
+        )
         if employee_id:
             row = (
                 _exec(
@@ -6503,18 +6935,51 @@ def _apply_rls_session(conn: Connection) -> None:
                 )
                 if acc and acc.get("Access"):
                     role_name = str(acc["Access"])
-        _exec(conn, "SELECT set_config('nualco.role_name', ?, true)", (role_name,))
-        _exec(conn, "SELECT set_config('nualco.employee_id', ?, true)", (employee_id,))
+        _exec(
+            conn,
+            "SELECT set_config('nualco.role_name', ?, true), "
+            "set_config('nualco.employee_id', ?, true)",
+            (role_name, employee_id),
+        )
+        _remember_actor(cache_key, (role_name, employee_id))
     except Exception:
-        try:
-            _exec(conn, "SELECT set_config('nualco.role_name', 'system', true)")
-        except Exception:
-            pass
+        # Fail closed. Swallowing this would leave the transaction stamped with
+        # whatever role was set last, and the fallback used to be the
+        # privileged 'system' role, so a lookup error granted full access.
+        _stamp_denied(conn)
+        raise
+
+
+def _stamp_denied(conn: Connection) -> None:
+    try:
+        _exec(
+            conn,
+            "SELECT set_config('nualco.role_name', 'denied', true), "
+            "set_config('nualco.employee_id', '', true)",
+        )
+    except Exception:
+        pass
 
 
 def _ensure_row_level_security(conn: Connection) -> None:
     """Enable RLS on every public table and install role-based policies."""
     if not IS_POSTGRES:
+        return
+    already = _exec(
+        conn,
+        """
+        SELECT 1
+        FROM pg_proc p
+        JOIN pg_namespace n ON n.oid = p.pronamespace
+        WHERE n.nspname = 'public' AND p.proname = 'nualco_role_name'
+        LIMIT 1
+        """,
+    ).first()
+    policy_count = _exec(
+        conn,
+        "SELECT COUNT(*) FROM pg_policy WHERE polname = 'nualco_all'",
+    ).first()
+    if already and policy_count and int(policy_count[0] or 0) > 0:
         return
     _exec(
         conn,
@@ -6676,21 +7141,239 @@ def _ensure_row_level_security(conn: Connection) -> None:
         _exec(conn, "GRANT USAGE ON SCHEMA public TO anon")
 
 
+_NON_NEGATIVE_GUARDS = (
+    ("raw_material_inventory", "rm_remaining_weight_non_negative", "Remaining_Weight >= 0"),
+    ("finished_goods_inventory", "fg_output_weight_non_negative", "Output_Weight >= -0.0005"),
+    ("finished_goods_inventory", "fg_output_pieces_non_negative", "Output_pieces >= 0"),
+)
+
+
+def _ensure_inventory_guards(conn: Connection) -> None:
+    """Backstop the atomic inventory updates with database constraints.
+
+    Added NOT VALID so historical rows that already went negative do not block
+    the migration; the constraint still rejects every new write.
+    """
+    if not IS_POSTGRES:
+        return
+    for table, name, expression in _NON_NEGATIVE_GUARDS:
+        if not _exec(conn, "SELECT to_regclass(?)", (f"public.{table}",)).scalar():
+            continue
+        exists = _exec(
+            conn,
+            "SELECT 1 FROM pg_constraint WHERE conname = ? LIMIT 1",
+            (name,),
+        ).first()
+        if exists:
+            continue
+        _exec(
+            conn,
+            f"ALTER TABLE {_sql_ident(table)} "
+            f"ADD CONSTRAINT {_sql_ident(name)} CHECK ({expression}) NOT VALID",
+        )
+
+    if not _exec(conn, "SELECT to_regclass('public.production_batch')").scalar():
+        return
+    if _exec(
+        conn,
+        "SELECT 1 FROM pg_constraint WHERE conname = 'production_batch_heat_no_unique' LIMIT 1",
+    ).first():
+        return
+    # A unique constraint cannot be added while duplicates exist. Leave it off
+    # and let the advisory lock prevent new collisions until they are cleaned up.
+    duplicated = _exec(
+        conn,
+        """
+        SELECT 1
+        FROM Production_batch
+        WHERE Heat_no IS NOT NULL AND btrim(Heat_no) <> ''
+        GROUP BY Furnace, Heat_no
+        HAVING COUNT(*) > 1
+        LIMIT 1
+        """,
+    ).first()
+    if duplicated:
+        return
+    _exec(
+        conn,
+        "ALTER TABLE Production_batch "
+        "ADD CONSTRAINT production_batch_heat_no_unique UNIQUE (Furnace, Heat_no)",
+    )
+
+
+_MIGRATIONS_RUN: set[str] = set()
+_MIGRATIONS_LOCK = threading.RLock()
+_SCHEMA_STATE_TABLE = "Nualco_schema_state"
+_SCHEMA_FINGERPRINT: str | None = None
+_SCHEMA_VERIFIED = False
+
+
+def _schema_fingerprint() -> str:
+    """Hash the source of every helper that emits DDL.
+
+    The migrations are idempotent but chatty: replaying them costs ~40 round
+    trips, which is seconds when the database is in another region. Recording
+    this hash lets a already-migrated database be recognised in one query.
+    Because the hash is derived from the code itself, editing any schema
+    helper invalidates it automatically -- there is no version to remember to
+    bump.
+    """
+    global _SCHEMA_FINGERPRINT
+    if _SCHEMA_FINGERPRINT is not None:
+        return _SCHEMA_FINGERPRINT
+    import inspect
+
+    module = sys.modules[__name__]
+    parts: list[str] = [_SCHEMA_SHARED]
+    for name in sorted(dir(module)):
+        if not (
+            name.startswith("_ensure")
+            or name.startswith("_backfill")
+            or name.startswith("_migrate")
+        ):
+            continue
+        member = getattr(module, name, None)
+        if not callable(member):
+            continue
+        try:
+            parts.append(inspect.getsource(member))
+        except (OSError, TypeError):
+            parts.append(name)
+    digest = hashlib.sha256("\n".join(parts).encode("utf-8")).hexdigest()
+    _SCHEMA_FINGERPRINT = f"{'pg' if IS_POSTGRES else 'sqlite'}-{digest[:32]}"
+    return _SCHEMA_FINGERPRINT
+
+
+def _read_schema_fingerprint(conn: Connection) -> str | None:
+    """Recorded fingerprint, or None when the schema has never been stamped."""
+    _exec(
+        conn,
+        f"""
+        CREATE TABLE IF NOT EXISTS {_SCHEMA_STATE_TABLE} (
+            Id INTEGER PRIMARY KEY,
+            Fingerprint TEXT NOT NULL,
+            Applied_at TEXT
+        )
+        """,
+    )
+    row = (
+        _exec(
+            conn,
+            f'SELECT Fingerprint AS "Fingerprint" FROM {_SCHEMA_STATE_TABLE} WHERE Id = 1',
+        )
+        .mappings()
+        .first()
+    )
+    return str(row["Fingerprint"]) if row and row.get("Fingerprint") else None
+
+
+def _write_schema_fingerprint(conn: Connection, fingerprint: str) -> None:
+    _exec(
+        conn,
+        f"""
+        INSERT INTO {_SCHEMA_STATE_TABLE} (Id, Fingerprint, Applied_at)
+        VALUES (1, ?, ?)
+        ON CONFLICT (Id) DO UPDATE
+            SET Fingerprint = excluded.Fingerprint,
+                Applied_at = excluded.Applied_at
+        """,
+        (fingerprint, datetime.now().isoformat(timespec="seconds")),
+    )
+
+
+def _schema_already_applied() -> bool:
+    """True when this database was last migrated by exactly this code."""
+    global _SCHEMA_VERIFIED
+    if _SCHEMA_VERIFIED:
+        return True
+    try:
+        with get_connection() as conn:
+            if _read_schema_fingerprint(conn) == _schema_fingerprint():
+                _SCHEMA_VERIFIED = True
+                return True
+    except Exception:
+        # Never let the fast path block startup; fall back to full migration.
+        return False
+    return False
+
+
+def _stamp_schema_applied() -> None:
+    global _SCHEMA_VERIFIED
+    try:
+        with get_connection() as conn:
+            _write_schema_fingerprint(conn, _schema_fingerprint())
+        _SCHEMA_VERIFIED = True
+    except Exception:
+        pass
+
+
+def _run_once(key: str, migrate: Callable[[], None]) -> None:
+    """Run an idempotent migration once per process.
+
+    These are cheap in SQL terms but chatty: each one issues CREATE TABLE IF
+    NOT EXISTS, ALTER TABLE, and information_schema lookups. Read paths call
+    them on every invocation, so a single report was replaying ~100 statements
+    of schema setup before it fetched any data.
+    """
+    if key in _MIGRATIONS_RUN:
+        return
+    with _MIGRATIONS_LOCK:
+        if key in _MIGRATIONS_RUN:
+            return
+        migrate()
+        _MIGRATIONS_RUN.add(key)
+
+
+def reset_migration_guard() -> None:
+    """Force the next call to re-run schema setup (after a schema change)."""
+    global _SCHEMA_VERIFIED
+    with _MIGRATIONS_LOCK:
+        _MIGRATIONS_RUN.clear()
+    _TABLE_COLUMNS.clear()
+    _SCHEMA_VERIFIED = False
+
+
 def _ensure_packing_list_ready() -> None:
-    with get_connection() as conn:
-        _ensure_packing_list(conn)
-        _ensure_company_profile(conn)
-        _ensure_employees(conn)
-        _ensure_row_level_security(conn)
+    def _migrate() -> None:
+        if _schema_already_applied():
+            return
+        with get_connection() as conn:
+            _ensure_packing_list(conn)
+            _ensure_company_profile(conn)
+            _ensure_employees(conn)
+            _ensure_inventory_guards(conn)
+            _ensure_row_level_security(conn)
+            # Live Postgres skips init_db(); purchase-header columns such as
+            # Weighment_slip_photo must be ensured on this path or they never land.
+            _ensure_raw_material_purchase_header(conn)
+            _ensure_columns(
+                conn,
+                "Raw_Material_Purchase",
+                [
+                    (
+                        "Weighment_slip_photo",
+                        "BYTEA" if IS_POSTGRES else "BLOB",
+                    ),
+                ],
+            )
+        _stamp_schema_applied()
+
+    _run_once("packing_list_ready", _migrate)
 
 
 def _ensure_company_ready() -> None:
-    with get_connection() as conn:
-        _ensure_company_profile(conn)
-        _ensure_employees(conn)
-        _ensure_row_level_security(conn)
+    def _migrate() -> None:
+        if _schema_already_applied():
+            return
+        with get_connection() as conn:
+            _ensure_company_profile(conn)
+            _ensure_employees(conn)
+            _ensure_row_level_security(conn)
+
+    _run_once("company_ready", _migrate)
 
 
+@cached_read(ttl_s=120)
 def list_packing_po_numbers() -> list[str]:
     rows = fetch_all(
         """
@@ -6703,6 +7386,7 @@ def list_packing_po_numbers() -> list[str]:
     return [str(r["Customer_PO_No"]) for r in rows if r.get("Customer_PO_No")]
 
 
+@cached_read(ttl_s=120)
 def list_packing_po_customers(po_no: str) -> list[dict[str, Any]]:
     """Customers on a PO, names taken from Customer_Master when possible."""
     return fetch_all(
@@ -6719,6 +7403,7 @@ def list_packing_po_customers(po_no: str) -> list[dict[str, Any]]:
     )
 
 
+@cached_read(ttl_s=120)
 def list_packing_po_alloys(
     po_no: str, cust_code: Optional[str] = None
 ) -> list[dict[str, Any]]:
@@ -6772,6 +7457,7 @@ def _alloy_matches_target(
     return False
 
 
+@cached_read(ttl_s=120)
 def list_packing_batch_candidates(
     alloy_id: int,
     *,
@@ -6914,6 +7600,7 @@ def list_dispatchable_batches(
     return eligible
 
 
+@cached_read(ttl_s=120)
 def list_packing_lists() -> list[dict[str, Any]]:
     _ensure_packing_list_ready()
     return fetch_all(
@@ -6945,6 +7632,7 @@ def list_packing_lists() -> list[dict[str, Any]]:
     )
 
 
+@cached_read(ttl_s=120)
 def get_packing_list(packing_list_id: int) -> Optional[dict[str, Any]]:
     _ensure_packing_list_ready()
     header = fetch_one(
@@ -7029,17 +7717,36 @@ def _apply_packing_lines_to_fg(
             raise ValueError(
                 f"No finished-goods inventory found for {bid}."
             )
-        new_w = float(row.get("Output_Weight") or 0) + delta_w
-        new_p = int(float(row.get("Output_pieces") or 0)) + delta_p
-        if new_w < -0.0005 or new_p < 0:
-            on_hand_w = float(row.get("Output_Weight") or 0)
-            on_hand_p = int(float(row.get("Output_pieces") or 0))
+        # Apply the delta in SQL. Computing new totals from a prior read and
+        # writing them back loses a concurrent dispatch against the same bundle.
+        applied = (
+            _exec(
+                conn,
+                """
+                UPDATE Finished_Goods_Inventory
+                SET Output_Weight = Output_Weight + ?,
+                    Output_pieces = Output_pieces + ?
+                WHERE Bundle_id = ?
+                  AND Output_Weight + ? >= -0.0005
+                  AND Output_pieces + ? >= 0
+                RETURNING Output_Weight AS "Output_Weight",
+                          Output_pieces AS "Output_pieces"
+                """,
+                (delta_w, delta_p, row["Bundle_id"], delta_w, delta_p),
+            )
+            .mappings()
+            .first()
+        )
+        if not applied:
+            on_hand = _fg_bundle_on_conn(conn, bid) or {}
+            on_hand_w = float(on_hand.get("Output_Weight") or 0)
+            on_hand_p = int(float(on_hand.get("Output_pieces") or 0))
             raise ValueError(
                 f"{bid} only has {on_hand_w:g} kg and {on_hand_p} pieces "
                 "remaining in finished goods."
             )
-        new_w = max(new_w, 0.0)
-        new_p = max(new_p, 0)
+        new_w = max(float(applied["Output_Weight"] or 0), 0.0)
+        new_p = max(int(float(applied["Output_pieces"] or 0)), 0)
         status = (
             FG_STATUS_AVAILABLE
             if new_w > 0.0005 and new_p > 0
@@ -7704,6 +8411,7 @@ def _replace_certificate_lines_on_conn(
             )
 
 
+@cached_read(ttl_s=120)
 def list_packing_lists_for_certificate() -> list[dict[str, Any]]:
     """Verified packing lists with current certificate status, if any."""
     _ensure_packing_list_ready()
@@ -7733,6 +8441,7 @@ def list_packing_lists_for_certificate() -> list[dict[str, Any]]:
     )
 
 
+@cached_read(ttl_s=120)
 def get_packing_list_certificate(
     packing_list_id: int,
 ) -> Optional[dict[str, Any]]:
@@ -7818,6 +8527,30 @@ def _format_cert_number(value: object) -> str:
     return f"{number:.4f}".rstrip("0").rstrip(".")
 
 
+
+def get_batch_k_mold_bulk(batch_ids: Iterable[str]) -> dict[str, float]:
+    """K mold value (defect pcs / sampled pcs) for several batches, by Batch_ID."""
+    ids = sorted({str(b).strip() for b in batch_ids if str(b).strip()})
+    if not ids:
+        return {}
+    rows = fetch_all(
+        """
+        SELECT Batch_ID AS "Batch_ID",
+               Sampled_pcs AS "Sampled_pcs",
+               Defect_pcs AS "Defect_pcs"
+        FROM Production_batch
+        WHERE Batch_ID = ANY(?)
+        """,
+        (ids,),
+    )
+    out: dict[str, float] = {}
+    for row in rows:
+        value = k_mold_value(row.get("Sampled_pcs"), row.get("Defect_pcs"))
+        if value is not None:
+            out[str(row["Batch_ID"])] = value
+    return out
+
+
 def format_alloy_spec_percent(min_percent: object, max_percent: object) -> str:
     """Customer spec text: '10 - 13.5' or '1.3 max' when min is 0."""
     try:
@@ -7833,6 +8566,7 @@ def format_alloy_spec_percent(min_percent: object, max_percent: object) -> str:
     return f"{_format_cert_number(low)} - {_format_cert_number(high)}"
 
 
+@cached_read(ttl_s=300)
 def list_certificate_spec_rows(alloy_id: int) -> list[dict[str, Any]]:
     """Alloy spec elements for the test certificate, plus Aluminium remainder."""
     rows = fetch_all(
@@ -7921,6 +8655,17 @@ def get_test_certificate_print_payload(
     inspection: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Assemble letterhead, header fields, spec, heats, and inspection for print."""
+    # One transaction for the whole payload. These reads used to open a
+    # separate transaction each, re-stamping the RLS session every time.
+    with shared_connection():
+        return _test_certificate_payload(packing_list_id, lines, inspection)
+
+
+def _test_certificate_payload(
+    packing_list_id: int,
+    lines: list[dict[str, Any]] | None,
+    inspection: list[dict[str, Any]] | None,
+) -> dict[str, Any]:
     header = get_packing_list(packing_list_id)
     if not header:
         raise ValueError(f"Packing list {packing_list_id} was not found.")
@@ -7938,6 +8683,18 @@ def get_test_certificate_print_payload(
         alloy.get("Colour_code") or header.get("Colour_code") or ""
     ).strip()
     spec_rows = list_certificate_spec_rows(int(header["Alloy_id"]))
+    # Collect every batch the certificate references, then fetch all of their
+    # chemistry in one query instead of one query per heat line.
+    wanted: list[str] = []
+    for line in printed:
+        for src in line.get("sources") or []:
+            bid = str(src.get("Batch_ID") or "").strip()
+            if bid:
+                wanted.append(bid)
+                break
+    chemistry = get_batch_chemistry_bulk(wanted)
+    k_mold = get_batch_k_mold_bulk(wanted)
+
     heats: list[dict[str, Any]] = []
     for line in printed:
         sources = line.get("sources") or []
@@ -7947,7 +8704,7 @@ def get_test_certificate_print_payload(
             bid = str(src.get("Batch_ID") or "").strip()
             if bid:
                 batch_id = batch_id or bid
-                for chem in get_batch_chemistry(bid):
+                for chem in chemistry.get(bid, []):
                     symbol = str(chem.get("Element_symbol") or "").strip().upper()
                     if symbol and symbol not in chem_by_symbol:
                         chem_by_symbol[symbol] = chem.get("Percentage")
@@ -7963,6 +8720,7 @@ def get_test_certificate_print_payload(
                 else int(float(line.get("Pieces") or 0)),
                 "Batch_ID": batch_id,
                 "actuals": chem_by_symbol,
+                "K_mold": k_mold.get(batch_id),
             }
         )
     element_rows: list[dict[str, Any]] = []
@@ -7983,6 +8741,20 @@ def get_test_certificate_print_payload(
                 "actuals": actuals,
             }
         )
+        if symbol == "AL":
+            element_rows.append(
+                {
+                    "Element_Name": "K mold Value",
+                    "Display_label": "K mold Value",
+                    "Spec_text": f"{K_MOLD_MAX:g}",
+                    "actuals": [
+                        _format_cert_number(heat.get("K_mold"))
+                        if heat.get("K_mold") is not None
+                        else "—"
+                        for heat in heats
+                    ],
+                }
+            )
     return {
         "company": company,
         "document_id": CERT_DOCUMENT_ID,
@@ -8003,7 +8775,7 @@ def get_test_certificate_print_payload(
         "colour_code": colour or "—",
         "heats": heats,
         "elements": element_rows,
-        "inspection": _normalize_visual_inspection_rows(
+        "inspection": _printed_visual_inspection_rows(
             inspection if inspection is not None else get_visual_inspection(packing_list_id)
         ),
         "analysis_method": CERT_ANALYSIS_METHOD,
@@ -8013,18 +8785,51 @@ def get_test_certificate_print_payload(
     }
 
 
+def _blank_visual_inspection_row(index: int, text: str) -> dict[str, Any]:
+    return {
+        "Question_no": index,
+        "Question_text": text,
+        "Answer": "",
+        "Verified": 0,
+        "Include_in_print": 1,
+    }
+
+
 def _blank_visual_inspection_rows() -> list[dict[str, Any]]:
-    rows = []
-    for index, text in enumerate(VISUAL_INSPECTION_QUESTIONS, start=1):
-        rows.append(
-            {
-                "Question_no": index,
-                "Question_text": text,
-                "Answer": "",
-                "Verified": 0,
-            }
-        )
-    return rows
+    return [
+        _blank_visual_inspection_row(index, text)
+        for index, text in enumerate(VISUAL_INSPECTION_QUESTIONS, start=1)
+    ]
+
+
+def _flag01(value: object, *, default: int = 1) -> int:
+    """Coerce stored 0/1 print flags; missing/blank values keep the default."""
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return 1 if value else 0
+    if isinstance(value, (int, float)):
+        return 0 if int(value) == 0 else 1
+    text = str(value).strip().lower()
+    if text == "":
+        return default
+    if text in {"0", "false", "no", "n", "off"}:
+        return 0
+    if text in {"1", "true", "yes", "y", "on"}:
+        return 1
+    try:
+        return 0 if int(float(text)) == 0 else 1
+    except (TypeError, ValueError):
+        return default
+
+
+def _include_in_print_flag(raw: dict[str, Any]) -> int:
+    """Existing rows without the column stay selected for print."""
+    if "Include_in_print" in raw:
+        return _flag01(raw.get("Include_in_print"), default=1)
+    if "include_in_print" in raw:
+        return _flag01(raw.get("include_in_print"), default=1)
+    return 1
 
 
 def _normalize_visual_inspection_rows(
@@ -8046,21 +8851,23 @@ def _normalize_visual_inspection_rows(
             "Question_text": VISUAL_INSPECTION_QUESTIONS[number - 1],
             "Answer": answer,
             "Verified": 1 if raw.get("Verified") else 0,
+            "Include_in_print": _include_in_print_flag(raw),
         }
     out = []
     for index, text in enumerate(VISUAL_INSPECTION_QUESTIONS, start=1):
-        out.append(
-            by_no.get(
-                index,
-                {
-                    "Question_no": index,
-                    "Question_text": text,
-                    "Answer": "",
-                    "Verified": 0,
-                },
-            )
-        )
+        out.append(by_no.get(index, _blank_visual_inspection_row(index, text)))
     return out
+
+
+def _printed_visual_inspection_rows(
+    rows: list[dict[str, Any]] | None,
+) -> list[dict[str, Any]]:
+    """Questions ticked for the test-certificate printout."""
+    return [
+        row
+        for row in _normalize_visual_inspection_rows(rows)
+        if row.get("Include_in_print")
+    ]
 
 
 def visual_inspection_errors(rows: list[dict[str, Any]] | None) -> list[str]:
@@ -8101,6 +8908,7 @@ def visual_inspection_errors(rows: list[dict[str, Any]] | None) -> list[str]:
     return errors
 
 
+@cached_read(ttl_s=120)
 def get_visual_inspection(packing_list_id: int) -> list[dict[str, Any]]:
     _ensure_packing_list_ready()
     saved = fetch_all(
@@ -8108,7 +8916,8 @@ def get_visual_inspection(packing_list_id: int) -> list[dict[str, Any]]:
         SELECT Question_no AS "Question_no",
                Question_text AS "Question_text",
                Answer AS "Answer",
-               Verified AS "Verified"
+               Verified AS "Verified",
+               Include_in_print AS "Include_in_print"
         FROM Packing_list_visual_inspection
         WHERE Packing_list_id = ?
         ORDER BY Question_no
@@ -8144,9 +8953,10 @@ def save_visual_inspection(
                 """
                 INSERT INTO Packing_list_visual_inspection (
                     Packing_list_id, Question_no, Question_text,
-                    Answer, Verified, Last_updated_by, Last_updated_datetime
+                    Answer, Verified, Include_in_print,
+                    Last_updated_by, Last_updated_datetime
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     packing_list_id,
@@ -8154,6 +8964,7 @@ def save_visual_inspection(
                     row["Question_text"],
                     row["Answer"] or None,
                     1 if row["Verified"] else 0,
+                    1 if row.get("Include_in_print") else 0,
                     by_val,
                     dt_val,
                 ),
@@ -8221,8 +9032,14 @@ def _spec_deviation_reason(
     return "; ".join(parts)
 
 
+@cached_read(ttl_s=120)
 def list_packing_list_chemistry_vs_spec(packing_list_id: int) -> list[dict[str, Any]]:
     """Compare each packed batch's chemistry to the packing-list alloy spec."""
+    with shared_connection():
+        return _packing_list_chemistry_vs_spec(packing_list_id)
+
+
+def _packing_list_chemistry_vs_spec(packing_list_id: int) -> list[dict[str, Any]]:
     _ensure_packing_list_ready()
     header = get_packing_list(packing_list_id)
     if not header:
@@ -8249,14 +9066,18 @@ def list_packing_list_chemistry_vs_spec(packing_list_id: int) -> list[dict[str, 
     )
     if not spec_rows:
         return []
+    packed = header.get("batches") or []
+    chemistry = get_batch_chemistry_bulk(
+        str(b.get("Batch_ID") or "").strip() for b in packed
+    )
     out: list[dict[str, Any]] = []
-    for batch in header.get("batches") or []:
+    for batch in packed:
         bid = str(batch.get("Batch_ID") or "").strip()
         if not bid:
             continue
         chem = {
             str(row.get("Element_symbol") or "").strip(): row
-            for row in get_batch_chemistry(bid)
+            for row in chemistry.get(bid, [])
             if str(row.get("Element_symbol") or "").strip()
         }
         for spec in spec_rows:
@@ -8676,6 +9497,7 @@ def cancel_packing_list(packing_list_id: int) -> dict[str, Any]:
     return updated
 
 
+@cached_read(ttl_s=120)
 def list_issued_certificates() -> list[dict[str, Any]]:
     """Issued test certificates for the Admin cancel page."""
     _ensure_packing_list_ready()
@@ -8765,6 +9587,7 @@ _BATCH_COLUMNS = """
 """
 
 
+@cached_read(ttl_s=120)
 def get_batch(batch_id: str) -> Optional[dict[str, Any]]:
     return fetch_one(
         f"SELECT {_BATCH_COLUMNS} FROM Production_batch WHERE Batch_ID = ?",
@@ -8772,6 +9595,7 @@ def get_batch(batch_id: str) -> Optional[dict[str, Any]]:
     )
 
 
+@cached_read(ttl_s=120)
 def get_batch_inputs(batch_id: str) -> list[dict[str, Any]]:
     return fetch_all(
         """
@@ -8829,6 +9653,7 @@ def allowed_batch_output_alloy_ids(batch_alloy_id: Optional[int]) -> set[int]:
     return allowed
 
 
+@cached_read(ttl_s=120)
 def list_batch_output_alloys(batch_alloy_id: Optional[int]) -> list[dict[str, Any]]:
     """Product alloy (if any) plus Broken Ingot / Furnace Empty / Not Ok Ingot."""
     ids: list[int] = []
@@ -9132,6 +9957,7 @@ def refresh_outputs_missing_conversion_rate() -> int:
     return len(rows)
 
 
+@cached_read(ttl_s=120)
 def get_batch_outputs(
     batch_id: str, *, include_photos: bool = False
 ) -> list[dict[str, Any]]:
@@ -9163,6 +9989,7 @@ def get_batch_outputs(
     )
 
 
+@cached_read(ttl_s=120)
 def list_all_batch_outputs(limit: int = 200) -> list[dict[str, Any]]:
     return fetch_all(
         """
@@ -9404,6 +10231,7 @@ def _sync_sidestream_inventory(conn: Connection, batch_id: str) -> None:
         )
 
 
+@cached_read(ttl_s=120)
 def get_batch_chemistry(batch_id: str) -> list[dict[str, Any]]:
     return fetch_all(
         """
@@ -9418,6 +10246,34 @@ def get_batch_chemistry(batch_id: str) -> list[dict[str, Any]]:
     )
 
 
+def get_batch_chemistry_bulk(batch_ids: Iterable[str]) -> dict[str, list[dict[str, Any]]]:
+    """Chemistry for several batches in one query, keyed by Batch_ID.
+
+    Reports used to call get_batch_chemistry() once per heat line, and each of
+    those was its own transaction.
+    """
+    ids = sorted({str(b).strip() for b in batch_ids if str(b).strip()})
+    if not ids:
+        return {}
+    rows = fetch_all(
+        """
+        SELECT s.Batch_ID AS "Batch_ID",
+               s.Element_symbol AS "Element_symbol", s.Percentage AS "Percentage",
+               COALESCE(_el.Serial_no, 9999) AS "Serial_no"
+        FROM Batch_Chemical_Composition s
+        LEFT JOIN Element_Master _el ON _el.Element_Symbol = s.Element_symbol
+        WHERE s.Batch_ID = ANY(?)
+        ORDER BY s.Batch_ID, COALESCE(_el.Serial_no, 9999), s.Element_symbol
+        """,
+        (ids,),
+    )
+    grouped: dict[str, list[dict[str, Any]]] = {bid: [] for bid in ids}
+    for row in rows:
+        grouped.setdefault(str(row["Batch_ID"]), []).append(row)
+    return grouped
+
+
+@cached_read(ttl_s=120)
 def list_batches() -> list[dict[str, Any]]:
     return fetch_all(
         """
@@ -9464,6 +10320,7 @@ def calc_yield(input_weight: float, output_weight: float) -> dict[str, float]:
 PO_DOCUMENT_EXTENSIONS = (".pdf", ".doc", ".docx", ".xls", ".xlsx")
 
 
+@cached_read(ttl_s=120)
 def list_purchase_orders() -> list[dict[str, Any]]:
     return fetch_all(
         """
@@ -9497,6 +10354,7 @@ def list_purchase_orders() -> list[dict[str, Any]]:
     )
 
 
+@cached_read(ttl_s=120)
 def list_po_supply_status() -> list[dict[str, Any]]:
     """Open-order kg, verified dispatch, packing-in-progress, and FG on hand."""
     return fetch_all(
@@ -9786,22 +10644,48 @@ def _oil_qty(value: Any) -> float:
     return qty if qty > 0 else 0.0
 
 
-def rebuild_furnace_oil_inventory() -> None:
+_FURNACE_OIL_LOCK_KEY = "nualco:furnace_oil_ledger"
+
+
+def _lock_furnace_oil_ledger(conn: Connection) -> None:
+    """Serialize ledger rebuilds for the rest of this transaction.
+
+    The ledger is recomputed by deleting every row and re-inserting it, so two
+    concurrent writers would otherwise interleave a delete with the other's
+    inserts.
+    """
+    if IS_POSTGRES:
+        _exec(
+            conn,
+            "SELECT pg_advisory_xact_lock(hashtext(?))",
+            (_FURNACE_OIL_LOCK_KEY,),
+        )
+
+
+def _rebuild_furnace_oil_inventory_on_conn(conn: Connection) -> None:
     """Rebuild the daily inventory ledger from purchases and consumption."""
     by_val, dt_val = audit_stamp()
-    purchases = fetch_all(
-        """
-        SELECT Received_date AS "Received_date", Quantity AS "Quantity",
-               Purchase_type AS "Purchase_type"
-        FROM Furnace_Oil_Purchase
-        """
-    )
-    consumed = fetch_all(
-        """
-        SELECT Consumption_date AS "Consumption_date", Quantity AS "Quantity"
-        FROM Furnace_Oil_Consumption
-        """
-    )
+    purchases = [
+        dict(r)
+        for r in _exec(
+            conn,
+            """
+            SELECT Received_date AS "Received_date", Quantity AS "Quantity",
+                   Purchase_type AS "Purchase_type"
+            FROM Furnace_Oil_Purchase
+            """,
+        ).mappings()
+    ]
+    consumed = [
+        dict(r)
+        for r in _exec(
+            conn,
+            """
+            SELECT Consumption_date AS "Consumption_date", Quantity AS "Quantity"
+            FROM Furnace_Oil_Consumption
+            """,
+        ).mappings()
+    ]
     days: dict[str, dict[str, float]] = {}
 
     def _day(key: str) -> dict[str, float]:
@@ -9831,30 +10715,48 @@ def rebuild_furnace_oil_inventory() -> None:
         ledger.append((key, opening, rec["purchase"], rec["consumption"], closing))
         carried = closing
 
+    _exec(conn, "DELETE FROM Furnace_Oil_Inventory")
+    for key, opening, purchase, consumption, closing in ledger:
+        _exec(
+            conn,
+            """
+            INSERT INTO Furnace_Oil_Inventory
+                (Inventory_date, Opening_qty, Purchase_qty, Consumption_qty,
+                 Closing_qty, Last_updated_by, Last_updated_datetime)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (key, opening, purchase, consumption, closing, by_val, dt_val),
+        )
+
+
+def rebuild_furnace_oil_inventory() -> None:
+    """Rebuild the daily furnace-oil ledger in a single transaction."""
     with get_connection() as conn:
-        _exec(conn, "DELETE FROM Furnace_Oil_Inventory")
-        for key, opening, purchase, consumption, closing in ledger:
-            _exec(
-                conn,
-                """
-                INSERT INTO Furnace_Oil_Inventory
-                    (Inventory_date, Opening_qty, Purchase_qty, Consumption_qty,
-                     Closing_qty, Last_updated_by, Last_updated_datetime)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-                """,
-                (key, opening, purchase, consumption, closing, by_val, dt_val),
-            )
+        _lock_furnace_oil_ledger(conn)
+        _rebuild_furnace_oil_inventory_on_conn(conn)
 
 
+_FURNACE_OIL_STOCK_SQL = """
+    SELECT Closing_qty AS "Closing_qty"
+    FROM Furnace_Oil_Inventory
+    ORDER BY Inventory_date DESC
+    LIMIT 1
+"""
+
+
+def _furnace_oil_stock_on_conn(conn: Connection) -> float:
+    row = _exec(conn, _FURNACE_OIL_STOCK_SQL).mappings().first()
+    if not row:
+        return 0.0
+    try:
+        return float(row["Closing_qty"] or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+@cached_read(ttl_s=120)
 def get_furnace_oil_stock() -> float:
-    row = fetch_one(
-        """
-        SELECT Closing_qty AS "Closing_qty"
-        FROM Furnace_Oil_Inventory
-        ORDER BY Inventory_date DESC
-        LIMIT 1
-        """
-    )
+    row = fetch_one(_FURNACE_OIL_STOCK_SQL)
     if not row:
         return 0.0
     try:
@@ -9863,6 +10765,7 @@ def get_furnace_oil_stock() -> float:
         return 0.0
 
 
+@cached_read(ttl_s=120)
 def list_furnace_oil_purchases(limit: int = 50) -> list[dict[str, Any]]:
     return fetch_all(
         """
@@ -9889,6 +10792,7 @@ def list_furnace_oil_purchases(limit: int = 50) -> list[dict[str, Any]]:
     )
 
 
+@cached_read(ttl_s=120)
 def list_furnace_oil_consumption(limit: int = 50) -> list[dict[str, Any]]:
     return fetch_all(
         """
@@ -9903,6 +10807,7 @@ def list_furnace_oil_consumption(limit: int = 50) -> list[dict[str, Any]]:
     )
 
 
+@cached_read(ttl_s=120)
 def list_furnace_oil_inventory(limit: int = 90) -> list[dict[str, Any]]:
     return fetch_all(
         """
@@ -9986,7 +10891,8 @@ def add_furnace_oil_purchase(
             ),
         )
         purchase_id = int(result.scalar_one())
-    rebuild_furnace_oil_inventory()
+        _lock_furnace_oil_ledger(conn)
+        _rebuild_furnace_oil_inventory_on_conn(conn)
     return purchase_id
 
 
@@ -10012,27 +10918,46 @@ def add_furnace_oil_consumption(
     day = _as_effective_date(consumption_date)
     if not day:
         raise ValueError("Consumption date is required.")
-    existing = get_furnace_oil_consumption_row(day)
-    available = get_furnace_oil_stock() + _oil_qty(existing.get("Quantity") if existing else 0)
-    if qty > available + 1e-9:
-        raise ValueError(
-            f"Consumption {qty:g} L exceeds available stock {available:g} L."
-        )
     by_val, dt_val = audit_stamp()
-    execute(
-        """
-        INSERT INTO Furnace_Oil_Consumption
-            (Consumption_date, Quantity, Notes, Last_updated_by, Last_updated_datetime)
-        VALUES (?, ?, ?, ?, ?)
-        ON CONFLICT(Consumption_date) DO UPDATE SET
-            Quantity=excluded.Quantity,
-            Notes=excluded.Notes,
-            Last_updated_by=excluded.Last_updated_by,
-            Last_updated_datetime=excluded.Last_updated_datetime
-        """,
-        (day, qty, (notes or "").strip() or None, by_val, dt_val),
-    )
-    rebuild_furnace_oil_inventory()
+    # Stock check, write, and ledger rebuild share one transaction. Split across
+    # three, two operators could each pass the check and jointly overdraw.
+    with get_connection() as conn:
+        _lock_furnace_oil_ledger(conn)
+        existing = (
+            _exec(
+                conn,
+                """
+                SELECT Quantity AS "Quantity"
+                FROM Furnace_Oil_Consumption
+                WHERE Consumption_date = ?
+                """,
+                (day,),
+            )
+            .mappings()
+            .first()
+        )
+        available = _furnace_oil_stock_on_conn(conn) + _oil_qty(
+            existing["Quantity"] if existing else 0
+        )
+        if qty > available + 1e-9:
+            raise ValueError(
+                f"Consumption {qty:g} L exceeds available stock {available:g} L."
+            )
+        _exec(
+            conn,
+            """
+            INSERT INTO Furnace_Oil_Consumption
+                (Consumption_date, Quantity, Notes, Last_updated_by, Last_updated_datetime)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(Consumption_date) DO UPDATE SET
+                Quantity=excluded.Quantity,
+                Notes=excluded.Notes,
+                Last_updated_by=excluded.Last_updated_by,
+                Last_updated_datetime=excluded.Last_updated_datetime
+            """,
+            (day, qty, (notes or "").strip() or None, by_val, dt_val),
+        )
+        _rebuild_furnace_oil_inventory_on_conn(conn)
 
 
 def furnace_oil_month_totals(year: int, month: int) -> dict[str, float]:
@@ -10082,6 +11007,7 @@ def normalize_electricity_line(line: Optional[str]) -> str:
     raise ValueError("Select EB Line 1 or EB Line 2.")
 
 
+@cached_read(ttl_s=120)
 def get_electricity_consumption(
     consumption_date: str, line: str
 ) -> Optional[dict[str, Any]]:
@@ -10104,6 +11030,7 @@ def get_electricity_consumption(
     )
 
 
+@cached_read(ttl_s=120)
 def get_previous_electricity_closing(
     consumption_date: str, line: str
 ) -> Optional[float]:
@@ -10130,6 +11057,7 @@ def get_previous_electricity_closing(
         return None
 
 
+@cached_read(ttl_s=120)
 def list_electricity_consumption(
     limit: int = 60, line: Optional[str] = None
 ) -> list[dict[str, Any]]:
@@ -10151,6 +11079,7 @@ def list_electricity_consumption(
     return fetch_all(sql, tuple(params))
 
 
+@cached_read(ttl_s=120)
 def electricity_month_totals(
     year: int, month: int, line: Optional[str] = None
 ) -> dict[str, Any]:
@@ -10271,6 +11200,7 @@ def _as_rate_4(value: Any, label: str) -> float:
     return rounded
 
 
+@cached_read(ttl_s=120)
 def list_cost_of_conversion(limit: int = 120) -> list[dict[str, Any]]:
     return fetch_all(
         """
@@ -10291,6 +11221,7 @@ def list_cost_of_conversion(limit: int = 120) -> list[dict[str, Any]]:
     )
 
 
+@cached_read(ttl_s=120)
 def get_cost_of_conversion(expense_month: str | date) -> Optional[dict[str, Any]]:
     month = _month_start_iso(expense_month)
     return fetch_one(
