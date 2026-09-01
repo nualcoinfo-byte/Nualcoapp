@@ -5063,6 +5063,13 @@ def save_inventory_invoice_document(
     )
 
 
+def _blob_bytes(data: Any) -> Optional[bytes]:
+    """Postgres BYTEA arrives as memoryview; Streamlit image() needs bytes."""
+    if not data:
+        return None
+    return data if isinstance(data, bytes) else bytes(data)
+
+
 def get_inventory_vehicle_photo(lot_id: int) -> Optional[bytes]:
     row = fetch_one(
         """
@@ -5073,8 +5080,7 @@ def get_inventory_vehicle_photo(lot_id: int) -> Optional[bytes]:
         """,
         (lot_id,),
     )
-    data = (row or {}).get("Vehicle_photo")
-    return data if data else None
+    return _blob_bytes((row or {}).get("Vehicle_photo"))
 
 
 def get_inventory_weighment_slip_photo(lot_id: int) -> Optional[bytes]:
@@ -5087,8 +5093,7 @@ def get_inventory_weighment_slip_photo(lot_id: int) -> Optional[bytes]:
         """,
         (lot_id,),
     )
-    data = (row or {}).get("Weighment_slip_photo")
-    return data if data else None
+    return _blob_bytes((row or {}).get("Weighment_slip_photo"))
 
 
 def get_inventory_invoice_document(lot_id: int) -> Optional[dict[str, Any]]:
