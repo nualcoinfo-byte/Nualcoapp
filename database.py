@@ -8110,6 +8110,30 @@ def _format_cert_number(value: object) -> str:
     return f"{number:.4f}".rstrip("0").rstrip(".")
 
 
+
+def get_batch_k_mold_bulk(batch_ids: Iterable[str]) -> dict[str, float]:
+    """K mold value (defect pcs / sampled pcs) for several batches, by Batch_ID."""
+    ids = sorted({str(b).strip() for b in batch_ids if str(b).strip()})
+    if not ids:
+        return {}
+    rows = fetch_all(
+        """
+        SELECT Batch_ID AS "Batch_ID",
+               Sampled_pcs AS "Sampled_pcs",
+               Defect_pcs AS "Defect_pcs"
+        FROM Production_batch
+        WHERE Batch_ID = ANY(?)
+        """,
+        (ids,),
+    )
+    out: dict[str, float] = {}
+    for row in rows:
+        value = k_mold_value(row.get("Sampled_pcs"), row.get("Defect_pcs"))
+        if value is not None:
+            out[str(row["Batch_ID"])] = value
+    return out
+
+
 def format_alloy_spec_percent(min_percent: object, max_percent: object) -> str:
     """Customer spec text: '10 - 13.5' or '1.3 max' when min is 0."""
     try:
@@ -8251,6 +8275,7 @@ def _test_certificate_payload(
                 wanted.append(bid)
                 break
     chemistry = get_batch_chemistry_bulk(wanted)
+    k_mold = get_batch_k_mold_bulk(wanted)
 
     heats: list[dict[str, Any]] = []
     for line in printed:
@@ -8277,6 +8302,7 @@ def _test_certificate_payload(
                 else int(float(line.get("Pieces") or 0)),
                 "Batch_ID": batch_id,
                 "actuals": chem_by_symbol,
+                "K_mold": k_mold.get(batch_id),
             }
         )
     element_rows: list[dict[str, Any]] = []
@@ -8297,6 +8323,20 @@ def _test_certificate_payload(
                 "actuals": actuals,
             }
         )
+        if symbol == "AL":
+            element_rows.append(
+                {
+                    "Element_Name": "K mold Value",
+                    "Display_label": "K mold Value",
+                    "Spec_text": f"{K_MOLD_MAX:g}",
+                    "actuals": [
+                        _format_cert_number(heat.get("K_mold"))
+                        if heat.get("K_mold") is not None
+                        else "—"
+                        for heat in heats
+                    ],
+                }
+            )
     return {
         "company": company,
         "document_id": CERT_DOCUMENT_ID,
