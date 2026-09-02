@@ -9019,6 +9019,147 @@ def _batch_output_weight_on_conn(conn: Connection, batch_id: str) -> float:
     return float(row["output_kg"] or 0) if row else 0.0
 
 
+def estimate_batch_input_cost(
+    lines: list[dict[str, Any]], *, as_of: date | None = None
+) -> dict[str, Any]:
+    """Projected cost per kg for a charge, before any output has been weighed.
+
+    Charge cost comes from the lot actually being charged, so the estimate is
+    directly comparable with the actual cost computed after output is saved.
+    Expected recovery comes from the newest Raw_Material_Master row for the
+    material, which is what turns charge weight into expected output weight.
+    """
+    cleaned: list[dict[str, Any]] = []
+    for line in lines or []:
+        try:
+            weight = float(line.get("Weight") or 0)
+        except (TypeError, ValueError):
+            weight = 0.0
+        name = str(line.get("Raw_Material_Name") or "").strip()
+        if weight <= 0 or not name:
+            continue
+        lot_id = line.get("Lot_id")
+        cleaned.append({"name": name, "lot_id": lot_id, "weight": weight})
+
+    empty = {
+        "lines": [],
+        "input_weight_total": 0.0,
+        "input_cost_total": 0.0,
+        "estimated_output_kg": 0.0,
+        "estimated_material_per_kg": None,
+        "conversion_rate_applied": 0.0,
+        "conversion_expense_month": None,
+        "estimated_cost_per_kg": None,
+        "missing_cost": [],
+        "missing_recovery": [],
+    }
+    if not cleaned:
+        return empty
+
+    with get_connection() as conn:
+        lot_ids = [l["lot_id"] for l in cleaned if l["lot_id"] not in (None, "")]
+        lot_cost: dict[int, float] = {}
+        if lot_ids:
+            placeholders = ", ".join("?" for _ in lot_ids)
+            for row in _exec(
+                conn,
+                f"""
+                SELECT Lot_id AS "Lot_id", Cost_per_kg AS "Cost_per_kg"
+                FROM Raw_Material_Inventory
+                WHERE Lot_id IN ({placeholders})
+                """,
+                tuple(lot_ids),
+            ).mappings():
+                if row.get("Cost_per_kg") is not None:
+                    lot_cost[int(row["Lot_id"])] = _as_cost_4(row["Cost_per_kg"])
+
+        names = sorted({l["name"] for l in cleaned})
+        placeholders = ", ".join("?" for _ in names)
+        master: dict[str, dict[str, Any]] = {}
+        for row in _exec(
+            conn,
+            f"""
+            SELECT Raw_Material_Name AS "Raw_Material_Name",
+                   Effective_date AS "Effective_date",
+                   Recovery AS "Recovery",
+                   Cost_per_kg AS "Cost_per_kg"
+            FROM Raw_Material_Master
+            WHERE LOWER(Raw_Material_Name) IN ({placeholders})
+            ORDER BY Effective_date DESC
+            """,
+            tuple(n.lower() for n in names),
+        ).mappings():
+            # Ordered newest first, so the first row seen for a name wins.
+            master.setdefault(str(row["Raw_Material_Name"]).lower(), dict(row))
+
+        conversion_rate, conversion_month = _latest_conversion_on_conn(
+            conn, as_of or date.today()
+        )
+
+    detail: list[dict[str, Any]] = []
+    missing_cost: list[str] = []
+    missing_recovery: list[str] = []
+    for line in cleaned:
+        info = master.get(line["name"].lower()) or {}
+        cost_per_kg = lot_cost.get(
+            int(line["lot_id"]) if line["lot_id"] not in (None, "") else -1
+        )
+        cost_source = "lot"
+        if cost_per_kg is None and info.get("Cost_per_kg") is not None:
+            cost_per_kg = _as_cost_4(info["Cost_per_kg"])
+            cost_source = "master"
+        if cost_per_kg is None:
+            missing_cost.append(line["name"])
+            cost_per_kg = 0.0
+            cost_source = "none"
+
+        recovery = info.get("Recovery")
+        if recovery is None:
+            missing_recovery.append(line["name"])
+            recovery_pct = 0.0
+        else:
+            recovery_pct = float(recovery)
+
+        detail.append(
+            {
+                "Raw_Material_Name": line["name"],
+                "Lot_id": line["lot_id"],
+                "Weight": line["weight"],
+                "Cost_per_kg": cost_per_kg,
+                "Cost_source": cost_source,
+                "Line_cost": round(line["weight"] * cost_per_kg, PERCENT_SCALE),
+                "Recovery_pct": recovery_pct,
+                "Effective_date": _iso_date_or_none(info.get("Effective_date")),
+                "Estimated_output_kg": round(
+                    line["weight"] * recovery_pct / 100.0, PERCENT_SCALE
+                ),
+            }
+        )
+
+    input_weight = round(sum(d["Weight"] for d in detail), PERCENT_SCALE)
+    input_cost = round(sum(d["Line_cost"] for d in detail), PERCENT_SCALE)
+    output_kg = round(sum(d["Estimated_output_kg"] for d in detail), PERCENT_SCALE)
+    material_per_kg = (
+        round(input_cost / output_kg, PERCENT_SCALE) if output_kg > 0 else None
+    )
+    return {
+        "lines": detail,
+        "input_weight_total": input_weight,
+        "input_cost_total": input_cost,
+        "estimated_output_kg": output_kg,
+        "estimated_material_per_kg": material_per_kg,
+        "conversion_rate_applied": conversion_rate,
+        "conversion_expense_month": conversion_month,
+        "estimated_cost_per_kg": (
+            round(material_per_kg + conversion_rate, PERCENT_SCALE)
+            if material_per_kg is not None
+            else None
+        ),
+        "missing_cost": sorted(set(missing_cost)),
+        "missing_recovery": sorted(set(missing_recovery)),
+    }
+
+
 def compute_batch_production_cost(
     batch_id: str, *, as_of: date | None = None
 ) -> dict[str, Any]:
