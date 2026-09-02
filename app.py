@@ -1565,12 +1565,21 @@ def _apply_logged_in_actor(emp: dict) -> None:
     )
 
 
+@st.cache_data(ttl=300)
+def _employee_id_prefix() -> str:
+    """Shared employee-ID prefix, so the login page can ask for just the number."""
+    try:
+        return db.employee_id_common_prefix()
+    except Exception:
+        return ""
+
+
 def _render_login() -> None:
     st.sidebar.caption("Sign in with your employee ID.")
     st.title("Sign in")
-    st.caption("Use the employee ID from the employees table. Admin sets passwords.")
     first_setup = not db.any_employee_has_password()
     if first_setup:
+        st.caption("Use the employee ID from the employees table. Admin sets passwords.")
         st.info(
             "No passwords are set yet. Create the first Admin password here, "
             "then use **Employee passwords** to set passwords for everyone else."
@@ -1603,8 +1612,25 @@ def _render_login() -> None:
             st.rerun()
         return
 
+    id_prefix = _employee_id_prefix()
+    if id_prefix:
+        st.caption(
+            f"Every employee ID starts with `{id_prefix}` — type only the number that "
+            "follows it. Admin sets passwords."
+        )
+    else:
+        st.caption("Use the employee ID from the employees table. Admin sets passwords.")
+
     with st.form("employee_login"):
-        login_id = st.text_input("Employee ID", placeholder="AL-2026-001")
+        login_id = st.text_input(
+            "Employee ID",
+            placeholder="001" if id_prefix else "AL-2026-001",
+            help=(
+                f"Enter 001 to sign in as {id_prefix}001. The full ID also works."
+                if id_prefix
+                else "Your full employee ID."
+            ),
+        )
         password = st.text_input("Password", type="password")
         submitted = st.form_submit_button("Sign in", type="primary")
     if submitted:

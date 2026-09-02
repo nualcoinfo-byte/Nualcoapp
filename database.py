@@ -6232,8 +6232,48 @@ def any_employee_has_password() -> bool:
     return bool(row)
 
 
+def _employee_id_tail_number(employee_id: str) -> Optional[int]:
+    match = re.search(r"(\d+)$", (employee_id or "").strip())
+    return int(match.group(1)) if match else None
+
+
+def employee_id_common_prefix() -> str:
+    """The prefix every employee ID shares, e.g. 'AL-2026-'. Empty if they differ."""
+    prefixes = {
+        re.sub(r"\d+$", "", str(row["employee_id"]).strip())
+        for row in fetch_all('SELECT employee_id AS "employee_id" FROM employees')
+        if row.get("employee_id")
+    }
+    return prefixes.pop() if len(prefixes) == 1 else ""
+
+
+def resolve_employee_login_id(login_id: str) -> Optional[str]:
+    """Accept a full employee ID or just its trailing number ('7' or '007')."""
+    entered = (login_id or "").strip()
+    if not entered:
+        return None
+    exact = fetch_one(
+        'SELECT employee_id AS "employee_id" FROM employees '
+        "WHERE lower(employee_id) = lower(?)",
+        (entered,),
+    )
+    if exact:
+        return str(exact["employee_id"])
+    if not re.fullmatch(r"\d+", entered):
+        return None
+    wanted = int(entered)
+    matches = [
+        str(row["employee_id"])
+        for row in fetch_all('SELECT employee_id AS "employee_id" FROM employees')
+        if _employee_id_tail_number(str(row.get("employee_id") or "")) == wanted
+    ]
+    # Two IDs can end in the same number (AL-2026-007 and AL-2027-007); make the
+    # user type the full ID rather than guessing which one they meant.
+    return matches[0] if len(matches) == 1 else None
+
+
 def authenticate_employee(login_id: str, password: str) -> Optional[dict[str, Any]]:
-    login_id = (login_id or "").strip()
+    login_id = resolve_employee_login_id(login_id) or ""
     if not login_id or not password:
         return None
     row = fetch_one(
