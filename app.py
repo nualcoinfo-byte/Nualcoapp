@@ -4042,6 +4042,71 @@ elif PAGE == "Production Batch & Chemistry":
             f"Total net input weight: **{total_in:,.2f} kg** across {total_lines} charge line(s)."
         )
 
+        estimate_lines = list(saved_charges) + list(display_charges)
+        estimate = (
+            db.estimate_batch_input_cost(estimate_lines) if estimate_lines else None
+        )
+        if estimate and estimate["lines"]:
+            st.markdown("##### Estimated cost")
+            est_per_kg = estimate["estimated_cost_per_kg"]
+            material_per_kg = estimate["estimated_material_per_kg"]
+            e1, e2, e3, e4 = st.columns(4)
+            e1.metric("Charge cost", f"{estimate['input_cost_total']:,.2f}")
+            e2.metric(
+                "Estimated output (kg)", f"{estimate['estimated_output_kg']:,.2f}"
+            )
+            e3.metric(
+                "Material ₹/kg",
+                f"{material_per_kg:,.2f}" if material_per_kg is not None else "—",
+            )
+            e4.metric(
+                "Estimated ₹/kg",
+                f"{est_per_kg:,.2f}" if est_per_kg is not None else "—",
+            )
+            conv_month = estimate["conversion_expense_month"]
+            st.caption(
+                "Charge cost ÷ estimated output, plus conversion "
+                f"**{estimate['conversion_rate_applied']:,.2f} ₹/kg**"
+                + (f" ({format_ui_date(conv_month)})" if conv_month else "")
+                + ". Estimated output is each line's weight × the recovery on the "
+                "newest **Raw Material Master** row for that material."
+            )
+            if estimate["missing_recovery"]:
+                st.warning(
+                    "No recovery on Raw Material Master for: "
+                    + ", ".join(estimate["missing_recovery"])
+                    + " — these contribute no estimated output."
+                )
+            if estimate["missing_cost"]:
+                st.warning(
+                    "No cost per kg on the lot or Raw Material Master for: "
+                    + ", ".join(estimate["missing_cost"])
+                    + " — these contribute no cost."
+                )
+            with st.expander("Estimate breakdown by charge line"):
+                show_dataframe(
+                    df_from_rows(
+                        [
+                            {
+                                "Raw material": d["Raw_Material_Name"],
+                                "Lot": d["Lot_id"],
+                                "Weight (kg)": d["Weight"],
+                                "Cost/kg": d["Cost_per_kg"],
+                                "Cost from": d["Cost_source"],
+                                "Line cost": d["Line_cost"],
+                                "Recovery %": d["Recovery_pct"],
+                                "Master effective": d["Effective_date"],
+                                "Est. output (kg)": d["Estimated_output_kg"],
+                            }
+                            for d in estimate["lines"]
+                        ]
+                    )
+                )
+                st.caption(
+                    "Cost/kg is the charged lot's cost, falling back to Raw Material "
+                    "Master when the lot has none."
+                )
+
         top_save_clicked = False
         if not existing_batch:
             st.caption(
