@@ -1604,7 +1604,7 @@ def _render_login() -> None:
         return
 
     with st.form("employee_login"):
-        login_id = st.text_input("Employee ID", placeholder="AL-2026-001")
+        login_id = st.text_input("Employee ID", placeholder="001")
         password = st.text_input("Password", type="password")
         submitted = st.form_submit_button("Sign in", type="primary")
     if submitted:
@@ -7889,6 +7889,14 @@ elif PAGE == "Data Browser":
             f"Locked key column(s): `{', '.join(pk_cols)}`."
             + (" New rows: use the dedicated entry pages for auto-IDs." if identity_cols else "")
         )
+        if table_key == "employees":
+            try:
+                st.caption(
+                    "Leave **employee_id** blank on a new row — the next number "
+                    f"(**{db.next_employee_id()}**) is assigned on save."
+                )
+            except Exception:
+                pass
 
         # Keep an unfiltered original snapshot for save (full table)
         original_key = f"data_browser_{table_key}_original_{st.session_state[state_token]}"

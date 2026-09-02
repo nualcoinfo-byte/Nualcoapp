@@ -3695,6 +3695,16 @@ def save_table_edits(
             key = _row_key(row, pk_cols)
             is_new = key not in original_map or any(v is None for v in key)
 
+            # The editor locks primary keys, so a new employee arrives without an
+            # ID. Hand out the next number instead of rejecting the row.
+            if resolved.lower() == "employees" and is_new:
+                id_col = next(
+                    (c for c in row if str(c).lower() == "employee_id"), None
+                )
+                if id_col and row.get(id_col) in (None, ""):
+                    row[id_col] = _next_employee_id_on_conn(conn)
+                    key = _row_key(row, pk_cols)
+
             if resolved.lower() == "batch_output":
                 lower_row = {str(k).lower(): v for k, v in row.items()}
                 bid = lower_row.get("batch_id")
@@ -5979,6 +5989,116 @@ def backfill_finished_goods_from_output() -> int:
     return updated
 
 
+EMPLOYEE_ID_WIDTH = 3
+
+
+def format_employee_id(number: int) -> str:
+    """Employee IDs are plain sequential numbers, zero padded so they sort."""
+    return f"{int(number):0{EMPLOYEE_ID_WIDTH}d}"
+
+
+def employee_id_number(employee_id: object) -> Optional[int]:
+    """The numeric value of an employee ID, ignoring any legacy prefix."""
+    match = re.search(r"(\d+)$", str(employee_id or "").strip())
+    return int(match.group(1)) if match else None
+
+
+def _next_employee_id_on_conn(conn: Connection) -> str:
+    rows = _exec(conn, 'SELECT employee_id AS "employee_id" FROM employees').mappings()
+    highest = 0
+    for row in rows:
+        number = employee_id_number(row.get("employee_id"))
+        if number is not None:
+            highest = max(highest, number)
+    return format_employee_id(highest + 1)
+
+
+def next_employee_id() -> str:
+    """The ID the next new employee will get."""
+    with get_connection() as conn:
+        return _next_employee_id_on_conn(conn)
+
+
+def _employee_id_referencing_columns(conn: Connection) -> list[tuple[str, str]]:
+    """Columns in other tables whose foreign key points at employees.employee_id."""
+    if not IS_POSTGRES:
+        return []
+    rows = _exec(
+        conn,
+        """
+        SELECT tc.table_name AS "table_name", kcu.column_name AS "column_name"
+        FROM information_schema.table_constraints tc
+        JOIN information_schema.key_column_usage kcu
+          ON tc.constraint_name = kcu.constraint_name
+        JOIN information_schema.constraint_column_usage ccu
+          ON tc.constraint_name = ccu.constraint_name
+        WHERE tc.constraint_type = 'FOREIGN KEY'
+          AND ccu.table_name = 'employees'
+          AND ccu.column_name = 'employee_id'
+        """,
+    ).mappings()
+    return [(str(r["table_name"]), str(r["column_name"])) for r in rows]
+
+
+def _ensure_numeric_employee_ids(conn: Connection) -> None:
+    """Drop legacy prefixes (AL-2026-001 -> 001) so IDs are just numbers."""
+    rows = list(
+        _exec(conn, 'SELECT employee_id AS "employee_id" FROM employees').mappings()
+    )
+    current = {str(row["employee_id"]) for row in rows if row.get("employee_id")}
+    if all(re.fullmatch(r"\d+", value) for value in current):
+        return
+
+    renames: list[tuple[str, str]] = []
+    taken = set(current)
+    for old in sorted(current, key=lambda v: (employee_id_number(v) or 0, v)):
+        if re.fullmatch(r"\d+", old):
+            continue
+        number = employee_id_number(old)
+        if number is None:
+            continue
+        new = format_employee_id(number)
+        # Two prefixed IDs can share a number (AL-2026-007, AL-2027-007); give the
+        # later one the next free slot rather than dropping it on a collision.
+        while new in taken:
+            number += 1
+            new = format_employee_id(number)
+        taken.discard(old)
+        taken.add(new)
+        renames.append((old, new))
+    if not renames:
+        return
+
+    children = _employee_id_referencing_columns(conn)
+    # A foreign key that still points at an old ID would block the rename. Keep the
+    # whole migration in one savepoint so a blocked rename leaves IDs as they were
+    # instead of failing startup and dropping the app to SQLite.
+    use_savepoint = IS_POSTGRES and not _USE_NEON_HTTP
+    if use_savepoint:
+        _exec(conn, "SAVEPOINT employee_id_migration")
+    try:
+        for old, new in renames:
+            _exec(
+                conn,
+                "UPDATE employees SET employee_id = ? WHERE employee_id = ?",
+                (new, old),
+            )
+            for table, column in children:
+                _exec(
+                    conn,
+                    f"UPDATE {_sql_ident(table)} SET {_sql_ident(column)} = ? "
+                    f"WHERE {_sql_ident(column)} = ?",
+                    (new, old),
+                )
+    except Exception:
+        if use_savepoint:
+            _exec(conn, "ROLLBACK TO SAVEPOINT employee_id_migration")
+            return
+        raise
+    if use_savepoint:
+        _exec(conn, "RELEASE SAVEPOINT employee_id_migration")
+
+
 def _ensure_employees(conn: Connection) -> None:
     """Create roles, employees, and role_permissions. Seed default nav access."""
     if IS_POSTGRES:
@@ -6025,6 +6145,7 @@ def _ensure_employees(conn: Connection) -> None:
             """,
         )
         _seed_role_permissions(conn)
+        _ensure_numeric_employee_ids(conn)
         return
     _exec(
         conn,
@@ -6068,6 +6189,7 @@ def _ensure_employees(conn: Connection) -> None:
         """,
     )
     _seed_role_permissions(conn)
+    _ensure_numeric_employee_ids(conn)
 
 
 def _normalize_role_name(name: object) -> str:
