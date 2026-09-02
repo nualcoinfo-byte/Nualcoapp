@@ -255,9 +255,20 @@ def _add_avg_piece_column(data: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+def _pandas_styler(data: pd.DataFrame):
+    """Return a pandas Styler, or None when jinja2 is not installed."""
+    try:
+        return data.style
+    except (AttributeError, ImportError):
+        return None
+
+
 def _style_avg_piece_column(data: pd.DataFrame):
     """Highlight product-alloy piece averages outside 5.6–6.1 kg in red."""
     if data is None or data.empty or "Avg_piece_kg" not in data.columns:
+        return data
+    styler = _pandas_styler(data)
+    if styler is None:
         return data
     alloy_ids = data["Alloy_id"] if "Alloy_id" in data.columns else None
 
@@ -281,7 +292,7 @@ def _style_avg_piece_column(data: pd.DataFrame):
         except (TypeError, ValueError):
             return "—"
 
-    return data.style.apply(_color, axis=0).format(
+    return styler.apply(_color, axis=0).format(
         {"Avg_piece_kg": _fmt_avg},
         na_rep="—",
     )
@@ -2486,7 +2497,7 @@ def _render_certificate_print(
     return payload
 
 
-def _style_spec_check_table(data: pd.DataFrame) -> pd.io.formats.style.Styler:
+def _style_spec_check_table(data: pd.DataFrame):
     """Highlight rows whose Status starts with Out of spec."""
 
     def _row_style(row: pd.Series) -> list[str]:
@@ -2497,7 +2508,10 @@ def _style_spec_check_table(data: pd.DataFrame) -> pd.io.formats.style.Styler:
             )
         return [""] * len(row)
 
-    return data.style.apply(_row_style, axis=1)
+    styler = _pandas_styler(data)
+    if styler is None:
+        return data
+    return styler.apply(_row_style, axis=1)
 
 
 def _render_tc_spec_and_deviation(packing_list_id: int, *, locked: bool) -> tuple[bool, bool]:
