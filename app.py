@@ -3978,6 +3978,122 @@ elif PAGE == "Production Batch & Chemistry":
             f"Total net input weight: **{total_in:,.2f} kg** across {total_lines} charge line(s)."
         )
 
+        if existing_batch:
+            try:
+                returnable = db.list_batch_input_returnable(preview_id)
+            except Exception as exc:
+                returnable = []
+                st.warning(f"Could not read returnable charge material: {exc}")
+            open_lines = [r for r in returnable if r["Returnable_weight"] > 0]
+
+            if open_lines and not locked:
+                st.markdown("##### Return charge material")
+                st.caption(
+                    "Send part of a saved charge line back to inventory, or write it "
+                    "off as scrap. **Back to inventory** reduces this heat's input "
+                    "weight and puts the metal back on the lot. **Scrap** leaves the "
+                    "input weight alone, so this heat still carries its cost."
+                )
+                return_labels = {
+                    (
+                        f"{r['Raw_Material_Name']} — Lot {r['Lot_id']} — "
+                        f"{r['Returnable_weight']:,.2f} kg on charge"
+                    ): r
+                    for r in open_lines
+                }
+                rc1, rc2 = st.columns([2.6, 1.4])
+                with rc1:
+                    return_pick = st.selectbox(
+                        "Charged material to return",
+                        options=list(return_labels.keys()),
+                        key=_pk("ret_line"),
+                        help="Only material saved as a charge line on this heat.",
+                    )
+                chosen_return = return_labels[return_pick]
+                max_return = float(chosen_return["Returnable_weight"])
+                with rc2:
+                    return_weight = empty_percent_input(
+                        "Return weight (kg) *",
+                        key=_pk("ret_weight"),
+                        max_value=None,
+                        step=0.1,
+                        help=f"Up to {max_return:,.2f} kg is still on this charge line.",
+                    )
+                rc3, rc4 = st.columns([1.6, 2.4])
+                with rc3:
+                    return_kind = st.radio(
+                        "Return to",
+                        options=db.BATCH_INPUT_RETURN_TYPES,
+                        format_func=lambda v: (
+                            "Back to inventory" if v == "Inventory" else "Scrap"
+                        ),
+                        horizontal=True,
+                        key=_pk("ret_kind"),
+                    )
+                with rc4:
+                    return_notes = st.text_input("Return notes", key=_pk("ret_notes"))
+
+                if _button_clicked(
+                    st.button(
+                        "Record return", type="primary", key=_pk("ret_save")
+                    ),
+                    _pk("ret_save"),
+                ):
+                    try:
+                        db.save_batch_input_return(
+                            preview_id,
+                            chosen_return["Raw_Material_Name"],
+                            int(chosen_return["Lot_id"]),
+                            float(return_weight or 0),
+                            return_kind,
+                            return_notes,
+                            allow_completed=bool(is_completed) and not locked,
+                        )
+                        where = (
+                            "back to inventory"
+                            if return_kind == "Inventory"
+                            else "as scrap"
+                        )
+                        st.success(
+                            f"Returned **{float(return_weight or 0):,.2f} kg** of "
+                            f"**{chosen_return['Raw_Material_Name']}** "
+                            f"(lot {chosen_return['Lot_id']}) {where}."
+                        )
+                        st.session_state.pop(_pk("ret_weight"), None)
+                        st.cache_data.clear()
+                        st.rerun()
+                    except Exception as exc:
+                        st.error(str(exc))
+            elif open_lines and locked:
+                st.caption(
+                    "Charge material cannot be returned on a Completed heat."
+                )
+
+            try:
+                past_returns = db.list_batch_input_returns(preview_id)
+            except Exception:
+                past_returns = []
+            if past_returns:
+                returned_kg = sum(
+                    float(r["Weight"] or 0)
+                    for r in past_returns
+                    if r["Return_type"] == "Inventory"
+                )
+                scrapped_kg = sum(
+                    float(r["Weight"] or 0)
+                    for r in past_returns
+                    if r["Return_type"] == "Scrap"
+                )
+                with st.expander(
+                    f"Returned to inventory {returned_kg:,.2f} kg · "
+                    f"scrapped {scrapped_kg:,.2f} kg"
+                ):
+                    show_dataframe(df_from_rows(past_returns))
+                    st.caption(
+                        "Inventory returns are already deducted from the input "
+                        "weight above. Scrap is not."
+                    )
+
         top_save_clicked = False
         if not existing_batch:
             st.caption(
