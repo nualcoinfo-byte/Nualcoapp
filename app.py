@@ -4590,6 +4590,48 @@ elif PAGE == "Batch Output":
 
                 render_batch_output_editor(batch, key_prefix="bo_page")
 
+                # Re-read so the yield reflects outputs just saved above.
+                batch = db.get_batch(bid) or batch
+                input_w = float(batch.get("Input_Weight") or 0)
+                output_w = float(batch.get("Output_Weight") or 0)
+                st.markdown("#### Batch yield")
+                y1, y2, y3 = st.columns(3)
+                y1.metric("Total input (kg)", f"{input_w:,.2f}")
+                y2.metric("Total output (kg)", f"{output_w:,.2f}")
+                with y3:
+                    st.markdown(
+                        '<p class="avg-piece-label">Yield %</p>', unsafe_allow_html=True
+                    )
+                    if input_w <= 0:
+                        st.markdown(
+                            '<p class="avg-piece">—</p>', unsafe_allow_html=True
+                        )
+                    elif output_w <= 0:
+                        st.markdown(
+                            '<p class="avg-piece">—</p>', unsafe_allow_html=True
+                        )
+                    else:
+                        pct = db.calc_yield(input_w, output_w)["recovery_pct"]
+                        css = (
+                            "yield-ok" if pct >= db.YIELD_TARGET_PCT else "yield-bad"
+                        )
+                        st.markdown(
+                            f'<p class="{css}">{pct:.2f}%</p>', unsafe_allow_html=True
+                        )
+                if input_w <= 0:
+                    st.caption(
+                        "No charge input on this heat yet — add it on "
+                        "**Production Batch & Chemistry**."
+                    )
+                elif output_w <= 0:
+                    st.caption("Save output lines above to see this heat's yield.")
+                else:
+                    st.caption(
+                        f"Total output ÷ total input for **{bid}**. "
+                        f"Melt loss {input_w - output_w:,.2f} kg. "
+                        f"Target {db.YIELD_TARGET_PCT:.0f}%."
+                    )
+
     st.subheader("Saved outputs")
     saved_all = df_from_rows(db.list_all_batch_outputs())
     if saved_all.empty:
