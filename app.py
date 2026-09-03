@@ -30,6 +30,47 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
+
+def _read_local_text(path: Path) -> str:
+    data = path.read_bytes()
+    for encoding in ("utf-8-sig", "utf-16", "utf-16-le", "cp1252", "utf-8"):
+        try:
+            return data.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    return data.decode("utf-8", errors="replace")
+
+
+def _assign_env_value(name: str, raw: str) -> None:
+    value = raw.strip().strip('"').strip("'")
+    if name and value:
+        os.environ[name] = value
+
+
+def _load_env_local() -> None:
+    """Load local secrets before database.py binds the engine at import time."""
+    root = Path(__file__).resolve().parent
+    for env_file in (root / ".env.local", root / ".env", root / "env.local"):
+        if not env_file.exists():
+            continue
+        for line in _read_local_text(env_file).splitlines():
+            text = line.strip()
+            if not text or text.startswith("#") or "=" not in text:
+                continue
+            key, _, raw = text.partition("=")
+            _assign_env_value(key.strip(), raw)
+    secrets_file = root / ".streamlit" / "secrets.toml"
+    if secrets_file.exists():
+        for line in _read_local_text(secrets_file).splitlines():
+            text = line.strip()
+            if not text or text.startswith("#") or "=" not in text:
+                continue
+            key, _, raw = text.partition("=")
+            _assign_env_value(key.strip(), raw)
+
+
+_load_env_local()
+
 # Inject Streamlit Cloud secrets into the environment BEFORE importing the
 # database module, which binds SQLAlchemy's engine at import time.
 _secret_url = ""
@@ -137,10 +178,13 @@ def _on_streamlit_cloud() -> bool:
 
 @st.cache_resource
 def _init_postgres() -> bool:
-    """Handshake once per process. Failures are cleared by the caller."""
-    db._ensure_packing_list_ready()
-    db._ensure_company_ready()
+    """Read-only handshake once per process; deployment migrations own DDL."""
+    db.verify_schema_ready()
     return True
+
+
+def _configured_database_url() -> str:
+    return (os.environ.get("DATABASE_URL") or os.environ.get("ADMIN_DATABASE_URL") or "").strip()
 
 
 def bootstrap() -> str:
@@ -170,7 +214,8 @@ def bootstrap() -> str:
                         _init_postgres.clear()
                     except Exception:
                         pass
-            if _on_streamlit_cloud():
+            configured = _configured_database_url().lower()
+            if _on_streamlit_cloud() or "supabase" in configured:
                 return "postgres-error"
             db.switch_to_sqlite()
             db.init_db()
@@ -190,6 +235,21 @@ def df_from_rows(rows) -> pd.DataFrame:
     if not rows:
         return pd.DataFrame()
     return pd.DataFrame([dict(r) for r in rows])
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def cached_raw_materials() -> list[str]:
+    return db.list_raw_materials()
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def cached_alloys() -> list[dict]:
+    return db.list_alloys()
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def cached_active_trolleys() -> list[dict]:
+    return db.list_trolleys(active_only=True)
 
 
 def _show_db_connection_error(exc: BaseException) -> None:
@@ -1655,12 +1715,18 @@ st.sidebar.divider()
 auth_employee = st.session_state.get("auth_employee")
 if not auth_employee:
     db.clear_session_actor()
-    if _db_mode == "postgres-error":
+    if _db_mode == "postgres-error" or not db.IS_POSTGRES:
         st.sidebar.error(
-            "Could not reach Supabase yet. Click **Retry**, or reboot the app."
+            "This app is not using Supabase. Put the session-pooler URI in "
+            "`.env.local` next to `app.py`, then click **Retry**."
         )
+        neon_err = st.session_state.get("_neon_init_error")
+        if neon_err:
+            st.sidebar.caption(f"Database init error: {neon_err}")
         if st.sidebar.button("Retry database connection"):
             st.session_state.pop("_neon_init_error", None)
+            st.session_state.pop("use_sqlite", None)
+            os.environ.pop("NUALCO_FORCE_SQLITE", None)
             st.cache_resource.clear()
             st.rerun()
     try:
@@ -1754,10 +1820,10 @@ elif st.session_state.get("use_sqlite") or os.environ.get("NUALCO_FORCE_SQLITE")
         st.rerun()
 elif not db.IS_POSTGRES:
     st.sidebar.error(
-        "Not connected to the database. In Streamlit Cloud go to "
-        "**Manage app → Settings → Secrets** and set:\n\n"
-        '```\nDATABASE_URL = "postgresql://..."\n```\n\n'
-        "Remove any leftover `DATABASE_URL_UNPOOLED` Neon URL, then reboot the app."
+        "Not connected to Supabase. Create `.env.local` next to `app.py` with:\n\n"
+        '`DATABASE_URL="postgresql://postgres.<project-ref>:...@aws-1-ap-south-1.pooler.supabase.com:5432/postgres?sslmode=require"`\n\n'
+        "Then stop Streamlit and start it again. Remove any leftover Neon "
+        "`DATABASE_URL_UNPOOLED`."
     )
 
 
@@ -2741,15 +2807,18 @@ if PAGE == "Dashboard":
     today = date.today()
     try:
         supply_rows = db.list_po_supply_status()
-        batches = db.list_batches()
-        materials = db.list_raw_materials()
-        lots = db.list_inventory_lots()
-        alloys = db.list_alloys()
+        batches = db.list_batches(limit=100)
+        batch_count = db.count_batches()
+        materials = cached_raw_materials()
+        lots = db.list_inventory_lots(limit=250)
+        lot_count = db.count_inventory_lots()
+        alloys = cached_alloys()
         oil_stock = db.get_furnace_oil_stock()
         elec_month = db.electricity_month_totals(today.year, today.month)
     except Exception as exc:
         _show_db_connection_error(exc)
         supply_rows, batches, materials, lots, alloys = [], [], [], [], []
+        batch_count = lot_count = 0
         oil_stock = 0.0
         elec_month = {"consumed": 0.0, "by_line": {}}
 
@@ -2892,9 +2961,9 @@ if PAGE == "Dashboard":
 
     st.divider()
     c1, c2, c3, c4, c5, c6 = st.columns(6)
-    c1.metric("Batches", len(batches))
+    c1.metric("Batches", batch_count)
     c2.metric("Raw materials", len(materials))
-    c3.metric("Active lots", len(lots))
+    c3.metric("Active lots", lot_count)
     c4.metric("Alloys", len(alloys))
     c5.metric("Furnace oil (L)", f"{oil_stock:,.1f}")
     c6.metric("Electricity this month", f"{elec_month['consumed']:,.1f}")
@@ -3450,7 +3519,7 @@ elif PAGE == "Production Batch & Chemistry":
         + (f" ({a['Customer_name']})" if a["Customer_name"] else ""): a["Alloy_id"]
         for a in alloys
     }
-    materials = db.list_raw_materials()
+    materials = cached_raw_materials()
 
     if not furnaces:
         st.error("Define at least one furnace under **Furnaces**.")
@@ -3767,7 +3836,7 @@ elif PAGE == "Production Batch & Chemistry":
             st.caption("Saved charge lines")
             show_dataframe(df_from_rows(saved_charges))
 
-        trolleys = db.list_trolleys(active_only=True)
+        trolleys = cached_active_trolleys()
         trolley_by_name = {t["Trolley_name"]: float(t["Weight"] or 0) for t in trolleys}
         trolley_colour_by_name = {
             t["Trolley_name"]: (t.get("Colour") or "").strip() or None for t in trolleys
@@ -3805,6 +3874,11 @@ elif PAGE == "Production Batch & Chemistry":
         if not trolleys:
             st.error("Define at least one active trolley under **Trolleys**.")
 
+        charge_lots_by_material: dict[str, list[dict]] = {}
+        for available_lot in db.list_inventory_lots(limit=2000):
+            material_name = str(available_lot.get("Raw_Material_Name") or "")
+            charge_lots_by_material.setdefault(material_name, []).append(available_lot)
+
         charge_inputs: list[dict] = []
         for idx, line in enumerate(furnace_charge_lines):
             st.markdown(f"**Charge line {idx + 1}**")
@@ -3815,7 +3889,7 @@ elif PAGE == "Production Batch & Chemistry":
                     options=[""] + materials,
                     key=_pk(f"mat_{idx}"),
                 )
-            lots = db.list_inventory_lots(material=mat or None) if mat else []
+            lots = charge_lots_by_material.get(mat, []) if mat else []
             lot_opts = {}
             for lot in lots:
                 rem = float(lot.get("Remaining_Weight") or 0)
@@ -5362,11 +5436,6 @@ elif PAGE == "Finished Goods Inventory":
         f"**{db.ALLOY_PIECE_KG_MIN:g}–{db.ALLOY_PIECE_KG_MAX:g} kg** and show in red "
         "if outside that range so you can check the piece count."
     )
-    try:
-        db.backfill_finished_goods_from_output()
-    except Exception as exc:
-        st.warning(f"Could not refresh finished goods from batch output: {exc}")
-
     all_fg = db.list_finished_goods()
     available_n = sum(
         1 for r in all_fg if r.get("Finished_Goods_Status") == db.FG_STATUS_AVAILABLE
@@ -5420,11 +5489,6 @@ elif PAGE == "Packing List":
         f"product alloy pieces are **{db.ALLOY_PIECE_KG_MIN:g}–{db.ALLOY_PIECE_KG_MAX:g} kg** "
         "and show in red if outside that range."
     )
-    try:
-        db.backfill_finished_goods_from_output()
-    except Exception as exc:
-        st.warning(f"Could not refresh finished goods from batch output: {exc}")
-
     def _clear_packing_form() -> None:
         keep = {"pl_load_pick"}
         for key in list(st.session_state.keys()):
@@ -7349,7 +7413,7 @@ elif PAGE == "Alloys":
             st.session_state.pop("alloy_full_specs", None)
             st.success(f"Created alloy **{aname}** (ID {aid}).")
     st.subheader("Alloys")
-    show_dataframe(df_from_rows(db.list_alloys()))
+    show_dataframe(df_from_rows(cached_alloys()))
 
     aid_view = st.number_input("View specs for Alloy ID", min_value=0, step=1, value=0)
     if aid_view > 0:
@@ -7572,7 +7636,7 @@ elif PAGE == "Purchase Orders":
         cust_code = cust["Cust_code"] if cust else None
         alloys = [
             a
-            for a in db.list_alloys()
+            for a in cached_alloys()
             if cust_code and a.get("Cust_code") == cust_code
         ]
         alloy_opts = {
@@ -8050,8 +8114,8 @@ elif PAGE == "Bill of Materials":
         f"{c['Cust_code']} — {c['Customer_name']}": c["Cust_code"]
         for c in db.list_customer_codes()
     }
-    materials = db.list_raw_materials()
-    alloys = [a["Alloy_name"] for a in db.list_alloys()]
+    materials = cached_raw_materials()
+    alloys = [a["Alloy_name"] for a in cached_alloys()]
 
     with st.form("bom_form", clear_on_submit=True):
         b1, b2 = st.columns(2)
@@ -8120,7 +8184,36 @@ elif PAGE == "Data Browser":
     if state_token not in st.session_state:
         st.session_state[state_token] = 0
 
-    rows = db.load_editable_table(table_key, order_by=meta["order_by"])
+    with t2:
+        search = st.text_input(
+            "Search",
+            placeholder="Search in the database…",
+            key=f"search_{table_key}_{st.session_state[state_token]}",
+        )
+    with t3:
+        page_size = st.selectbox(
+            "Rows/page",
+            [25, 50, 100, 250],
+            index=1,
+            key=f"page_size_{table_key}",
+        )
+    total_rows = db.count_editable_table(table_key, search=search)
+    page_count = max(1, (total_rows + page_size - 1) // page_size)
+    page_number = st.number_input(
+        "Page",
+        min_value=1,
+        max_value=page_count,
+        value=1,
+        step=1,
+        key=f"page_{table_key}_{st.session_state[state_token]}",
+    )
+    rows = db.load_editable_table(
+        table_key,
+        order_by=meta["order_by"],
+        search=search,
+        limit=page_size,
+        offset=(int(page_number) - 1) * page_size,
+    )
     full_df = df_from_rows(rows)
     if table_key == "raw_material_spec" and not full_df.empty:
         sym_col = next(
@@ -8136,14 +8229,9 @@ elif PAGE == "Data Browser":
             ].copy()
     full_df = format_df_dates(full_df)
 
-    with t2:
-        search = st.text_input(
-            "Search",
-            placeholder="Filter any column…",
-            key=f"search_{table_key}_{st.session_state[state_token]}",
-        )
-    with t3:
-        st.metric("Rows", len(full_df))
+    st.caption(
+        f"Page {int(page_number)} of {page_count} · {total_rows:,} matching rows"
+    )
 
     if full_df.empty:
         st.info(f"No rows in **{chosen_label}** yet.")
@@ -8190,16 +8278,8 @@ elif PAGE == "Data Browser":
                     if picked:
                         filter_df = filter_df[filter_df[col].astype(str).isin(picked)]
 
-        if search.strip():
-            q = search.strip().lower()
-            mask = filter_df.apply(
-                lambda r: any(q in str(v).lower() for v in r.values if v is not None),
-                axis=1,
-            )
-            filter_df = filter_df[mask]
-
         st.caption(
-            f"Showing **{len(filter_df)}** of **{len(full_df)}** rows. "
+            f"Showing **{len(filter_df)}** rows on this page. "
             f"Locked key column(s): `{', '.join(pk_cols)}`."
             + (" New rows: use the dedicated entry pages for auto-IDs." if identity_cols else "")
         )

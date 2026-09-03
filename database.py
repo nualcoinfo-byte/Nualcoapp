@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import json
 import os
 import re
 import secrets
@@ -26,6 +27,7 @@ import struct
 import sys
 import time
 from contextlib import contextmanager
+from contextvars import ContextVar
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Callable, Generator, Iterable, Optional, TypeVar
@@ -63,8 +65,8 @@ def _quote_pg_password(url: str) -> str:
 
 
 def _should_probe_pooler() -> bool:
-    """Linux/Streamlit Cloud can reach the pooler; this Windows network cannot."""
-    return os.name != "nt"
+    """Try the IPv4 session pooler on every OS, including Windows."""
+    return True
 
 
 def _supabase_pooler_region(direct_host: str) -> str:
@@ -799,10 +801,10 @@ AUDIT_TABLES = {
     "packing_list_visual_inspection",
     "company_profile",
 }
-_ACTING_USER: str = "system"
-_ACTING_EMPLOYEE_ID: str = ""
-_ACTING_ROLE_NAME: str = "system"
-_ACTING_ROLE_ID: int | None = None
+_ACTOR_CONTEXT: ContextVar[tuple[str, str, str, int | None]] = ContextVar(
+    "nualco_actor",
+    default=("system", "", "system", None),
+)
 
 NAV_SECTION_DEFS: list[tuple[str, str]] = [
     ("overview", "Overview"),
@@ -854,9 +856,9 @@ _SECRET_COLUMNS = frozenset({"password_hash"})
 
 def set_acting_user(name: str | None) -> None:
     """Set the user stamp used for Last_updated_by (from the Streamlit sidebar)."""
-    global _ACTING_USER
+    _old_name, employee_id, role_name, role_id = _ACTOR_CONTEXT.get()
     text = (name or "").strip()
-    _ACTING_USER = text or "system"
+    _ACTOR_CONTEXT.set((text or "system", employee_id, role_name, role_id))
 
 
 def set_session_actor(
@@ -867,14 +869,18 @@ def set_session_actor(
     role_id: int | None = None,
 ) -> None:
     """Bind the logged-in employee for audit stamps, nav, and RLS."""
-    global _ACTING_EMPLOYEE_ID, _ACTING_ROLE_NAME, _ACTING_ROLE_ID
-    set_acting_user(name)
-    _ACTING_EMPLOYEE_ID = (employee_id or "").strip()
-    _ACTING_ROLE_NAME = (role_name or "").strip() or "system"
     try:
-        _ACTING_ROLE_ID = int(role_id) if role_id is not None else None
+        normalized_role_id = int(role_id) if role_id is not None else None
     except (TypeError, ValueError):
-        _ACTING_ROLE_ID = None
+        normalized_role_id = None
+    _ACTOR_CONTEXT.set(
+        (
+            (name or "").strip() or "system",
+            (employee_id or "").strip(),
+            (role_name or "").strip() or "system",
+            normalized_role_id,
+        )
+    )
 
 
 def clear_session_actor() -> None:
@@ -882,24 +888,127 @@ def clear_session_actor() -> None:
 
 
 def get_acting_user() -> str:
-    return _ACTING_USER or "system"
+    return _ACTOR_CONTEXT.get()[0] or "system"
 
 
 def get_acting_employee_id() -> str:
-    return _ACTING_EMPLOYEE_ID or ""
+    return _ACTOR_CONTEXT.get()[1] or ""
 
 
 def get_acting_role_name() -> str:
-    return _ACTING_ROLE_NAME or "system"
+    return _ACTOR_CONTEXT.get()[2] or "system"
 
 
 def get_acting_role_id() -> int | None:
-    return _ACTING_ROLE_ID
+    return _ACTOR_CONTEXT.get()[3]
 
 
 def audit_stamp() -> tuple[str, str]:
     """Return (Last_updated_by, Last_updated_datetime) for the current actor."""
     return get_acting_user(), datetime.now().isoformat(timespec="seconds")
+
+
+def _require_permission(table_name: str, action: str) -> None:
+    """Fail closed before sensitive writes; Postgres RLS remains authoritative."""
+    if not IS_POSTGRES:
+        return
+    with get_connection() as conn:
+        row = _exec(
+            conn,
+            'SELECT public.nualco_can(?, ?) AS "allowed"',
+            (table_name.lower(), action.lower()),
+        ).mappings().first()
+    if not row or not bool(row.get("allowed")):
+        raise PermissionError(
+            f"{get_acting_role_name()} cannot {action.lower()} {table_name}."
+        )
+
+
+def _record_inventory_movement(
+    conn: Connection,
+    *,
+    inventory_kind: str,
+    quantity_delta: float,
+    unit: str,
+    movement_type: str,
+    idempotency_key: str,
+    lot_id: int | None = None,
+    bundle_id: int | None = None,
+    batch_id: str | None = None,
+    packing_list_id: int | None = None,
+    source_type: str | None = None,
+    source_id: str | None = None,
+    reason: str | None = None,
+    metadata: dict[str, Any] | None = None,
+) -> None:
+    delta = float(quantity_delta or 0)
+    if abs(delta) <= 1e-12:
+        return
+    _exec(
+        conn,
+        """
+        INSERT INTO Inventory_Movements (
+            Inventory_kind, Lot_id, Bundle_id, Batch_ID, Packing_list_id,
+            Quantity_delta, Unit, Movement_type, Source_type, Source_id,
+            Idempotency_key, Actor_employee_id, Occurred_at, Reason, Metadata
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(Idempotency_key) DO NOTHING
+        """,
+        (
+            inventory_kind,
+            lot_id,
+            bundle_id,
+            batch_id,
+            packing_list_id,
+            delta,
+            unit,
+            movement_type,
+            source_type,
+            source_id,
+            idempotency_key,
+            get_acting_employee_id() or None,
+            datetime.now().isoformat(timespec="seconds"),
+            reason,
+            json.dumps(metadata or {}, sort_keys=True),
+        ),
+    )
+
+
+def list_inventory_movements(
+    *,
+    inventory_kind: str | None = None,
+    lot_id: int | None = None,
+    bundle_id: int | None = None,
+    limit: int = 200,
+) -> list[dict[str, Any]]:
+    clauses: list[str] = []
+    params: list[Any] = []
+    if inventory_kind:
+        clauses.append("Inventory_kind = ?")
+        params.append(inventory_kind)
+    if lot_id is not None:
+        clauses.append("Lot_id = ?")
+        params.append(int(lot_id))
+    if bundle_id is not None:
+        clauses.append("Bundle_id = ?")
+        params.append(int(bundle_id))
+    sql = """
+        SELECT Movement_id AS "Movement_id",
+               Inventory_kind AS "Inventory_kind",
+               Lot_id AS "Lot_id", Bundle_id AS "Bundle_id",
+               Batch_ID AS "Batch_ID", Packing_list_id AS "Packing_list_id",
+               Quantity_delta AS "Quantity_delta", Unit AS "Unit",
+               Movement_type AS "Movement_type", Source_type AS "Source_type",
+               Source_id AS "Source_id", Actor_employee_id AS "Actor_employee_id",
+               Occurred_at AS "Occurred_at", Reason AS "Reason"
+        FROM Inventory_Movements
+    """
+    if clauses:
+        sql += " WHERE " + " AND ".join(clauses)
+    sql += " ORDER BY Movement_id DESC LIMIT ?"
+    params.append(max(1, min(int(limit), 1000)))
+    return fetch_all(sql, params)
 
 
 # ---------- Schema ----------
@@ -1343,6 +1452,25 @@ CREATE TABLE IF NOT EXISTS Furnace_Oil_Inventory (
     Closing_qty {float} NOT NULL DEFAULT 0,
     Last_updated_by TEXT,
     Last_updated_datetime TEXT
+);
+CREATE TABLE IF NOT EXISTS Inventory_Movements (
+    Movement_id {autopk},
+    Inventory_kind TEXT NOT NULL
+        CHECK(Inventory_kind IN ('raw_material', 'finished_goods', 'furnace_oil')),
+    Lot_id INTEGER REFERENCES Raw_Material_Inventory(Lot_id),
+    Bundle_id INTEGER REFERENCES Finished_Goods_Inventory(Bundle_id),
+    Batch_ID TEXT REFERENCES Production_batch(Batch_ID),
+    Packing_list_id INTEGER REFERENCES Packing_list(Packing_list_id),
+    Quantity_delta {float} NOT NULL CHECK(Quantity_delta <> 0),
+    Unit TEXT NOT NULL CHECK(Unit IN ('kg', 'litre', 'piece')),
+    Movement_type TEXT NOT NULL,
+    Source_type TEXT,
+    Source_id TEXT,
+    Idempotency_key TEXT NOT NULL UNIQUE,
+    Actor_employee_id TEXT REFERENCES employees(employee_id),
+    Occurred_at TEXT NOT NULL DEFAULT {now},
+    Reason TEXT,
+    Metadata TEXT DEFAULT '{}'
 );
 CREATE TABLE IF NOT EXISTS Electricity_Consumption (
     Consumption_date TEXT NOT NULL,
@@ -3446,14 +3574,6 @@ EDITABLE_TABLES: list[dict[str, Any]] = [
         "allow_add": False,
     },
     {
-        "key": "raw_material_inventory",
-        "label": "Raw material inventory",
-        "pk": ["lot_id"],
-        "order_by": "lot_id",
-        "identity": ["lot_id"],
-        "allow_add": False,
-    },
-    {
         "key": "raw_material_spec",
         "label": "Raw material chemistry",
         "pk": ["raw_material_name", "effective_date", "element_symbol"],
@@ -3550,14 +3670,6 @@ EDITABLE_TABLES: list[dict[str, Any]] = [
         "allow_add": True,
     },
     {
-        "key": "finished_goods_inventory",
-        "label": "Finished goods inventory",
-        "pk": ["bundle_id"],
-        "order_by": "bundle_id",
-        "identity": ["bundle_id"],
-        "allow_add": True,
-    },
-    {
         "key": "production_supervisor",
         "label": "Production supervisors",
         "pk": ["production_supervisor"],
@@ -3566,42 +3678,10 @@ EDITABLE_TABLES: list[dict[str, Any]] = [
         "allow_add": True,
     },
     {
-        "key": "batch_output",
-        "label": "Batch outputs",
-        "pk": ["output_id"],
-        "order_by": "output_id",
-        "identity": ["output_id"],
-        "allow_add": False,
-    },
-    {
         "key": "element_master",
         "label": "Elements",
         "pk": ["serial_no"],
         "order_by": "serial_no",
-        "identity": [],
-        "allow_add": False,
-    },
-    {
-        "key": "furnace_oil_purchase",
-        "label": "Furnace oil purchases",
-        "pk": ["purchase_id"],
-        "order_by": "purchase_id",
-        "identity": ["purchase_id"],
-        "allow_add": False,
-    },
-    {
-        "key": "furnace_oil_consumption",
-        "label": "Furnace oil consumption",
-        "pk": ["consumption_date"],
-        "order_by": "consumption_date",
-        "identity": [],
-        "allow_add": True,
-    },
-    {
-        "key": "furnace_oil_inventory",
-        "label": "Furnace oil inventory",
-        "pk": ["inventory_date"],
-        "order_by": "inventory_date",
         "identity": [],
         "allow_add": False,
     },
@@ -3660,12 +3740,29 @@ def editable_columns(table_name: str) -> list[str]:
     return _retry_on_disconnect(_run)
 
 
-def load_editable_table(table_name: str, order_by: str | None = None) -> list[dict[str, Any]]:
+def load_editable_table(
+    table_name: str,
+    order_by: str | None = None,
+    *,
+    search: str | None = None,
+    limit: int = 100,
+    offset: int = 0,
+) -> list[dict[str, Any]]:
     resolved = _resolve_table_name(table_name)
     cols = editable_columns(resolved)
     if not cols:
         return []
     select_list = ", ".join(f't.{c} AS "{c}"' for c in cols)
+    params: list[Any] = []
+    where = ""
+    if search and search.strip():
+        operator = "ILIKE" if IS_POSTGRES else "LIKE"
+        where = " WHERE (" + " OR ".join(
+            f"CAST(t.{col} AS TEXT) {operator} ?" for col in cols
+        ) + ")"
+        params.extend([f"%{search.strip()}%"] * len(cols))
+    bounded_limit = max(1, min(int(limit), 500))
+    bounded_offset = max(0, int(offset))
     # Always sort chemistry / spec tables by Element_Master.Serial_no
     has_element = any(c.lower() == "element_symbol" for c in cols)
     if has_element:
@@ -3675,11 +3772,40 @@ def load_editable_table(table_name: str, order_by: str | None = None) -> list[di
             SELECT {select_list}
             FROM {resolved} t
             LEFT JOIN Element_Master _el ON _el.Element_Symbol = t.{sym_col}
+            {where}
             ORDER BY COALESCE(_el.Serial_no, 9999), t.{sym_col}
-            """
+            LIMIT ? OFFSET ?
+            """,
+            (*params, bounded_limit, bounded_offset),
         )
     order = order_by if order_by in cols else cols[0]
-    return fetch_all(f"SELECT {select_list} FROM {resolved} t ORDER BY t.{order}")
+    return fetch_all(
+        f"""
+        SELECT {select_list} FROM {resolved} t
+        {where}
+        ORDER BY t.{order}
+        LIMIT ? OFFSET ?
+        """,
+        (*params, bounded_limit, bounded_offset),
+    )
+
+
+def count_editable_table(table_name: str, search: str | None = None) -> int:
+    resolved = _resolve_table_name(table_name)
+    cols = editable_columns(resolved)
+    params: list[Any] = []
+    where = ""
+    if search and search.strip():
+        operator = "ILIKE" if IS_POSTGRES else "LIKE"
+        where = " WHERE (" + " OR ".join(
+            f"CAST(t.{col} AS TEXT) {operator} ?" for col in cols
+        ) + ")"
+        params.extend([f"%{search.strip()}%"] * len(cols))
+    row = fetch_one(
+        f'SELECT COUNT(*) AS "count" FROM {resolved} t{where}',
+        params,
+    )
+    return int((row or {}).get("count") or 0)
 
 
 def _row_key(row: dict[str, Any], pk: list[str]) -> tuple[Any, ...]:
@@ -4327,7 +4453,9 @@ def get_alloy_specs(alloy_id: int) -> dict[str, dict[str, Any]]:
 
 
 def list_inventory_lots(
-    material: Optional[str] = None, ready_only: bool = False
+    material: Optional[str] = None,
+    ready_only: bool = False,
+    limit: int | None = None,
 ) -> list[dict[str, Any]]:
     sql = """
         SELECT i.Lot_id AS "Lot_id", i.Raw_Material_Name AS "Raw_Material_Name",
@@ -4356,7 +4484,29 @@ def list_inventory_lots(
     if ready_only:
         sql += " AND i.Raw_Material_Status = 'Ready For Melt'"
     sql += " ORDER BY i.Lot_id DESC"
+    if limit is not None:
+        sql += " LIMIT ?"
+        params.append(max(1, min(int(limit), 2000)))
     return fetch_all(sql, params)
+
+
+def count_inventory_lots(
+    material: Optional[str] = None,
+    ready_only: bool = False,
+) -> int:
+    sql = """
+        SELECT COUNT(*) AS "count"
+        FROM Raw_Material_Inventory
+        WHERE Remaining_Weight > 0
+    """
+    params: list[Any] = []
+    if material:
+        sql += " AND Raw_Material_Name = ?"
+        params.append(material)
+    if ready_only:
+        sql += " AND Raw_Material_Status = 'Ready For Melt'"
+    row = fetch_one(sql, params)
+    return int((row or {}).get("count") or 0)
 
 
 # ---------- Company (issuer) / Customers / Suppliers ----------
@@ -4635,6 +4785,7 @@ def add_inventory_lot(
     photo: Optional[bytes] = None,
     cost_per_kg: Optional[float] = None,
 ) -> int:
+    _require_permission("raw_material_inventory", "insert")
     with get_connection() as conn:
         result = _exec(
             conn,
@@ -4656,7 +4807,20 @@ def add_inventory_lot(
                 cost_per_kg,
             ),
         )
-        return int(result.scalar_one())
+        lot_id = int(result.scalar_one())
+        _record_inventory_movement(
+            conn,
+            inventory_kind="raw_material",
+            lot_id=lot_id,
+            quantity_delta=float(weight),
+            unit="kg",
+            movement_type="receipt",
+            source_type="raw_material_purchase",
+            source_id=str(purchase_id),
+            idempotency_key=f"raw-receipt:{lot_id}",
+            reason=f"Received {material}",
+        )
+        return lot_id
 
 
 def save_raw_material_invoice(
@@ -4674,6 +4838,7 @@ def save_raw_material_invoice(
     weighment_slip_photo: Optional[bytes] = None,
 ) -> tuple[int, list[int]]:
     """Save one vendor invoice and its lots in a single transaction."""
+    _require_permission("raw_material_purchase", "insert")
     if not lines:
         raise ValueError("Add at least one raw material line.")
     if invoice_document and invoice_document_name:
@@ -4729,7 +4894,20 @@ def save_raw_material_invoice(
                     line.get("cost"),
                 ),
             )
-            lot_ids.append(int(lot.scalar_one()))
+            lot_id = int(lot.scalar_one())
+            lot_ids.append(lot_id)
+            _record_inventory_movement(
+                conn,
+                inventory_kind="raw_material",
+                lot_id=lot_id,
+                quantity_delta=weight,
+                unit="kg",
+                movement_type="receipt",
+                source_type="raw_material_purchase",
+                source_id=str(purchase_id),
+                idempotency_key=f"raw-receipt:{lot_id}",
+                reason=f"Received {line['material']} on invoice {invoice}",
+            )
         return purchase_id, lot_ids
 
 
@@ -5036,57 +5214,20 @@ def list_access_users() -> list[str]:
 
 
 def is_admin_user(name: str | None = None) -> bool:
-    """True when the logged-in employee (or Access_matrix fallback) is Admin."""
-    if name is None:
-        if role_is_admin(get_acting_role_name(), get_acting_role_id()):
-            return True
-    user = (name or get_acting_user() or "").strip()
-    if not user:
-        return False
-    emp_id = get_acting_employee_id() if name is None else ""
-    try:
-        if emp_id:
-            row = fetch_one(
-                """
-                SELECT e.role_id AS "role_id", r.role_name AS "role_name"
-                FROM employees e
-                LEFT JOIN roles r ON r.role_id = e.role_id
-                WHERE lower(e.employee_id) = lower(?)
-                """,
-                (emp_id,),
-            )
-            if row and role_is_admin(row.get("role_name"), row.get("role_id")):
-                return True
-        row = fetch_one(
-            """
-            SELECT e.role_id AS "role_id", r.role_name AS "role_name"
-            FROM employees e
-            LEFT JOIN roles r ON r.role_id = e.role_id
-            WHERE lower(trim(e.first_name) || ' ' || trim(e.last_name)) = lower(?)
-               OR lower(e.employee_id) = lower(?)
-               OR lower(trim(e.first_name)) = lower(?)
-            """,
-            (user, user, user),
-        )
-        if row and role_is_admin(row.get("role_name"), row.get("role_id")):
-            return True
-    except Exception:
-        pass
-    try:
-        row = fetch_one(
-            """
-            SELECT Name AS "Name", Access AS "Access"
-            FROM Access_matrix
-            WHERE LOWER(Name) = LOWER(?)
-            """,
-            (user,),
-        )
-    except Exception:
-        return False
-    if not row:
-        return False
-    access = str(row.get("Access") or "").strip().lower()
-    return access in {"admin", "administrator"}
+    """Verify Admin from the database; never trust the session role label alone."""
+    if IS_POSTGRES:
+        if name is not None and name.strip().lower() != get_acting_user().lower():
+            return False
+        if not get_acting_employee_id():
+            return False
+        try:
+            row = fetch_one('SELECT public.nualco_is_admin() AS "is_admin"')
+            return bool(row and row.get("is_admin"))
+        except Exception:
+            return False
+    if name is not None:
+        return name.strip().lower() == "admin"
+    return role_is_admin(get_acting_role_name(), get_acting_role_id())
 
 
 def _require_admin() -> None:
@@ -5483,29 +5624,53 @@ def make_batch_id(
 
 
 def _insert_charge_lines(conn: Connection, batch_id: str, inputs: list[dict[str, Any]]) -> None:
+    if not inputs:
+        return
+    needed: dict[int, float] = {}
     for item in inputs:
-        lot = _exec(
-            conn,
-            'SELECT Remaining_Weight AS "Remaining_Weight" '
-            "FROM Raw_Material_Inventory WHERE Lot_id = ?",
-            (item["Lot_id"],),
-        ).mappings().first()
-        if not lot:
-            raise ValueError(f"Lot {item['Lot_id']} not found.")
-        remaining = float(lot["Remaining_Weight"] or 0)
-        w = float(item["Weight"])
-        if w > remaining + 1e-9:
+        lot_id = int(item["Lot_id"])
+        weight = float(item["Weight"])
+        if weight <= 0:
+            raise ValueError("Charge weight must be greater than zero.")
+        needed[lot_id] = needed.get(lot_id, 0.0) + weight
+    lot_ids = sorted(needed)
+    placeholders = ", ".join("?" for _ in lot_ids)
+    lock_clause = " FOR UPDATE" if IS_POSTGRES else ""
+    rows = _exec(
+        conn,
+        f"""
+        SELECT Lot_id AS "Lot_id", Remaining_Weight AS "Remaining_Weight"
+        FROM Raw_Material_Inventory
+        WHERE Lot_id IN ({placeholders})
+        ORDER BY Lot_id{lock_clause}
+        """,
+        tuple(lot_ids),
+    ).mappings().all()
+    balances = {int(row["Lot_id"]): float(row["Remaining_Weight"] or 0) for row in rows}
+    for lot_id, weight in needed.items():
+        if lot_id not in balances:
+            raise ValueError(f"Lot {lot_id} not found.")
+        if weight > balances[lot_id] + 1e-9:
             raise ValueError(
-                f"Insufficient stock on Lot {item['Lot_id']}: need {w}, have {remaining}."
+                f"Insufficient stock on Lot {lot_id}: need {weight}, "
+                f"have {balances[lot_id]}."
             )
-        _exec(
+    for lot_id, weight in needed.items():
+        result = _exec(
             conn,
             """
             UPDATE Raw_Material_Inventory
             SET Remaining_Weight = Remaining_Weight - ?
-            WHERE Lot_id = ?
+            WHERE Lot_id = ? AND Remaining_Weight >= ?
             """,
-            (w, item["Lot_id"]),
+            (weight, lot_id, weight),
+        )
+        if result.rowcount != 1:
+            raise ValueError(f"Lot {lot_id} stock changed; retry the charge.")
+    for index, item in enumerate(inputs):
+        w = float(item["Weight"])
+        charged_at = item.get("Charge_time") or datetime.now().isoformat(
+            timespec="seconds"
         )
         _exec(
             conn,
@@ -5524,11 +5689,27 @@ def _insert_charge_lines(conn: Connection, batch_id: str, inputs: list[dict[str,
                 item.get("Weighment_scale_weight"),
                 item.get("Trolley_weight"),
                 item.get("Trolley_name"),
-                item.get("Charge_time") or datetime.now().isoformat(timespec="seconds"),
+                charged_at,
                 item.get("Notes", ""),
                 item.get("Weighment_scale_photo"),
                 item.get("Input_photo"),
             ),
+        )
+        movement_token = hashlib.sha256(
+            f"{batch_id}|{item['Lot_id']}|{charged_at}|{w}|{index}".encode()
+        ).hexdigest()[:24]
+        _record_inventory_movement(
+            conn,
+            inventory_kind="raw_material",
+            lot_id=int(item["Lot_id"]),
+            batch_id=batch_id,
+            quantity_delta=-w,
+            unit="kg",
+            movement_type="batch_charge",
+            source_type="batch_input",
+            source_id=batch_id,
+            idempotency_key=f"batch-charge:{movement_token}",
+            reason=item.get("Notes") or "Charged to production batch",
         )
 
 
@@ -5768,6 +5949,7 @@ def update_production_batch_input(
 
 def complete_production_batch(batch_id: str) -> None:
     """Set production_status to Completed after required fields are present."""
+    _require_permission("production_batch", "update")
     batch = get_batch(batch_id)
     if not batch:
         raise ValueError(f"Batch {batch_id} not found.")
@@ -5838,7 +6020,35 @@ def add_finished_goods_bundle(
             ),
         )
         row = result.first()
-        return int(row[0])
+        bundle_id = int(row[0])
+        token = secrets.token_hex(12)
+        _record_inventory_movement(
+            conn,
+            inventory_kind="finished_goods",
+            bundle_id=bundle_id,
+            batch_id=batch_id,
+            quantity_delta=float(output_weight or 0),
+            unit="kg",
+            movement_type="batch_output",
+            source_type="batch_output",
+            source_id=batch_id,
+            idempotency_key=f"fg-output:kg:{bundle_id}:{token}",
+            reason="Finished goods created from batch output",
+        )
+        _record_inventory_movement(
+            conn,
+            inventory_kind="finished_goods",
+            bundle_id=bundle_id,
+            batch_id=batch_id,
+            quantity_delta=float(pieces or 0),
+            unit="piece",
+            movement_type="batch_output",
+            source_type="batch_output",
+            source_id=batch_id,
+            idempotency_key=f"fg-output:piece:{bundle_id}:{token}",
+            reason="Finished goods pieces created from batch output",
+        )
+        return bundle_id
 
 
 def list_finished_goods(
@@ -5969,7 +6179,9 @@ def _sync_finished_goods_from_output(conn: Connection, batch_id: str) -> Optiona
             conn,
             """
             SELECT Bundle_id AS "Bundle_id",
-                   Finished_Goods_Status AS "Finished_Goods_Status"
+                   Finished_Goods_Status AS "Finished_Goods_Status",
+                   Output_Weight AS "Output_Weight",
+                   Output_pieces AS "Output_pieces"
             FROM Finished_Goods_Inventory
             WHERE Batch_ID = ?
             ORDER BY Bundle_id DESC
@@ -5991,6 +6203,8 @@ def _sync_finished_goods_from_output(conn: Connection, batch_id: str) -> Optiona
     ]
     if editable:
         bundle_id = int(editable[0]["Bundle_id"])
+        previous_weight = float(editable[0].get("Output_Weight") or 0)
+        previous_pieces = int(float(editable[0].get("Output_pieces") or 0))
         _exec(
             conn,
             """
@@ -5999,6 +6213,33 @@ def _sync_finished_goods_from_output(conn: Connection, batch_id: str) -> Optiona
             WHERE Bundle_id = ?
             """,
             (weight, pieces, status, bundle_id),
+        )
+        token = secrets.token_hex(12)
+        _record_inventory_movement(
+            conn,
+            inventory_kind="finished_goods",
+            bundle_id=bundle_id,
+            batch_id=batch_id,
+            quantity_delta=weight - previous_weight,
+            unit="kg",
+            movement_type="batch_output_adjustment",
+            source_type="batch_output",
+            source_id=batch_id,
+            idempotency_key=f"fg-output-adjust:kg:{bundle_id}:{token}",
+            reason="Synchronized from batch output",
+        )
+        _record_inventory_movement(
+            conn,
+            inventory_kind="finished_goods",
+            bundle_id=bundle_id,
+            batch_id=batch_id,
+            quantity_delta=float((pieces or 0) - previous_pieces),
+            unit="piece",
+            movement_type="batch_output_adjustment",
+            source_type="batch_output",
+            source_id=batch_id,
+            idempotency_key=f"fg-output-adjust:piece:{bundle_id}:{token}",
+            reason="Synchronized pieces from batch output",
         )
         return bundle_id
     result = _exec(
@@ -6012,7 +6253,37 @@ def _sync_finished_goods_from_output(conn: Connection, batch_id: str) -> Optiona
         (batch_id, weight, pieces, status),
     )
     row = result.first()
-    return int(row[0]) if row else None
+    if not row:
+        return None
+    bundle_id = int(row[0])
+    token = secrets.token_hex(12)
+    _record_inventory_movement(
+        conn,
+        inventory_kind="finished_goods",
+        bundle_id=bundle_id,
+        batch_id=batch_id,
+        quantity_delta=weight,
+        unit="kg",
+        movement_type="batch_output",
+        source_type="batch_output",
+        source_id=batch_id,
+        idempotency_key=f"fg-output:kg:{bundle_id}:{token}",
+        reason="Created from batch output",
+    )
+    _record_inventory_movement(
+        conn,
+        inventory_kind="finished_goods",
+        bundle_id=bundle_id,
+        batch_id=batch_id,
+        quantity_delta=float(pieces or 0),
+        unit="piece",
+        movement_type="batch_output",
+        source_type="batch_output",
+        source_id=batch_id,
+        idempotency_key=f"fg-output:piece:{bundle_id}:{token}",
+        reason="Created from batch output",
+    )
+    return bundle_id
 
 
 def backfill_finished_goods_from_output() -> int:
@@ -6379,6 +6650,16 @@ def get_employee(employee_id: str) -> Optional[dict[str, Any]]:
 
 
 def list_admin_employees() -> list[dict[str, Any]]:
+    if IS_POSTGRES and not get_acting_employee_id():
+        return fetch_all(
+            """
+            SELECT employee_id AS "employee_id", first_name AS "first_name",
+                   last_name AS "last_name", email AS "email",
+                   role_id AS "role_id", role_name AS "role_name",
+                   status AS "status"
+            FROM public.nualco_bootstrap_admins()
+            """
+        )
     return [
         row
         for row in list_employees(include_inactive=False)
@@ -6387,6 +6668,11 @@ def list_admin_employees() -> list[dict[str, Any]]:
 
 
 def any_employee_has_password() -> bool:
+    if IS_POSTGRES:
+        row = fetch_one(
+            'SELECT public.nualco_passwords_initialized() AS "initialized"'
+        )
+        return bool(row and row.get("initialized"))
     row = fetch_one(
         """
         SELECT 1 AS "ok"
@@ -6402,22 +6688,34 @@ def authenticate_employee(login_id: str, password: str) -> Optional[dict[str, An
     login_id = (login_id or "").strip()
     if not login_id or not password:
         return None
-    row = fetch_one(
-        """
-        SELECT e.employee_id AS "employee_id",
-               e.first_name AS "first_name",
-               e.last_name AS "last_name",
-               e.email AS "email",
-               e.role_id AS "role_id",
-               r.role_name AS "role_name",
-               e.status AS "status",
-               e.password_hash AS "password_hash"
-        FROM employees e
-        LEFT JOIN roles r ON r.role_id = e.role_id
-        WHERE lower(e.employee_id) = lower(?)
-        """,
-        (login_id,),
-    )
+    if IS_POSTGRES:
+        row = fetch_one(
+            """
+            SELECT employee_id AS "employee_id", first_name AS "first_name",
+                   last_name AS "last_name", email AS "email",
+                   role_id AS "role_id", role_name AS "role_name",
+                   status AS "status", password_hash AS "password_hash"
+            FROM public.nualco_auth_record(?)
+            """,
+            (login_id,),
+        )
+    else:
+        row = fetch_one(
+            """
+            SELECT e.employee_id AS "employee_id",
+                   e.first_name AS "first_name",
+                   e.last_name AS "last_name",
+                   e.email AS "email",
+                   e.role_id AS "role_id",
+                   r.role_name AS "role_name",
+                   e.status AS "status",
+                   e.password_hash AS "password_hash"
+            FROM employees e
+            LEFT JOIN roles r ON r.role_id = e.role_id
+            WHERE lower(e.employee_id) = lower(?)
+            """,
+            (login_id,),
+        )
     if not row:
         return None
     status = str(row.get("status") or "Active").strip().lower()
@@ -6466,8 +6764,18 @@ def bootstrap_first_admin_password(employee_id: str, password: str) -> dict[str,
     admins = list_admin_employees()
     if admins and not role_is_admin(emp.get("role_name"), emp.get("role_id")):
         raise ValueError("The first password must be set for an Admin employee.")
-    set_employee_password(employee_id, password, require_admin=False)
-    ready = get_employee(employee_id)
+    hashed = hash_password(_validate_new_password(password))
+    if IS_POSTGRES:
+        result = fetch_one(
+            'SELECT public.nualco_set_first_admin_password(?, ?) AS "saved"',
+            (employee_id, hashed),
+        )
+        if not result or not result.get("saved"):
+            raise ValueError("The first Admin password could not be set.")
+        ready = authenticate_employee(employee_id, password)
+    else:
+        set_employee_password(employee_id, password, require_admin=False)
+        ready = get_employee(employee_id)
     if not ready:
         raise ValueError("Could not load the employee after setting the password.")
     return ready
@@ -6605,77 +6913,29 @@ def _apply_rls_session(conn: Connection) -> None:
     """Stamp the acting user's role onto this transaction for RLS policies."""
     if not IS_POSTGRES:
         return
-    role_name = get_acting_role_name() or "system"
     employee_id = get_acting_employee_id()
-    user = (get_acting_user() or "").strip()
     try:
-        _exec(conn, "SELECT set_config('nualco.role_name', 'system', true)")
-        _exec(conn, "SELECT set_config('nualco.employee_id', '', true)")
+        _exec(
+            conn,
+            "SELECT set_config('nualco.employee_id', ?, true)",
+            (employee_id,),
+        )
+        role_name = ""
         if employee_id:
             row = (
                 _exec(
                     conn,
-                    """
-                    SELECT e.employee_id AS "employee_id",
-                           r.role_name AS "role_name"
-                    FROM employees e
-                    LEFT JOIN roles r ON r.role_id = e.role_id
-                    WHERE lower(e.employee_id) = lower(?)
-                    LIMIT 1
-                    """,
-                    (employee_id,),
+                    'SELECT public.nualco_role_name() AS "role_name"',
                 )
                 .mappings()
                 .first()
             )
             if row:
-                employee_id = str(row.get("employee_id") or employee_id)
-                role_name = str(row.get("role_name") or role_name or "system")
-        elif user and user.lower() != "system":
-            row = (
-                _exec(
-                    conn,
-                    """
-                    SELECT e.employee_id AS "employee_id",
-                           r.role_name AS "role_name"
-                    FROM employees e
-                    LEFT JOIN roles r ON r.role_id = e.role_id
-                    WHERE lower(btrim(e.first_name) || ' ' || btrim(e.last_name))
-                          = lower(?)
-                       OR lower(btrim(e.first_name)) = lower(?)
-                    LIMIT 1
-                    """,
-                    (user, user),
-                )
-                .mappings()
-                .first()
-            )
-            if row:
-                employee_id = str(row.get("employee_id") or "")
-                role_name = str(row.get("role_name") or "system")
-            else:
-                acc = (
-                    _exec(
-                        conn,
-                        """
-                        SELECT Access AS "Access"
-                        FROM Access_matrix
-                        WHERE lower(Name) = lower(?)
-                        """,
-                        (user,),
-                    )
-                    .mappings()
-                    .first()
-                )
-                if acc and acc.get("Access"):
-                    role_name = str(acc["Access"])
+                role_name = str(row.get("role_name") or "")
         _exec(conn, "SELECT set_config('nualco.role_name', ?, true)", (role_name,))
-        _exec(conn, "SELECT set_config('nualco.employee_id', ?, true)", (employee_id,))
     except Exception:
-        try:
-            _exec(conn, "SELECT set_config('nualco.role_name', 'system', true)")
-        except Exception:
-            pass
+        # Authorization setup must fail closed; continuing would risk stale context.
+        raise
 
 
 def _ensure_row_level_security(conn: Connection) -> None:
@@ -6886,6 +7146,8 @@ def _ensure_batch_input_return(conn: Connection) -> None:
 
 
 def _ensure_packing_list_ready() -> None:
+    if IS_POSTGRES:
+        return
     with get_connection() as conn:
         _ensure_columns(
             conn,
@@ -6905,10 +7167,38 @@ def _ensure_packing_list_ready() -> None:
 
 
 def _ensure_company_ready() -> None:
+    if IS_POSTGRES:
+        return
     with get_connection() as conn:
         _ensure_company_profile(conn)
         _ensure_employees(conn)
         _ensure_row_level_security(conn)
+
+
+def verify_schema_ready() -> None:
+    """Read-only production startup check; migrations own Postgres DDL."""
+    if not IS_POSTGRES:
+        init_db()
+        return
+    required = (
+        "employees",
+        "role_permissions",
+        "section_table_permissions",
+        "inventory_movements",
+    )
+    missing: list[str] = []
+    for name in required:
+        row = fetch_one(
+            'SELECT to_regclass(?) AS "rel"',
+            (f"public.{name}",),
+        )
+        if not row or not row.get("rel"):
+            missing.append(name)
+    if missing:
+        raise RuntimeError(
+            "Database migrations are incomplete; run scripts/apply_migrations.py. "
+            "Missing: " + ", ".join(missing)
+        )
 
 
 def list_packing_po_numbers() -> list[str]:
@@ -7023,23 +7313,70 @@ def list_packing_batch_candidates(
     editing_verified = (
         str(packing_list_status or "").strip() == PACKING_STATUS_VERIFIED
     )
+    match_clauses = ["b.Alloy_id = ?"]
+    match_params: list[Any] = [int(alloy_id)]
+    target_name = str(target.get("Alloy_name") or "").strip()
+    target_group = str(target.get("Alloy_group") or "").strip()
+    if match_name and target_name:
+        match_clauses.append(
+            "(lower(trim(a.Alloy_name)) = lower(?) "
+            "OR lower(trim(a.Alloy_group)) = lower(?))"
+        )
+        match_params.extend([target_name, target_name])
+    if match_group and target_group:
+        match_clauses.append(
+            "(lower(trim(a.Alloy_group)) = lower(?) "
+            "OR lower(trim(a.Alloy_name)) = lower(?))"
+        )
+        match_params.extend([target_group, target_group])
     rows = fetch_all(
-        """
+        f"""
         SELECT b.Batch_ID AS "Batch_ID",
                b.Heat_no AS "Heat_no",
                b.Production_status AS "Production_status",
+               b.Degassing_time AS "Degassing_time",
+               b.Sampled_pcs AS "Sampled_pcs",
+               b.Defect_pcs AS "Defect_pcs",
+               b.Top_Sample AS "Top_Sample",
+               b.Middle_Sample AS "Middle_Sample",
+               b.Bottom_Sample AS "Bottom_Sample",
+               b.Vacum_Sample AS "Vacum_Sample",
+               b.Top_Sample_datetime AS "Top_Sample_datetime",
+               b.Middle_Sample_datetime AS "Middle_Sample_datetime",
+               b.Bottom_Sample_datetime AS "Bottom_Sample_datetime",
                a.Alloy_id AS "Alloy_id",
                a.Alloy_name AS "Alloy_name",
                a.Alloy_group AS "Alloy_group",
                fg.Bundle_id AS "Bundle_id",
                fg.Output_Weight AS "Output_Weight",
                fg.Output_pieces AS "Output_pieces",
-               fg.Finished_Goods_Status AS "Finished_Goods_Status"
+               fg.Finished_Goods_Status AS "Finished_Goods_Status",
+               COALESCE(chem.chemistry_count, 0) AS "Chemistry_count",
+               COALESCE(charges.charge_line_count, 0) AS "Charge_line_count"
         FROM Production_batch b
         LEFT JOIN Alloy_Master a ON a.Alloy_id = b.Alloy_id
-        LEFT JOIN Finished_Goods_Inventory fg ON fg.Batch_ID = b.Batch_ID
-        ORDER BY b.Batch_ID, fg.Bundle_id DESC
-        """
+        LEFT JOIN Finished_Goods_Inventory fg
+          ON fg.Bundle_id = (
+              SELECT MAX(latest.Bundle_id)
+              FROM Finished_Goods_Inventory latest
+              WHERE latest.Batch_ID = b.Batch_ID
+          )
+        LEFT JOIN (
+            SELECT Batch_ID, COUNT(*) AS chemistry_count
+            FROM Batch_Chemical_Composition
+            WHERE Percentage > 0
+            GROUP BY Batch_ID
+        ) chem ON chem.Batch_ID = b.Batch_ID
+        LEFT JOIN (
+            SELECT Batch_ID, COUNT(*) AS charge_line_count
+            FROM batch_input
+            WHERE Weight > 0
+            GROUP BY Batch_ID
+        ) charges ON charges.Batch_ID = b.Batch_ID
+        WHERE {" OR ".join(match_clauses)}
+        ORDER BY b.Batch_ID
+        """,
+        match_params,
     )
     seen: set[str] = set()
     eligible: list[dict[str, Any]] = []
@@ -7049,10 +7386,6 @@ def list_packing_batch_candidates(
         if bid in seen:
             continue
         seen.add(bid)
-        if not _alloy_matches_target(
-            row, target, match_name=match_name, match_group=match_group
-        ):
-            continue
         item = dict(row)
         packed = this_packed.get(bid) or {}
         packed_w = float(packed.get("Weight") or 0)
@@ -7076,7 +7409,20 @@ def list_packing_batch_candidates(
         item["Max_pieces"] = max_p
         on_this_list = bid in include
         if (item.get("Production_status") or "") != BATCH_STATUS_COMPLETED:
-            gaps = production_batch_completion_gaps_for_id(bid)
+            gaps = production_batch_completion_gaps(
+                degassing_time=item.get("Degassing_time"),
+                sampled_pcs=item.get("Sampled_pcs"),
+                defect_pcs=item.get("Defect_pcs"),
+                top_sample=item.get("Top_Sample"),
+                middle_sample=item.get("Middle_Sample"),
+                bottom_sample=item.get("Bottom_Sample"),
+                vacum_sample=item.get("Vacum_Sample"),
+                top_sample_datetime=item.get("Top_Sample_datetime"),
+                middle_sample_datetime=item.get("Middle_Sample_datetime"),
+                bottom_sample_datetime=item.get("Bottom_Sample_datetime"),
+                chemistry_count=int(item.get("Chemistry_count") or 0),
+                charge_line_count=int(item.get("Charge_line_count") or 0),
+            )
             if gaps:
                 item["Reason"] = (
                     "Mark the heat Completed on Production Batch & Chemistry "
@@ -7206,22 +7552,21 @@ def get_packing_list(packing_list_id: int) -> Optional[dict[str, Any]]:
 
 
 def _fg_bundle_on_conn(conn: Connection, batch_id: str) -> Optional[dict[str, Any]]:
+    sql = """
+        SELECT Bundle_id AS "Bundle_id",
+               Batch_ID AS "Batch_ID",
+               Output_Weight AS "Output_Weight",
+               Output_pieces AS "Output_pieces",
+               Finished_Goods_Status AS "Finished_Goods_Status"
+        FROM Finished_Goods_Inventory
+        WHERE Batch_ID = ?
+        ORDER BY Bundle_id DESC
+        LIMIT 1
+    """
+    if IS_POSTGRES:
+        sql += " FOR UPDATE"
     row = (
-        _exec(
-            conn,
-            """
-            SELECT Bundle_id AS "Bundle_id",
-                   Batch_ID AS "Batch_ID",
-                   Output_Weight AS "Output_Weight",
-                   Output_pieces AS "Output_pieces",
-                   Finished_Goods_Status AS "Finished_Goods_Status"
-            FROM Finished_Goods_Inventory
-            WHERE Batch_ID = ?
-            ORDER BY Bundle_id DESC
-            LIMIT 1
-            """,
-            (batch_id,),
-        )
+        _exec(conn, sql, (batch_id,))
         .mappings()
         .first()
     )
@@ -7233,9 +7578,11 @@ def _apply_packing_lines_to_fg(
     lines: list[dict[str, Any]],
     *,
     restore: bool,
+    packing_list_id: int,
 ) -> None:
     """Add packed qty back to FG (restore) or subtract it (dispatch)."""
     sign = 1 if restore else -1
+    token = secrets.token_hex(12)
     for line in lines:
         bid = str(line.get("Batch_ID") or "").strip()
         if not bid:
@@ -7273,6 +7620,39 @@ def _apply_packing_lines_to_fg(
             WHERE Bundle_id = ?
             """,
             (new_w, new_p, status, row["Bundle_id"]),
+        )
+        movement_type = "dispatch_reversal" if restore else "dispatch"
+        _record_inventory_movement(
+            conn,
+            inventory_kind="finished_goods",
+            bundle_id=int(row["Bundle_id"]),
+            batch_id=bid,
+            packing_list_id=packing_list_id,
+            quantity_delta=delta_w,
+            unit="kg",
+            movement_type=movement_type,
+            source_type="packing_list",
+            source_id=str(packing_list_id),
+            idempotency_key=(
+                f"packing:{movement_type}:kg:{packing_list_id}:{bid}:{token}"
+            ),
+            reason="Packing list inventory reversal" if restore else "Verified dispatch",
+        )
+        _record_inventory_movement(
+            conn,
+            inventory_kind="finished_goods",
+            bundle_id=int(row["Bundle_id"]),
+            batch_id=bid,
+            packing_list_id=packing_list_id,
+            quantity_delta=float(delta_p),
+            unit="piece",
+            movement_type=movement_type,
+            source_type="packing_list",
+            source_id=str(packing_list_id),
+            idempotency_key=(
+                f"packing:{movement_type}:piece:{packing_list_id}:{bid}:{token}"
+            ),
+            reason="Packing list inventory reversal" if restore else "Verified dispatch",
         )
 
 
@@ -7318,6 +7698,9 @@ def save_packing_list(
     batch_ids: Optional[list[str]] = None,
 ) -> int:
     """Create or update a packing list. Verified lists subtract packed qty from FG."""
+    _require_permission(
+        "packing_list", "update" if packing_list_id is not None else "insert"
+    )
     _ensure_packing_list_ready()
     status = (packing_list_status or "").strip()
     if status not in PACKING_LIST_STATUS:
@@ -7383,7 +7766,12 @@ def save_packing_list(
         ):
             _delete_certificate_rows_on_conn(conn, int(packing_list_id))
         if previous_status == PACKING_STATUS_VERIFIED:
-            _apply_packing_lines_to_fg(conn, previous_lines, restore=True)
+            _apply_packing_lines_to_fg(
+                conn,
+                previous_lines,
+                restore=True,
+                packing_list_id=int(packing_list_id),
+            )
         for line in unique_lines:
             row = _fg_bundle_on_conn(conn, line["Batch_ID"])
             if not row:
@@ -7477,7 +7865,9 @@ def save_packing_list(
                 (pid, line["Batch_ID"], line["Weight"], line["Pieces"]),
             )
         if status == PACKING_STATUS_VERIFIED:
-            _apply_packing_lines_to_fg(conn, unique_lines, restore=False)
+            _apply_packing_lines_to_fg(
+                conn, unique_lines, restore=False, packing_list_id=pid
+            )
     return pid
 
 
@@ -8739,6 +9129,7 @@ def save_packing_list_certificate_draft(
     certificate_no: Optional[str] = None,
     issued_date: Optional[str] = None,
 ) -> dict[str, Any]:
+    _require_permission("packing_list_certificate", "update")
     _ensure_packing_list_ready()
     existing = get_packing_list_certificate(packing_list_id)
     if not existing:
@@ -8884,7 +9275,12 @@ def cancel_packing_list(packing_list_id: int) -> dict[str, Any]:
     status = header.get("Packing_list_status") or ""
     with get_connection() as conn:
         if status == PACKING_STATUS_VERIFIED:
-            _apply_packing_lines_to_fg(conn, packed, restore=True)
+            _apply_packing_lines_to_fg(
+                conn,
+                packed,
+                restore=True,
+                packing_list_id=packing_list_id,
+            )
         _set_packing_list_status_on_conn(
             conn, packing_list_id, PACKING_STATUS_IN_PROGRESS
         )
@@ -8940,7 +9336,12 @@ def cancel_issued_test_certificate(packing_list_id: int) -> dict[str, Any]:
     packed = _packed_lines_from_header(header)
     with get_connection() as conn:
         if (header.get("Packing_list_status") or "") == PACKING_STATUS_VERIFIED:
-            _apply_packing_lines_to_fg(conn, packed, restore=True)
+            _apply_packing_lines_to_fg(
+                conn,
+                packed,
+                restore=True,
+                packing_list_id=packing_list_id,
+            )
         _set_packing_list_status_on_conn(
             conn, packing_list_id, PACKING_STATUS_IN_PROGRESS
         )
@@ -9785,6 +10186,7 @@ def list_all_batch_outputs(limit: int = 200) -> list[dict[str, Any]]:
 
 def save_batch_outputs(batch_id: str, lines: list[dict[str, Any]]) -> None:
     """Replace all output rows for a batch. Weight > 0 lines are kept."""
+    _require_permission("batch_output", "update")
     require_completed_batch_for_output(batch_id)
     batch = get_batch(batch_id)
     if not batch:
@@ -9897,6 +10299,7 @@ def _sqlite_internal_remelt_purchase_id(conn: Connection) -> int:
 
 def _sync_sidestream_inventory(conn: Connection, batch_id: str) -> None:
     """Turn Broken Ingot / Furnace Empty / Not Ok Ingot outputs into remelt lots."""
+    token = secrets.token_hex(12)
     placeholders = ", ".join("?" for _ in SIDESTREAM_ALLOY_IDS)
     totals = list(
         _exec(
@@ -9944,7 +10347,7 @@ def _sync_sidestream_inventory(conn: Connection, batch_id: str) -> None:
         rm_name = _sidestream_rm_name_on_conn(conn, alloy_id)
         current = by_alloy.get(alloy_id)
         if current is None:
-            _exec(
+            result = _exec(
                 conn,
                 """
                 INSERT INTO Raw_Material_Inventory
@@ -9952,6 +10355,7 @@ def _sync_sidestream_inventory(conn: Connection, batch_id: str) -> None:
                      Storage_bay, Raw_Material_Status, Cost_per_kg,
                      Source_Batch_ID, Source_Alloy_id)
                 VALUES (?, ?, ?, ?, 'Remelt', 'Ready For Melt', ?, ?, ?)
+                RETURNING Lot_id
                 """,
                 (
                     purchase_id,
@@ -9962,6 +10366,20 @@ def _sync_sidestream_inventory(conn: Connection, batch_id: str) -> None:
                     batch_id,
                     alloy_id,
                 ),
+            )
+            lot_id = int(result.scalar_one())
+            _record_inventory_movement(
+                conn,
+                inventory_kind="raw_material",
+                lot_id=lot_id,
+                batch_id=batch_id,
+                quantity_delta=weight,
+                unit="kg",
+                movement_type="sidestream_return",
+                source_type="batch_output",
+                source_id=batch_id,
+                idempotency_key=f"sidestream:{batch_id}:{alloy_id}:{token}",
+                reason=f"{rm_name} returned for remelt",
             )
             continue
         old_received = float(current["Received_weight"] or 0)
@@ -9986,6 +10404,19 @@ def _sync_sidestream_inventory(conn: Connection, batch_id: str) -> None:
             """,
             (rm_name, weight, weight - consumed, cost_per_kg, current["Lot_id"]),
         )
+        _record_inventory_movement(
+            conn,
+            inventory_kind="raw_material",
+            lot_id=int(current["Lot_id"]),
+            batch_id=batch_id,
+            quantity_delta=weight - old_received,
+            unit="kg",
+            movement_type="sidestream_adjustment",
+            source_type="batch_output",
+            source_id=batch_id,
+            idempotency_key=f"sidestream-adjust:{batch_id}:{alloy_id}:{token}",
+            reason=f"{rm_name} output adjusted",
+        )
 
     for alloy_id, current in by_alloy.items():
         if alloy_id in wanted:
@@ -10000,8 +10431,26 @@ def _sync_sidestream_inventory(conn: Connection, batch_id: str) -> None:
             )
         _exec(
             conn,
-            "DELETE FROM Raw_Material_Inventory WHERE Lot_id = ?",
+            """
+            UPDATE Raw_Material_Inventory
+            SET Received_weight = 0, Remaining_Weight = 0,
+                Raw_Material_Status = 'Not Ready for Melt'
+            WHERE Lot_id = ?
+            """,
             (current["Lot_id"],),
+        )
+        _record_inventory_movement(
+            conn,
+            inventory_kind="raw_material",
+            lot_id=int(current["Lot_id"]),
+            batch_id=batch_id,
+            quantity_delta=-remaining,
+            unit="kg",
+            movement_type="sidestream_reversal",
+            source_type="batch_output",
+            source_id=batch_id,
+            idempotency_key=f"sidestream-reverse:{batch_id}:{alloy_id}:{token}",
+            reason="Sidestream output removed",
         )
 
 
@@ -10019,35 +10468,44 @@ def get_batch_chemistry(batch_id: str) -> list[dict[str, Any]]:
     )
 
 
-def list_batches() -> list[dict[str, Any]]:
-    return fetch_all(
-        """
+def list_batches(limit: int | None = None) -> list[dict[str, Any]]:
+    sql = """
+        WITH input_totals AS (
+            SELECT Batch_ID, SUM(Weight) AS input_weight
+            FROM batch_input GROUP BY Batch_ID
+        ),
+        output_totals AS (
+            SELECT Batch_ID, SUM(Weight) AS output_weight, SUM(Pieces) AS output_pieces
+            FROM batch_output GROUP BY Batch_ID
+        )
         SELECT b.Batch_ID AS "Batch_ID", b.Production_Date AS "Production_Date",
                b.Furnace AS "Furnace", b.Crucible_no AS "Crucible_no",
                b.Heat_no AS "Heat_no", b.Melt_No AS "Melt_No",
                b.Shift AS "Shift", b.Alloy_id AS "Alloy_id",
-               COALESCE(
-                   (SELECT SUM(i.Weight) FROM batch_input i WHERE i.Batch_ID = b.Batch_ID),
-                   0
-               ) AS "Input_Weight",
-               COALESCE(
-                   (SELECT SUM(o.Weight) FROM batch_output o WHERE o.Batch_ID = b.Batch_ID),
-                   0
-               ) AS "Output_Weight",
-               COALESCE(
-                   (SELECT SUM(o.Pieces) FROM batch_output o WHERE o.Batch_ID = b.Batch_ID),
-                   0
-               ) AS "Output_pieces",
+               COALESCE(i.input_weight, 0) AS "Input_Weight",
+               COALESCE(o.output_weight, 0) AS "Output_Weight",
+               COALESCE(o.output_pieces, 0) AS "Output_pieces",
                b.Production_status AS "Production_status",
                b.Workflow_stage AS "Workflow_stage", a.Alloy_name AS "Alloy_name",
                b.Production_supervisor AS "Production_supervisor",
                b.Top_Sample AS "Top_Sample", b.Middle_Sample AS "Middle_Sample",
                b.Bottom_Sample AS "Bottom_Sample", b.Vacum_Sample AS "Vacum_Sample"
         FROM Production_batch b
+        LEFT JOIN input_totals i ON i.Batch_ID = b.Batch_ID
+        LEFT JOIN output_totals o ON o.Batch_ID = b.Batch_ID
         LEFT JOIN Alloy_Master a ON a.Alloy_id = b.Alloy_id
         ORDER BY b.Production_Date DESC, b.Batch_ID DESC
-        """
-    )
+    """
+    params: list[Any] = []
+    if limit is not None:
+        sql += " LIMIT ?"
+        params.append(max(1, min(int(limit), 1000)))
+    return fetch_all(sql, params)
+
+
+def count_batches() -> int:
+    row = fetch_one('SELECT COUNT(*) AS "count" FROM Production_batch')
+    return int((row or {}).get("count") or 0)
 
 
 def calc_yield(input_weight: float, output_weight: float) -> dict[str, float]:
@@ -10388,22 +10846,51 @@ def _oil_qty(value: Any) -> float:
     return qty if qty > 0 else 0.0
 
 
-def rebuild_furnace_oil_inventory() -> None:
-    """Rebuild the daily inventory ledger from purchases and consumption."""
+def rebuild_furnace_oil_inventory(
+    start_date: str | None = None,
+    *,
+    conn: Connection | None = None,
+) -> None:
+    """Rebuild only the oil-ledger suffix affected by a write."""
+    if conn is None:
+        with get_connection() as managed:
+            rebuild_furnace_oil_inventory(start_date, conn=managed)
+        return
+    start = _as_effective_date(start_date) if start_date else None
     by_val, dt_val = audit_stamp()
-    purchases = fetch_all(
-        """
+    purchase_sql = """
         SELECT Received_date AS "Received_date", Quantity AS "Quantity",
                Purchase_type AS "Purchase_type"
         FROM Furnace_Oil_Purchase
-        """
-    )
-    consumed = fetch_all(
-        """
+    """
+    consumption_sql = """
         SELECT Consumption_date AS "Consumption_date", Quantity AS "Quantity"
         FROM Furnace_Oil_Consumption
-        """
-    )
+    """
+    params: list[Any] = []
+    carried = 0.0
+    if start:
+        purchase_sql += " WHERE Received_date >= ?"
+        consumption_sql += " WHERE Consumption_date >= ?"
+        params = [start]
+        prior = (
+            _exec(
+                conn,
+                """
+                SELECT Closing_qty AS "Closing_qty"
+                FROM Furnace_Oil_Inventory
+                WHERE Inventory_date < ?
+                ORDER BY Inventory_date DESC
+                LIMIT 1
+                """,
+                (start,),
+            )
+            .mappings()
+            .first()
+        )
+        carried = _oil_qty(prior.get("Closing_qty") if prior else 0)
+    purchases = list(_exec(conn, purchase_sql, tuple(params)).mappings())
+    consumed = list(_exec(conn, consumption_sql, tuple(params)).mappings())
     days: dict[str, dict[str, float]] = {}
 
     def _day(key: str) -> dict[str, float]:
@@ -10425,27 +10912,36 @@ def rebuild_furnace_oil_inventory() -> None:
         _day(key)["consumption"] += _oil_qty(row.get("Quantity"))
 
     ledger: list[tuple[str, float, float, float, float]] = []
-    carried = 0.0
     for key in sorted(days):
         rec = days[key]
         opening = rec["opening"] if rec["opening"] > 0 else carried
         closing = opening + rec["purchase"] - rec["consumption"]
+        if closing < -1e-9:
+            raise ValueError(
+                f"Furnace oil stock would be negative ({closing:g} L) on {key}."
+            )
         ledger.append((key, opening, rec["purchase"], rec["consumption"], closing))
         carried = closing
 
-    with get_connection() as conn:
+    if start:
+        _exec(
+            conn,
+            "DELETE FROM Furnace_Oil_Inventory WHERE Inventory_date >= ?",
+            (start,),
+        )
+    else:
         _exec(conn, "DELETE FROM Furnace_Oil_Inventory")
-        for key, opening, purchase, consumption, closing in ledger:
-            _exec(
-                conn,
-                """
-                INSERT INTO Furnace_Oil_Inventory
-                    (Inventory_date, Opening_qty, Purchase_qty, Consumption_qty,
-                     Closing_qty, Last_updated_by, Last_updated_datetime)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-                """,
-                (key, opening, purchase, consumption, closing, by_val, dt_val),
-            )
+    for key, opening, purchase, consumption, closing in ledger:
+        _exec(
+            conn,
+            """
+            INSERT INTO Furnace_Oil_Inventory
+                (Inventory_date, Opening_qty, Purchase_qty, Consumption_qty,
+                 Closing_qty, Last_updated_by, Last_updated_datetime)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (key, opening, purchase, consumption, closing, by_val, dt_val),
+        )
 
 
 def get_furnace_oil_stock() -> float:
@@ -10539,6 +11035,7 @@ def add_furnace_oil_purchase(
     weighment_slip_type: Optional[str] = None,
     purchase_type: str = "Purchase",
 ) -> int:
+    _require_permission("furnace_oil_purchase", "insert")
     qty = _oil_qty(quantity)
     if qty <= 0:
         raise ValueError("Quantity (litres) must be greater than zero.")
@@ -10588,8 +11085,19 @@ def add_furnace_oil_purchase(
             ),
         )
         purchase_id = int(result.scalar_one())
-    rebuild_furnace_oil_inventory()
-    return purchase_id
+        _record_inventory_movement(
+            conn,
+            inventory_kind="furnace_oil",
+            quantity_delta=qty,
+            unit="litre",
+            movement_type="opening_balance" if kind == "Opening" else "purchase",
+            source_type="furnace_oil_purchase",
+            source_id=str(purchase_id),
+            idempotency_key=f"oil-purchase:{purchase_id}",
+            reason=(notes or "").strip() or f"Oil {kind.lower()}",
+        )
+        rebuild_furnace_oil_inventory(received_date, conn=conn)
+        return purchase_id
 
 
 def get_furnace_oil_consumption_row(consumption_date: str) -> Optional[dict[str, Any]]:
@@ -10608,33 +11116,74 @@ def add_furnace_oil_consumption(
     quantity: float,
     notes: Optional[str] = None,
 ) -> None:
+    _require_permission("furnace_oil_consumption", "update")
     qty = _oil_qty(quantity)
     if qty <= 0:
         raise ValueError("Consumption (litres) must be greater than zero.")
     day = _as_effective_date(consumption_date)
     if not day:
         raise ValueError("Consumption date is required.")
-    existing = get_furnace_oil_consumption_row(day)
-    available = get_furnace_oil_stock() + _oil_qty(existing.get("Quantity") if existing else 0)
-    if qty > available + 1e-9:
-        raise ValueError(
-            f"Consumption {qty:g} L exceeds available stock {available:g} L."
-        )
     by_val, dt_val = audit_stamp()
-    execute(
-        """
-        INSERT INTO Furnace_Oil_Consumption
-            (Consumption_date, Quantity, Notes, Last_updated_by, Last_updated_datetime)
-        VALUES (?, ?, ?, ?, ?)
-        ON CONFLICT(Consumption_date) DO UPDATE SET
-            Quantity=excluded.Quantity,
-            Notes=excluded.Notes,
-            Last_updated_by=excluded.Last_updated_by,
-            Last_updated_datetime=excluded.Last_updated_datetime
-        """,
-        (day, qty, (notes or "").strip() or None, by_val, dt_val),
-    )
-    rebuild_furnace_oil_inventory()
+    with get_connection() as conn:
+        lock = " FOR UPDATE" if IS_POSTGRES else ""
+        latest = (
+            _exec(
+                conn,
+                """
+                SELECT Closing_qty AS "Closing_qty"
+                FROM Furnace_Oil_Inventory
+                ORDER BY Inventory_date DESC
+                LIMIT 1
+                """ + lock,
+            )
+            .mappings()
+            .first()
+        )
+        existing = (
+            _exec(
+                conn,
+                """
+                SELECT Quantity AS "Quantity"
+                FROM Furnace_Oil_Consumption
+                WHERE Consumption_date = ?
+                """ + lock,
+                (day,),
+            )
+            .mappings()
+            .first()
+        )
+        previous_qty = _oil_qty(existing.get("Quantity") if existing else 0)
+        available = _oil_qty(latest.get("Closing_qty") if latest else 0) + previous_qty
+        if qty > available + 1e-9:
+            raise ValueError(
+                f"Consumption {qty:g} L exceeds available stock {available:g} L."
+            )
+        _exec(
+            conn,
+            """
+            INSERT INTO Furnace_Oil_Consumption
+                (Consumption_date, Quantity, Notes, Last_updated_by, Last_updated_datetime)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(Consumption_date) DO UPDATE SET
+                Quantity=excluded.Quantity,
+                Notes=excluded.Notes,
+                Last_updated_by=excluded.Last_updated_by,
+                Last_updated_datetime=excluded.Last_updated_datetime
+            """,
+            (day, qty, (notes or "").strip() or None, by_val, dt_val),
+        )
+        _record_inventory_movement(
+            conn,
+            inventory_kind="furnace_oil",
+            quantity_delta=previous_qty - qty,
+            unit="litre",
+            movement_type="consumption_adjustment" if existing else "consumption",
+            source_type="furnace_oil_consumption",
+            source_id=day,
+            idempotency_key=f"oil-consumption:{day}:{secrets.token_hex(12)}",
+            reason=(notes or "").strip() or "Furnace oil consumed",
+        )
+        rebuild_furnace_oil_inventory(day, conn=conn)
 
 
 def furnace_oil_month_totals(year: int, month: int) -> dict[str, float]:
