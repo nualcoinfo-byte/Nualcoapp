@@ -1121,6 +1121,7 @@ def _is_ephemeral_widget_key(key: object) -> bool:
             "_create_batch",
             "_complete_batch",
             "_open_all_elements",
+            "_ret_save",
         )
     ) or key.endswith(("_btn", "_cam", "_file"))
 
