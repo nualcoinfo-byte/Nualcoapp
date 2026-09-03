@@ -10110,6 +10110,7 @@ def list_po_supply_status() -> list[dict[str, Any]]:
                p.Order_Date AS "Order_Date",
                p.Delivery_Date AS "Delivery_Date",
                COALESCE(p.Order_Qty, 0) AS "Order_Qty",
+               p.Rate AS "Rate",
                COALESCE(p.Purchase_Order_Status, 'Open') AS "Purchase_Order_Status",
                COALESCE(d.Dispatched_Qty, 0) AS "Dispatched_Qty",
                COALESCE(d.In_packing_Qty, 0) AS "In_packing_Qty",

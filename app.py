@@ -2686,16 +2686,51 @@ def _po_priority(row: dict, *, alloy_to_produce: float, today: date) -> str:
     return "Covered"
 
 
+def _po_rate(value: object) -> float | None:
+    if value is None or value == "":
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _allocate_po_to_produce(rows: list[dict], alloy_plan: dict[int, dict]) -> None:
+    """Assign remaining melt kg to each open PO line.
+
+    Finished goods are shared per alloy, so cover earlier-due lines first.
+    ``rows`` must already be sorted by priority / delivery date.
+    """
+    fg_left = {
+        aid: float(item.get("FG_Available_Qty") or 0) for aid, item in alloy_plan.items()
+    }
+    for row in rows:
+        try:
+            alloy_id = int(row.get("Alloy_Id"))
+        except (TypeError, ValueError):
+            alloy_id = None
+        uncovered = max(
+            0.0, _kg(row.get("Balance_Qty")) - _kg(row.get("In_packing_Qty"))
+        )
+        if alloy_id is None:
+            row["To_Produce_Qty"] = uncovered
+            continue
+        take = min(uncovered, fg_left.get(alloy_id, 0.0))
+        fg_left[alloy_id] = fg_left.get(alloy_id, 0.0) - take
+        row["To_Produce_Qty"] = max(0.0, uncovered - take)
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # Dashboard
 # ═══════════════════════════════════════════════════════════════════════════════
 if PAGE == "Dashboard":
     st.title("Production Dashboard")
     st.caption(
-        "Open purchase-order quantity versus quantity already dispatched, "
-        "balance still to supply, and finished-goods stock. "
-        "Produce alloys with a **To produce** quantity first. "
-        "Finished goods are shared across every open PO for that alloy. "
+        "Open purchase-order lines versus quantity already dispatched, "
+        "balance still to supply, rate, and finished-goods stock. "
+        "Produce lines with a **To produce** quantity first. "
+        "Finished goods are shared across every open PO for that alloy, "
+        "allocated to earlier delivery dates first. "
         "Dispatch is verified packing-list weight."
     )
     today = date.today()
@@ -2777,12 +2812,13 @@ if PAGE == "Dashboard":
             str(r.get("Customer_PO_No") or ""),
         )
     )
+    _allocate_po_to_produce(po_view, alloy_plan)
 
     total_order = sum(_kg(r.get("Order_Qty")) for r in open_rows)
     total_dispatched = sum(_kg(r.get("Dispatched_Qty")) for r in open_rows)
     total_balance = sum(_kg(r.get("Balance_Qty")) for r in open_rows)
     total_fg = sum(item["FG_Available_Qty"] for item in alloy_plan.values())
-    total_to_produce = sum(item["To_Produce_Qty"] for item in alloy_plan.values())
+    total_to_produce = sum(_kg(r.get("To_Produce_Qty")) for r in po_view)
     overdue_n = sum(1 for r in po_view if r.get("Priority") == "Overdue")
 
     m1, m2, m3, m4, m5 = st.columns(5)
@@ -2799,60 +2835,14 @@ if PAGE == "Dashboard":
 
     st.subheader("What to produce")
     st.caption(
-        "Balance still due on open POs, minus in-packing and available finished goods. "
-        "Highest **To produce** alloys should be scheduled first."
-    )
-    if not alloy_plan:
-        st.info("No open purchase orders. Create one under **Purchase Orders**.")
-    else:
-        alloy_rows = sorted(
-            alloy_plan.values(),
-            key=lambda r: (-r["To_Produce_Qty"], -r["Balance_Qty"], str(r["Alloy"])),
-        )
-        alloy_df = pd.DataFrame(
-            [
-                {
-                    "Alloy": r["Alloy"],
-                    "Open POs": r["Open_POs"],
-                    "Order qty (kg)": r["Order_Qty"],
-                    "Dispatched (kg)": r["Dispatched_Qty"],
-                    "Balance (kg)": r["Balance_Qty"],
-                    "In packing (kg)": r["In_packing_Qty"],
-                    "FG available (kg)": r["FG_Available_Qty"],
-                    "Under testing (kg)": r["FG_Under_Testing_Qty"],
-                    "To produce (kg)": r["To_Produce_Qty"],
-                }
-                for r in alloy_rows
-            ]
-        )
-        kg_cols = [
-            "Order qty (kg)",
-            "Dispatched (kg)",
-            "Balance (kg)",
-            "In packing (kg)",
-            "FG available (kg)",
-            "Under testing (kg)",
-            "To produce (kg)",
-        ]
-        show_dataframe(
-            alloy_df,
-            column_config={
-                "Open POs": st.column_config.NumberColumn(format="%d"),
-                **{
-                    col: st.column_config.NumberColumn(format="%.1f")
-                    for col in kg_cols
-                },
-            },
-        )
-
-    st.subheader("Open purchase orders")
-    st.caption(
-        "One row per customer PO and alloy. "
+        "One row per open customer PO and alloy. "
+        "**To produce** is the remaining melt after in-packing and available "
+        "finished goods (shared FG is applied to earlier delivery dates first). "
         "**Overdue** / **Due today** are by delivery date. "
         "**Produce** means this alloy still has a melt shortfall."
     )
     if not po_view:
-        st.info("No open purchase-order lines.")
+        st.info("No open purchase orders. Create one under **Purchase Orders**.")
     else:
         po_df = pd.DataFrame(
             [
@@ -2862,24 +2852,36 @@ if PAGE == "Dashboard":
                     "PO No": r.get("Customer_PO_No"),
                     "Alloy": r.get("Alloy_name") or r.get("Alloy_Id"),
                     "Delivery date": r.get("Delivery_Date"),
+                    "Rate": _po_rate(r.get("Rate")),
                     "Order qty (kg)": _kg(r.get("Order_Qty")),
                     "Dispatched (kg)": _kg(r.get("Dispatched_Qty")),
                     "In packing (kg)": _kg(r.get("In_packing_Qty")),
                     "Balance (kg)": _kg(r.get("Balance_Qty")),
                     "FG available (kg)": _kg(r.get("FG_Available_Qty")),
+                    "Under testing (kg)": _kg(r.get("FG_Under_Testing_Qty")),
+                    "To produce (kg)": _kg(r.get("To_Produce_Qty")),
                 }
                 for r in po_view
             ]
         )
+        kg_cols = [
+            "Order qty (kg)",
+            "Dispatched (kg)",
+            "In packing (kg)",
+            "Balance (kg)",
+            "FG available (kg)",
+            "Under testing (kg)",
+            "To produce (kg)",
+        ]
         show_dataframe(
             po_df,
             column_config={
                 "Priority": st.column_config.TextColumn("Priority"),
-                "Order qty (kg)": st.column_config.NumberColumn(format="%.1f"),
-                "Dispatched (kg)": st.column_config.NumberColumn(format="%.1f"),
-                "In packing (kg)": st.column_config.NumberColumn(format="%.1f"),
-                "Balance (kg)": st.column_config.NumberColumn(format="%.1f"),
-                "FG available (kg)": st.column_config.NumberColumn(format="%.1f"),
+                "Rate": st.column_config.NumberColumn(format="%.2f"),
+                **{
+                    col: st.column_config.NumberColumn(format="%.1f")
+                    for col in kg_cols
+                },
             },
         )
 
