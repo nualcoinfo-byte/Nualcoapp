@@ -9797,13 +9797,21 @@ def save_batch_outputs(batch_id: str, lines: list[dict[str, Any]]) -> None:
         except (TypeError, ValueError, KeyError):
             continue
         scale = float(line.get("Weighment_scale_weight") or 0)
-        stand = float(line.get("Stand_weight") or 0)
+        stand_raw = line.get("Stand_weight")
+        stand = float(stand_raw or 0)
         if scale > 0:
             weight = max(scale - stand, 0.0)
         else:
             weight = float(line.get("Weight") or 0)
         if weight <= 0:
             continue
+        # Blank is not the same as zero: a forgotten stand silently inflates the
+        # net weight, so make the operator state it either way.
+        if stand_raw in (None, ""):
+            raise ValueError(
+                f"Enter the stand weight for the {alloy_id} output line on batch "
+                f"{batch_id}. Use 0 if the metal was weighed without a stand."
+            )
         if alloy_id not in allowed:
             raise ValueError(
                 f"Alloy {alloy_id} is not an allowed output for batch {batch_id}. "
@@ -9816,7 +9824,7 @@ def save_batch_outputs(batch_id: str, lines: list[dict[str, Any]]) -> None:
                 "Alloy_id": alloy_id,
                 "Weight": weight,
                 "Weighment_scale_weight": scale if scale > 0 else None,
-                "Stand_weight": stand if stand > 0 else (0.0 if scale > 0 else None),
+                "Stand_weight": stand,
                 "Pieces": pieces,
                 "Notes": (str(line.get("Notes") or "")).strip() or None,
                 "Weighment_scale_photo": _as_sql_photo(

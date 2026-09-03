@@ -516,10 +516,12 @@ def render_batch_output_editor(batch: dict, *, key_prefix: str) -> None:
         "The product alloy is the one selected on the batch. "
         "**Broken Ingot**, **Furnace Empty**, and **Not Ok Ingot** (alloy IDs 78–80) "
         "are for samples and portions taken out so they do not spoil the chemistry. "
-        "They have no spec."
+        "They have no spec. Stand weight must be entered on every line, **0** "
+        "included, so a forgotten stand cannot inflate the net weight."
     )
 
     collected: list[dict] = []
+    missing_stand: list[int] = []
     for idx in range(n_lines):
         st.markdown(f"**Output line {idx + 1}**")
         c1, c2, c3 = st.columns([2.4, 1.2, 2.4])
@@ -581,16 +583,28 @@ def render_batch_output_editor(batch: dict, *, key_prefix: str) -> None:
                 )
                 if scale_photo_bytes:
                     st.caption("Weighment scale photo attached.")
+        scale_val = float(scale_w or 0)
         with w2:
             stand_w = empty_percent_input(
-                "Stand weight (kg)",
+                "Stand weight (kg) *",
                 key=_k("stand", idx),
                 max_value=None,
                 step=1.0,
+                allow_zero=True,
+                help=(
+                    "Required on every output line. Enter 0 when the metal was "
+                    "weighed without a stand — it cannot be left blank."
+                ),
             )
-        scale_val = float(scale_w or 0)
+            if scale_val > 0 and stand_w is None:
+                st.markdown(
+                    '<p class="chem-spec-bad">Enter the stand weight (0 if none).</p>',
+                    unsafe_allow_html=True,
+                )
         stand_val = float(stand_w or 0)
         net_w = max(scale_val - stand_val, 0.0) if scale_val > 0 else 0.0
+        if (scale_val > 0 or net_w > 0) and stand_w is None:
+            missing_stand.append(idx + 1)
         net_key = _k("wt", idx)
         st.session_state[net_key] = float(net_w)
         with w3:
@@ -650,7 +664,7 @@ def render_batch_output_editor(batch: dict, *, key_prefix: str) -> None:
                 "Alloy_id": label_to_id[alloy_label],
                 "Weight": net_w,
                 "Weighment_scale_weight": scale_val,
-                "Stand_weight": stand_val,
+                "Stand_weight": stand_w,
                 "Pieces": pieces,
                 "Notes": notes,
                 "Weighment_scale_photo": scale_photo_bytes,
@@ -666,13 +680,20 @@ def render_batch_output_editor(batch: dict, *, key_prefix: str) -> None:
         st.session_state[state_key] = n_lines - 1
         st.rerun()
     if save_c.button("Save outputs", type="primary", key=f"{key_prefix}_{bid}_save"):
-        try:
-            db.save_batch_outputs(bid, collected)
-            st.session_state.pop(loaded_key, None)
-            st.success(f"Saved outputs for **{bid}**.")
-            st.rerun()
-        except Exception as exc:
-            st.error(str(exc))
+        if missing_stand:
+            lines = ", ".join(str(n) for n in missing_stand)
+            st.error(
+                f"Stand weight is missing on output line {lines}. Enter the stand "
+                "weight — use **0** if the metal was weighed without a stand."
+            )
+        else:
+            try:
+                db.save_batch_outputs(bid, collected)
+                st.session_state.pop(loaded_key, None)
+                st.success(f"Saved outputs for **{bid}**.")
+                st.rerun()
+            except Exception as exc:
+                st.error(str(exc))
 
     saved = db.get_batch_outputs(bid)
     if saved:
