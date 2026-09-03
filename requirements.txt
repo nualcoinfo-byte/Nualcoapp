@@ -1,6 +1,8 @@
-streamlit>=1.28.0
-pandas>=2.0.0
-jinja2>=3.1.5
-sqlalchemy>=2.0.33
-psycopg2-binary>=2.9
-fpdf2>=2.8.0
+# Pinned exactly so a Railway rebuild cannot pick up a new major version.
+# Previously `pandas>=2.0.0` resolved to pandas 3.x on a clean install.
+streamlit==1.62.0
+pandas==2.3.3
+jinja2==3.1.6
+SQLAlchemy==2.0.52
+psycopg2-binary==2.9.12
+fpdf2==2.8.8

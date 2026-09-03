@@ -2,6 +2,15 @@
 builder = "NIXPACKS"
 
 [deploy]
+# Streamlit is not a WSGI/ASGI app, so it cannot be served by Gunicorn or
+# Uvicorn. `streamlit run` is the only supported entry point; it starts its own
+# Uvicorn internally.
 startCommand = "streamlit run app.py --server.address 0.0.0.0 --server.port $PORT --server.headless true --server.fileWatcherType none --browser.gatherUsageStats false"
+healthcheckPath = "/_stcore/health"
+healthcheckTimeout = 120
 restartPolicyType = "ON_FAILURE"
 restartPolicyMaxRetries = 5
+
+# Session state lives in this process and the browser holds an open WebSocket,
+# so keep a single replica unless sticky sessions are configured.
+numReplicas = 1

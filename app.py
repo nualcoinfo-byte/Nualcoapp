@@ -20,6 +20,8 @@ LOGO_PATH = Path(__file__).resolve().parent / "assets" / "nualco_logo.png"
 ISO_LOGO_PATH = Path(__file__).resolve().parent / "assets" / "iso_9001_2015.png"
 _BRAND_ORANGE = "#F15A22"
 _BRAND_INK = "#1A1A1A"
+# Sidebar marker so a stale Railway replica is obvious on the login page.
+APP_BUILD = "2026-09-03-dashboard-produce"
 
 st.set_page_config(
     page_title="Nualco Alloy Tracker",
@@ -1665,7 +1667,9 @@ if not auth_employee:
         _render_login()
     except Exception as exc:
         st.error(f"Could not load the login page: {exc}")
-    st.sidebar.markdown(f"**DB:** `{db.DB_LABEL}`")
+    st.sidebar.markdown(
+        f"**DB:** `{db.DB_LABEL}`  \n`build {APP_BUILD}`"
+    )
     st.stop()
 
 _apply_logged_in_actor(auth_employee)
@@ -1718,7 +1722,8 @@ if PAGE not in allowed_pages:
 
 st.sidebar.markdown(
     f"**Yield target:** {db.YIELD_TARGET_PCT:.0f}%  \n"
-    f"**DB:** `{db.DB_LABEL}`"
+    f"**DB:** `{db.DB_LABEL}`  \n"
+    f"`build {APP_BUILD}`"
 )
 if _db_mode == "postgres-error":
     st.sidebar.error(
