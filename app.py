@@ -5506,10 +5506,12 @@ elif PAGE == "Production Data Analysis":
         "variance** is (actual output − estimated output) ÷ estimated output — "
         "above +1% is highlighted green, below −1% red. **Cost/kg** is charge "
         "material cost ÷ actual output, plus that production month's Cost of "
-        "Conversion total rate."
+        "Conversion total rate. Select several furnaces (or all of them) to also "
+        "see an overall view combined by day, shift, and alloy — useful since a "
+        "shift can run across more than one furnace."
     )
 
-    d1, d2, d3 = st.columns([1, 1, 1.4])
+    d1, d2, d3 = st.columns([1, 1, 1.6])
     with d1:
         start_date = ui_date_input(
             "From date", value=date.today() - timedelta(days=30), key="pda_start"
@@ -5517,20 +5519,26 @@ elif PAGE == "Production Data Analysis":
     with d2:
         end_date = ui_date_input("To date", value=date.today(), key="pda_end")
     with d3:
-        furnace_opts = ["All furnaces"] + db.list_furnaces(active_only=False)
-        furnace_filter = st.selectbox("Furnace", furnace_opts, key="pda_furnace")
+        all_furnaces = db.list_furnaces(active_only=False)
+        furnace_filter = st.multiselect(
+            "Furnaces",
+            all_furnaces,
+            default=all_furnaces,
+            key="pda_furnaces",
+            help="See one furnace, several, or all of them together.",
+        )
 
     if start_date > end_date:
         st.error("From date must be on or before To date.")
+    elif not furnace_filter:
+        st.info("Select at least one furnace.")
     else:
         data = db.production_analysis(start_date.isoformat(), end_date.isoformat())
-        summary = data["summary"]
-        materials = data["materials"]
-        if furnace_filter != "All furnaces":
-            summary = [r for r in summary if str(r.get("Furnace")) == furnace_filter]
-            materials = [
-                r for r in materials if str(r.get("Furnace")) == furnace_filter
-            ]
+        selected = {str(f) for f in furnace_filter}
+        summary = [r for r in data["summary"] if str(r.get("Furnace")) in selected]
+        materials = [
+            r for r in data["materials"] if str(r.get("Furnace")) in selected
+        ]
 
         if not summary:
             st.info("No production data in this date range.")
@@ -5566,6 +5574,27 @@ elif PAGE == "Production Data Analysis":
                 if materials:
                     materials_df = df_from_rows(materials).drop(columns=["Alloy_id"])
                     show_dataframe(materials_df)
+                else:
+                    st.caption("No charge lines in this date range.")
+
+            st.markdown("#### Overall — by day, shift, alloy")
+            st.caption(
+                "Selected furnaces combined: rates are recomputed from the summed "
+                "totals, not averaged across furnaces."
+            )
+            rollup = db.production_analysis_rollup_by_shift(summary)
+            rollup_df = df_from_rows(rollup).drop(columns=["Alloy_id"])
+            show_dataframe(rollup_df, highlight_recovery_variance=True)
+
+            with st.expander(
+                "Raw material input mix — combined across selected furnaces"
+            ):
+                material_rollup = db.production_analysis_materials_rollup(materials)
+                if material_rollup:
+                    material_rollup_df = df_from_rows(material_rollup).drop(
+                        columns=["Alloy_id"]
+                    )
+                    show_dataframe(material_rollup_df)
                 else:
                     st.caption("No charge lines in this date range.")
 

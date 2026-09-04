@@ -10069,6 +10069,159 @@ def production_analysis(start_date: str, end_date: str) -> dict[str, list[dict[s
     return {"summary": summary, "materials": material_detail}
 
 
+def production_analysis_rollup_by_shift(
+    summary_rows: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Combine production_analysis()["summary"] rows across furnaces.
+
+    Groups by (day, shift, alloy) only, for when several furnaces are
+    selected and the user wants one shift's total regardless of which
+    furnace each heat ran on. Rates (yield %, recovery variance, cost/kg)
+    are recomputed from the summed totals, not averaged across furnaces.
+    """
+    groups: dict[tuple, dict[str, Any]] = {}
+    for row in summary_rows:
+        key = (
+            str(row.get("Production_Date") or ""),
+            str(row.get("Shift") or ""),
+            row.get("Alloy_id"),
+        )
+        g = groups.setdefault(
+            key,
+            {
+                "Production_Date": row.get("Production_Date"),
+                "Shift": row.get("Shift"),
+                "Alloy_id": row.get("Alloy_id"),
+                "Alloy_name": row.get("Alloy_name"),
+                "Total_Input": 0.0,
+                "Total_Output": 0.0,
+                "Estimated_Output": 0.0,
+                "Input_Cost_Total": 0.0,
+                "Conversion_Rate_per_kg": row.get("Conversion_Rate_per_kg"),
+                "Conversion_Month": row.get("Conversion_Month"),
+            },
+        )
+        g["Total_Input"] += float(row.get("Total_Input") or 0)
+        g["Total_Output"] += float(row.get("Total_Output") or 0)
+        g["Estimated_Output"] += float(row.get("Estimated_Output") or 0)
+        g["Input_Cost_Total"] += float(row.get("Input_Cost_Total") or 0)
+
+    out: list[dict[str, Any]] = []
+    for g in groups.values():
+        total_input = round(g["Total_Input"], PERCENT_SCALE)
+        total_output = round(g["Total_Output"], PERCENT_SCALE)
+        estimated_output = round(g["Estimated_Output"], PERCENT_SCALE)
+        input_cost = round(g["Input_Cost_Total"], PERCENT_SCALE)
+        yield_pct = (
+            round(total_output / total_input * 100.0, 2) if total_input > 0 else None
+        )
+        recovery_variance_pct = (
+            round((total_output - estimated_output) / estimated_output * 100.0, 2)
+            if estimated_output > 0
+            else None
+        )
+        material_per_kg = (
+            round(input_cost / total_output, PERCENT_SCALE) if total_output > 0 else None
+        )
+        conversion_rate = float(g.get("Conversion_Rate_per_kg") or 0)
+        overall_per_kg = (
+            round(material_per_kg + conversion_rate, PERCENT_SCALE)
+            if material_per_kg is not None
+            else None
+        )
+        out.append(
+            {
+                "Production_Date": g["Production_Date"],
+                "Shift": g["Shift"],
+                "Alloy_id": g["Alloy_id"],
+                "Alloy_name": g["Alloy_name"],
+                "Total_Input": total_input,
+                "Total_Output": total_output,
+                "Estimated_Output": estimated_output,
+                "Yield_pct": yield_pct,
+                "Recovery_Variance_pct": recovery_variance_pct,
+                "Input_Cost_Total": input_cost,
+                "Material_Cost_per_kg": material_per_kg,
+                "Conversion_Rate_per_kg": conversion_rate,
+                "Conversion_Month": g.get("Conversion_Month"),
+                "Overall_Cost_per_kg": overall_per_kg,
+            }
+        )
+
+    out.sort(
+        key=lambda r: (
+            str(r["Production_Date"] or ""),
+            str(r["Shift"] or ""),
+            str(r["Alloy_name"] or ""),
+        )
+    )
+    return out
+
+
+def production_analysis_materials_rollup(
+    materials_rows: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Combine production_analysis()["materials"] rows across furnaces.
+
+    Groups by (day, shift, alloy, raw material) and re-percents each
+    material against the combined total input for that day/shift/alloy.
+    """
+    weights: dict[tuple, dict[str, Any]] = {}
+    group_totals: dict[tuple, float] = {}
+    for row in materials_rows:
+        group_key = (
+            str(row.get("Production_Date") or ""),
+            str(row.get("Shift") or ""),
+            row.get("Alloy_id"),
+        )
+        weight = float(row.get("Weight") or 0)
+        group_totals[group_key] = group_totals.get(group_key, 0.0) + weight
+        mat_key = group_key + (str(row.get("Raw_Material_Name") or ""),)
+        entry = weights.setdefault(
+            mat_key,
+            {
+                "Production_Date": row.get("Production_Date"),
+                "Shift": row.get("Shift"),
+                "Alloy_id": row.get("Alloy_id"),
+                "Alloy_name": row.get("Alloy_name"),
+                "Raw_Material_Name": row.get("Raw_Material_Name"),
+                "Recovery_pct": row.get("Recovery_pct"),
+                "Weight": 0.0,
+            },
+        )
+        entry["Weight"] += weight
+
+    out: list[dict[str, Any]] = []
+    for mat_key, entry in weights.items():
+        group_key = mat_key[:3]
+        total_input = group_totals.get(group_key) or 0.0
+        weight = round(entry["Weight"], PERCENT_SCALE)
+        out.append(
+            {
+                "Production_Date": entry["Production_Date"],
+                "Shift": entry["Shift"],
+                "Alloy_id": entry["Alloy_id"],
+                "Alloy_name": entry["Alloy_name"],
+                "Raw_Material_Name": entry["Raw_Material_Name"],
+                "Weight": weight,
+                "Percent_of_Input": (
+                    round(weight / total_input * 100.0, 2) if total_input > 0 else None
+                ),
+                "Recovery_pct": entry["Recovery_pct"],
+            }
+        )
+
+    out.sort(
+        key=lambda r: (
+            str(r["Production_Date"] or ""),
+            str(r["Shift"] or ""),
+            str(r["Alloy_name"] or ""),
+            str(r["Raw_Material_Name"] or ""),
+        )
+    )
+    return out
+
+
 def get_batch_outputs(
     batch_id: str, *, include_photos: bool = False
 ) -> list[dict[str, Any]]:
