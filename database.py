@@ -9896,6 +9896,31 @@ def _production_analysis_outputs(start_date: str, end_date: str) -> list[dict[st
     )
 
 
+def _production_analysis_output_lines(
+    start_date: str, end_date: str
+) -> list[dict[str, Any]]:
+    """Output weight by day, furnace, shift, group alloy, and output-alloy line.
+
+    "Output-alloy line" is the group alloy itself, or one of the non-spec
+    sidestream alloys (Broken Ingot / Furnace Empty / Not Ok Ingot).
+    """
+    return fetch_all(
+        """
+        SELECT b.Production_Date AS "Production_Date",
+               b.Furnace AS "Furnace",
+               b.Shift AS "Shift",
+               b.Alloy_id AS "Alloy_id",
+               o.Alloy_id AS "Output_Alloy_id",
+               SUM(o.Weight) AS "Weight"
+        FROM batch_output o
+        JOIN Production_batch b ON b.Batch_ID = o.Batch_ID
+        WHERE b.Production_Date BETWEEN ? AND ?
+        GROUP BY b.Production_Date, b.Furnace, b.Shift, b.Alloy_id, o.Alloy_id
+        """,
+        (start_date, end_date),
+    )
+
+
 def production_analysis(start_date: str, end_date: str) -> dict[str, list[dict[str, Any]]]:
     """Production performance grouped by day, furnace, shift, and alloy.
 
@@ -9903,17 +9928,21 @@ def production_analysis(start_date: str, end_date: str) -> dict[str, list[dict[s
     heats in one shift, and leftover material is only accounted for at the
     end of the shift or day — per-heat numbers alone would be misleading.
 
-    Returns {"summary": [...], "materials": [...]}. "summary" has one row per
-    group with Total_Input, Total_Output, Yield_pct, an estimated output
-    (each raw material's charge weight x its newest Raw_Material_Master
-    Recovery %), the recovery variance of actual vs. estimated output, and
-    cost per kg (charge material cost / output, plus the production month's
-    Cost_of_conversion.total_conversion_rate_per_kg). "materials" has one row
-    per raw material within each group, with that material's % of the
-    group's total input.
+    Returns {"summary": [...], "materials": [...], "outputs": [...]}.
+    "summary" has one row per group with Total_Input, Total_Output,
+    Yield_pct, an estimated output (each raw material's charge weight x its
+    newest Raw_Material_Master Recovery %), the recovery variance of actual
+    vs. estimated output, and cost per kg (charge material cost / output,
+    plus the production month's Cost_of_conversion.total_conversion_rate_per_kg).
+    "materials" has one row per raw material within each group, with that
+    material's % of the group's total input. "outputs" has exactly four rows
+    per group — the group's own alloy plus Broken Ingot / Furnace Empty /
+    Not Ok Ingot (0 kg where a line was not actually produced) — for a
+    snapshot of where the output weight went.
     """
     input_rows = _production_analysis_inputs(start_date, end_date)
     output_rows = _production_analysis_outputs(start_date, end_date)
+    output_line_rows = _production_analysis_output_lines(start_date, end_date)
     recovery_map = _production_analysis_recovery_map()
 
     def _key(row: dict[str, Any]) -> tuple:
@@ -9965,6 +9994,18 @@ def production_analysis(start_date: str, end_date: str) -> dict[str, list[dict[s
         if not g.get("Alloy_name"):
             g["Alloy_name"] = row.get("Alloy_name")
         g["Total_Output"] += float(row.get("Weight") or 0)
+
+    output_lines: dict[tuple, dict[int, float]] = {}
+    for row in output_line_rows:
+        key = _key(row)
+        try:
+            output_alloy_id = int(row.get("Output_Alloy_id"))
+        except (TypeError, ValueError):
+            continue
+        per_alloy = output_lines.setdefault(key, {})
+        per_alloy[output_alloy_id] = per_alloy.get(output_alloy_id, 0.0) + float(
+            row.get("Weight") or 0
+        )
 
     conversion_cache: dict[str, tuple[float, Optional[str]]] = {}
 
@@ -10066,7 +10107,39 @@ def production_analysis(start_date: str, end_date: str) -> dict[str, list[dict[s
         )
     )
 
-    return {"summary": summary, "materials": material_detail}
+    output_detail: list[dict[str, Any]] = []
+    for key, g in groups.items():
+        per_alloy = output_lines.get(key, {})
+        lines = [(g["Alloy_id"], g["Alloy_name"])] + [
+            (sid, SIDESTREAM_RM_NAMES[sid]) for sid in SIDESTREAM_ALLOY_IDS
+        ]
+        for output_alloy_id, output_alloy_name in lines:
+            if output_alloy_id is None:
+                continue
+            output_detail.append(
+                {
+                    "Production_Date": g["Production_Date"],
+                    "Furnace": g["Furnace"],
+                    "Shift": g["Shift"],
+                    "Alloy_id": g["Alloy_id"],
+                    "Alloy_name": g["Alloy_name"],
+                    "Output_Alloy_id": output_alloy_id,
+                    "Output_Alloy_name": output_alloy_name,
+                    "Weight": round(per_alloy.get(int(output_alloy_id), 0.0), PERCENT_SCALE),
+                }
+            )
+
+    output_detail.sort(
+        key=lambda r: (
+            str(r["Production_Date"] or ""),
+            str(r["Furnace"] or ""),
+            str(r["Shift"] or ""),
+            str(r["Alloy_name"] or ""),
+            r["Output_Alloy_id"] != r["Alloy_id"],
+        )
+    )
+
+    return {"summary": summary, "materials": material_detail, "outputs": output_detail}
 
 
 def production_analysis_rollup_by_shift(
@@ -10217,6 +10290,49 @@ def production_analysis_materials_rollup(
             str(r["Shift"] or ""),
             str(r["Alloy_name"] or ""),
             str(r["Raw_Material_Name"] or ""),
+        )
+    )
+    return out
+
+
+def production_analysis_outputs_rollup(
+    output_rows: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Combine production_analysis()["outputs"] rows across furnaces.
+
+    Groups by (day, shift, alloy, output-alloy line) and sums weight.
+    """
+    groups: dict[tuple, dict[str, Any]] = {}
+    for row in output_rows:
+        key = (
+            str(row.get("Production_Date") or ""),
+            str(row.get("Shift") or ""),
+            row.get("Alloy_id"),
+            row.get("Output_Alloy_id"),
+        )
+        g = groups.setdefault(
+            key,
+            {
+                "Production_Date": row.get("Production_Date"),
+                "Shift": row.get("Shift"),
+                "Alloy_id": row.get("Alloy_id"),
+                "Alloy_name": row.get("Alloy_name"),
+                "Output_Alloy_id": row.get("Output_Alloy_id"),
+                "Output_Alloy_name": row.get("Output_Alloy_name"),
+                "Weight": 0.0,
+            },
+        )
+        g["Weight"] += float(row.get("Weight") or 0)
+
+    out = [
+        {**g, "Weight": round(g["Weight"], PERCENT_SCALE)} for g in groups.values()
+    ]
+    out.sort(
+        key=lambda r: (
+            str(r["Production_Date"] or ""),
+            str(r["Shift"] or ""),
+            str(r["Alloy_name"] or ""),
+            r["Output_Alloy_id"] != r["Alloy_id"],
         )
     )
     return out

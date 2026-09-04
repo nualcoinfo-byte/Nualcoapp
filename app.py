@@ -5500,7 +5500,9 @@ elif PAGE == "Production Data Analysis":
         "Input and output are grouped by **day, furnace, shift, and alloy** — not "
         "by individual heat — because a furnace can run several heats in a shift "
         "and leftover material is only accounted for at the end of the shift or "
-        "day. **Estimated output** sums each raw material's charge weight × its "
+        "day. The **daily snapshot** below shows one card per alloy, with the "
+        "day/furnace/shift shown once as a heading rather than repeated on every "
+        "row. **Estimated output** sums each raw material's charge weight × its "
         "newest **Expected recovery %** from Raw Material Master (e.g. 100 kg AK "
         "Wire at 99% + 100 kg SAF Boring at 85% → 184 kg estimated). **Recovery "
         "variance** is (actual output − estimated output) ÷ estimated output — "
@@ -5510,6 +5512,95 @@ elif PAGE == "Production Data Analysis":
         "see an overall view combined by day, shift, and alloy — useful since a "
         "shift can run across more than one furnace."
     )
+
+    def _pda_group_key(row: dict) -> tuple:
+        return (
+            row.get("Production_Date"),
+            row.get("Furnace"),
+            row.get("Shift"),
+            row.get("Alloy_id"),
+        )
+
+    def _pda_render_card(
+        row: dict,
+        materials_by_key: dict[tuple, list[dict]],
+        outputs_by_key: dict[tuple, list[dict]],
+    ) -> None:
+        key = _pda_group_key(row)
+        with st.container(border=True):
+            st.markdown(f"**{row.get('Alloy_name') or '—'}**")
+            out_lines = outputs_by_key.get(key, [])
+            if out_lines:
+                show_dataframe(
+                    pd.DataFrame(
+                        {
+                            "Output line": [
+                                o["Output_Alloy_name"] for o in out_lines
+                            ],
+                            "Weight (kg)": [o["Weight"] for o in out_lines],
+                        }
+                    )
+                )
+
+            io1, io2, io3 = st.columns(3)
+            io1.metric("Total output (kg)", f"{row['Total_Output']:,.2f}")
+            io2.metric("Total input (kg)", f"{row['Total_Input']:,.2f}")
+            io3.metric(
+                "Yield %",
+                f"{row['Yield_pct']:.2f}%" if row["Yield_pct"] is not None else "—",
+            )
+
+            e1, e2, e3 = st.columns(3)
+            e1.metric("Estimated output (kg)", f"{row['Estimated_Output']:,.2f}")
+            delta = row["Total_Output"] - row["Estimated_Output"]
+            e2.metric("Actual − estimated (kg)", f"{delta:+,.2f}")
+            with e3:
+                st.markdown(
+                    '<p style="font-size:0.8rem;color:rgba(49,51,63,0.6);'
+                    'margin-bottom:0.2rem">Recovery loss/gain</p>',
+                    unsafe_allow_html=True,
+                )
+                variance = row["Recovery_Variance_pct"]
+                if variance is None:
+                    st.markdown(
+                        '<p style="font-size:1.5rem;margin:0">—</p>',
+                        unsafe_allow_html=True,
+                    )
+                else:
+                    color = (
+                        "#2e7d32"
+                        if variance > 1
+                        else ("#c62828" if variance < -1 else "inherit")
+                    )
+                    st.markdown(
+                        f'<p style="font-size:1.5rem;font-weight:600;color:{color};'
+                        f'margin:0">{variance:+.2f}%</p>',
+                        unsafe_allow_html=True,
+                    )
+
+            material_kg = row.get("Material_Cost_per_kg")
+            overall_kg = row.get("Overall_Cost_per_kg")
+            st.caption(
+                "Material ₹/kg: "
+                + (f"{material_kg:,.2f}" if material_kg is not None else "—")
+                + " · Overall ₹/kg: "
+                + (f"{overall_kg:,.2f}" if overall_kg is not None else "—")
+            )
+
+            mats = materials_by_key.get(key, [])
+            if mats:
+                st.markdown("Raw material input")
+                show_dataframe(
+                    pd.DataFrame(
+                        {
+                            "Raw material": [m["Raw_Material_Name"] for m in mats],
+                            "Weight (kg)": [m["Weight"] for m in mats],
+                            "% of input": [m["Percent_of_Input"] for m in mats],
+                        }
+                    )
+                )
+                total_pct = sum((m["Percent_of_Input"] or 0) for m in mats)
+                st.caption(f"Total: {total_pct:.1f}%")
 
     d1, d2, d3 = st.columns([1, 1, 1.6])
     with d1:
@@ -5539,6 +5630,7 @@ elif PAGE == "Production Data Analysis":
         materials = [
             r for r in data["materials"] if str(r.get("Furnace")) in selected
         ]
+        outputs = [r for r in data["outputs"] if str(r.get("Furnace")) in selected]
 
         if not summary:
             st.info("No production data in this date range.")
@@ -5566,37 +5658,84 @@ elif PAGE == "Production Data Analysis":
                 f"{overall_variance:+.2f}%" if overall_variance is not None else "—",
             )
 
-            st.markdown("#### Production summary — by day, furnace, shift, alloy")
-            summary_df = df_from_rows(summary).drop(columns=["Alloy_id"])
-            show_dataframe(summary_df, highlight_recovery_variance=True)
-
-            with st.expander("Raw material input mix (% of input per group)"):
-                if materials:
-                    materials_df = df_from_rows(materials).drop(columns=["Alloy_id"])
-                    show_dataframe(materials_df)
-                else:
-                    st.caption("No charge lines in this date range.")
-
-            st.markdown("#### Overall — by day, shift, alloy")
+            st.markdown("#### Daily snapshot")
             st.caption(
-                "Selected furnaces combined: rates are recomputed from the summed "
-                "totals, not averaged across furnaces."
+                "Expand a day to see each furnace and shift, with one card per "
+                "alloy — day, furnace, and shift are each shown once."
             )
-            rollup = db.production_analysis_rollup_by_shift(summary)
-            rollup_df = df_from_rows(rollup).drop(columns=["Alloy_id"])
-            show_dataframe(rollup_df, highlight_recovery_variance=True)
+            materials_by_key: dict[tuple, list[dict]] = {}
+            for m in materials:
+                materials_by_key.setdefault(_pda_group_key(m), []).append(m)
+            outputs_by_key: dict[tuple, list[dict]] = {}
+            for o in outputs:
+                outputs_by_key.setdefault(_pda_group_key(o), []).append(o)
 
-            with st.expander(
-                "Raw material input mix — combined across selected furnaces"
-            ):
-                material_rollup = db.production_analysis_materials_rollup(materials)
-                if material_rollup:
-                    material_rollup_df = df_from_rows(material_rollup).drop(
-                        columns=["Alloy_id"]
+            by_date: dict = {}
+            for row in summary:
+                by_date.setdefault(row["Production_Date"], {}).setdefault(
+                    row["Furnace"], {}
+                ).setdefault(row["Shift"], []).append(row)
+
+            dates_sorted = sorted(by_date.keys(), key=lambda d: str(d or ""), reverse=True)
+            for i, d in enumerate(dates_sorted):
+                with st.expander(format_ui_date(d) or str(d), expanded=(i == 0)):
+                    furnaces_sorted = sorted(
+                        by_date[d].keys(), key=lambda f: (len(str(f)), str(f))
                     )
-                    show_dataframe(material_rollup_df)
-                else:
-                    st.caption("No charge lines in this date range.")
+                    for furnace in furnaces_sorted:
+                        st.markdown(f"**Furnace {furnace}**")
+                        shifts_sorted = sorted(
+                            by_date[d][furnace].keys(), key=lambda s: str(s or "")
+                        )
+                        for shift in shifts_sorted:
+                            st.caption(f"Shift {shift}")
+                            alloy_rows = sorted(
+                                by_date[d][furnace][shift],
+                                key=lambda r: str(r.get("Alloy_name") or ""),
+                            )
+                            cols = st.columns(len(alloy_rows))
+                            for col, row in zip(cols, alloy_rows):
+                                with col:
+                                    _pda_render_card(
+                                        row, materials_by_key, outputs_by_key
+                                    )
+
+            with st.expander("Detailed tables (flat, for export)"):
+                st.markdown("##### Production summary — by day, furnace, shift, alloy")
+                summary_df = df_from_rows(summary).drop(columns=["Alloy_id"])
+                show_dataframe(summary_df, highlight_recovery_variance=True)
+
+                with st.expander("Raw material input mix (% of input per group)"):
+                    if materials:
+                        materials_df = df_from_rows(materials).drop(
+                            columns=["Alloy_id"]
+                        )
+                        show_dataframe(materials_df)
+                    else:
+                        st.caption("No charge lines in this date range.")
+
+                st.markdown("##### Overall — by day, shift, alloy")
+                st.caption(
+                    "Selected furnaces combined: rates are recomputed from the "
+                    "summed totals, not averaged across furnaces."
+                )
+                rollup = db.production_analysis_rollup_by_shift(summary)
+                rollup_df = df_from_rows(rollup).drop(columns=["Alloy_id"])
+                show_dataframe(rollup_df, highlight_recovery_variance=True)
+
+                with st.expander(
+                    "Raw material input mix — combined across selected furnaces"
+                ):
+                    material_rollup = db.production_analysis_materials_rollup(
+                        materials
+                    )
+                    if material_rollup:
+                        material_rollup_df = df_from_rows(material_rollup).drop(
+                            columns=["Alloy_id"]
+                        )
+                        show_dataframe(material_rollup_df)
+                    else:
+                        st.caption("No charge lines in this date range.")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
