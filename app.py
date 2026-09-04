@@ -4282,6 +4282,57 @@ elif PAGE == "Production Batch & Chemistry":
                 "Estimated ₹/kg",
                 f"{est_per_kg:,.2f}" if est_per_kg is not None else "—",
             )
+
+            open_po = db.latest_open_po_rate(alloy_id) if alloy_id else None
+            po_rate = (
+                float(open_po["Rate"])
+                if open_po and open_po.get("Rate") is not None
+                else None
+            )
+            if po_rate is not None:
+                f1, f2 = st.columns(2)
+                f1.metric(
+                    "Open PO rate (₹/kg)",
+                    f"{po_rate:,.2f}",
+                    help=(
+                        f"Latest Open PO for this alloy: "
+                        f"{open_po.get('Customer_PO_No') or '—'} "
+                        f"({format_ui_date(open_po.get('Order_Date')) or '—'})."
+                    ),
+                )
+                with f2:
+                    st.markdown(
+                        '<p style="font-size:0.8rem;color:rgba(49,51,63,0.6);'
+                        'margin-bottom:0.2rem">Profit/Loss (₹/kg)</p>',
+                        unsafe_allow_html=True,
+                    )
+                    if est_per_kg is None:
+                        st.markdown(
+                            '<p style="font-size:1.5rem;margin:0">—</p>',
+                            unsafe_allow_html=True,
+                        )
+                    else:
+                        profit_loss = po_rate - est_per_kg
+                        color = (
+                            "#2e7d32"
+                            if profit_loss > 0
+                            else ("#c62828" if profit_loss < 0 else "inherit")
+                        )
+                        st.markdown(
+                            f'<p style="font-size:1.5rem;font-weight:600;'
+                            f'color:{color};margin:0">{profit_loss:+,.2f}</p>',
+                            unsafe_allow_html=True,
+                        )
+                st.caption(
+                    "Profit/Loss = Open PO rate − Estimated ₹/kg. Positive means "
+                    "this alloy is selling for more than it costs to produce."
+                )
+            elif alloy_id:
+                st.caption(
+                    "No Open purchase order for this alloy — no rate to compare "
+                    "the estimated cost against."
+                )
+
             conv_month = estimate["conversion_expense_month"]
             st.caption(
                 "Charge cost ÷ estimated output, plus conversion "

@@ -8477,6 +8477,31 @@ def list_certificate_spec_rows(alloy_id: int) -> list[dict[str, Any]]:
     return out
 
 
+def latest_open_po_rate(alloy_id: object) -> Optional[dict[str, Any]]:
+    """Latest (by Order_Date) Open purchase-order rate for an alloy, or None.
+
+    Lets Production Batch & Chemistry show a batch's estimated cost against
+    what the customer is actually paying for that alloy right now.
+    """
+    try:
+        aid = int(alloy_id)
+    except (TypeError, ValueError):
+        return None
+    return fetch_one(
+        """
+        SELECT Customer_PO_No AS "Customer_PO_No",
+               Customer_name AS "Customer_name",
+               Order_Date AS "Order_Date",
+               Rate AS "Rate"
+        FROM Purchase_Order
+        WHERE Alloy_Id = ? AND COALESCE(Purchase_Order_Status, 'Open') = 'Open'
+        ORDER BY Order_Date DESC, Customer_PO_No DESC
+        LIMIT 1
+        """,
+        (aid,),
+    )
+
+
 def get_purchase_order_date(po_no: object, alloy_id: object) -> Optional[str]:
     po = str(po_no or "").strip()
     if not po:
