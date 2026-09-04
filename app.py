@@ -10,7 +10,7 @@ import base64
 import html
 import os
 import re
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import pandas as pd
@@ -296,6 +296,49 @@ def _style_avg_piece_column(data: pd.DataFrame):
 
     return styler.apply(_color, axis=0).format(
         {"Avg_piece_kg": _fmt_avg},
+        na_rep="—",
+    )
+
+
+def _style_recovery_variance_column(data: pd.DataFrame):
+    """Green above +1%, red below -1%, on Recovery_Variance_pct."""
+    if data is None or data.empty or "Recovery_Variance_pct" not in data.columns:
+        return data
+    styler = _pandas_styler(data)
+    if styler is None:
+        return data
+
+    def _color(col: pd.Series) -> list[str]:
+        if col.name != "Recovery_Variance_pct":
+            return [""] * len(col)
+        styles: list[str] = []
+        for val in col:
+            if val is None or (isinstance(val, float) and pd.isna(val)):
+                styles.append("")
+                continue
+            try:
+                v = float(val)
+            except (TypeError, ValueError):
+                styles.append("")
+                continue
+            if v > 1.0:
+                styles.append("color: #2e7d32; font-weight: 700")
+            elif v < -1.0:
+                styles.append("color: #c62828; font-weight: 700")
+            else:
+                styles.append("")
+        return styles
+
+    def _fmt_pct(val: object) -> str:
+        if val is None or (isinstance(val, float) and pd.isna(val)):
+            return "—"
+        try:
+            return f"{float(val):+.2f}%"
+        except (TypeError, ValueError):
+            return "—"
+
+    return styler.apply(_color, axis=0).format(
+        {"Recovery_Variance_pct": _fmt_pct},
         na_rep="—",
     )
 
@@ -1153,12 +1196,15 @@ def format_df_dates(data: pd.DataFrame) -> pd.DataFrame:
 def show_dataframe(data, **kwargs):
     """Display a table with date columns as DD-MON-YYYY."""
     highlight_avg = kwargs.pop("highlight_avg_piece", False)
+    highlight_recovery = kwargs.pop("highlight_recovery_variance", False)
     if isinstance(data, pd.DataFrame):
         if highlight_avg:
             data = _add_avg_piece_column(data)
         data = format_df_dates(data)
         if highlight_avg:
             data = _style_avg_piece_column(data)
+        elif highlight_recovery:
+            data = _style_recovery_variance_column(data)
     kwargs.setdefault("use_container_width", True)
     kwargs.setdefault("hide_index", True)
     return st.dataframe(data, **kwargs)
@@ -1598,6 +1644,7 @@ NAV_SECTIONS: list[tuple[str, list[str]]] = [
             "Batch Output",
             "Production Batches",
             "Material Recovery & Yield",
+            "Production Data Analysis",
         ],
     ),
     (
@@ -5442,6 +5489,85 @@ elif PAGE == "Material Recovery & Yield":
             st.info("This batch has no charge input yet.")
         else:
             st.info("Save batch outputs above to calculate recovery.")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 5. Production Data Analysis
+# ═══════════════════════════════════════════════════════════════════════════════
+elif PAGE == "Production Data Analysis":
+    st.title("Production Data Analysis")
+    st.caption(
+        "Input and output are grouped by **day, furnace, shift, and alloy** — not "
+        "by individual heat — because a furnace can run several heats in a shift "
+        "and leftover material is only accounted for at the end of the shift or "
+        "day. **Estimated output** sums each raw material's charge weight × its "
+        "newest **Expected recovery %** from Raw Material Master (e.g. 100 kg AK "
+        "Wire at 99% + 100 kg SAF Boring at 85% → 184 kg estimated). **Recovery "
+        "variance** is (actual output − estimated output) ÷ estimated output — "
+        "above +1% is highlighted green, below −1% red. **Cost/kg** is charge "
+        "material cost ÷ actual output, plus that production month's Cost of "
+        "Conversion total rate."
+    )
+
+    d1, d2, d3 = st.columns([1, 1, 1.4])
+    with d1:
+        start_date = ui_date_input(
+            "From date", value=date.today() - timedelta(days=30), key="pda_start"
+        )
+    with d2:
+        end_date = ui_date_input("To date", value=date.today(), key="pda_end")
+    with d3:
+        furnace_opts = ["All furnaces"] + db.list_furnaces(active_only=False)
+        furnace_filter = st.selectbox("Furnace", furnace_opts, key="pda_furnace")
+
+    if start_date > end_date:
+        st.error("From date must be on or before To date.")
+    else:
+        data = db.production_analysis(start_date.isoformat(), end_date.isoformat())
+        summary = data["summary"]
+        materials = data["materials"]
+        if furnace_filter != "All furnaces":
+            summary = [r for r in summary if str(r.get("Furnace")) == furnace_filter]
+            materials = [
+                r for r in materials if str(r.get("Furnace")) == furnace_filter
+            ]
+
+        if not summary:
+            st.info("No production data in this date range.")
+        else:
+            total_input = sum(r["Total_Input"] for r in summary)
+            total_output = sum(r["Total_Output"] for r in summary)
+            total_estimated = sum(r["Estimated_Output"] for r in summary)
+            overall_yield = (
+                total_output / total_input * 100.0 if total_input > 0 else None
+            )
+            overall_variance = (
+                (total_output - total_estimated) / total_estimated * 100.0
+                if total_estimated > 0
+                else None
+            )
+            k1, k2, k3, k4 = st.columns(4)
+            k1.metric("Total input (kg)", f"{total_input:,.2f}")
+            k2.metric("Total output (kg)", f"{total_output:,.2f}")
+            k3.metric(
+                "Overall yield %",
+                f"{overall_yield:.2f}%" if overall_yield is not None else "—",
+            )
+            k4.metric(
+                "Overall recovery variance",
+                f"{overall_variance:+.2f}%" if overall_variance is not None else "—",
+            )
+
+            st.markdown("#### Production summary — by day, furnace, shift, alloy")
+            summary_df = df_from_rows(summary).drop(columns=["Alloy_id"])
+            show_dataframe(summary_df, highlight_recovery_variance=True)
+
+            with st.expander("Raw material input mix (% of input per group)"):
+                if materials:
+                    materials_df = df_from_rows(materials).drop(columns=["Alloy_id"])
+                    show_dataframe(materials_df)
+                else:
+                    st.caption("No charge lines in this date range.")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
