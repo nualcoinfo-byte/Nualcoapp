@@ -459,6 +459,44 @@ def render_batch_output_editor(batch: dict, *, key_prefix: str) -> None:
                 highlight_avg_piece=True,
             )
         return
+
+    output_completed = (
+        batch.get("Output_status") or db.BATCH_STATUS_IN_PROGRESS
+    ) == db.BATCH_STATUS_COMPLETED
+    is_admin = db.is_admin_user()
+    unlock_key = f"{key_prefix}_{bid}_unlock_output"
+    locked = output_completed and not (
+        is_admin and st.session_state.get(unlock_key)
+    )
+    output_gaps: list[str] = []
+    try:
+        output_gaps = db.batch_output_completion_gaps_for_id(bid)
+    except Exception:
+        output_gaps = []
+
+    status_col, unlock_col = st.columns([2, 2])
+    with status_col:
+        st.markdown(
+            "**Output status:** `"
+            f"{batch.get('Output_status') or db.BATCH_STATUS_IN_PROGRESS}`"
+        )
+    with unlock_col:
+        if output_completed and is_admin:
+            st.checkbox(
+                "Correct history (unlock completed output)",
+                key=unlock_key,
+                help=(
+                    "Admin only. Check this to edit output after it is Completed. "
+                    "Finished Goods Inventory is re-synced on save; status stays "
+                    "Completed."
+                ),
+            )
+        elif output_completed:
+            st.info(
+                "Output for this heat is **Completed** and locked. Ask an Admin "
+                "to unlock it if history needs correction."
+            )
+
     product_id = batch.get("Alloy_id")
     alloys = db.list_batch_output_alloys(product_id)
     if not alloys:
@@ -532,15 +570,17 @@ def render_batch_output_editor(batch: dict, *, key_prefix: str) -> None:
                 "Output alloy *",
                 options=labels,
                 key=_k("alloy", idx),
+                disabled=locked,
             )
         with c2:
             pieces = empty_int_input(
                 "Pieces",
                 key=_k("pcs", idx),
                 help="Whole number of pieces. No decimals.",
+                disabled=locked,
             )
         with c3:
-            notes = st.text_input("Notes", key=_k("notes", idx))
+            notes = st.text_input("Notes", key=_k("notes", idx), disabled=locked)
 
         w1, w2, w3, w4 = st.columns(4)
         with w1:
@@ -549,6 +589,7 @@ def render_batch_output_editor(batch: dict, *, key_prefix: str) -> None:
                 key=_k("scale", idx),
                 max_value=None,
                 step=1.0,
+                disabled=locked,
             )
             wsp_open_key = _k("wsp_open", idx)
             if st.button(
@@ -556,6 +597,7 @@ def render_batch_output_editor(batch: dict, *, key_prefix: str) -> None:
                 key=_k("wsp_btn", idx),
                 help="Open camera or choose a photo from the phone gallery",
                 use_container_width=True,
+                disabled=locked,
             ):
                 st.session_state[wsp_open_key] = not bool(
                     st.session_state.get(wsp_open_key)
@@ -597,6 +639,7 @@ def render_batch_output_editor(batch: dict, *, key_prefix: str) -> None:
                     "Required on every output line. Enter 0 when the metal was "
                     "weighed without a stand — it cannot be left blank."
                 ),
+                disabled=locked,
             )
             if scale_val > 0 and stand_w is None:
                 st.markdown(
@@ -624,6 +667,7 @@ def render_batch_output_editor(batch: dict, *, key_prefix: str) -> None:
                 key=_k("out_btn", idx),
                 help="Open camera or choose a photo of the output",
                 use_container_width=True,
+                disabled=locked,
             ):
                 st.session_state[out_open_key] = not bool(
                     st.session_state.get(out_open_key)
@@ -674,14 +718,27 @@ def render_batch_output_editor(batch: dict, *, key_prefix: str) -> None:
             }
         )
 
-    add_c, rem_c, save_c = st.columns([1, 1, 3])
-    if add_c.button("Add output line", key=f"{key_prefix}_{bid}_add"):
+    add_c, rem_c, save_c, complete_c = st.columns([1, 1, 1.6, 1.8])
+    if add_c.button(
+        "Add output line", key=f"{key_prefix}_{bid}_add", disabled=locked
+    ):
         st.session_state[state_key] = n_lines + 1
         st.rerun()
-    if rem_c.button("Remove last line", key=f"{key_prefix}_{bid}_rem") and n_lines > 1:
+    if (
+        rem_c.button(
+            "Remove last line", key=f"{key_prefix}_{bid}_rem", disabled=locked
+        )
+        and n_lines > 1
+    ):
         st.session_state[state_key] = n_lines - 1
         st.rerun()
-    if save_c.button("Save outputs", type="primary", key=f"{key_prefix}_{bid}_save"):
+    save_label = "Save history correction" if output_completed else "Save outputs"
+    if save_c.button(
+        save_label,
+        type="primary",
+        key=f"{key_prefix}_{bid}_save",
+        disabled=locked,
+    ):
         if missing_stand:
             lines = ", ".join(str(n) for n in missing_stand)
             st.error(
@@ -690,12 +747,42 @@ def render_batch_output_editor(batch: dict, *, key_prefix: str) -> None:
             )
         else:
             try:
-                db.save_batch_outputs(bid, collected)
+                db.save_batch_outputs(
+                    bid, collected, allow_completed=output_completed
+                )
                 st.session_state.pop(loaded_key, None)
-                st.success(f"Saved outputs for **{bid}**.")
+                st.success(
+                    f"Saved history correction for **{bid}**."
+                    if output_completed
+                    else f"Saved outputs for **{bid}**."
+                )
                 st.rerun()
             except Exception as exc:
                 st.error(str(exc))
+    if complete_c.button(
+        "Mark Output as Completed",
+        type="primary",
+        key=f"{key_prefix}_{bid}_complete_output",
+        disabled=locked or output_completed or bool(output_gaps),
+        help=(
+            "Locks output entry for this heat and posts it to Finished Goods "
+            "Inventory. Requires at least one output line."
+        ),
+    ):
+        try:
+            db.complete_batch_output(bid)
+            st.success(
+                f"Output for **{bid}** is **Completed** and locked. It is now "
+                "posted to **Finished Goods Inventory**."
+            )
+            st.rerun()
+        except Exception as exc:
+            st.error(str(exc))
+    if not output_completed and output_gaps:
+        st.caption(
+            "**Mark Output as Completed** stays disabled until: "
+            + "; ".join(output_gaps)
+        )
 
     saved = db.get_batch_outputs(bid)
     if saved:
@@ -4795,8 +4882,10 @@ elif PAGE == "Batch Output":
         "**Not Ok Ingot (80)** for samples and portions taken out so they do not "
         "spoil the chemistry. Those three have no spec. "
         "Create and mark the batch **Completed** first on **Production Batch & Chemistry**. "
-        "Saving product-alloy output posts that heat into **Finished Goods Inventory**. "
-        "Dispatch those bundles on **Packing List**. "
+        "Output lines can be saved as drafts and edited freely until you click "
+        "**Mark Output as Completed**, which locks this heat's output and posts it "
+        "into **Finished Goods Inventory** — only Completed output reaches Finished "
+        "Goods. Dispatch those bundles on **Packing List**. "
         "Avg piece weight is net output ÷ pieces; product alloy pieces are typically "
         f"{db.ALLOY_PIECE_KG_MIN:g}–{db.ALLOY_PIECE_KG_MAX:g} kg and show in red if outside that range. "
         "On save, each output line stores material ₹/kg (charge lot cost ÷ total output kg) "
@@ -4838,7 +4927,7 @@ elif PAGE == "Batch Output":
                     (b.get("Alloy_name") for b in filtered if b["Batch_ID"] == bid),
                     None,
                 )
-                m1, m2, m3, m4, m5 = st.columns(5)
+                m1, m2, m3, m4, m5, m6 = st.columns(6)
                 m1.metric("Batch ID", batch["Batch_ID"])
                 m2.metric("Furnace", batch.get("Furnace") or "—")
                 m3.metric("Heat No", batch.get("Heat_no") or "—")
@@ -4847,8 +4936,12 @@ elif PAGE == "Batch Output":
                     f"{batch.get('Alloy_id')} — {alloy_name or '—'}",
                 )
                 m5.metric(
-                    "Status",
+                    "Production status",
                     batch.get("Production_status") or "—",
+                )
+                m6.metric(
+                    "Output status",
+                    batch.get("Output_status") or "—",
                 )
                 st.caption(
                     f"Charge input: {float(batch.get('Input_Weight') or 0):,.2f} kg"
@@ -5357,8 +5450,9 @@ elif PAGE == "Material Recovery & Yield":
 elif PAGE == "Finished Goods Inventory":
     st.title("Finished Goods Inventory")
     st.caption(
-        "Product-alloy output saved on **Batch Output** posts here as **Available**. "
-        "Dispatch stock by entering a **Packing List**. "
+        "Product-alloy output posts here as **Available** once you click "
+        "**Mark Output as Completed** on **Batch Output** — draft output does not "
+        "appear here. Dispatch stock by entering a **Packing List**. "
         "Avg piece is output weight ÷ pieces; typical product alloy pieces are "
         f"**{db.ALLOY_PIECE_KG_MIN:g}–{db.ALLOY_PIECE_KG_MAX:g} kg** and show in red "
         "if outside that range so you can check the piece count."
@@ -5383,8 +5477,8 @@ elif PAGE == "Finished Goods Inventory":
         show_dataframe(df_from_rows(all_fg), highlight_avg_piece=True)
     else:
         st.info(
-            "No finished goods yet. Mark a heat **Completed**, then save product-alloy "
-            "output on **Batch Output**."
+            "No finished goods yet. Mark a heat **Completed**, save product-alloy "
+            "output on **Batch Output**, then click **Mark Output as Completed**."
         )
 
 
@@ -5822,7 +5916,8 @@ elif PAGE == "Packing List":
         else:
             st.warning(
                 "No Available finished-goods batches match this alloy name or group. "
-                "Mark the heat **Completed**, then save product-alloy output on **Batch Output**."
+                "Mark the heat **Completed**, save product-alloy output on "
+                "**Batch Output**, then click **Mark Output as Completed**."
             )
 
         st.markdown("##### Selected batches")

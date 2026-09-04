@@ -1100,6 +1100,8 @@ CREATE TABLE IF NOT EXISTS Production_batch (
     Photo1 {blob}, Photo2 {blob}, Photo3 {blob},
     Production_status TEXT NOT NULL DEFAULT 'In-Progress'
         CHECK(Production_status IN ('In-Progress', 'Completed')),
+    Output_status TEXT NOT NULL DEFAULT 'In-Progress'
+        CHECK(Output_status IN ('In-Progress', 'Completed')),
     Workflow_stage TEXT DEFAULT 'Raw Material',
     Degassing_time TEXT,
     Sampled_pcs {float},
@@ -1446,6 +1448,7 @@ def init_db() -> None:
                 ("Production_supervisor", "TEXT"),
                 ("Vacum_Sample", "TEXT"),
                 ("Crucible_no", "TEXT REFERENCES Crucible_Master(Crucible_no)"),
+                ("Output_status", "TEXT DEFAULT 'In-Progress'"),
             ],
         )
         _ensure_columns(
@@ -1562,6 +1565,7 @@ def init_db() -> None:
         _ensure_purchase_order_composite_pk(conn)
         _ensure_finished_goods_status(conn)
         _ensure_production_batch_status(conn)
+        _ensure_batch_output_status(conn)
         _ensure_finished_goods_release_trigger(conn)
         _ensure_vacum_sample_check(conn)
         _drop_columns(
@@ -3210,6 +3214,59 @@ def _ensure_production_batch_status(conn: Connection) -> None:
         ALTER TABLE Production_batch
         ADD CONSTRAINT production_batch_production_status_check
         CHECK (Production_status IN ('In-Progress', 'Completed'))
+        """,
+    )
+
+
+def _ensure_batch_output_status(conn: Connection) -> None:
+    """Restrict Output_status to In-Progress and Completed, defaulting old rows."""
+    _exec(
+        conn,
+        """
+        UPDATE Production_batch
+        SET Output_status = 'In-Progress'
+        WHERE Output_status IS NULL
+           OR Output_status NOT IN ('In-Progress', 'Completed')
+        """,
+    )
+    if not IS_POSTGRES:
+        return
+    _exec(
+        conn,
+        """
+        ALTER TABLE Production_batch
+        ALTER COLUMN Output_status SET DEFAULT 'In-Progress'
+        """,
+    )
+    _exec(
+        conn,
+        "ALTER TABLE Production_batch ALTER COLUMN Output_status SET NOT NULL",
+    )
+    rows = list(
+        _exec(
+            conn,
+            """
+            SELECT conname
+            FROM pg_constraint
+            WHERE conrelid = 'production_batch'::regclass
+              AND contype = 'c'
+              AND position(
+                    'output_status' IN lower(pg_get_constraintdef(oid))
+                  ) > 0
+            """,
+        ).mappings()
+    )
+    for row in rows:
+        _exec(
+            conn,
+            f'ALTER TABLE Production_batch DROP CONSTRAINT "{row["conname"]}"',
+        )
+    _exec(
+        conn,
+        """
+        ALTER TABLE Production_batch
+        ADD CONSTRAINT production_batch_output_status_check
+        CHECK (Output_status IN ('In-Progress', 'Completed'))
         """,
     )
 
@@ -5785,6 +5842,45 @@ def complete_production_batch(batch_id: str) -> None:
     release_finished_goods_for_batch(batch_id)
 
 
+def batch_output_completion_gaps_for_id(batch_id: str) -> list[str]:
+    """What is missing before this heat's output can be marked Completed."""
+    if not get_batch_outputs(batch_id):
+        return ["at least one output line"]
+    return []
+
+
+def complete_batch_output(batch_id: str) -> None:
+    """Lock this heat's output and post it into Finished Goods Inventory.
+
+    Until this is called, batch_output lines are drafts: they can be saved
+    and re-saved freely but never reach Finished Goods, so an in-progress
+    edit can never appear as sellable stock.
+    """
+    batch = get_batch(batch_id)
+    if not batch:
+        raise ValueError(f"Batch {batch_id} not found.")
+    if batch.get("Production_status") != BATCH_STATUS_COMPLETED:
+        raise ValueError(
+            f"Mark {batch_id} Completed on Production Batch & Chemistry before "
+            "completing its output."
+        )
+    if batch.get("Output_status") == BATCH_STATUS_COMPLETED:
+        return
+    gaps = batch_output_completion_gaps_for_id(batch_id)
+    if gaps:
+        raise ValueError(
+            "Cannot mark output Completed until these are entered: "
+            + "; ".join(gaps)
+        )
+    with get_connection() as conn:
+        _exec(
+            conn,
+            "UPDATE Production_batch SET Output_status = ? WHERE Batch_ID = ?",
+            (BATCH_STATUS_COMPLETED, batch_id),
+        )
+        _sync_finished_goods_from_output(conn, batch_id)
+
+
 def update_batch_workflow(
     batch_id: str,
     workflow_stage: str,
@@ -6016,14 +6112,18 @@ def _sync_finished_goods_from_output(conn: Connection, batch_id: str) -> Optiona
 
 
 def backfill_finished_goods_from_output() -> int:
-    """Ensure every completed heat with product output has an FG bundle."""
+    """Ensure every heat with Completed output has an FG bundle.
+
+    Output_status must also be Completed — a heat whose output is still a
+    draft (In-Progress) must not appear in Finished Goods.
+    """
     batches = fetch_all(
         """
         SELECT Batch_ID AS "Batch_ID"
         FROM Production_batch
-        WHERE Production_status = ?
+        WHERE Production_status = ? AND Output_status = ?
         """,
-        (BATCH_STATUS_COMPLETED,),
+        (BATCH_STATUS_COMPLETED, BATCH_STATUS_COMPLETED),
     )
     updated = 0
     with get_connection() as conn:
@@ -7089,7 +7189,10 @@ def list_packing_batch_candidates(
             blocked.append(item)
             continue
         if item.get("Bundle_id") in (None, "") and not on_this_list:
-            item["Reason"] = "Save product-alloy output on Batch Output"
+            item["Reason"] = (
+                "Save product-alloy output and click Mark Output as Completed "
+                "on Batch Output"
+            )
             blocked.append(item)
             continue
         if (
@@ -8970,6 +9073,7 @@ _BATCH_COLUMNS = """
         0
     ) AS "Output_pieces",
     Notes AS "Notes", Production_status AS "Production_status",
+    Output_status AS "Output_status",
     Workflow_stage AS "Workflow_stage",
     Degassing_time AS "Degassing_time",
     Sampled_pcs AS "Sampled_pcs", Defect_pcs AS "Defect_pcs",
@@ -9783,12 +9887,26 @@ def list_all_batch_outputs(limit: int = 200) -> list[dict[str, Any]]:
     )
 
 
-def save_batch_outputs(batch_id: str, lines: list[dict[str, Any]]) -> None:
+def save_batch_outputs(
+    batch_id: str,
+    lines: list[dict[str, Any]],
+    *,
+    allow_completed: bool = False,
+) -> None:
     """Replace all output rows for a batch. Weight > 0 lines are kept."""
     require_completed_batch_for_output(batch_id)
     batch = get_batch(batch_id)
     if not batch:
         raise ValueError(f"Batch {batch_id} not found.")
+    output_completed = batch.get("Output_status") == BATCH_STATUS_COMPLETED
+    if output_completed:
+        if not allow_completed:
+            raise ValueError(
+                f"Output for {batch_id} is Completed and locked. An Admin can "
+                "unlock it on Batch Output to correct history."
+            )
+        if not is_admin_user():
+            raise ValueError("Only Admin can correct Completed output.")
     allowed = allowed_batch_output_alloy_ids(batch.get("Alloy_id"))
     cleaned: list[dict[str, Any]] = []
     for line in lines:
@@ -9862,7 +9980,12 @@ def save_batch_outputs(batch_id: str, lines: list[dict[str, Any]]) -> None:
         if cleaned:
             _apply_batch_output_costs(conn, batch_id)
         _sync_sidestream_inventory(conn, batch_id)
-        _sync_finished_goods_from_output(conn, batch_id)
+        if output_completed:
+            # Draft saves (Output_status still In-Progress) never reach
+            # Finished Goods — only Mark Output as Completed posts them there.
+            # This resave only happens as an admin history correction, so
+            # re-sync to keep Finished Goods matching the corrected output.
+            _sync_finished_goods_from_output(conn, batch_id)
 
 
 def _sqlite_internal_remelt_purchase_id(conn: Connection) -> int:
@@ -10039,6 +10162,7 @@ def list_batches() -> list[dict[str, Any]]:
                    0
                ) AS "Output_pieces",
                b.Production_status AS "Production_status",
+               b.Output_status AS "Output_status",
                b.Workflow_stage AS "Workflow_stage", a.Alloy_name AS "Alloy_name",
                b.Production_supervisor AS "Production_supervisor",
                b.Top_Sample AS "Top_Sample", b.Middle_Sample AS "Middle_Sample",
