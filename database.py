@@ -26,7 +26,7 @@ import struct
 import sys
 import time
 from contextlib import contextmanager
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Generator, Iterable, Optional, TypeVar
 from urllib.parse import parse_qsl, quote, unquote, urlencode, urlparse, urlunparse
@@ -6985,6 +6985,278 @@ def _ensure_batch_input_return(conn: Connection) -> None:
     )
 
 
+DASHBOARD_MATERIALIZED_VIEWS = (
+    "mv_po_supply_status",
+    "mv_production_analysis_inputs",
+    "mv_production_analysis_outputs_total",
+    "mv_production_analysis_output_lines",
+)
+
+
+def _ensure_dashboard_materialized_views(conn: Connection) -> None:
+    """Materialized views + supporting indexes behind the Dashboard pages.
+
+    Postgres only: these views precompute the multi-table joins/aggregations
+    that the Production Dashboard and Production Data Analysis pages need,
+    so a page view is a plain indexed SELECT instead of re-joining
+    batch_input/batch_output/Purchase_Order/Packing_list/Finished_Goods_Inventory
+    on every visit. Refreshed on a timer or on demand — see
+    refresh_dashboard_materialized_views().
+    """
+    if not IS_POSTGRES:
+        return
+
+    # FK / range-filter columns the views and their base queries actually
+    # join or filter on. B-Tree for equality/FK lookups; BRIN for the
+    # date-range scan on Production_Date, which is cheap on an
+    # append-mostly, roughly time-ordered table. A few of these already
+    # existed on the live database from earlier work but were never
+    # codified here — IF NOT EXISTS makes declaring them again safe, and
+    # means a fresh database gets the same indexes.
+    _exec(conn, "CREATE INDEX IF NOT EXISTS idx_batch_input_lot_id ON batch_input (Lot_id)")
+    _exec(
+        conn,
+        "CREATE INDEX IF NOT EXISTS idx_batch_output_batch_alloy "
+        "ON batch_output (Batch_ID, Alloy_id)",
+    )
+    _exec(
+        conn,
+        'CREATE INDEX IF NOT EXISTS idx_production_batch_alloy_id ON Production_batch (Alloy_id)',
+    )
+    _exec(
+        conn,
+        'CREATE INDEX IF NOT EXISTS idx_production_batch_furnace ON Production_batch (Furnace)',
+    )
+    _exec(
+        conn,
+        "CREATE INDEX IF NOT EXISTS idx_production_batch_production_date_brin "
+        "ON Production_batch USING BRIN (Production_Date)",
+    )
+    _exec(
+        conn,
+        "CREATE INDEX IF NOT EXISTS idx_fg_inventory_batch_bundle_desc "
+        "ON Finished_Goods_Inventory (Batch_ID, Bundle_id DESC)",
+    )
+    _exec(
+        conn,
+        "CREATE INDEX IF NOT EXISTS idx_fg_inventory_status_batch "
+        "ON Finished_Goods_Inventory (Finished_Goods_Status, Batch_ID) "
+        "WHERE Finished_Goods_Status IN ('Available', 'Under_Testing', 'Assigned')",
+    )
+    _exec(
+        conn,
+        "CREATE INDEX IF NOT EXISTS idx_packing_list_po_alloy_status "
+        "ON Packing_list (Customer_PO_No, Alloy_id, Packing_list_status)",
+    )
+    _exec(
+        conn,
+        "CREATE INDEX IF NOT EXISTS idx_packing_list_batch_batch_id "
+        "ON Packing_list_batch (Batch_ID)",
+    )
+    _exec(
+        conn,
+        "CREATE INDEX IF NOT EXISTS idx_purchase_order_open_delivery "
+        "ON Purchase_Order (Delivery_Date, Customer_PO_No, Alloy_Id) "
+        "WHERE Purchase_Order_Status = 'Open'",
+    )
+
+    _exec(
+        conn,
+        """
+        CREATE MATERIALIZED VIEW IF NOT EXISTS mv_po_supply_status AS
+        SELECT p.Customer_PO_No AS "Customer_PO_No",
+               p.Cust_code AS "Cust_code",
+               p.Customer_name AS "Customer_name",
+               p.Alloy_Id AS "Alloy_Id",
+               a.Alloy_name AS "Alloy_name",
+               p.Order_Date AS "Order_Date",
+               p.Delivery_Date AS "Delivery_Date",
+               COALESCE(p.Order_Qty, 0) AS "Order_Qty",
+               p.Rate AS "Rate",
+               COALESCE(p.Purchase_Order_Status, 'Open') AS "Purchase_Order_Status",
+               COALESCE(d.Dispatched_Qty, 0) AS "Dispatched_Qty",
+               COALESCE(d.In_packing_Qty, 0) AS "In_packing_Qty",
+               COALESCE(p.Order_Qty, 0) - COALESCE(d.Dispatched_Qty, 0)
+                   AS "Balance_Qty",
+               COALESCE(fg.FG_Available_Qty, 0) AS "FG_Available_Qty",
+               COALESCE(fg.FG_Under_Testing_Qty, 0) AS "FG_Under_Testing_Qty"
+        FROM Purchase_Order p
+        LEFT JOIN Alloy_Master a ON a.Alloy_id = p.Alloy_Id
+        LEFT JOIN (
+            SELECT pl.Customer_PO_No AS po_no,
+                   pl.Alloy_id AS alloy_id,
+                   SUM(CASE WHEN pl.Packing_list_status = 'Verified'
+                            THEN COALESCE(lb.Weight, 0) ELSE 0 END)
+                       AS Dispatched_Qty,
+                   SUM(CASE WHEN pl.Packing_list_status = 'In-Progress'
+                            THEN COALESCE(lb.Weight, 0) ELSE 0 END)
+                       AS In_packing_Qty
+            FROM Packing_list pl
+            JOIN Packing_list_batch lb
+                ON lb.Packing_list_id = pl.Packing_list_id
+            GROUP BY pl.Customer_PO_No, pl.Alloy_id
+        ) d ON d.po_no = p.Customer_PO_No AND d.alloy_id = p.Alloy_Id
+        LEFT JOIN (
+            SELECT b.Alloy_id AS alloy_id,
+                   SUM(CASE WHEN fg.Finished_Goods_Status = 'Available'
+                            THEN COALESCE(fg.Output_Weight, 0) ELSE 0 END)
+                       AS FG_Available_Qty,
+                   SUM(CASE WHEN fg.Finished_Goods_Status = 'Under_Testing'
+                            THEN COALESCE(fg.Output_Weight, 0) ELSE 0 END)
+                       AS FG_Under_Testing_Qty
+            FROM Finished_Goods_Inventory fg
+            JOIN Production_batch b ON b.Batch_ID = fg.Batch_ID
+            GROUP BY b.Alloy_id
+        ) fg ON fg.alloy_id = p.Alloy_Id
+        """,
+    )
+    _exec(
+        conn,
+        'CREATE UNIQUE INDEX IF NOT EXISTS idx_mv_po_supply_status_pk '
+        'ON mv_po_supply_status ("Customer_PO_No", "Alloy_Id")',
+    )
+
+    _exec(
+        conn,
+        """
+        CREATE MATERIALIZED VIEW IF NOT EXISTS mv_production_analysis_inputs AS
+        SELECT b.Production_Date AS "Production_Date",
+               b.Furnace AS "Furnace",
+               b.Shift AS "Shift",
+               b.Alloy_id AS "Alloy_id",
+               a.Alloy_name AS "Alloy_name",
+               i.Raw_Material_Name AS "Raw_Material_Name",
+               SUM(i.Weight) AS "Weight",
+               SUM(i.Weight * COALESCE(inv.Cost_per_kg, 0)) AS "Cost"
+        FROM batch_input i
+        JOIN Production_batch b ON b.Batch_ID = i.Batch_ID
+        LEFT JOIN Alloy_Master a ON a.Alloy_id = b.Alloy_id
+        LEFT JOIN Raw_Material_Inventory inv ON inv.Lot_id = i.Lot_id
+        GROUP BY b.Production_Date, b.Furnace, b.Shift, b.Alloy_id, a.Alloy_name,
+                 i.Raw_Material_Name
+        """,
+    )
+    _exec(
+        conn,
+        'CREATE UNIQUE INDEX IF NOT EXISTS idx_mv_pa_inputs_pk '
+        'ON mv_production_analysis_inputs '
+        '("Production_Date", "Furnace", "Shift", "Alloy_id", "Raw_Material_Name")',
+    )
+
+    _exec(
+        conn,
+        """
+        CREATE MATERIALIZED VIEW IF NOT EXISTS mv_production_analysis_outputs_total AS
+        SELECT b.Production_Date AS "Production_Date",
+               b.Furnace AS "Furnace",
+               b.Shift AS "Shift",
+               b.Alloy_id AS "Alloy_id",
+               a.Alloy_name AS "Alloy_name",
+               SUM(o.Weight) AS "Weight"
+        FROM batch_output o
+        JOIN Production_batch b ON b.Batch_ID = o.Batch_ID
+        LEFT JOIN Alloy_Master a ON a.Alloy_id = b.Alloy_id
+        GROUP BY b.Production_Date, b.Furnace, b.Shift, b.Alloy_id, a.Alloy_name
+        """,
+    )
+    _exec(
+        conn,
+        'CREATE UNIQUE INDEX IF NOT EXISTS idx_mv_pa_outputs_total_pk '
+        'ON mv_production_analysis_outputs_total '
+        '("Production_Date", "Furnace", "Shift", "Alloy_id")',
+    )
+
+    _exec(
+        conn,
+        """
+        CREATE MATERIALIZED VIEW IF NOT EXISTS mv_production_analysis_output_lines AS
+        SELECT b.Production_Date AS "Production_Date",
+               b.Furnace AS "Furnace",
+               b.Shift AS "Shift",
+               b.Alloy_id AS "Alloy_id",
+               o.Alloy_id AS "Output_Alloy_id",
+               SUM(o.Weight) AS "Weight"
+        FROM batch_output o
+        JOIN Production_batch b ON b.Batch_ID = o.Batch_ID
+        GROUP BY b.Production_Date, b.Furnace, b.Shift, b.Alloy_id, o.Alloy_id
+        """,
+    )
+    _exec(
+        conn,
+        'CREATE UNIQUE INDEX IF NOT EXISTS idx_mv_pa_output_lines_pk '
+        'ON mv_production_analysis_output_lines '
+        '("Production_Date", "Furnace", "Shift", "Alloy_id", "Output_Alloy_id")',
+    )
+
+    _exec(
+        conn,
+        """
+        CREATE TABLE IF NOT EXISTS materialized_view_refresh_log (
+            view_name TEXT PRIMARY KEY,
+            refreshed_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        )
+        """,
+    )
+
+
+def refresh_dashboard_materialized_views() -> Optional[datetime]:
+    """Refresh the Dashboard / Production Data Analysis materialized views.
+
+    Called on a staleness check (see dashboard_data_is_stale) and from the
+    "Refresh now" button on both pages. No-op on SQLite — those pages read
+    live tables there. Returns the new refreshed_at, or None on SQLite.
+    """
+    if not IS_POSTGRES:
+        return None
+    stamp = datetime.now(timezone.utc)
+    with get_connection() as conn:
+        for view in DASHBOARD_MATERIALIZED_VIEWS:
+            _exec(conn, f"REFRESH MATERIALIZED VIEW CONCURRENTLY {view}")
+            _exec(
+                conn,
+                """
+                INSERT INTO materialized_view_refresh_log (view_name, refreshed_at)
+                VALUES (?, ?)
+                ON CONFLICT (view_name)
+                DO UPDATE SET refreshed_at = EXCLUDED.refreshed_at
+                """,
+                (view, stamp),
+            )
+    return stamp
+
+
+def get_dashboard_last_refreshed() -> Optional[datetime]:
+    """Oldest refreshed_at across the dashboard views, or None if never run."""
+    if not IS_POSTGRES:
+        return None
+    placeholders = ", ".join("?" for _ in DASHBOARD_MATERIALIZED_VIEWS)
+    rows = fetch_all(
+        f"""
+        SELECT refreshed_at AS "refreshed_at"
+        FROM materialized_view_refresh_log
+        WHERE view_name IN ({placeholders})
+        """,
+        DASHBOARD_MATERIALIZED_VIEWS,
+    )
+    stamps = [r["refreshed_at"] for r in rows if r.get("refreshed_at")]
+    if len(stamps) < len(DASHBOARD_MATERIALIZED_VIEWS):
+        return None
+    return min(stamps)
+
+
+def dashboard_data_is_stale(max_age_minutes: int = 15) -> bool:
+    """True when the dashboard views are missing or older than max_age_minutes."""
+    if not IS_POSTGRES:
+        return False
+    last = get_dashboard_last_refreshed()
+    if last is None:
+        return True
+    if last.tzinfo is None:
+        last = last.replace(tzinfo=timezone.utc)
+    age = datetime.now(timezone.utc) - last
+    return age.total_seconds() > max_age_minutes * 60
+
+
 def _ensure_packing_list_ready() -> None:
     with get_connection() as conn:
         _ensure_columns(
@@ -7002,6 +7274,7 @@ def _ensure_packing_list_ready() -> None:
         _ensure_company_profile(conn)
         _ensure_employees(conn)
         _ensure_row_level_security(conn)
+        _ensure_dashboard_materialized_views(conn)
 
 
 def _ensure_company_ready() -> None:
@@ -9853,7 +10126,22 @@ def _production_analysis_recovery_map() -> dict[str, dict[str, Any]]:
 
 
 def _production_analysis_inputs(start_date: str, end_date: str) -> list[dict[str, Any]]:
-    """Charge weight and cost by day, furnace, shift, alloy, and raw material."""
+    """Charge weight and cost by day, furnace, shift, alloy, and raw material.
+
+    Reads mv_production_analysis_inputs on Postgres (see
+    refresh_dashboard_materialized_views) instead of joining batch_input on
+    every call; SQLite has no materialized views, so it joins live there.
+    """
+    if IS_POSTGRES:
+        return fetch_all(
+            """
+            SELECT "Production_Date", "Furnace", "Shift", "Alloy_id",
+                   "Alloy_name", "Raw_Material_Name", "Weight", "Cost"
+            FROM mv_production_analysis_inputs
+            WHERE "Production_Date" BETWEEN ? AND ?
+            """,
+            (start_date, end_date),
+        )
     return fetch_all(
         """
         SELECT b.Production_Date AS "Production_Date",
@@ -9877,7 +10165,21 @@ def _production_analysis_inputs(start_date: str, end_date: str) -> list[dict[str
 
 
 def _production_analysis_outputs(start_date: str, end_date: str) -> list[dict[str, Any]]:
-    """Output weight by day, furnace, shift, and alloy."""
+    """Output weight by day, furnace, shift, and alloy.
+
+    Reads mv_production_analysis_outputs_total on Postgres; joins live on
+    SQLite (see _production_analysis_inputs).
+    """
+    if IS_POSTGRES:
+        return fetch_all(
+            """
+            SELECT "Production_Date", "Furnace", "Shift", "Alloy_id",
+                   "Alloy_name", "Weight"
+            FROM mv_production_analysis_outputs_total
+            WHERE "Production_Date" BETWEEN ? AND ?
+            """,
+            (start_date, end_date),
+        )
     return fetch_all(
         """
         SELECT b.Production_Date AS "Production_Date",
@@ -9902,8 +10204,19 @@ def _production_analysis_output_lines(
     """Output weight by day, furnace, shift, group alloy, and output-alloy line.
 
     "Output-alloy line" is the group alloy itself, or one of the non-spec
-    sidestream alloys (Broken Ingot / Furnace Empty / Not Ok Ingot).
+    sidestream alloys (Broken Ingot / Furnace Empty / Not Ok Ingot). Reads
+    mv_production_analysis_output_lines on Postgres; joins live on SQLite.
     """
+    if IS_POSTGRES:
+        return fetch_all(
+            """
+            SELECT "Production_Date", "Furnace", "Shift", "Alloy_id",
+                   "Output_Alloy_id", "Weight"
+            FROM mv_production_analysis_output_lines
+            WHERE "Production_Date" BETWEEN ? AND ?
+            """,
+            (start_date, end_date),
+        )
     return fetch_all(
         """
         SELECT b.Production_Date AS "Production_Date",
@@ -10732,7 +11045,26 @@ def list_purchase_orders() -> list[dict[str, Any]]:
 
 
 def list_po_supply_status() -> list[dict[str, Any]]:
-    """Open-order kg, verified dispatch, packing-in-progress, and FG on hand."""
+    """Open-order kg, verified dispatch, packing-in-progress, and FG on hand.
+
+    Reads mv_po_supply_status on Postgres (see
+    refresh_dashboard_materialized_views) instead of joining Purchase_Order,
+    Packing_list, and Finished_Goods_Inventory on every Dashboard visit;
+    joins live on SQLite, which has no materialized views.
+    """
+    if IS_POSTGRES:
+        return fetch_all(
+            """
+            SELECT "Customer_PO_No", "Cust_code", "Customer_name", "Alloy_Id",
+                   "Alloy_name", "Order_Date", "Delivery_Date", "Order_Qty",
+                   "Rate", "Purchase_Order_Status", "Dispatched_Qty",
+                   "In_packing_Qty", "Balance_Qty", "FG_Available_Qty",
+                   "FG_Under_Testing_Qty"
+            FROM mv_po_supply_status
+            ORDER BY "Delivery_Date", "Customer_name", "Customer_PO_No",
+                     "Alloy_name"
+            """
+        )
     return fetch_all(
         """
         SELECT p.Customer_PO_No AS "Customer_PO_No",

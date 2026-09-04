@@ -10,7 +10,7 @@ import base64
 import html
 import os
 import re
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 import pandas as pd
@@ -1623,7 +1623,7 @@ else:
 st.sidebar.caption("Secondary Aluminum Alloy Manufacturing")
 
 NAV_SECTIONS: list[tuple[str, list[str]]] = [
-    ("Overview", ["Dashboard"]),
+    ("Overview", ["Dashboard", "Production Data Analysis"]),
     (
         "Purchasing & inventory",
         [
@@ -1644,7 +1644,6 @@ NAV_SECTIONS: list[tuple[str, list[str]]] = [
             "Batch Output",
             "Production Batches",
             "Material Recovery & Yield",
-            "Production Data Analysis",
         ],
     ),
     (
@@ -2860,6 +2859,39 @@ def _allocate_po_to_produce(rows: list[dict], alloy_plan: dict[int, dict]) -> No
         row["To_Produce_Qty"] = max(0.0, uncovered - take)
 
 
+_IST = timezone(timedelta(hours=5, minutes=30))
+
+
+def _render_dashboard_refresh_bar(*, key_prefix: str) -> None:
+    """Last-refreshed time + a manual refresh button for a materialized-view page.
+
+    Auto-refreshes once when the views are missing or stale (see
+    db.dashboard_data_is_stale) so nobody has to remember to click Refresh;
+    the button underneath is for refreshing on demand regardless of age.
+    No-op on SQLite, which has no materialized views to refresh.
+    """
+    if not db.IS_POSTGRES:
+        return
+    if db.dashboard_data_is_stale():
+        with st.spinner("Refreshing dashboard data…"):
+            db.refresh_dashboard_materialized_views()
+
+    bar_l, bar_r = st.columns([4, 1])
+    with bar_l:
+        last = db.get_dashboard_last_refreshed()
+        if last:
+            st.caption(
+                f"Data last refreshed: **{format_ui_date(last.astimezone(_IST), with_time=True)} IST**"
+            )
+        else:
+            st.caption("Data last refreshed: —")
+    with bar_r:
+        if st.button("Refresh now", key=f"{key_prefix}_refresh_now"):
+            with st.spinner("Refreshing dashboard data…"):
+                db.refresh_dashboard_materialized_views()
+            st.rerun()
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # Dashboard
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -2873,6 +2905,7 @@ if PAGE == "Dashboard":
         "allocated to earlier delivery dates first. "
         "Dispatch is verified packing-list weight."
     )
+    _render_dashboard_refresh_bar(key_prefix="dash")
     today = date.today()
     try:
         supply_rows = db.list_po_supply_status()
@@ -5512,6 +5545,7 @@ elif PAGE == "Production Data Analysis":
         "see an overall view combined by day, shift, and alloy — useful since a "
         "shift can run across more than one furnace."
     )
+    _render_dashboard_refresh_bar(key_prefix="pda")
 
     def _pda_group_key(row: dict) -> tuple:
         return (
