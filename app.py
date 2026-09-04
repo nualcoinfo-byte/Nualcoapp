@@ -2892,6 +2892,28 @@ def _render_dashboard_refresh_bar(*, key_prefix: str) -> None:
             st.rerun()
 
 
+@st.cache_data(ttl=60, show_spinner=False)
+def _dashboard_overview_data(year: int, month: int) -> dict:
+    """Dashboard-only cache for the small summary-row lookups.
+
+    list_po_supply_status() is already materialized-view backed and fast;
+    these are plain table scans that don't need to re-run on every rerun
+    of this page (furnace filter changes, the refresh bar's own button,
+    etc.), so a short TTL is enough to cut repeat DB round-trips. Scoped to
+    the Dashboard only -- other pages that call these same db.* functions
+    (e.g. Furnace Oil Purchase showing the stock right after a save) still
+    read live, since they need to reflect a write immediately.
+    """
+    return {
+        "batches": db.list_batches(),
+        "materials": db.list_raw_materials(),
+        "lots": db.list_inventory_lots(),
+        "alloys": db.list_alloys(),
+        "oil_stock": db.get_furnace_oil_stock(),
+        "elec_month": db.electricity_month_totals(year, month),
+    }
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # Dashboard
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -2909,12 +2931,13 @@ if PAGE == "Dashboard":
     today = date.today()
     try:
         supply_rows = db.list_po_supply_status()
-        batches = db.list_batches()
-        materials = db.list_raw_materials()
-        lots = db.list_inventory_lots()
-        alloys = db.list_alloys()
-        oil_stock = db.get_furnace_oil_stock()
-        elec_month = db.electricity_month_totals(today.year, today.month)
+        overview = _dashboard_overview_data(today.year, today.month)
+        batches = overview["batches"]
+        materials = overview["materials"]
+        lots = overview["lots"]
+        alloys = overview["alloys"]
+        oil_stock = overview["oil_stock"]
+        elec_month = overview["elec_month"]
     except Exception as exc:
         _show_db_connection_error(exc)
         supply_rows, batches, materials, lots, alloys = [], [], [], [], []
