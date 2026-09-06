@@ -953,7 +953,6 @@ CREATE TABLE IF NOT EXISTS Raw_Material_Master (
     Recovery {float},
     Photo {blob},
     Status TEXT CHECK(Status IN ('Active', 'Inactive')) DEFAULT 'Active',
-    Cost_per_kg {float} DEFAULT 0,
     Last_updated_by TEXT,
     Last_updated_datetime TEXT,
     PRIMARY KEY (Raw_Material_Name, Effective_date)
@@ -1497,7 +1496,7 @@ def init_db() -> None:
         _drop_columns(
             conn,
             "Raw_Material_Master",
-            ["Alloy_family", "Fe", "Cu", "Mg"],
+            ["Alloy_family", "Fe", "Cu", "Mg", "Cost_per_kg"],
         )
         _audit_cols = [
             ("Last_updated_by", "TEXT"),
@@ -1522,7 +1521,6 @@ def init_db() -> None:
                 conn,
                 "Raw_Material_Master",
                 [
-                    ("Cost_per_kg", "REAL DEFAULT 0"),
                     ("ISRI_CODE", "TEXT REFERENCES ISRI_CODE_TABLE(ISRI_CODE)"),
                 ],
             )
@@ -2066,9 +2064,9 @@ def _ensure_sidestream_remelt_inventory(conn: Connection) -> None:
             """
             INSERT INTO Raw_Material_Master
                 (Raw_Material_Name, Effective_date, Vendor_code, ISRI_CODE,
-                 Availability_class, Recovery, Photo, Status, Cost_per_kg,
+                 Availability_class, Recovery, Photo, Status,
                  Last_updated_by, Last_updated_datetime)
-            VALUES (?, ?, NULL, NULL, 'Internal', ?, NULL, 'Active', 0, ?, ?)
+            VALUES (?, ?, NULL, NULL, 'Internal', ?, NULL, 'Active', ?, ?)
             ON CONFLICT(Raw_Material_Name, Effective_date) DO UPDATE SET
                 Availability_class = excluded.Availability_class,
                 Recovery = excluded.Recovery,
@@ -4168,7 +4166,6 @@ def get_raw_material_master(name: str) -> Optional[dict[str, Any]]:
                m.ISRI_CODE AS "ISRI_CODE",
                m.Availability_class AS "Availability_class",
                m.Recovery AS "Recovery",
-               m.Cost_per_kg AS "Cost_per_kg",
                m.Status AS "Status",
                m.Last_updated_by AS "Last_updated_by",
                m.Last_updated_datetime AS "Last_updated_datetime"
@@ -4294,7 +4291,6 @@ def list_raw_material_master() -> list[dict[str, Any]]:
                m.ISRI_CODE AS "ISRI_CODE",
                m.Availability_class AS "Availability_class",
                m.Recovery AS "Recovery",
-               m.Cost_per_kg AS "Cost_per_kg",
                m.Status AS "Status",
                m.Last_updated_by AS "Last_updated_by",
                m.Last_updated_datetime AS "Last_updated_datetime"
@@ -4582,7 +4578,6 @@ def add_raw_material_master(
     availability_class: str,
     recovery: Optional[float],
     status: str,
-    cost_per_kg: float,
     photo: Optional[bytes] = None,
     isri_code: Optional[str] = None,
     create_new: bool = False,
@@ -4611,14 +4606,14 @@ def add_raw_material_master(
         """
         INSERT INTO Raw_Material_Master
             (Raw_Material_Name, Effective_date, Vendor_code, ISRI_CODE,
-             Availability_class, Recovery, Photo, Status, Cost_per_kg,
+             Availability_class, Recovery, Photo, Status,
              Last_updated_by, Last_updated_datetime)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(Raw_Material_Name, Effective_date) DO UPDATE SET
             Vendor_code=excluded.Vendor_code, ISRI_CODE=excluded.ISRI_CODE,
             Availability_class=excluded.Availability_class, Recovery=excluded.Recovery,
             Photo=COALESCE(excluded.Photo, Raw_Material_Master.Photo),
-            Status=excluded.Status, Cost_per_kg=excluded.Cost_per_kg,
+            Status=excluded.Status,
             Last_updated_by=excluded.Last_updated_by,
             Last_updated_datetime=excluded.Last_updated_datetime
         """,
@@ -4631,7 +4626,6 @@ def add_raw_material_master(
             recovery,
             photo,
             status,
-            cost_per_kg,
             by_val,
             dt_val,
         ),
@@ -9935,8 +9929,7 @@ def estimate_batch_input_cost(
             f"""
             SELECT Raw_Material_Name AS "Raw_Material_Name",
                    Effective_date AS "Effective_date",
-                   Recovery AS "Recovery",
-                   Cost_per_kg AS "Cost_per_kg"
+                   Recovery AS "Recovery"
             FROM Raw_Material_Master
             WHERE LOWER(Raw_Material_Name) IN ({placeholders})
             ORDER BY Effective_date DESC
@@ -9959,9 +9952,6 @@ def estimate_batch_input_cost(
             int(line["lot_id"]) if line["lot_id"] not in (None, "") else -1
         )
         cost_source = "lot"
-        if cost_per_kg is None and info.get("Cost_per_kg") is not None:
-            cost_per_kg = _as_cost_4(info["Cost_per_kg"])
-            cost_source = "master"
         if cost_per_kg is None:
             missing_cost.append(line["name"])
             cost_per_kg = 0.0
@@ -10128,7 +10118,7 @@ def refresh_outputs_missing_conversion_rate() -> int:
 
 
 def _production_analysis_recovery_map() -> dict[str, dict[str, Any]]:
-    """Raw_Material_Name (lowercased) -> newest Recovery % and Cost_per_kg.
+    """Raw_Material_Name (lowercased) -> newest Recovery %.
 
     Same "newest Effective_date row wins" rule as estimate_batch_input_cost.
     """
@@ -10136,8 +10126,7 @@ def _production_analysis_recovery_map() -> dict[str, dict[str, Any]]:
         """
         SELECT Raw_Material_Name AS "Raw_Material_Name",
                Effective_date AS "Effective_date",
-               Recovery AS "Recovery",
-               Cost_per_kg AS "Cost_per_kg"
+               Recovery AS "Recovery"
         FROM Raw_Material_Master
         ORDER BY Effective_date DESC
         """

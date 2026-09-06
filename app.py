@@ -3342,7 +3342,6 @@ elif PAGE == "Raw Material Logging":
                             availability_class=db.RAW_MATERIAL_AVAILABILITY[0],
                             recovery=None,
                             status="Active",
-                            cost_per_kg=ln["cost"],
                             create_new=True,
                         )
                     lines.append(
@@ -4008,6 +4007,7 @@ elif PAGE == "Production Batch & Chemistry":
                 )
             lots = db.list_inventory_lots(material=mat or None) if mat else []
             lot_opts = {}
+            lot_cost_by_label = {}
             for lot in lots:
                 rem = float(lot.get("Remaining_Weight") or 0)
                 status = lot.get("Raw_Material_Status") or ""
@@ -4022,6 +4022,7 @@ elif PAGE == "Production Batch & Chemistry":
                 else:
                     label = f"Lot {lot['Lot_id']} — rem {rem:.1f} kg ({status})"
                 lot_opts[label] = lot["Lot_id"]
+                lot_cost_by_label[label] = lot.get("Cost_per_kg")
             with r1c2:
                 lot_label = st.selectbox(
                     "Lot",
@@ -4090,6 +4091,17 @@ elif PAGE == "Production Batch & Chemistry":
                         key=_pk(f"trolley_{idx}"),
                         disabled=not bool(trolleys),
                     )
+
+            if mat:
+                master_row = db.get_raw_material_master(mat) or {}
+                recovery_val = master_row.get("Recovery")
+                lot_cost_val = lot_cost_by_label.get(lot_label) if lot_label else None
+                st.caption(
+                    "Recovery: "
+                    + (f"{float(recovery_val):.1f}%" if recovery_val is not None else "—")
+                    + "  |  Cost/kg: "
+                    + (f"₹{float(lot_cost_val):,.2f}" if lot_cost_val is not None else "—")
+                )
 
             trolley_name = trolley_label_to_name.get(trolley_label) if trolley_label else None
             trolley_w = float(trolley_by_name.get(trolley_name, 0)) if trolley_name else 0.0
@@ -4349,7 +4361,7 @@ elif PAGE == "Production Batch & Chemistry":
                 )
             if estimate["missing_cost"]:
                 st.warning(
-                    "No cost per kg on the lot or Raw Material Master for: "
+                    "No cost per kg on the lot for: "
                     + ", ".join(estimate["missing_cost"])
                     + " — these contribute no cost."
                 )
@@ -4372,10 +4384,7 @@ elif PAGE == "Production Batch & Chemistry":
                         ]
                     )
                 )
-                st.caption(
-                    "Cost/kg is the charged lot's cost, falling back to Raw Material "
-                    "Master when the lot has none."
-                )
+                st.caption("Cost/kg is the charged lot's cost.")
 
         if existing_batch:
             try:
@@ -7533,9 +7542,6 @@ elif PAGE == "Raw Material Master":
                 st.session_state["rmm_mod_recovery"] = _optional_percent(
                     row.get("Recovery")
                 )
-                st.session_state["rmm_mod_cost"] = _optional_percent(
-                    row.get("Cost_per_kg")
-                )
                 status = row.get("Status")
                 st.session_state["rmm_mod_status"] = (
                     status if status in db.ACTIVE_STATUS else db.ACTIVE_STATUS[0]
@@ -7586,12 +7592,6 @@ elif PAGE == "Raw Material Master":
                 "Expected recovery %",
                 key=f"{prefix}_recovery",
                 step=0.1,
-            )
-            cost = empty_percent_input(
-                "Cost per kg",
-                key=f"{prefix}_cost",
-                max_value=None,
-                step=0.01,
             )
             rm_status = st.selectbox(
                 "Status", db.ACTIVE_STATUS, key=f"{prefix}_status"
@@ -7687,7 +7687,6 @@ elif PAGE == "Raw Material Master":
                         availability_class=availability,
                         recovery=recovery,
                         status=rm_status,
-                        cost_per_kg=cost if cost is not None else 0.0,
                         photo=photo_bytes(photo),
                         isri_code=isri_opts[isri_label] if isri_label else None,
                         create_new=not is_modify,
