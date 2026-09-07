@@ -5990,43 +5990,6 @@ elif PAGE == "Production Data Analysis":
                                         row, materials_by_key, outputs_by_key
                                     )
 
-            with st.expander("Detailed tables (flat, for export)"):
-                st.markdown("##### Production summary — by day, furnace, shift, alloy")
-                summary_df = df_from_rows(summary).drop(columns=["Alloy_id"])
-                show_dataframe(summary_df, highlight_recovery_variance=True)
-
-                with st.expander("Raw material input mix (% of input per group)"):
-                    if materials:
-                        materials_df = df_from_rows(materials).drop(
-                            columns=["Alloy_id"]
-                        )
-                        show_dataframe(materials_df)
-                    else:
-                        st.caption("No charge lines in this date range.")
-
-                st.markdown("##### Overall — by day, shift, alloy")
-                st.caption(
-                    "Selected furnaces combined: rates are recomputed from the "
-                    "summed totals, not averaged across furnaces."
-                )
-                rollup = db.production_analysis_rollup_by_shift(summary)
-                rollup_df = df_from_rows(rollup).drop(columns=["Alloy_id"])
-                show_dataframe(rollup_df, highlight_recovery_variance=True)
-
-                with st.expander(
-                    "Raw material input mix — combined across selected furnaces"
-                ):
-                    material_rollup = db.production_analysis_materials_rollup(
-                        materials
-                    )
-                    if material_rollup:
-                        material_rollup_df = df_from_rows(material_rollup).drop(
-                            columns=["Alloy_id"]
-                        )
-                        show_dataframe(material_rollup_df)
-                    else:
-                        st.caption("No charge lines in this date range.")
-
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Finished Goods Inventory
