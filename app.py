@@ -5815,6 +5815,7 @@ elif PAGE == "Production Data Analysis":
         row: dict,
         materials_by_key: dict[tuple, list[dict]],
         outputs_by_key: dict[tuple, list[dict]],
+        po_cache: dict,
     ) -> None:
         key = _pda_group_key(row)
         with st.container(border=True):
@@ -5876,6 +5877,79 @@ elif PAGE == "Production Data Analysis":
                 + " · Overall ₹/kg: "
                 + (f"{overall_kg:,.2f}" if overall_kg is not None else "—")
             )
+
+            alloy_id = row.get("Alloy_id")
+            if alloy_id not in po_cache:
+                po_cache[alloy_id] = (
+                    db.latest_open_po_rate(alloy_id) if alloy_id is not None else None
+                )
+            open_po = po_cache[alloy_id]
+            po_rate = (
+                float(open_po["Rate"])
+                if open_po and open_po.get("Rate") is not None
+                else None
+            )
+            if po_rate is not None:
+                p1, p2, p3 = st.columns(3)
+                p1.metric(
+                    "Open PO rate (₹/kg)",
+                    f"{po_rate:,.2f}",
+                    help=(
+                        f"Latest Open PO for this alloy: "
+                        f"{open_po.get('Customer_PO_No') or '—'} "
+                        f"({format_ui_date(open_po.get('Order_Date')) or '—'})."
+                    ),
+                )
+                if overall_kg is None:
+                    p2.markdown(
+                        '<p style="font-size:0.8rem;color:rgba(49,51,63,0.6);'
+                        'margin-bottom:0.2rem">Profit/Loss (₹/kg)</p>'
+                        '<p style="font-size:1.5rem;margin:0">—</p>',
+                        unsafe_allow_html=True,
+                    )
+                    p3.markdown(
+                        '<p style="font-size:0.8rem;color:rgba(49,51,63,0.6);'
+                        'margin-bottom:0.2rem">Profit/Loss %</p>'
+                        '<p style="font-size:1.5rem;margin:0">—</p>',
+                        unsafe_allow_html=True,
+                    )
+                else:
+                    profit_loss = po_rate - overall_kg
+                    profit_loss_pct = (
+                        (profit_loss / overall_kg * 100.0) if overall_kg > 0 else None
+                    )
+                    color = (
+                        "#2e7d32"
+                        if profit_loss > 0
+                        else ("#c62828" if profit_loss < 0 else "inherit")
+                    )
+                    p2.markdown(
+                        '<p style="font-size:0.8rem;color:rgba(49,51,63,0.6);'
+                        'margin-bottom:0.2rem">Profit/Loss (₹/kg)</p>'
+                        f'<p style="font-size:1.5rem;font-weight:600;color:{color};'
+                        f'margin:0">{profit_loss:+,.2f}</p>',
+                        unsafe_allow_html=True,
+                    )
+                    p3.markdown(
+                        '<p style="font-size:0.8rem;color:rgba(49,51,63,0.6);'
+                        'margin-bottom:0.2rem">Profit/Loss %</p>'
+                        + (
+                            f'<p style="font-size:1.5rem;font-weight:600;color:{color};'
+                            f'margin:0">{profit_loss_pct:+.2f}%</p>'
+                            if profit_loss_pct is not None
+                            else '<p style="font-size:1.5rem;margin:0">—</p>'
+                        ),
+                        unsafe_allow_html=True,
+                    )
+                st.caption(
+                    "Profit/Loss = Open PO rate − Overall ₹/kg. Profit/Loss % is "
+                    "that amount ÷ Overall ₹/kg."
+                )
+            elif alloy_id is not None:
+                st.caption(
+                    "No Open purchase order for this alloy — no rate to compare "
+                    "the output cost against."
+                )
 
             mats = materials_by_key.get(key, [])
             if mats:
@@ -5965,6 +6039,7 @@ elif PAGE == "Production Data Analysis":
             outputs_by_key: dict[tuple, list[dict]] = {}
             for o in outputs:
                 outputs_by_key.setdefault(_pda_group_key(o), []).append(o)
+            po_cache: dict = {}
 
             by_date: dict = {}
             for row in summary:
@@ -5993,7 +6068,7 @@ elif PAGE == "Production Data Analysis":
                             for col, row in zip(cols, alloy_rows):
                                 with col:
                                     _pda_render_card(
-                                        row, materials_by_key, outputs_by_key
+                                        row, materials_by_key, outputs_by_key, po_cache
                                     )
 
 
