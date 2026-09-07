@@ -1210,6 +1210,24 @@ def show_dataframe(data, **kwargs):
     return st.dataframe(data, **kwargs)
 
 
+def draft_banner(label: str, has_draft: bool, on_discard) -> None:
+    """Show a dismissable 'unsaved draft' banner when has_draft is True.
+
+    The draft itself already survives page navigation via session_state;
+    this just makes that state visible instead of leaving it silent, and
+    gives an explicit way to discard it.
+    """
+    if not has_draft:
+        return
+    b1, b2 = st.columns([5, 1])
+    with b1:
+        st.warning(f"You have unsaved {label}. It's kept until you save or discard it.")
+    with b2:
+        if st.button("Discard", key=f"discard_{label.replace(' ', '_')}"):
+            on_discard()
+            st.rerun()
+
+
 def ui_date_input(label: str, value="today", **kwargs):
     kwargs.setdefault("format", UI_DATE_WIDGET_FORMAT)
     return st.date_input(label, value=value, **kwargs)
@@ -3991,6 +4009,39 @@ elif PAGE == "Production Batch & Chemistry":
         elif existing_batch:
             st.markdown("##### Additional charge lines")
             st.caption("Saved lines above stay as-is. Use this to charge more metal.")
+
+        _charge_line_fields = (
+            "mat", "lot", "trolley", "trolley_w", "_prev_trolley_label",
+            "scale_w", "wsp_open", "wsp_cam", "wsp_file", "wsp_bytes",
+            "wt", "ln", "inp_open", "inp_cam", "inp_file", "inp_bytes",
+        )
+
+        def _charge_draft_has_input() -> bool:
+            for idx in range(len(furnace_charge_lines)):
+                if st.session_state.get(_pk(f"mat_{idx}")):
+                    return True
+                if st.session_state.get(_pk(f"lot_{idx}")):
+                    return True
+                if st.session_state.get(_pk(f"trolley_{idx}")):
+                    return True
+                if float(st.session_state.get(_pk(f"scale_w_{idx}")) or 0) > 0:
+                    return True
+                if (st.session_state.get(_pk(f"ln_{idx}")) or "").strip():
+                    return True
+            return False
+
+        def _discard_charge_draft() -> None:
+            for idx in range(len(furnace_charge_lines)):
+                for field in _charge_line_fields:
+                    st.session_state.pop(_pk(f"{field}_{idx}"), None)
+            drafts[furnace] = [
+                {"material": "", "lot_id": None, "weight": 0.0, "notes": ""}
+            ]
+
+        if not locked:
+            draft_banner(
+                "charge line input", _charge_draft_has_input(), _discard_charge_draft
+            )
 
         if not trolleys:
             st.error("Define at least one active trolley under **Trolleys**.")
