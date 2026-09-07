@@ -5148,7 +5148,8 @@ elif PAGE == "Batch Output":
             st.info("No batches for this furnace.")
         else:
             labels = {
-                f"{b['Batch_ID']}  |  {b.get('Alloy_name') or '—'}  |  "
+                f"{b['Batch_ID']}  |  Shift {b.get('Shift') or '—'}  |  "
+                f"Melt {b.get('Melt_No') or '—'}  |  {b.get('Alloy_name') or '—'}  |  "
                 f"in={float(b.get('Input_Weight') or 0):.0f} kg  |  "
                 f"out={float(b.get('Output_Weight') or 0):.0f} kg": b["Batch_ID"]
                 for b in filtered
@@ -5163,19 +5164,21 @@ elif PAGE == "Batch Output":
                     (b.get("Alloy_name") for b in filtered if b["Batch_ID"] == bid),
                     None,
                 )
-                m1, m2, m3, m4, m5, m6 = st.columns(6)
+                m1, m2, m3, m4, m5, m6, m7, m8 = st.columns(8)
                 m1.metric("Batch ID", batch["Batch_ID"])
-                m2.metric("Furnace", batch.get("Furnace") or "—")
-                m3.metric("Heat No", batch.get("Heat_no") or "—")
-                m4.metric(
+                m2.metric("Shift", batch.get("Shift") or "—")
+                m3.metric("Melt", batch.get("Melt_No") or "—")
+                m4.metric("Furnace", batch.get("Furnace") or "—")
+                m5.metric("Heat No", batch.get("Heat_no") or "—")
+                m6.metric(
                     "Product alloy",
                     f"{batch.get('Alloy_id')} — {alloy_name or '—'}",
                 )
-                m5.metric(
+                m7.metric(
                     "Production status",
                     batch.get("Production_status") or "—",
                 )
-                m6.metric(
+                m8.metric(
                     "Output status",
                     batch.get("Output_status") or "—",
                 )
@@ -5346,7 +5349,9 @@ elif PAGE == "Daily Batch Summary":
                                 r.get("Furnace") or "All furnaces"
                             )
                             st.session_state["bo_batch"] = (
-                                f"{r['Batch_ID']}  |  {r.get('Alloy_name') or '—'}  |  "
+                                f"{r['Batch_ID']}  |  Shift {r.get('Shift') or '—'}  |  "
+                                f"Melt {r.get('Melt_No') or '—'}  |  "
+                                f"{r.get('Alloy_name') or '—'}  |  "
                                 f"in={float(r.get('Input_Weight') or 0):.0f} kg  |  "
                                 f"out={float(r.get('Output_Weight') or 0):.0f} kg"
                             )
