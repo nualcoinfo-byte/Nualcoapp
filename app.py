@@ -5886,11 +5886,17 @@ elif PAGE == "Production Data Analysis":
                             "Raw material": [m["Raw_Material_Name"] for m in mats],
                             "Weight (kg)": [m["Weight"] for m in mats],
                             "% of input": [m["Percent_of_Input"] for m in mats],
+                            "Cost ₹/kg": [m.get("Cost_per_kg") for m in mats],
+                            "Recovery %": [m.get("Recovery_pct") for m in mats],
                         }
                     )
                 )
                 total_pct = sum((m["Percent_of_Input"] or 0) for m in mats)
-                st.caption(f"Total: {total_pct:.1f}%")
+                st.caption(
+                    f"Total: {total_pct:.1f}%. Cost ₹/kg is that material's charge "
+                    "cost ÷ charge weight in this group; Recovery % is from the "
+                    "newest **Raw Material Master** row."
+                )
 
     d1, d2, d3 = st.columns([1, 1, 1.6])
     with d1:

@@ -10307,7 +10307,9 @@ def production_analysis(start_date: str, end_date: str) -> dict[str, list[dict[s
     vs. estimated output, and cost per kg (charge material cost / output,
     plus the production month's Cost_of_conversion.total_conversion_rate_per_kg).
     "materials" has one row per raw material within each group, with that
-    material's % of the group's total input. "outputs" has exactly four rows
+    material's % of the group's total input, its cost per kg (that material's
+    charge cost in this group ÷ its charge weight), and the Recovery % used
+    for the group's estimated output. "outputs" has exactly four rows
     per group — the group's own alloy plus Broken Ingot / Furnace Empty /
     Not Ok Ingot (0 kg where a line was not actually produced) — for a
     snapshot of where the output weight went.
@@ -10356,6 +10358,7 @@ def production_analysis(start_date: str, end_date: str) -> dict[str, list[dict[s
             {
                 "Raw_Material_Name": name,
                 "Weight": weight,
+                "Cost": float(row.get("Cost") or 0),
                 "Recovery_pct": recovery_pct if has_recovery else None,
             }
         )
@@ -10464,6 +10467,9 @@ def production_analysis(start_date: str, end_date: str) -> dict[str, list[dict[s
                         round(m["Weight"] / total_input * 100.0, 2)
                         if total_input > 0
                         else None
+                    ),
+                    "Cost_per_kg": (
+                        _as_cost_4(m["Cost"] / m["Weight"]) if m["Weight"] > 0 else None
                     ),
                     "Recovery_pct": m["Recovery_pct"],
                 }
