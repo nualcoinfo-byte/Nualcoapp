@@ -9868,7 +9868,10 @@ def _batch_output_weight_on_conn(conn: Connection, batch_id: str) -> float:
 
 
 def estimate_batch_input_cost(
-    lines: list[dict[str, Any]], *, as_of: date | None = None
+    lines: list[dict[str, Any]],
+    *,
+    as_of: date | None = None,
+    batch_id: Optional[str] = None,
 ) -> dict[str, Any]:
     """Projected cost per kg for a charge, before any output has been weighed.
 
@@ -9876,6 +9879,11 @@ def estimate_batch_input_cost(
     directly comparable with the actual cost computed after output is saved.
     Expected recovery comes from the newest Raw_Material_Master row for the
     material, which is what turns charge weight into expected output weight.
+
+    A Scrap return leaves the charge line's weight and cost untouched (the
+    heat still carries them), so when `batch_id` is given, any Scrap-returned
+    weight for this batch is netted out of the estimated output — that metal
+    was charged and paid for but will never become product.
     """
     cleaned: list[dict[str, Any]] = []
     for line in lines or []:
@@ -9900,6 +9908,8 @@ def estimate_batch_input_cost(
         "estimated_cost_per_kg": None,
         "missing_cost": [],
         "missing_recovery": [],
+        "scrap_returned_kg": 0.0,
+        "scrap_output_reduction_kg": 0.0,
     }
     if not cleaned:
         return empty
@@ -9921,8 +9931,27 @@ def estimate_batch_input_cost(
                 if row.get("Cost_per_kg") is not None:
                     lot_cost[int(row["Lot_id"])] = _as_cost_4(row["Cost_per_kg"])
 
-        names = sorted({l["name"] for l in cleaned})
-        placeholders = ", ".join("?" for _ in names)
+        scrap_by_material: dict[str, float] = {}
+        if batch_id:
+            for row in _exec(
+                conn,
+                """
+                SELECT Raw_Material_Name AS "Raw_Material_Name", Weight AS "Weight"
+                FROM batch_input_return
+                WHERE Batch_ID = ? AND Return_type = 'Scrap'
+                """,
+                (batch_id,),
+            ).mappings():
+                key = str(row.get("Raw_Material_Name") or "").strip().lower()
+                if key:
+                    scrap_by_material[key] = scrap_by_material.get(
+                        key, 0.0
+                    ) + float(row.get("Weight") or 0)
+
+        names_lower = sorted(
+            {l["name"].lower() for l in cleaned} | set(scrap_by_material.keys())
+        )
+        placeholders = ", ".join("?" for _ in names_lower)
         master: dict[str, dict[str, Any]] = {}
         for row in _exec(
             conn,
@@ -9934,7 +9963,7 @@ def estimate_batch_input_cost(
             WHERE LOWER(Raw_Material_Name) IN ({placeholders})
             ORDER BY Effective_date DESC
             """,
-            tuple(n.lower() for n in names),
+            tuple(names_lower),
         ).mappings():
             # Ordered newest first, so the first row seen for a name wins.
             master.setdefault(str(row["Raw_Material_Name"]).lower(), dict(row))
@@ -9980,9 +10009,23 @@ def estimate_batch_input_cost(
             }
         )
 
+    scrap_returned = round(sum(scrap_by_material.values()), PERCENT_SCALE)
+    scrap_output_reduction = 0.0
+    for name_lower, scrap_weight in scrap_by_material.items():
+        recovery = (master.get(name_lower) or {}).get("Recovery")
+        if recovery is not None:
+            scrap_output_reduction += scrap_weight * float(recovery) / 100.0
+    scrap_output_reduction = round(scrap_output_reduction, PERCENT_SCALE)
+
     input_weight = round(sum(d["Weight"] for d in detail), PERCENT_SCALE)
     input_cost = round(sum(d["Line_cost"] for d in detail), PERCENT_SCALE)
-    output_kg = round(sum(d["Estimated_output_kg"] for d in detail), PERCENT_SCALE)
+    output_kg = round(
+        max(
+            sum(d["Estimated_output_kg"] for d in detail) - scrap_output_reduction,
+            0.0,
+        ),
+        PERCENT_SCALE,
+    )
     material_per_kg = (
         round(input_cost / output_kg, PERCENT_SCALE) if output_kg > 0 else None
     )
@@ -10001,6 +10044,8 @@ def estimate_batch_input_cost(
         ),
         "missing_cost": sorted(set(missing_cost)),
         "missing_recovery": sorted(set(missing_recovery)),
+        "scrap_returned_kg": scrap_returned,
+        "scrap_output_reduction_kg": scrap_output_reduction,
     }
 
 

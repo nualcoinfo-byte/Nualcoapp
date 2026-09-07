@@ -4275,7 +4275,12 @@ elif PAGE == "Production Batch & Chemistry":
 
         estimate_lines = list(saved_charges) + list(display_charges)
         estimate = (
-            db.estimate_batch_input_cost(estimate_lines) if estimate_lines else None
+            db.estimate_batch_input_cost(
+                estimate_lines,
+                batch_id=preview_id if existing_batch else None,
+            )
+            if estimate_lines
+            else None
         )
         if estimate and estimate["lines"]:
             st.markdown("##### Estimated cost")
@@ -4351,8 +4356,16 @@ elif PAGE == "Production Batch & Chemistry":
                 f"**{estimate['conversion_rate_applied']:,.2f} ₹/kg**"
                 + (f" ({format_ui_date(conv_month)})" if conv_month else "")
                 + ". Estimated output is each line's weight × the recovery on the "
-                "newest **Raw Material Master** row for that material."
+                "newest **Raw Material Master** row for that material, less the "
+                "expected output of any material returned as **Scrap**."
             )
+            if estimate["scrap_returned_kg"] > 0:
+                st.caption(
+                    f"Scrap returns on this heat: **{estimate['scrap_returned_kg']:,.2f} kg** "
+                    f"charged, cutting estimated output by "
+                    f"**{estimate['scrap_output_reduction_kg']:,.2f} kg**. Charge cost is "
+                    "unaffected — the heat still carries that cost."
+                )
             if estimate["missing_recovery"]:
                 st.warning(
                     "No recovery on Raw Material Master for: "
@@ -4384,7 +4397,15 @@ elif PAGE == "Production Batch & Chemistry":
                         ]
                     )
                 )
-                st.caption("Cost/kg is the charged lot's cost.")
+                cost_caption = "Cost/kg is the charged lot's cost."
+                if estimate["scrap_returned_kg"] > 0:
+                    cost_caption += (
+                        " Est. output (kg) per line does **not** reflect Scrap "
+                        "returns — the "
+                        f"**{estimate['scrap_output_reduction_kg']:,.2f} kg** "
+                        "scrap deduction is only applied to the total above."
+                    )
+                st.caption(cost_caption)
 
         if existing_batch:
             try:
