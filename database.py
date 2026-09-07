@@ -11034,9 +11034,16 @@ def get_batch_chemistry(batch_id: str) -> list[dict[str, Any]]:
     )
 
 
-def list_batches() -> list[dict[str, Any]]:
+def list_batches(production_date: object = None) -> list[dict[str, Any]]:
+    """All batches, newest first, or just those on `production_date` if given."""
+    where = "WHERE b.Production_Date = ?" if production_date is not None else ""
+    params = (
+        (_coerce_production_date(production_date).isoformat(),)
+        if production_date is not None
+        else ()
+    )
     return fetch_all(
-        """
+        f"""
         SELECT b.Batch_ID AS "Batch_ID", b.Production_Date AS "Production_Date",
                b.Furnace AS "Furnace", b.Crucible_no AS "Crucible_no",
                b.Heat_no AS "Heat_no", b.Melt_No AS "Melt_No",
@@ -11061,8 +11068,10 @@ def list_batches() -> list[dict[str, Any]]:
                b.Bottom_Sample AS "Bottom_Sample", b.Vacum_Sample AS "Vacum_Sample"
         FROM Production_batch b
         LEFT JOIN Alloy_Master a ON a.Alloy_id = b.Alloy_id
+        {where}
         ORDER BY b.Production_Date DESC, b.Batch_ID DESC
-        """
+        """,
+        params,
     )
 
 
