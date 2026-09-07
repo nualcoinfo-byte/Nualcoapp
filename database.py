@@ -10741,9 +10741,19 @@ def get_batch_outputs(
     )
 
 
-def list_all_batch_outputs(limit: int = 200) -> list[dict[str, Any]]:
+def list_all_batch_outputs(
+    limit: int = 200, date_prefix: Optional[str] = None
+) -> list[dict[str, Any]]:
+    """Batch output rows, newest first.
+
+    `date_prefix` restricts this to batches whose Batch_ID starts with that
+    DDMMYY (Batch_ID is built as DDMMYY + furnace + shift + melt), i.e. one
+    production day, instead of the whole history.
+    """
+    where = "WHERE o.Batch_ID LIKE ?" if date_prefix else ""
+    params: tuple = (f"{date_prefix}%",) if date_prefix else ()
     return fetch_all(
-        """
+        f"""
         SELECT o.Output_id AS "Output_id", o.Batch_ID AS "Batch_ID",
                b.Furnace AS "Furnace", b.Heat_no AS "Heat_no",
                o.Alloy_id AS "Alloy_id", a.Alloy_name AS "Alloy_name",
@@ -10761,10 +10771,11 @@ def list_all_batch_outputs(limit: int = 200) -> list[dict[str, Any]]:
         FROM batch_output o
         LEFT JOIN Alloy_Master a ON a.Alloy_id = o.Alloy_id
         LEFT JOIN Production_batch b ON b.Batch_ID = o.Batch_ID
+        {where}
         ORDER BY o.Output_id DESC
         LIMIT ?
         """,
-        (limit,),
+        params + (limit,),
     )
 
 

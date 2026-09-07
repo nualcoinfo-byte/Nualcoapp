@@ -5233,12 +5233,15 @@ elif PAGE == "Batch Output":
                         f"Target {db.YIELD_TARGET_PCT:.0f}%."
                     )
 
-    st.subheader("Saved outputs")
-    saved_all = df_from_rows(db.list_all_batch_outputs())
-    if saved_all.empty:
-        st.info("No output rows yet. Select a batch above and save output lines.")
-    else:
-        show_dataframe(saved_all, highlight_avg_piece=True)
+                day_label = format_ui_date(batch.get("Production_Date")) or bid[:6]
+                st.subheader(f"Saved outputs for {day_label}")
+                saved_day = df_from_rows(
+                    db.list_all_batch_outputs(date_prefix=bid[:6])
+                )
+                if saved_day.empty:
+                    st.info("No output rows yet for this day.")
+                else:
+                    show_dataframe(saved_day, highlight_avg_piece=True)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
