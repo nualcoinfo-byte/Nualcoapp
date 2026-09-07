@@ -6030,8 +6030,9 @@ elif PAGE == "Production Data Analysis":
 
             st.markdown("#### Daily snapshot")
             st.caption(
-                "Expand a day to see each furnace and shift, with one card per "
-                "alloy — day, furnace, and shift are each shown once."
+                "Expand a day to see each shift, grouped by alloy. When more "
+                "than one furnace ran the same alloy in a shift, their cards "
+                "sit side by side so cost and yield can be compared directly."
             )
             materials_by_key: dict[tuple, list[dict]] = {}
             for m in materials:
@@ -6044,29 +6045,39 @@ elif PAGE == "Production Data Analysis":
             by_date: dict = {}
             for row in summary:
                 by_date.setdefault(row["Production_Date"], {}).setdefault(
-                    row["Furnace"], {}
-                ).setdefault(row["Shift"], []).append(row)
+                    row["Shift"], {}
+                ).setdefault(row["Alloy_id"], []).append(row)
 
             dates_sorted = sorted(by_date.keys(), key=lambda d: str(d or ""), reverse=True)
             for i, d in enumerate(dates_sorted):
                 with st.expander(format_ui_date(d) or str(d), expanded=(i == 0)):
-                    furnaces_sorted = sorted(
-                        by_date[d].keys(), key=lambda f: (len(str(f)), str(f))
+                    shifts_sorted = sorted(
+                        by_date[d].keys(), key=lambda s: str(s or "")
                     )
-                    for furnace in furnaces_sorted:
-                        st.markdown(f"**Furnace {furnace}**")
-                        shifts_sorted = sorted(
-                            by_date[d][furnace].keys(), key=lambda s: str(s or "")
+                    for shift in shifts_sorted:
+                        st.markdown(f"**Shift {shift}**")
+                        alloy_groups = by_date[d][shift]
+                        alloy_ids_sorted = sorted(
+                            alloy_groups.keys(),
+                            key=lambda aid: str(alloy_groups[aid][0].get("Alloy_name") or ""),
                         )
-                        for shift in shifts_sorted:
-                            st.caption(f"Shift {shift}")
-                            alloy_rows = sorted(
-                                by_date[d][furnace][shift],
-                                key=lambda r: str(r.get("Alloy_name") or ""),
+                        for alloy_id_key in alloy_ids_sorted:
+                            furnace_rows = sorted(
+                                alloy_groups[alloy_id_key],
+                                key=lambda r: (len(str(r.get("Furnace"))), str(r.get("Furnace"))),
                             )
-                            cols = st.columns(len(alloy_rows))
-                            for col, row in zip(cols, alloy_rows):
+                            alloy_name = furnace_rows[0].get("Alloy_name") or "—"
+                            if len(furnace_rows) > 1:
+                                st.caption(
+                                    f"{alloy_name} — {len(furnace_rows)} furnaces, "
+                                    "side by side for comparison"
+                                )
+                            else:
+                                st.caption(alloy_name)
+                            cols = st.columns(len(furnace_rows))
+                            for col, row in zip(cols, furnace_rows):
                                 with col:
+                                    st.caption(f"Furnace {row.get('Furnace') or '—'}")
                                     _pda_render_card(
                                         row, materials_by_key, outputs_by_key, po_cache
                                     )
