@@ -5304,6 +5304,8 @@ elif PAGE == "Daily Batch Summary":
         table_rows = [
             {
                 "Batch_ID": r["Batch_ID"],
+                "Shift": r.get("Shift") or "—",
+                "Melt": r.get("Melt_No") or "—",
                 "Alloy": r.get("Alloy_name") or "—",
                 "Total input (kg)": float(r.get("Input_Weight") or 0),
                 "Total output (kg)": float(r.get("Output_Weight") or 0),
@@ -5328,7 +5330,8 @@ elif PAGE == "Daily Batch Summary":
                     continue
                 rc1, rc2 = st.columns([3, 1])
                 rc1.markdown(
-                    f"**{r['Batch_ID']}** — {r.get('Alloy_name') or '—'} "
+                    f"**{r['Batch_ID']}** — Shift {r.get('Shift') or '—'}, "
+                    f"Melt {r.get('Melt_No') or '—'} — {r.get('Alloy_name') or '—'} "
                     f"(Furnace {r.get('Furnace') or '—'}) — "
                     f"{'Input' if needs_input else 'Output'} pending"
                 )
