@@ -4522,6 +4522,13 @@ elif PAGE == "Production Batch & Chemistry":
 
         _render_charge_and_estimate()
 
+        # The fragment above writes its charge-line drafts to session_state
+        # under this key on every run (fragment-scoped or full); a full
+        # rerun always re-executes the fragment before reaching here, so
+        # this is always current for what follows.
+        pending_charges_key = _pk("pending_charges")
+        pending_charges = st.session_state.get(pending_charges_key) or []
+
         if existing_batch:
             try:
                 returnable = db.list_batch_input_returnable(preview_id)
@@ -4661,7 +4668,7 @@ elif PAGE == "Production Batch & Chemistry":
             create_error_key = _pk("create_error")
             if available_crucible is None:
                 st.error("No crucible available for the respective furnace.")
-            elif not charge_inputs and not saved_pending_charges:
+            elif not pending_charges:
                 st.caption("Add at least one charge line with net weight > 0.")
             if create_clicked:
                 try:
@@ -4669,7 +4676,7 @@ elif PAGE == "Production Batch & Chemistry":
                         raise ValueError(
                             "No crucible available for the respective furnace."
                         )
-                    inputs_to_save = charge_inputs or list(saved_pending_charges)
+                    inputs_to_save = list(pending_charges)
                     total_save_weight = sum(
                         float(c.get("Weight") or 0) for c in inputs_to_save
                     )
@@ -5029,7 +5036,7 @@ elif PAGE == "Production Batch & Chemistry":
                 else None
             ),
             chemistry_count=len(composition),
-            charge_line_count=len(saved_charges) + len(charge_inputs),
+            charge_line_count=len(saved_charges) + len(pending_charges),
         )
         if existing_batch and not is_completed:
             if completion_gaps:
@@ -5087,7 +5094,7 @@ elif PAGE == "Production Batch & Chemistry":
                 )
             db.update_production_batch_input(
                 preview_id,
-                extra_inputs=charge_inputs,
+                extra_inputs=pending_charges,
                 allow_completed=bool(
                     is_completed and is_admin and st.session_state.get(unlock_key)
                 ),
