@@ -4363,38 +4363,28 @@ elif PAGE == "Production Batch & Chemistry":
             )
             if po_rate is not None:
                 cost_target = po_rate / (1 + db.MIN_PROFIT_MARGIN_PCT / 100.0)
-                f1, f2 = st.columns(2)
-                f1.metric(
-                    "Open PO rate (₹/kg)",
-                    f"{po_rate:,.2f}",
-                    help=(
-                        f"Latest Open PO for this alloy: "
-                        f"{open_po.get('Customer_PO_No') or '—'} "
-                        f"({format_ui_date(open_po.get('Order_Date')) or '—'})."
-                    ),
+                st.markdown(
+                    '<p style="font-size:0.8rem;color:rgba(49,51,63,0.6);'
+                    'margin-bottom:0.2rem">Cost Target (₹/kg)</p>',
+                    unsafe_allow_html=True,
                 )
-                with f2:
-                    st.markdown(
-                        '<p style="font-size:0.8rem;color:rgba(49,51,63,0.6);'
-                        'margin-bottom:0.2rem">Cost Target (₹/kg)</p>',
-                        unsafe_allow_html=True,
-                    )
-                    color = (
-                        "inherit"
-                        if est_per_kg is None
-                        else (
-                            "#2e7d32" if est_per_kg <= cost_target else "#c62828"
-                        )
-                    )
-                    st.markdown(
-                        f'<p style="font-size:1.5rem;font-weight:600;'
-                        f'color:{color};margin:0">{cost_target:,.2f}</p>',
-                        unsafe_allow_html=True,
-                    )
+                color = (
+                    "inherit"
+                    if est_per_kg is None
+                    else ("#2e7d32" if est_per_kg <= cost_target else "#c62828")
+                )
+                st.markdown(
+                    f'<p style="font-size:1.5rem;font-weight:600;'
+                    f'color:{color};margin:0">{cost_target:,.2f}</p>',
+                    unsafe_allow_html=True,
+                )
                 st.caption(
                     f"Cost Target = Open PO rate ÷ (1 + {db.MIN_PROFIT_MARGIN_PCT:.0f}%) "
                     f"— the ₹/kg needed to hit a minimum "
-                    f"{db.MIN_PROFIT_MARGIN_PCT:.0f}% profit margin on cost. Green "
+                    f"{db.MIN_PROFIT_MARGIN_PCT:.0f}% profit margin on cost, based "
+                    f"on the latest Open PO for this alloy "
+                    f"({open_po.get('Customer_PO_No') or '—'}, "
+                    f"{format_ui_date(open_po.get('Order_Date')) or '—'}). Green "
                     "when Estimated ₹/kg is at or under target, red when over."
                 )
             elif alloy_id:
