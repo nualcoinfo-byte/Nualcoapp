@@ -772,6 +772,9 @@ SHIFTS = ["A", "B"]
 MELT_NOS = [1, 2, 3, 4, 5, 6, 7, 9]
 HEAT_NOS = list(range(1, 13))
 YIELD_TARGET_PCT = 70.0
+# Minimum profit margin (on cost) production should target when a batch's
+# alloy has an Open PO: Cost_Target = PO_Rate / (1 + MIN_PROFIT_MARGIN_PCT/100).
+MIN_PROFIT_MARGIN_PCT = 4.0
 # Typical finished-alloy ingot piece weight. Used to flag a likely
 # wrong piece count when supervisors enter batch output.
 ALLOY_PIECE_KG_MIN = 5.6

@@ -4359,6 +4359,7 @@ elif PAGE == "Production Batch & Chemistry":
                 else None
             )
             if po_rate is not None:
+                cost_target = po_rate / (1 + db.MIN_PROFIT_MARGIN_PCT / 100.0)
                 f1, f2 = st.columns(2)
                 f1.metric(
                     "Open PO rate (₹/kg)",
@@ -4372,34 +4373,31 @@ elif PAGE == "Production Batch & Chemistry":
                 with f2:
                     st.markdown(
                         '<p style="font-size:0.8rem;color:rgba(49,51,63,0.6);'
-                        'margin-bottom:0.2rem">Profit/Loss (₹/kg)</p>',
+                        'margin-bottom:0.2rem">Cost Target (₹/kg)</p>',
                         unsafe_allow_html=True,
                     )
-                    if est_per_kg is None:
-                        st.markdown(
-                            '<p style="font-size:1.5rem;margin:0">—</p>',
-                            unsafe_allow_html=True,
+                    color = (
+                        "inherit"
+                        if est_per_kg is None
+                        else (
+                            "#2e7d32" if est_per_kg <= cost_target else "#c62828"
                         )
-                    else:
-                        profit_loss = po_rate - est_per_kg
-                        color = (
-                            "#2e7d32"
-                            if profit_loss > 0
-                            else ("#c62828" if profit_loss < 0 else "inherit")
-                        )
-                        st.markdown(
-                            f'<p style="font-size:1.5rem;font-weight:600;'
-                            f'color:{color};margin:0">{profit_loss:+,.2f}</p>',
-                            unsafe_allow_html=True,
-                        )
+                    )
+                    st.markdown(
+                        f'<p style="font-size:1.5rem;font-weight:600;'
+                        f'color:{color};margin:0">{cost_target:,.2f}</p>',
+                        unsafe_allow_html=True,
+                    )
                 st.caption(
-                    "Profit/Loss = Open PO rate − Estimated ₹/kg. Positive means "
-                    "this alloy is selling for more than it costs to produce."
+                    f"Cost Target = Open PO rate ÷ (1 + {db.MIN_PROFIT_MARGIN_PCT:.0f}%) "
+                    f"— the ₹/kg needed to hit a minimum "
+                    f"{db.MIN_PROFIT_MARGIN_PCT:.0f}% profit margin on cost. Green "
+                    "when Estimated ₹/kg is at or under target, red when over."
                 )
             elif alloy_id:
                 st.caption(
-                    "No Open purchase order for this alloy — no rate to compare "
-                    "the estimated cost against."
+                    "No Open purchase order for this alloy — no cost target to "
+                    "compare the estimated cost against."
                 )
 
             conv_month = estimate["conversion_expense_month"]
@@ -5890,7 +5888,8 @@ elif PAGE == "Production Data Analysis":
                 else None
             )
             if po_rate is not None:
-                p1, p2, p3 = st.columns(3)
+                cost_target = po_rate / (1 + db.MIN_PROFIT_MARGIN_PCT / 100.0)
+                p1, p2 = st.columns(2)
                 p1.metric(
                     "Open PO rate (₹/kg)",
                     f"{po_rate:,.2f}",
@@ -5900,55 +5899,32 @@ elif PAGE == "Production Data Analysis":
                         f"({format_ui_date(open_po.get('Order_Date')) or '—'})."
                     ),
                 )
-                if overall_kg is None:
-                    p2.markdown(
+                with p2:
+                    st.markdown(
                         '<p style="font-size:0.8rem;color:rgba(49,51,63,0.6);'
-                        'margin-bottom:0.2rem">Profit/Loss (₹/kg)</p>'
-                        '<p style="font-size:1.5rem;margin:0">—</p>',
+                        'margin-bottom:0.2rem">Cost Target (₹/kg)</p>',
                         unsafe_allow_html=True,
-                    )
-                    p3.markdown(
-                        '<p style="font-size:0.8rem;color:rgba(49,51,63,0.6);'
-                        'margin-bottom:0.2rem">Profit/Loss %</p>'
-                        '<p style="font-size:1.5rem;margin:0">—</p>',
-                        unsafe_allow_html=True,
-                    )
-                else:
-                    profit_loss = po_rate - overall_kg
-                    profit_loss_pct = (
-                        (profit_loss / overall_kg * 100.0) if overall_kg > 0 else None
                     )
                     color = (
-                        "#2e7d32"
-                        if profit_loss > 0
-                        else ("#c62828" if profit_loss < 0 else "inherit")
+                        "inherit"
+                        if overall_kg is None
+                        else ("#2e7d32" if overall_kg <= cost_target else "#c62828")
                     )
-                    p2.markdown(
-                        '<p style="font-size:0.8rem;color:rgba(49,51,63,0.6);'
-                        'margin-bottom:0.2rem">Profit/Loss (₹/kg)</p>'
-                        f'<p style="font-size:1.5rem;font-weight:600;color:{color};'
-                        f'margin:0">{profit_loss:+,.2f}</p>',
-                        unsafe_allow_html=True,
-                    )
-                    p3.markdown(
-                        '<p style="font-size:0.8rem;color:rgba(49,51,63,0.6);'
-                        'margin-bottom:0.2rem">Profit/Loss %</p>'
-                        + (
-                            f'<p style="font-size:1.5rem;font-weight:600;color:{color};'
-                            f'margin:0">{profit_loss_pct:+.2f}%</p>'
-                            if profit_loss_pct is not None
-                            else '<p style="font-size:1.5rem;margin:0">—</p>'
-                        ),
+                    st.markdown(
+                        f'<p style="font-size:1.5rem;font-weight:600;'
+                        f'color:{color};margin:0">{cost_target:,.2f}</p>',
                         unsafe_allow_html=True,
                     )
                 st.caption(
-                    "Profit/Loss = Open PO rate − Overall ₹/kg. Profit/Loss % is "
-                    "that amount ÷ Overall ₹/kg."
+                    f"Cost Target = Open PO rate ÷ (1 + {db.MIN_PROFIT_MARGIN_PCT:.0f}%) "
+                    f"— the ₹/kg needed to hit a minimum "
+                    f"{db.MIN_PROFIT_MARGIN_PCT:.0f}% profit margin on cost. Green "
+                    "when Overall ₹/kg is at or under target, red when over."
                 )
             elif alloy_id is not None:
                 st.caption(
-                    "No Open purchase order for this alloy — no rate to compare "
-                    "the output cost against."
+                    "No Open purchase order for this alloy — no cost target to "
+                    "compare the output cost against."
                 )
 
             mats = materials_by_key.get(key, [])
