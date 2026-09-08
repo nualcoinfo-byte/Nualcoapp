@@ -24,6 +24,7 @@ import secrets
 import socket
 import struct
 import sys
+import threading
 import time
 from contextlib import contextmanager
 from datetime import date, datetime, timezone
@@ -7199,7 +7200,9 @@ def _ensure_dashboard_materialized_views(conn: Connection) -> None:
 def refresh_dashboard_materialized_views() -> Optional[datetime]:
     """Refresh the Dashboard / Production Data Analysis materialized views.
 
-    Called on a staleness check (see dashboard_data_is_stale) and from the
+    Called every DASHBOARD_REFRESH_INTERVAL_SECONDS by the background
+    scheduler (see start_dashboard_refresh_scheduler), from the staleness
+    check (see dashboard_data_is_stale) as a safety net, and from the
     "Refresh now" button on both pages. No-op on SQLite — those pages read
     live tables there. Returns the new refreshed_at, or None on SQLite.
     """
@@ -7241,8 +7244,16 @@ def get_dashboard_last_refreshed() -> Optional[datetime]:
     return min(stamps)
 
 
-def dashboard_data_is_stale(max_age_minutes: int = 15) -> bool:
-    """True when the dashboard views are missing or older than max_age_minutes."""
+def dashboard_data_is_stale(max_age_minutes: int = 300) -> bool:
+    """True when the dashboard views are missing, or stale enough that the
+    4-hourly background refresh looks like it has stalled.
+
+    This is a safety net, not the primary refresh path: the background
+    scheduler already keeps the views under DASHBOARD_REFRESH_INTERVAL_SECONDS
+    old, so the default threshold here (5 hours) sits just past that and
+    should not normally trigger. It only exists so a page load can self-heal
+    if the scheduler thread ever dies, instead of serving stale data forever.
+    """
     if not IS_POSTGRES:
         return False
     last = get_dashboard_last_refreshed()
@@ -7252,6 +7263,36 @@ def dashboard_data_is_stale(max_age_minutes: int = 15) -> bool:
         last = last.replace(tzinfo=timezone.utc)
     age = datetime.now(timezone.utc) - last
     return age.total_seconds() > max_age_minutes * 60
+
+
+DASHBOARD_REFRESH_INTERVAL_SECONDS = 4 * 60 * 60  # 6 refreshes/day
+_dashboard_refresh_thread_started = False
+
+
+def _dashboard_refresh_loop() -> None:
+    while True:
+        time.sleep(DASHBOARD_REFRESH_INTERVAL_SECONDS)
+        try:
+            refresh_dashboard_materialized_views()
+        except Exception as exc:  # keep the loop alive across transient DB errors
+            print(f"[dashboard refresh] failed: {exc}", file=sys.stderr)
+
+
+def start_dashboard_refresh_scheduler() -> None:
+    """Start the background thread that refreshes dashboard views every 4 hours.
+
+    One Streamlit process serves every user, so a single scheduled refresh
+    keeps all of them on the same freshly-computed data instead of tying the
+    refresh cost (a REFRESH MATERIALIZED VIEW CONCURRENTLY per view) to
+    whichever user's page load happens to find the data stale. Runs once per
+    server process (guarded by a module-level flag). No-op on SQLite, which
+    has no materialized views.
+    """
+    global _dashboard_refresh_thread_started
+    if not IS_POSTGRES or _dashboard_refresh_thread_started:
+        return
+    _dashboard_refresh_thread_started = True
+    threading.Thread(target=_dashboard_refresh_loop, daemon=True).start()
 
 
 def _ensure_packing_list_ready() -> None:

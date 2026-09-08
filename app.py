@@ -140,6 +140,7 @@ def _init_postgres() -> bool:
     """Handshake once per process. Failures are cleared by the caller."""
     db._ensure_packing_list_ready()
     db._ensure_company_ready()
+    db.start_dashboard_refresh_scheduler()
     return True
 
 
@@ -2884,10 +2885,12 @@ _IST = timezone(timedelta(hours=5, minutes=30))
 def _render_dashboard_refresh_bar(*, key_prefix: str) -> None:
     """Last-refreshed time + a manual refresh button for a materialized-view page.
 
-    Auto-refreshes once when the views are missing or stale (see
-    db.dashboard_data_is_stale) so nobody has to remember to click Refresh;
-    the button underneath is for refreshing on demand regardless of age.
-    No-op on SQLite, which has no materialized views to refresh.
+    The views refresh on their own every 4 hours (db.start_dashboard_refresh_
+    scheduler, started once per process), so a page load normally does not
+    trigger a refresh. The staleness check here (db.dashboard_data_is_stale)
+    is only a safety net for the rare case the background scheduler has
+    stalled; the button underneath is for refreshing on demand regardless
+    of age. No-op on SQLite, which has no materialized views to refresh.
     """
     if not db.IS_POSTGRES:
         return
