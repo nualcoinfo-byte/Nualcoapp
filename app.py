@@ -2936,6 +2936,38 @@ def _dashboard_overview_data(year: int, month: int) -> dict:
     }
 
 
+@st.cache_data(ttl=60, show_spinner=False)
+def _production_batch_reference_data() -> dict:
+    """Cached bundle of rarely-changing reference lists Production Batch &
+    Chemistry reads.
+
+    Streamlit reruns the whole script on every keystroke/click, so without
+    caching, each of these plain table scans (and its own RLS-session round
+    trip) re-runs on every single interaction on this page — the app's
+    heaviest, most-interacted-with page. Furnaces/melters/supervisors/alloys/
+    raw materials/trolleys/chemistry elements only change via their own
+    Master pages, so a short TTL is enough to keep this fresh in practice.
+
+    raw_material_master_by_name folds in every charge line's per-material
+    Recovery lookup (previously one db.get_raw_material_master() call per
+    line, every rerun) into this same cached bundle — newest Effective_date
+    row wins per name, same rule used everywhere else in this codebase.
+    """
+    master_by_name: dict[str, dict] = {}
+    for row in db.list_raw_material_master():
+        master_by_name.setdefault(str(row["Raw_Material_Name"]).lower(), row)
+    return {
+        "furnaces": db.list_furnaces(),
+        "melters": db.list_melters(),
+        "supervisors": db.list_production_supervisors(),
+        "alloys": db.list_alloys(include_sidestream=False),
+        "raw_materials": db.list_raw_materials(),
+        "trolleys": db.list_trolleys(active_only=True),
+        "chem_elements": db.list_batch_chem_elements(),
+        "raw_material_master_by_name": master_by_name,
+    }
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # Dashboard
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -3653,16 +3685,17 @@ elif PAGE == "Production Batch & Chemistry":
         "Browse existing batches under **Production Batches**."
     )
 
-    furnaces = db.list_furnaces()
-    melters = db.list_melters()
-    supervisors = db.list_production_supervisors()
-    alloys = db.list_alloys(include_sidestream=False)
+    _pb_ref = _production_batch_reference_data()
+    furnaces = _pb_ref["furnaces"]
+    melters = _pb_ref["melters"]
+    supervisors = _pb_ref["supervisors"]
+    alloys = _pb_ref["alloys"]
     alloy_labels = {
         f"{a['Alloy_id']} — {a['Alloy_name']}"
         + (f" ({a['Customer_name']})" if a["Customer_name"] else ""): a["Alloy_id"]
         for a in alloys
     }
-    materials = db.list_raw_materials()
+    materials = _pb_ref["raw_materials"]
 
     if not furnaces:
         st.error("Define at least one furnace under **Furnaces**.")
@@ -3979,7 +4012,7 @@ elif PAGE == "Production Batch & Chemistry":
             st.caption("Saved charge lines")
             show_dataframe(df_from_rows(saved_charges))
 
-        trolleys = db.list_trolleys(active_only=True)
+        trolleys = _pb_ref["trolleys"]
         trolley_by_name = {t["Trolley_name"]: float(t["Weight"] or 0) for t in trolleys}
         trolley_colour_by_name = {
             t["Trolley_name"]: (t.get("Colour") or "").strip() or None for t in trolleys
@@ -4050,405 +4083,444 @@ elif PAGE == "Production Batch & Chemistry":
         if not trolleys:
             st.error("Define at least one active trolley under **Trolleys**.")
 
-        charge_inputs: list[dict] = []
-        for idx, line in enumerate(furnace_charge_lines):
-            st.markdown(f"**Charge line {idx + 1}**")
-            r1c1, r1c2, r1c3 = st.columns([2, 2, 2])
-            with r1c1:
-                mat = st.selectbox(
-                    "Raw material",
-                    options=[""] + materials,
-                    key=_pk(f"mat_{idx}"),
-                )
-            lots = db.list_inventory_lots(material=mat or None) if mat else []
-            lot_opts = {}
-            lot_cost_by_label = {}
-            for lot in lots:
-                rem = float(lot.get("Remaining_Weight") or 0)
-                status = lot.get("Raw_Material_Status") or ""
-                src = lot.get("Source_Batch_ID")
-                origin = lot.get("Origin_Alloy_name")
-                if src:
-                    origin_bit = f" {origin}" if origin else ""
-                    label = (
-                        f"Lot {lot['Lot_id']} — rem {rem:.1f} kg | "
-                        f"from {src}{origin_bit} ({status})"
+        @st.fragment
+        def _render_charge_and_estimate() -> None:
+            """Charge-line entry + live cost estimate, isolated from the rest
+            of the page.
+
+            Streamlit reruns the whole script on every widget interaction by
+            default; on this page that meant every keystroke in a charge-line
+            field re-ran the per-line lot/master lookups, the multi-query cost
+            estimate, header fields, chemistry entry, everything. @st.fragment
+            scopes reruns triggered by a widget inside this function to just
+            this function, so editing charge lines stays fast without touching
+            the rest of the form. It still participates fully in any full-page
+            rerun (e.g. switching furnace, saving the batch), so outer values
+            it closes over (furnace, existing_batch, preview_id, alloy_id,
+            saved_charges, locked, the cached reference-data lists) are only
+            ever stale between fragment-scoped reruns, and none of those change
+            as a result of editing a charge line itself.
+            """
+            # Batch the lot lookup for every line's already-selected material
+            # into one query instead of one query per line (N+1). Streamlit
+            # already updated session_state for the widget that triggered
+            # this rerun before the script runs, so this sees this rerun's
+            # selections, not last rerun's.
+            _selected_materials = [
+                st.session_state.get(_pk(f"mat_{idx}"))
+                for idx in range(len(furnace_charge_lines))
+            ]
+            _selected_materials = [m for m in _selected_materials if m]
+            lots_by_material: dict[str, list[dict]] = {}
+            if _selected_materials:
+                for lot in db.list_inventory_lots(materials=_selected_materials):
+                    lots_by_material.setdefault(
+                        str(lot["Raw_Material_Name"]).lower(), []
+                    ).append(lot)
+
+            charge_inputs: list[dict] = []
+            for idx, line in enumerate(furnace_charge_lines):
+                st.markdown(f"**Charge line {idx + 1}**")
+                r1c1, r1c2, r1c3 = st.columns([2, 2, 2])
+                with r1c1:
+                    mat = st.selectbox(
+                        "Raw material",
+                        options=[""] + materials,
+                        key=_pk(f"mat_{idx}"),
                     )
-                else:
-                    label = f"Lot {lot['Lot_id']} — rem {rem:.1f} kg ({status})"
-                lot_opts[label] = lot["Lot_id"]
-                lot_cost_by_label[label] = lot.get("Cost_per_kg")
-            with r1c2:
-                lot_label = st.selectbox(
-                    "Lot",
-                    options=[""] + list(lot_opts.keys()),
-                    key=_pk(f"lot_{idx}"),
-                )
-            with r1c3:
-                # Style from current selection (session) so highlight updates on rerun
-                _pending_label = st.session_state.get(_pk(f"trolley_{idx}"), "") or ""
-                _pending_name = trolley_label_to_name.get(_pending_label)
-                _pending_colour = (
-                    trolley_colour_by_name.get(_pending_name) if _pending_name else None
-                )
-                _css = _trolley_css_color(_pending_colour)
-                safe_colour = html.escape(str(_pending_colour)) if _pending_colour else ""
-                sw, fld = st.columns([0.18, 0.82], gap="small")
-                with sw:
-                    if _css:
-                        st.markdown(
-                            f"""
-                            <div title="{safe_colour}" style="
-                                margin-top: 1.7rem;
-                                height: 2.55rem;
-                                border-radius: 8px;
-                                background: {_css};
-                                border: 1px solid rgba(0,0,0,0.28);
-                                box-shadow: inset 0 0 0 1px rgba(255,255,255,0.25);
-                            "></div>
-                            """,
-                            unsafe_allow_html=True,
+                lots = lots_by_material.get(mat.lower(), []) if mat else []
+                lot_opts = {}
+                lot_cost_by_label = {}
+                for lot in lots:
+                    rem = float(lot.get("Remaining_Weight") or 0)
+                    status = lot.get("Raw_Material_Status") or ""
+                    src = lot.get("Source_Batch_ID")
+                    origin = lot.get("Origin_Alloy_name")
+                    if src:
+                        origin_bit = f" {origin}" if origin else ""
+                        label = (
+                            f"Lot {lot['Lot_id']} — rem {rem:.1f} kg | "
+                            f"from {src}{origin_bit} ({status})"
                         )
                     else:
-                        st.markdown(
-                            """
-                            <div style="
-                                margin-top: 1.7rem;
-                                height: 2.55rem;
-                                border-radius: 8px;
-                                background: #ECEFF1;
-                                border: 1px dashed #90A4AE;
-                            "></div>
-                            """,
-                            unsafe_allow_html=True,
+                        label = f"Lot {lot['Lot_id']} — rem {rem:.1f} kg ({status})"
+                    lot_opts[label] = lot["Lot_id"]
+                    lot_cost_by_label[label] = lot.get("Cost_per_kg")
+                with r1c2:
+                    lot_label = st.selectbox(
+                        "Lot",
+                        options=[""] + list(lot_opts.keys()),
+                        key=_pk(f"lot_{idx}"),
+                    )
+                with r1c3:
+                    # Style from current selection (session) so highlight updates on rerun
+                    _pending_label = st.session_state.get(_pk(f"trolley_{idx}"), "") or ""
+                    _pending_name = trolley_label_to_name.get(_pending_label)
+                    _pending_colour = (
+                        trolley_colour_by_name.get(_pending_name) if _pending_name else None
+                    )
+                    _css = _trolley_css_color(_pending_colour)
+                    safe_colour = html.escape(str(_pending_colour)) if _pending_colour else ""
+                    sw, fld = st.columns([0.18, 0.82], gap="small")
+                    with sw:
+                        if _css:
+                            st.markdown(
+                                f"""
+                                <div title="{safe_colour}" style="
+                                    margin-top: 1.7rem;
+                                    height: 2.55rem;
+                                    border-radius: 8px;
+                                    background: {_css};
+                                    border: 1px solid rgba(0,0,0,0.28);
+                                    box-shadow: inset 0 0 0 1px rgba(255,255,255,0.25);
+                                "></div>
+                                """,
+                                unsafe_allow_html=True,
+                            )
+                        else:
+                            st.markdown(
+                                """
+                                <div style="
+                                    margin-top: 1.7rem;
+                                    height: 2.55rem;
+                                    border-radius: 8px;
+                                    background: #ECEFF1;
+                                    border: 1px dashed #90A4AE;
+                                "></div>
+                                """,
+                                unsafe_allow_html=True,
+                            )
+                    with fld:
+                        if _css:
+                            st.markdown(
+                                f"""
+                                <div style="
+                                    border: 2px solid {_css};
+                                    border-radius: 10px;
+                                    padding: 0.15rem 0.35rem 0.35rem;
+                                    background: linear-gradient(90deg, {_css}30 0%, transparent 70%);
+                                    margin-bottom: 0.05rem;
+                                ">
+                                  <div style="font-size:0.72rem;font-weight:600;opacity:0.9;">
+                                    {safe_colour}
+                                  </div>
+                                </div>
+                                """,
+                                unsafe_allow_html=True,
+                            )
+                        trolley_label = st.selectbox(
+                            "Trolley *",
+                            options=[""] + trolley_labels,
+                            key=_pk(f"trolley_{idx}"),
+                            disabled=not bool(trolleys),
                         )
-                with fld:
-                    if _css:
-                        st.markdown(
-                            f"""
-                            <div style="
-                                border: 2px solid {_css};
-                                border-radius: 10px;
-                                padding: 0.15rem 0.35rem 0.35rem;
-                                background: linear-gradient(90deg, {_css}30 0%, transparent 70%);
-                                margin-bottom: 0.05rem;
-                            ">
-                              <div style="font-size:0.72rem;font-weight:600;opacity:0.9;">
-                                {safe_colour}
-                              </div>
-                            </div>
-                            """,
-                            unsafe_allow_html=True,
-                        )
-                    trolley_label = st.selectbox(
-                        "Trolley *",
-                        options=[""] + trolley_labels,
-                        key=_pk(f"trolley_{idx}"),
-                        disabled=not bool(trolleys),
+
+                if mat:
+                    master_row = _pb_ref["raw_material_master_by_name"].get(
+                        mat.lower(), {}
+                    )
+                    recovery_val = master_row.get("Recovery")
+                    lot_cost_val = lot_cost_by_label.get(lot_label) if lot_label else None
+                    st.caption(
+                        "Recovery: "
+                        + (f"{float(recovery_val):.1f}%" if recovery_val is not None else "—")
+                        + "  |  Cost/kg: "
+                        + (f"₹{float(lot_cost_val):,.2f}" if lot_cost_val is not None else "—")
                     )
 
-            if mat:
-                master_row = db.get_raw_material_master(mat) or {}
-                recovery_val = master_row.get("Recovery")
-                lot_cost_val = lot_cost_by_label.get(lot_label) if lot_label else None
-                st.caption(
-                    "Recovery: "
-                    + (f"{float(recovery_val):.1f}%" if recovery_val is not None else "—")
-                    + "  |  Cost/kg: "
-                    + (f"₹{float(lot_cost_val):,.2f}" if lot_cost_val is not None else "—")
-                )
+                trolley_name = trolley_label_to_name.get(trolley_label) if trolley_label else None
+                trolley_w = float(trolley_by_name.get(trolley_name, 0)) if trolley_name else 0.0
 
-            trolley_name = trolley_label_to_name.get(trolley_label) if trolley_label else None
-            trolley_w = float(trolley_by_name.get(trolley_name, 0)) if trolley_name else 0.0
+                # Streamlit number_input ignores `value` after first render when `key` is set.
+                # Sync tare whenever the selected trolley changes.
+                tare_key = _pk(f"trolley_w_{idx}")
+                prev_trolley_key = _pk(f"_prev_trolley_label_{idx}")
+                if st.session_state.get(prev_trolley_key) != trolley_label:
+                    st.session_state[tare_key] = float(trolley_w)
+                    st.session_state[prev_trolley_key] = trolley_label
+                elif tare_key not in st.session_state:
+                    st.session_state[tare_key] = float(trolley_w)
 
-            # Streamlit number_input ignores `value` after first render when `key` is set.
-            # Sync tare whenever the selected trolley changes.
-            tare_key = _pk(f"trolley_w_{idx}")
-            prev_trolley_key = _pk(f"_prev_trolley_label_{idx}")
-            if st.session_state.get(prev_trolley_key) != trolley_label:
-                st.session_state[tare_key] = float(trolley_w)
-                st.session_state[prev_trolley_key] = trolley_label
-            elif tare_key not in st.session_state:
-                st.session_state[tare_key] = float(trolley_w)
-
-            r2c1, r2c2, r2c3, r2c4 = st.columns([1.5, 1.5, 1.5, 2])
-            with r2c1:
-                st.number_input(
-                    "Trolley weight (kg)",
-                    min_value=0.0,
-                    step=0.1,
-                    disabled=True,
-                    key=tare_key,
-                    help="Auto-filled from Trolley_Master when a trolley is selected.",
-                )
-            with r2c2:
-                scale_w = empty_percent_input(
-                    "Weighment Weight (kg) *",
-                    key=_pk(f"scale_w_{idx}"),
-                    max_value=None,
-                    step=1.0,
-                )
-                wsp_open_key = _pk(f"wsp_open_{idx}")
-                if st.button(
-                    "📷 Weighment photo",
-                    key=_pk(f"wsp_btn_{idx}"),
-                    help="Open camera or choose a photo from the phone gallery",
-                    use_container_width=True,
-                ):
-                    st.session_state[wsp_open_key] = not bool(
-                        st.session_state.get(wsp_open_key)
+                r2c1, r2c2, r2c3, r2c4 = st.columns([1.5, 1.5, 1.5, 2])
+                with r2c1:
+                    st.number_input(
+                        "Trolley weight (kg)",
+                        min_value=0.0,
+                        step=0.1,
+                        disabled=True,
+                        key=tare_key,
+                        help="Auto-filled from Trolley_Master when a trolley is selected.",
                     )
-                    st.rerun()
+                with r2c2:
+                    scale_w = empty_percent_input(
+                        "Weighment Weight (kg) *",
+                        key=_pk(f"scale_w_{idx}"),
+                        max_value=None,
+                        step=1.0,
+                    )
+                    wsp_open_key = _pk(f"wsp_open_{idx}")
+                    if st.button(
+                        "📷 Weighment photo",
+                        key=_pk(f"wsp_btn_{idx}"),
+                        help="Open camera or choose a photo from the phone gallery",
+                        use_container_width=True,
+                    ):
+                        st.session_state[wsp_open_key] = not bool(
+                            st.session_state.get(wsp_open_key)
+                        )
+                        st.rerun()
 
-                scale_photo_bytes: bytes | None = None
-                if st.session_state.get(wsp_open_key):
-                    st.caption("Capture with camera or pick from gallery")
-                    wsp_cam = st.camera_input(
-                        "Camera",
-                        key=_pk(f"wsp_cam_{idx}"),
+                    scale_photo_bytes: bytes | None = None
+                    if st.session_state.get(wsp_open_key):
+                        st.caption("Capture with camera or pick from gallery")
+                        wsp_cam = st.camera_input(
+                            "Camera",
+                            key=_pk(f"wsp_cam_{idx}"),
+                            help="Uses the phone camera when available.",
+                        )
+                        wsp_file = st.file_uploader(
+                            "Gallery / files",
+                            type=["png", "jpg", "jpeg", "webp"],
+                            key=_pk(f"wsp_file_{idx}"),
+                            help="Choose an existing photo from the device gallery.",
+                        )
+                        scale_photo_bytes = photo_bytes(wsp_cam) or photo_bytes(wsp_file)
+                        if scale_photo_bytes:
+                            st.session_state[_pk(f"wsp_bytes_{idx}")] = scale_photo_bytes
+                            st.success("Weighment photo ready to save with this charge line.")
+                    else:
+                        scale_photo_bytes = st.session_state.get(_pk(f"wsp_bytes_{idx}"))
+                        if scale_photo_bytes:
+                            st.caption("Weighment photo attached.")
+
+                # Net charge = weighment scale − trolley tare (always recompute into widget state)
+                tare_w = float(st.session_state.get(tare_key, trolley_w) or 0.0)
+                scale_val = float(scale_w or 0)
+                net_w = max(scale_val - tare_w, 0.0) if trolley_name and scale_val > 0 else 0.0
+                net_key = _pk(f"wt_{idx}")
+                if st.session_state.get(net_key) != float(net_w):
+                    st.session_state[net_key] = float(net_w)
+                with r2c3:
+                    st.number_input(
+                        "Net weight (kg)",
+                        min_value=0.0,
+                        step=0.1,
+                        disabled=True,
+                        key=net_key,
+                        help="Auto: weighment scale weight − trolley weight.",
+                    )
+                with r2c4:
+                    n = st.text_input("Line notes", key=_pk(f"ln_{idx}"))
+                    inp_open_key = _pk(f"inp_open_{idx}")
+                    if st.button(
+                        "📷 Material Photo",
+                        key=_pk(f"inp_btn_{idx}"),
+                        help="Open camera or choose a photo from the phone gallery for Material Photo",
+                        use_container_width=True,
+                    ):
+                        st.session_state[inp_open_key] = not bool(
+                            st.session_state.get(inp_open_key)
+                        )
+                        st.rerun()
+
+                input_photo_bytes: bytes | None = None
+                if st.session_state.get(inp_open_key):
+                    st.caption(f"Charge line {idx + 1} — Material Photo (camera or gallery)")
+                    inp_cam = st.camera_input(
+                        "Input camera",
+                        key=_pk(f"inp_cam_{idx}"),
                         help="Uses the phone camera when available.",
                     )
-                    wsp_file = st.file_uploader(
-                        "Gallery / files",
+                    inp_file = st.file_uploader(
+                        "Input gallery / files",
                         type=["png", "jpg", "jpeg", "webp"],
-                        key=_pk(f"wsp_file_{idx}"),
+                        key=_pk(f"inp_file_{idx}"),
                         help="Choose an existing photo from the device gallery.",
                     )
-                    scale_photo_bytes = photo_bytes(wsp_cam) or photo_bytes(wsp_file)
-                    if scale_photo_bytes:
-                        st.session_state[_pk(f"wsp_bytes_{idx}")] = scale_photo_bytes
-                        st.success("Weighment photo ready to save with this charge line.")
+                    input_photo_bytes = photo_bytes(inp_cam) or photo_bytes(inp_file)
+                    if input_photo_bytes:
+                        st.session_state[_pk(f"inp_bytes_{idx}")] = input_photo_bytes
+                        st.success("Material Photo ready to save with this charge line.")
                 else:
-                    scale_photo_bytes = st.session_state.get(_pk(f"wsp_bytes_{idx}"))
-                    if scale_photo_bytes:
-                        st.caption("Weighment photo attached.")
+                    input_photo_bytes = st.session_state.get(_pk(f"inp_bytes_{idx}"))
+                    if input_photo_bytes:
+                        st.caption(f"Charge line {idx + 1}: Material Photo attached.")
 
-            # Net charge = weighment scale − trolley tare (always recompute into widget state)
-            tare_w = float(st.session_state.get(tare_key, trolley_w) or 0.0)
-            scale_val = float(scale_w or 0)
-            net_w = max(scale_val - tare_w, 0.0) if trolley_name and scale_val > 0 else 0.0
-            net_key = _pk(f"wt_{idx}")
-            if st.session_state.get(net_key) != float(net_w):
-                st.session_state[net_key] = float(net_w)
-            with r2c3:
-                st.number_input(
-                    "Net weight (kg)",
-                    min_value=0.0,
-                    step=0.1,
-                    disabled=True,
-                    key=net_key,
-                    help="Auto: weighment scale weight − trolley weight.",
-                )
-            with r2c4:
-                n = st.text_input("Line notes", key=_pk(f"ln_{idx}"))
-                inp_open_key = _pk(f"inp_open_{idx}")
-                if st.button(
-                    "📷 Material Photo",
-                    key=_pk(f"inp_btn_{idx}"),
-                    help="Open camera or choose a photo from the phone gallery for Material Photo",
-                    use_container_width=True,
-                ):
-                    st.session_state[inp_open_key] = not bool(
-                        st.session_state.get(inp_open_key)
+                if mat and lot_label and trolley_name and scale_val > 0 and net_w > 0:
+                    charge_inputs.append(
+                        {
+                            "Raw_Material_Name": mat,
+                            "Lot_id": lot_opts[lot_label],
+                            "Weight": net_w,
+                            "Weighment_scale_weight": scale_val,
+                            "Trolley_weight": tare_w,
+                            "Trolley_name": trolley_name,
+                            "Notes": n,
+                            "Weighment_scale_photo": scale_photo_bytes,
+                            "Input_photo": input_photo_bytes,
+                            "Charge_time": datetime.now().isoformat(timespec="seconds"),
+                        }
                     )
-                    st.rerun()
 
-            input_photo_bytes: bytes | None = None
-            if st.session_state.get(inp_open_key):
-                st.caption(f"Charge line {idx + 1} — Material Photo (camera or gallery)")
-                inp_cam = st.camera_input(
-                    "Input camera",
-                    key=_pk(f"inp_cam_{idx}"),
-                    help="Uses the phone camera when available.",
+            pending_charges_key = _pk("pending_charges")
+            if charge_inputs:
+                st.session_state[pending_charges_key] = charge_inputs
+            saved_pending_charges = st.session_state.get(pending_charges_key) or []
+
+            add_col, rem_col, _ = st.columns([1, 1, 4])
+            if _button_clicked(
+                add_col.button(
+                    "Add charge line", key=_pk("add_charge"), disabled=locked
+                ),
+                _pk("add_charge"),
+            ):
+                drafts[furnace].append(
+                    {"material": "", "lot_id": None, "weight": 0.0, "notes": ""}
                 )
-                inp_file = st.file_uploader(
-                    "Input gallery / files",
-                    type=["png", "jpg", "jpeg", "webp"],
-                    key=_pk(f"inp_file_{idx}"),
-                    help="Choose an existing photo from the device gallery.",
+                st.rerun()
+            if _button_clicked(
+                rem_col.button(
+                    "Remove last line", key=_pk("rem_charge"), disabled=locked
+                ),
+                _pk("rem_charge"),
+            ) and len(drafts[furnace]) > 1:
+                drafts[furnace].pop()
+                st.rerun()
+
+            display_charges = charge_inputs or saved_pending_charges
+            saved_in = sum(float(c.get("Weight") or 0) for c in saved_charges)
+            extra_in = sum(float(c.get("Weight") or 0) for c in display_charges)
+            total_in = saved_in + extra_in
+            total_lines = len(saved_charges) + len(display_charges)
+            if total_in > 0:
+                st.session_state.pop(_pk("create_error"), None)
+            st.info(
+                f"Total net input weight: **{total_in:,.2f} kg** across {total_lines} charge line(s)."
+            )
+
+            estimate_lines = list(saved_charges) + list(display_charges)
+            estimate = (
+                db.estimate_batch_input_cost(
+                    estimate_lines,
+                    batch_id=preview_id if existing_batch else None,
                 )
-                input_photo_bytes = photo_bytes(inp_cam) or photo_bytes(inp_file)
-                if input_photo_bytes:
-                    st.session_state[_pk(f"inp_bytes_{idx}")] = input_photo_bytes
-                    st.success("Material Photo ready to save with this charge line.")
-            else:
-                input_photo_bytes = st.session_state.get(_pk(f"inp_bytes_{idx}"))
-                if input_photo_bytes:
-                    st.caption(f"Charge line {idx + 1}: Material Photo attached.")
-
-            if mat and lot_label and trolley_name and scale_val > 0 and net_w > 0:
-                charge_inputs.append(
-                    {
-                        "Raw_Material_Name": mat,
-                        "Lot_id": lot_opts[lot_label],
-                        "Weight": net_w,
-                        "Weighment_scale_weight": scale_val,
-                        "Trolley_weight": tare_w,
-                        "Trolley_name": trolley_name,
-                        "Notes": n,
-                        "Weighment_scale_photo": scale_photo_bytes,
-                        "Input_photo": input_photo_bytes,
-                        "Charge_time": datetime.now().isoformat(timespec="seconds"),
-                    }
-                )
-
-        pending_charges_key = _pk("pending_charges")
-        if charge_inputs:
-            st.session_state[pending_charges_key] = charge_inputs
-        saved_pending_charges = st.session_state.get(pending_charges_key) or []
-
-        add_col, rem_col, _ = st.columns([1, 1, 4])
-        if _button_clicked(
-            add_col.button(
-                "Add charge line", key=_pk("add_charge"), disabled=locked
-            ),
-            _pk("add_charge"),
-        ):
-            drafts[furnace].append(
-                {"material": "", "lot_id": None, "weight": 0.0, "notes": ""}
-            )
-            st.rerun()
-        if _button_clicked(
-            rem_col.button(
-                "Remove last line", key=_pk("rem_charge"), disabled=locked
-            ),
-            _pk("rem_charge"),
-        ) and len(drafts[furnace]) > 1:
-            drafts[furnace].pop()
-            st.rerun()
-
-        display_charges = charge_inputs or saved_pending_charges
-        saved_in = sum(float(c.get("Weight") or 0) for c in saved_charges)
-        extra_in = sum(float(c.get("Weight") or 0) for c in display_charges)
-        total_in = saved_in + extra_in
-        total_lines = len(saved_charges) + len(display_charges)
-        if total_in > 0:
-            st.session_state.pop(_pk("create_error"), None)
-        st.info(
-            f"Total net input weight: **{total_in:,.2f} kg** across {total_lines} charge line(s)."
-        )
-
-        estimate_lines = list(saved_charges) + list(display_charges)
-        estimate = (
-            db.estimate_batch_input_cost(
-                estimate_lines,
-                batch_id=preview_id if existing_batch else None,
-            )
-            if estimate_lines
-            else None
-        )
-        if estimate and estimate["lines"]:
-            st.markdown("##### Estimated cost")
-            est_per_kg = estimate["estimated_cost_per_kg"]
-            material_per_kg = estimate["estimated_material_per_kg"]
-            e1, e2, e3, e4 = st.columns(4)
-            e1.metric("Charge cost", f"{estimate['input_cost_total']:,.2f}")
-            e2.metric(
-                "Estimated output (kg)", f"{estimate['estimated_output_kg']:,.2f}"
-            )
-            e3.metric(
-                "Material ₹/kg",
-                f"{material_per_kg:,.2f}" if material_per_kg is not None else "—",
-            )
-            e4.metric(
-                "Estimated ₹/kg",
-                f"{est_per_kg:,.2f}" if est_per_kg is not None else "—",
-            )
-
-            open_po = db.latest_open_po_rate(alloy_id) if alloy_id else None
-            po_rate = (
-                float(open_po["Rate"])
-                if open_po and open_po.get("Rate") is not None
+                if estimate_lines
                 else None
             )
-            if po_rate is not None:
-                cost_target = po_rate / (1 + db.MIN_PROFIT_MARGIN_PCT / 100.0)
-                st.markdown(
-                    '<p style="font-size:0.8rem;color:rgba(49,51,63,0.6);'
-                    'margin-bottom:0.2rem">Cost Target (₹/kg)</p>',
-                    unsafe_allow_html=True,
+            if estimate and estimate["lines"]:
+                st.markdown("##### Estimated cost")
+                est_per_kg = estimate["estimated_cost_per_kg"]
+                material_per_kg = estimate["estimated_material_per_kg"]
+                e1, e2, e3, e4 = st.columns(4)
+                e1.metric("Charge cost", f"{estimate['input_cost_total']:,.2f}")
+                e2.metric(
+                    "Estimated output (kg)", f"{estimate['estimated_output_kg']:,.2f}"
                 )
-                color = (
-                    "inherit"
-                    if est_per_kg is None
-                    else ("#2e7d32" if est_per_kg <= cost_target else "#c62828")
+                e3.metric(
+                    "Material ₹/kg",
+                    f"{material_per_kg:,.2f}" if material_per_kg is not None else "—",
                 )
-                st.markdown(
-                    f'<p style="font-size:1.5rem;font-weight:600;'
-                    f'color:{color};margin:0">{cost_target:,.2f}</p>',
-                    unsafe_allow_html=True,
-                )
-                st.caption(
-                    f"Cost Target = Open PO rate ÷ (1 + {db.MIN_PROFIT_MARGIN_PCT:.0f}%) "
-                    f"— the ₹/kg needed to hit a minimum "
-                    f"{db.MIN_PROFIT_MARGIN_PCT:.0f}% profit margin on cost, based "
-                    f"on the latest Open PO for this alloy "
-                    f"({open_po.get('Customer_PO_No') or '—'}, "
-                    f"{format_ui_date(open_po.get('Order_Date')) or '—'}). Green "
-                    "when Estimated ₹/kg is at or under target, red when over."
-                )
-            elif alloy_id:
-                st.caption(
-                    "No Open purchase order for this alloy — no cost target to "
-                    "compare the estimated cost against."
+                e4.metric(
+                    "Estimated ₹/kg",
+                    f"{est_per_kg:,.2f}" if est_per_kg is not None else "—",
                 )
 
-            conv_month = estimate["conversion_expense_month"]
-            st.caption(
-                "Charge cost ÷ estimated output, plus conversion "
-                f"**{estimate['conversion_rate_applied']:,.2f} ₹/kg**"
-                + (f" ({format_ui_date(conv_month)})" if conv_month else "")
-                + ". Estimated output is each line's weight × the recovery on the "
-                "newest **Raw Material Master** row for that material, less the "
-                "expected output of any material returned as **Scrap**."
-            )
-            if estimate["scrap_returned_kg"] > 0:
+                open_po = db.latest_open_po_rate(alloy_id) if alloy_id else None
+                po_rate = (
+                    float(open_po["Rate"])
+                    if open_po and open_po.get("Rate") is not None
+                    else None
+                )
+                if po_rate is not None:
+                    cost_target = po_rate / (1 + db.MIN_PROFIT_MARGIN_PCT / 100.0)
+                    st.markdown(
+                        '<p style="font-size:0.8rem;color:rgba(49,51,63,0.6);'
+                        'margin-bottom:0.2rem">Cost Target (₹/kg)</p>',
+                        unsafe_allow_html=True,
+                    )
+                    color = (
+                        "inherit"
+                        if est_per_kg is None
+                        else ("#2e7d32" if est_per_kg <= cost_target else "#c62828")
+                    )
+                    st.markdown(
+                        f'<p style="font-size:1.5rem;font-weight:600;'
+                        f'color:{color};margin:0">{cost_target:,.2f}</p>',
+                        unsafe_allow_html=True,
+                    )
+                    st.caption(
+                        f"Cost Target = Open PO rate ÷ (1 + {db.MIN_PROFIT_MARGIN_PCT:.0f}%) "
+                        f"— the ₹/kg needed to hit a minimum "
+                        f"{db.MIN_PROFIT_MARGIN_PCT:.0f}% profit margin on cost, based "
+                        f"on the latest Open PO for this alloy "
+                        f"({open_po.get('Customer_PO_No') or '—'}, "
+                        f"{format_ui_date(open_po.get('Order_Date')) or '—'}). Green "
+                        "when Estimated ₹/kg is at or under target, red when over."
+                    )
+                elif alloy_id:
+                    st.caption(
+                        "No Open purchase order for this alloy — no cost target to "
+                        "compare the estimated cost against."
+                    )
+
+                conv_month = estimate["conversion_expense_month"]
                 st.caption(
-                    f"Scrap returns on this heat: **{estimate['scrap_returned_kg']:,.2f} kg** "
-                    f"charged, cutting estimated output by "
-                    f"**{estimate['scrap_output_reduction_kg']:,.2f} kg**. Charge cost is "
-                    "unaffected — the heat still carries that cost."
+                    "Charge cost ÷ estimated output, plus conversion "
+                    f"**{estimate['conversion_rate_applied']:,.2f} ₹/kg**"
+                    + (f" ({format_ui_date(conv_month)})" if conv_month else "")
+                    + ". Estimated output is each line's weight × the recovery on the "
+                    "newest **Raw Material Master** row for that material, less the "
+                    "expected output of any material returned as **Scrap**."
                 )
-            if estimate["missing_recovery"]:
-                st.warning(
-                    "No recovery on Raw Material Master for: "
-                    + ", ".join(estimate["missing_recovery"])
-                    + " — these contribute no estimated output."
-                )
-            if estimate["missing_cost"]:
-                st.warning(
-                    "No cost per kg on the lot for: "
-                    + ", ".join(estimate["missing_cost"])
-                    + " — these contribute no cost."
-                )
-            with st.expander("Estimate breakdown by charge line"):
-                show_dataframe(
-                    df_from_rows(
-                        [
-                            {
-                                "Raw material": d["Raw_Material_Name"],
-                                "Lot": d["Lot_id"],
-                                "Weight (kg)": d["Weight"],
-                                "Cost/kg": d["Cost_per_kg"],
-                                "Cost from": d["Cost_source"],
-                                "Line cost": d["Line_cost"],
-                                "Recovery %": d["Recovery_pct"],
-                                "Master effective": d["Effective_date"],
-                                "Est. output (kg)": d["Estimated_output_kg"],
-                            }
-                            for d in estimate["lines"]
-                        ]
-                    )
-                )
-                cost_caption = "Cost/kg is the charged lot's cost."
                 if estimate["scrap_returned_kg"] > 0:
-                    cost_caption += (
-                        " Est. output (kg) per line does **not** reflect Scrap "
-                        "returns — the "
-                        f"**{estimate['scrap_output_reduction_kg']:,.2f} kg** "
-                        "scrap deduction is only applied to the total above."
+                    st.caption(
+                        f"Scrap returns on this heat: **{estimate['scrap_returned_kg']:,.2f} kg** "
+                        f"charged, cutting estimated output by "
+                        f"**{estimate['scrap_output_reduction_kg']:,.2f} kg**. Charge cost is "
+                        "unaffected — the heat still carries that cost."
                     )
-                st.caption(cost_caption)
+                if estimate["missing_recovery"]:
+                    st.warning(
+                        "No recovery on Raw Material Master for: "
+                        + ", ".join(estimate["missing_recovery"])
+                        + " — these contribute no estimated output."
+                    )
+                if estimate["missing_cost"]:
+                    st.warning(
+                        "No cost per kg on the lot for: "
+                        + ", ".join(estimate["missing_cost"])
+                        + " — these contribute no cost."
+                    )
+                with st.expander("Estimate breakdown by charge line"):
+                    show_dataframe(
+                        df_from_rows(
+                            [
+                                {
+                                    "Raw material": d["Raw_Material_Name"],
+                                    "Lot": d["Lot_id"],
+                                    "Weight (kg)": d["Weight"],
+                                    "Cost/kg": d["Cost_per_kg"],
+                                    "Cost from": d["Cost_source"],
+                                    "Line cost": d["Line_cost"],
+                                    "Recovery %": d["Recovery_pct"],
+                                    "Master effective": d["Effective_date"],
+                                    "Est. output (kg)": d["Estimated_output_kg"],
+                                }
+                                for d in estimate["lines"]
+                            ]
+                        )
+                    )
+                    cost_caption = "Cost/kg is the charged lot's cost."
+                    if estimate["scrap_returned_kg"] > 0:
+                        cost_caption += (
+                            " Est. output (kg) per line does **not** reflect Scrap "
+                            "returns — the "
+                            f"**{estimate['scrap_output_reduction_kg']:,.2f} kg** "
+                            "scrap deduction is only applied to the total above."
+                        )
+                    st.caption(cost_caption)
+
+        _render_charge_and_estimate()
 
         if existing_batch:
             try:
@@ -4816,7 +4888,7 @@ elif PAGE == "Production Batch & Chemistry":
         if not alloy_id:
             st.info("Select an alloy above to display spec ranges and validate ladle chemistry.")
         alloy_specs = db.get_alloy_specs(alloy_id) if alloy_id else {}
-        entry_elements = db.list_batch_chem_elements()
+        entry_elements = _pb_ref["chem_elements"]
         full_chem_key = _pk("full_chem")
         sync_batch_keys = {
             el["Element_Symbol"]: _pk(f"bchem_{el['Element_Symbol']}")

@@ -4384,8 +4384,16 @@ def get_alloy_specs(alloy_id: int) -> dict[str, dict[str, Any]]:
 
 
 def list_inventory_lots(
-    material: Optional[str] = None, ready_only: bool = False
+    material: Optional[str] = None,
+    materials: Optional[list[str]] = None,
+    ready_only: bool = False,
 ) -> list[dict[str, Any]]:
+    """Open inventory lots, optionally for one `material` or a batch of `materials`.
+
+    `materials` lets a caller that needs lots for several raw materials at
+    once (e.g. one row per charge line) fetch them in a single query instead
+    of one call per material.
+    """
     sql = """
         SELECT i.Lot_id AS "Lot_id", i.Raw_Material_Name AS "Raw_Material_Name",
                i.Purchase_id AS "Purchase_id",
@@ -4410,6 +4418,13 @@ def list_inventory_lots(
     if material:
         sql += " AND i.Raw_Material_Name = ?"
         params.append(material)
+    elif materials is not None:
+        names = [m for m in dict.fromkeys(materials) if m]
+        if not names:
+            return []
+        placeholders = ", ".join("?" for _ in names)
+        sql += f" AND i.Raw_Material_Name IN ({placeholders})"
+        params.extend(names)
     if ready_only:
         sql += " AND i.Raw_Material_Status = 'Ready For Melt'"
     sql += " ORDER BY i.Lot_id DESC"
@@ -6700,36 +6715,26 @@ def _sql_literal(value: str) -> str:
 
 
 def _apply_rls_session(conn: Connection) -> None:
-    """Stamp the acting user's role onto this transaction for RLS policies."""
+    """Stamp the acting user's role onto this transaction for RLS policies.
+
+    role_name/employee_id are already resolved once at login (see
+    set_session_actor, called from app.py's _apply_logged_in_actor on every
+    rerun from the session-cached auth_employee — no DB round trip there)
+    and cached in the module-level _ACTING_* globals read via
+    get_acting_role_name()/get_acting_employee_id(). This function used to
+    re-derive the same values from `employees`/`roles` on every single
+    connection regardless, which meant every db.*() call anywhere in the
+    app paid for an extra query it didn't need. Trust the cached values for
+    the normal (employee_id known) case and only hit the DB for the legacy
+    name-only fallback below, which the current login flow never exercises.
+    """
     if not IS_POSTGRES:
         return
     role_name = get_acting_role_name() or "system"
     employee_id = get_acting_employee_id()
     user = (get_acting_user() or "").strip()
     try:
-        _exec(conn, "SELECT set_config('nualco.role_name', 'system', true)")
-        _exec(conn, "SELECT set_config('nualco.employee_id', '', true)")
-        if employee_id:
-            row = (
-                _exec(
-                    conn,
-                    """
-                    SELECT e.employee_id AS "employee_id",
-                           r.role_name AS "role_name"
-                    FROM employees e
-                    LEFT JOIN roles r ON r.role_id = e.role_id
-                    WHERE lower(e.employee_id) = lower(?)
-                    LIMIT 1
-                    """,
-                    (employee_id,),
-                )
-                .mappings()
-                .first()
-            )
-            if row:
-                employee_id = str(row.get("employee_id") or employee_id)
-                role_name = str(row.get("role_name") or role_name or "system")
-        elif user and user.lower() != "system":
+        if not employee_id and user and user.lower() != "system":
             row = (
                 _exec(
                     conn,
