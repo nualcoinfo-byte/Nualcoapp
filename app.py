@@ -551,10 +551,6 @@ def _allocate_po_to_produce(rows: list[dict], alloy_plan: dict[int, dict]) -> No
         row["To_Produce_Qty"] = max(0.0, uncovered - take)
 
 
-
-
-
-
 @st.cache_data(ttl=60, show_spinner=False)
 def _dashboard_overview_data(year: int, month: int) -> dict:
     """Dashboard-only cache for the small summary-row lookups.
