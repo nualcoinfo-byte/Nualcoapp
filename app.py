@@ -2097,6 +2097,46 @@ def _production_batch_reference_data() -> dict:
     }
 
 
+# ── Phase 1 multipage dispatch ────────────────────────────────────────────────
+# st.navigation/st.Page run only the 7 pages already migrated to app_pages/;
+# everything else still runs via the legacy `elif PAGE ==` chain below,
+# unchanged. position="hidden" keeps Streamlit's own nav widget invisible so
+# the existing NAV_SECTIONS sidebar (unchanged, above) is still what the user
+# sees and clicks -- st.navigation here is pure internal plumbing to legally
+# execute the migrated files, not a second navigation UI.
+def _legacy_stub() -> None:
+    """No-op placeholder Page. The un-migrated pages still run via the
+    `elif PAGE ==` chain below; later phases move more of them into
+    MIGRATED_PAGES/app_pages/ one at a time."""
+    return None
+
+
+MIGRATED_PAGES: dict[str, st.Page] = {
+    "Company": st.Page("app_pages/company.py", title="Company", url_path="company"),
+    "Customers": st.Page(
+        "app_pages/customers.py", title="Customers", url_path="customers"
+    ),
+    "Vendors": st.Page("app_pages/vendors.py", title="Vendors", url_path="vendors"),
+    "Furnaces": st.Page(
+        "app_pages/furnaces.py", title="Furnaces", url_path="furnaces"
+    ),
+    "Crucibles": st.Page(
+        "app_pages/crucibles.py", title="Crucibles", url_path="crucibles"
+    ),
+    "Melters": st.Page("app_pages/melters.py", title="Melters", url_path="melters"),
+    "Trolleys": st.Page(
+        "app_pages/trolleys.py", title="Trolleys", url_path="trolleys"
+    ),
+}
+_LEGACY_PAGE = st.Page(_legacy_stub, title="Legacy", url_path="legacy", default=True)
+
+_pg = st.navigation(list(MIGRATED_PAGES.values()) + [_LEGACY_PAGE], position="hidden")
+_target = MIGRATED_PAGES.get(PAGE, _LEGACY_PAGE)
+if _pg.url_path != _target.url_path:
+    st.switch_page(_target)  # NoReturn -- stops execution here, triggers a rerun
+_pg.run()  # runs the matched migrated file, or no-ops for the legacy stub
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # Dashboard
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -6524,354 +6564,6 @@ elif PAGE == "Test Certificate":
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# Company (issuer — not a customer)
-# ═══════════════════════════════════════════════════════════════════════════════
-elif PAGE == "Company":
-    st.title("Company")
-    st.caption(
-        "Nualco is the **issuer** on packing lists, invoices, and test certificates. "
-        "These details stay in **Company_profile**, not Customer Master."
-    )
-    try:
-        profile = db.get_company_profile()
-    except Exception as exc:
-        st.error(str(exc))
-        profile = dict(db.DEFAULT_COMPANY_PROFILE)
-
-    def _co_date(value: object) -> date:
-        try:
-            return date.fromisoformat(str(value or "")[:10])
-        except ValueError:
-            return date(2017, 11, 8)
-
-    states = db.list_states()
-    saved_state = str(profile.get("State") or "")
-    state_options = [""] + states
-    if saved_state and saved_state not in state_options:
-        state_options.append(saved_state)
-
-    c1, c2 = st.columns(2)
-    with c1:
-        company_name = st.text_input(
-            "Company name *",
-            value=str(profile.get("Company_name") or ""),
-            key="co_name",
-        )
-        contact_person = st.text_input(
-            "Contact person",
-            value=str(profile.get("Contact_person") or ""),
-            key="co_contact",
-        )
-        phone1 = st.text_input(
-            "Contact no 1",
-            value=str(profile.get("Phone1") or ""),
-            key="co_phone1",
-        )
-        phone2 = st.text_input(
-            "Contact no 2",
-            value=str(profile.get("Phone2") or ""),
-            key="co_phone2",
-        )
-        email1 = st.text_input(
-            "E-mail 1",
-            value=str(profile.get("Email1") or ""),
-            key="co_email1",
-        )
-        email2 = st.text_input(
-            "E-mail 2",
-            value=str(profile.get("Email2") or ""),
-            key="co_email2",
-        )
-        pan = st.text_input("PAN", value=str(profile.get("PAN") or ""), key="co_pan")
-        gst = st.text_input("GST", value=str(profile.get("GST") or ""), key="co_gst")
-        cin = st.text_input(
-            "CIN (Corporate Identity Number)",
-            value=str(profile.get("CIN") or ""),
-            key="co_cin",
-        )
-        msme = st.text_input(
-            "MSME UAM",
-            value=str(profile.get("MSME_UAM") or ""),
-            key="co_msme",
-        )
-        hsn = st.text_input(
-            "HSN code",
-            value=str(profile.get("HSN_code") or ""),
-            key="co_hsn",
-        )
-    with c2:
-        address = st.text_input(
-            "Address",
-            value=str(profile.get("Address") or ""),
-            key="co_address",
-        )
-        state = st.selectbox(
-            "State",
-            options=state_options,
-            index=state_options.index(saved_state) if saved_state in state_options else 0,
-            key="co_state",
-        )
-        cities = db.list_cities(state) if state else []
-        saved_city = str(profile.get("City") or "")
-        city_options = [""] + cities
-        if saved_city and saved_city not in city_options:
-            city_options.append(saved_city)
-        city = st.selectbox(
-            "City",
-            options=city_options,
-            index=city_options.index(saved_city) if saved_city in city_options else 0,
-            key="co_city",
-            disabled=not bool(state),
-        )
-        pincode = st.text_input(
-            "Pincode",
-            value=str(profile.get("Pincode") or ""),
-            key="co_pincode",
-        )
-        country = st.text_input(
-            "Country",
-            value=str(profile.get("Country") or "India"),
-            key="co_country",
-        )
-        incorporation = st.date_input(
-            "Date of incorporation",
-            value=_co_date(profile.get("Incorporation_date")),
-            key="co_inc",
-        )
-        iec = st.text_input(
-            "IEC code",
-            value=str(profile.get("IEC_code") or ""),
-            key="co_iec",
-        )
-        bank_name = st.text_input(
-            "Bank",
-            value=str(profile.get("Bank_name") or ""),
-            key="co_bank",
-        )
-        branch = st.text_input(
-            "Branch",
-            value=str(profile.get("Branch") or ""),
-            key="co_branch",
-        )
-        bank_account = st.text_input(
-            "Account number",
-            value=str(profile.get("Bank_account") or ""),
-            key="co_account",
-        )
-        ifsc = st.text_input(
-            "IFSC",
-            value=str(profile.get("IFSC_code") or ""),
-            key="co_ifsc",
-        )
-
-    if st.button("Save company details", type="primary", key="co_save"):
-        try:
-            saved = db.save_company_profile(
-                {
-                    "Company_name": company_name,
-                    "Address": address,
-                    "City": city,
-                    "State": state,
-                    "Pincode": pincode,
-                    "Country": country,
-                    "Contact_person": contact_person,
-                    "Phone1": phone1,
-                    "Phone2": phone2,
-                    "Email1": email1,
-                    "Email2": email2,
-                    "PAN": pan,
-                    "GST": gst,
-                    "CIN": cin,
-                    "MSME_UAM": msme,
-                    "HSN_code": hsn,
-                    "Incorporation_date": incorporation.isoformat()
-                    if incorporation
-                    else None,
-                    "IEC_code": iec,
-                    "Bank_name": bank_name,
-                    "Branch": branch,
-                    "Bank_account": bank_account,
-                    "IFSC_code": ifsc,
-                }
-            )
-            st.success(f"Saved **{saved.get('Company_name')}**.")
-            st.rerun()
-        except Exception as exc:
-            st.error(str(exc))
-
-    show_dataframe(df_from_rows([db.get_company_profile()]))
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# Customers
-# ═══════════════════════════════════════════════════════════════════════════════
-elif PAGE == "Customers":
-    st.title("Customer Master")
-    states = db.list_states()
-    if not states:
-        st.warning("No states found. Load **State_City_Master** before saving customers.")
-
-    c1, c2 = st.columns(2)
-    with c1:
-        code = st.text_input("Customer code (PK) *", placeholder="e.g. CUST_0026", key="cust_code")
-        name = st.text_input("Customer name *", key="cust_name")
-        gst = st.text_input("GST", key="cust_gst")
-        pan = st.text_input("PAN", key="cust_pan")
-        contact1 = st.text_input("Contact 1 name", key="cust_contact1")
-        phone1 = st.text_input("Phone 1", key="cust_phone1")
-        contact2 = st.text_input("Contact 2 name", key="cust_contact2")
-        phone2 = st.text_input("Phone 2", key="cust_phone2")
-        email = st.text_input("Email", key="cust_email")
-        website = st.text_input("Website", key="cust_website")
-        status = st.selectbox("Status", db.ACTIVE_STATUS, key="cust_status")
-    with c2:
-        address = st.text_input("Address", key="cust_address")
-        state = st.selectbox(
-            "State *",
-            options=[""] + states,
-            key="cust_state_sel",
-        )
-        cities = db.list_cities(state) if state else []
-        city = st.selectbox(
-            "City *",
-            options=[""] + cities,
-            key="cust_city_sel",
-            disabled=not bool(state),
-        )
-        pincode = st.text_input("Pincode", key="cust_pincode")
-        country = st.text_input("Country", value="India", key="cust_country")
-        bank_account = st.text_input("Bank account", key="cust_bank_account")
-        ifsc_code = st.text_input("IFSC code", key="cust_ifsc")
-        bank_name = st.text_input("Bank name", key="cust_bank_name")
-        branch_category = st.text_input("Branch", key="cust_branch")
-
-    if st.button("Save customer", type="primary", key="cust_save"):
-        if not code.strip() or not name.strip():
-            st.error("Customer code and name are required.")
-        elif not state or not city:
-            st.error("State and City must be selected from the master list.")
-        else:
-            db.upsert_customer(
-                {
-                    "Cust_code": code.strip(),
-                    "Customer_name": name.strip(),
-                    "GST": gst,
-                    "PAN": pan,
-                    "Address": address,
-                    "City": city,
-                    "State": state,
-                    "Pincode": pincode,
-                    "Country": country,
-                    "Contact1_name": contact1,
-                    "Phone1": phone1,
-                    "Contact_name2": contact2,
-                    "Phone2": phone2,
-                    "Email": email,
-                    "Website": website,
-                    "Bank_account": bank_account,
-                    "IFSC_code": ifsc_code,
-                    "Bank_name": bank_name,
-                    "Branch_category": branch_category,
-                    "Status": status,
-                }
-            )
-            st.success(f"Saved customer **{name.strip()}**.")
-
-    show_dataframe(df_from_rows(db.get_all_records("Customer_Master", order_by="Cust_code")))
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# Vendors
-# ═══════════════════════════════════════════════════════════════════════════════
-elif PAGE == "Vendors":
-    st.title("Vendor Master")
-    st.caption("Vendor code is auto-generated serially when a new vendor is created.")
-    states = db.list_states()
-    if not states:
-        st.warning("No states found. Load **State_City_Master** before saving vendors.")
-
-    c1, c2 = st.columns(2)
-    with c1:
-        name = st.text_input("Vendor name *", key="vend_name")
-        gst = st.text_input("GST", key="vend_gst")
-        pan = st.text_input("PAN", key="vend_pan")
-        status = st.selectbox("Status", db.ACTIVE_STATUS, key="vend_status")
-    with c2:
-        address = st.text_input("Address", key="vend_address")
-        state = st.selectbox(
-            "State *",
-            options=[""] + states,
-            key="vend_state_sel",
-        )
-        cities = db.list_cities(state) if state else []
-        city = st.selectbox(
-            "City *",
-            options=[""] + cities,
-            key="vend_city_sel",
-            disabled=not bool(state),
-        )
-        pincode = st.text_input("Pincode", key="vend_pincode")
-        country = st.text_input("Country", value="India", key="vend_country")
-
-    st.markdown("#### Contacts")
-    k1, k2 = st.columns(2)
-    with k1:
-        contact1 = st.text_input("Contact person 1", key="vend_contact1")
-        phone1 = st.text_input("Phone 1", key="vend_phone1")
-        email = st.text_input("Email", key="vend_email")
-    with k2:
-        contact2 = st.text_input("Contact person 2", key="vend_contact2")
-        phone2 = st.text_input("Phone 2", key="vend_phone2")
-        website = st.text_input("Website", key="vend_website")
-
-    st.markdown("#### Commercial & bank details")
-    b1, b2 = st.columns(2)
-    with b1:
-        credit_period = st.number_input(
-            "Credit period (days)", min_value=0, value=0, step=1, key="vend_credit"
-        )
-        bank_account = st.text_input("Bank account no.", key="vend_bank_account")
-        bank_name = st.text_input("Bank name", key="vend_bank_name")
-    with b2:
-        branch = st.text_input("Branch", key="vend_branch")
-        ifsc = st.text_input("IFSC code", key="vend_ifsc")
-
-    if st.button("Save vendor", type="primary", key="vend_save"):
-        if not name.strip():
-            st.error("Vendor name is required.")
-        elif not state or not city:
-            st.error("State and City must be selected from the master list.")
-        else:
-            db.upsert_supplier(
-                {
-                    "Vendor_name": name.strip(),
-                    "GST": gst,
-                    "PAN": pan,
-                    "Address": address,
-                    "City": city,
-                    "State": state,
-                    "Pincode": pincode,
-                    "Country": country,
-                    "Contact1": contact1.strip(),
-                    "Phone1": phone1.strip(),
-                    "Contact2": contact2.strip(),
-                    "Phone2": phone2.strip(),
-                    "Email": email.strip(),
-                    "Website": website.strip(),
-                    "Credit_period": int(credit_period),
-                    "Bank_account": bank_account.strip(),
-                    "Branch": branch.strip(),
-                    "IFSC_code": ifsc.strip().upper(),
-                    "Bank_name": bank_name.strip(),
-                    "Status": status,
-                }
-            )
-            st.success(f"Saved vendor **{name.strip()}**.")
-
-    show_dataframe(df_from_rows(db.get_all_records("Vendor_Master", order_by="Vendor_code")))
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
 # Raw Material Master
 # ═══════════════════════════════════════════════════════════════════════════════
 elif PAGE == "Raw Material Master":
@@ -7270,178 +6962,6 @@ elif PAGE == "Alloys":
             )
         )
         show_dataframe(specs_df)
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# Furnaces
-# ═══════════════════════════════════════════════════════════════════════════════
-elif PAGE == "Furnaces":
-    st.title("Furnace Master")
-    with st.form("furn_form", clear_on_submit=True):
-        fname = st.text_input("Furnace ID *", placeholder="e.g. 1, 2, 3, 4")
-        fstatus = st.selectbox("Status", db.ACTIVE_STATUS)
-        if st.form_submit_button("Save furnace", type="primary"):
-            if not fname.strip():
-                st.error("Furnace ID is required.")
-            else:
-                db.upsert_furnace(fname.strip(), fstatus)
-                st.success(f"Saved furnace **{fname.strip()}**.")
-
-    show_dataframe(df_from_rows(db.get_all_records("Furnace_Master", order_by="Furnace")))
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# Crucibles
-# ═══════════════════════════════════════════════════════════════════════════════
-elif PAGE == "Crucibles":
-    st.title("Crucible Master")
-    st.caption(
-        "Add or delete crucibles for a furnace, and set each crucible to "
-        "**Available** or **Damaged**. A furnace can have only one "
-        "**Available** crucible at a time."
-    )
-    furnaces = db.list_furnaces()
-    vendors = db.list_suppliers()
-    if not furnaces:
-        st.warning("Add at least one furnace under **Furnaces** before managing crucibles.")
-    if not vendors:
-        st.warning("Add at least one vendor under **Vendors** if you want to record the supplier.")
-
-    furnace = st.selectbox(
-        "Furnace *",
-        furnaces,
-        key="crucible_furnace",
-        disabled=not furnaces,
-        help="All add, status, and delete actions apply to this furnace.",
-    )
-
-    available = db.get_available_crucible(furnace) if furnace else None
-    if available:
-        st.info(
-            f"Available on furnace **{furnace}**: **{available['Crucible_no']}**. "
-            "Mark it Damaged before another crucible can be Available."
-        )
-    elif furnace:
-        st.info(f"No Available crucible on furnace **{furnace}** yet.")
-
-    st.markdown("#### Add crucible")
-    add_default = "Damaged" if available else "Available"
-    with st.form("crucible_add_form", clear_on_submit=True):
-        a1, a2, a3 = st.columns(3)
-        with a1:
-            cno = st.text_input("Crucible no *", placeholder="e.g. C-01")
-        with a2:
-            vendor_name = st.selectbox("Vendor name", [""] + vendors)
-        with a3:
-            cstatus = st.selectbox(
-                "Crucible status",
-                db.CRUCIBLE_STATUS,
-                index=db.CRUCIBLE_STATUS.index(add_default),
-            )
-        if st.form_submit_button("Add crucible", type="primary"):
-            if not furnace:
-                st.error("Select a furnace first.")
-            elif not cno.strip():
-                st.error("Crucible no is required.")
-            else:
-                try:
-                    db.upsert_crucible(
-                        cno.strip(),
-                        furnace,
-                        cstatus,
-                        vendor_name or None,
-                    )
-                    st.success(f"Added crucible **{cno.strip()}** to furnace **{furnace}**.")
-                    st.rerun()
-                except Exception as exc:
-                    st.error(f"Could not add crucible: {exc}")
-
-    st.markdown(f"#### Crucibles on furnace {furnace or '—'}")
-    rows = db.list_crucibles(furnace=furnace) if furnace else []
-    if not rows:
-        st.info("No crucibles for this furnace yet.")
-    else:
-        h1, h2, h3, h4, h5 = st.columns([2, 3, 2, 1.4, 1.2])
-        h1.caption("Crucible no")
-        h2.caption("Vendor")
-        h3.caption("Status")
-        h4.caption("Update")
-        h5.caption("Delete")
-        for row in rows:
-            cno_val = str(row["Crucible_no"])
-            current = str(row["Crucible_status"] or db.CRUCIBLE_STATUS[0])
-            if current not in db.CRUCIBLE_STATUS:
-                current = db.CRUCIBLE_STATUS[0]
-            r1, r2, r3, r4, r5 = st.columns([2, 3, 2, 1.4, 1.2])
-            r1.markdown(f"**{cno_val}**")
-            r2.markdown(row["Vendor_name"] or "—")
-            new_status = r3.selectbox(
-                "Status",
-                db.CRUCIBLE_STATUS,
-                index=db.CRUCIBLE_STATUS.index(current),
-                key=f"cstat_{furnace}_{cno_val}",
-                label_visibility="collapsed",
-            )
-            if r4.button("Update", key=f"cupd_{furnace}_{cno_val}", use_container_width=True):
-                try:
-                    db.update_crucible_status(cno_val, new_status)
-                    st.success(f"Updated **{cno_val}** to **{new_status}**.")
-                    st.rerun()
-                except Exception as exc:
-                    st.error(f"Could not update status: {exc}")
-            if r5.button("Delete", key=f"cdel_{furnace}_{cno_val}", use_container_width=True):
-                try:
-                    db.delete_crucible(cno_val)
-                    st.success(f"Deleted crucible **{cno_val}**.")
-                    st.rerun()
-                except Exception as exc:
-                    st.error(f"Could not delete crucible: {exc}")
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# Melters
-# ═══════════════════════════════════════════════════════════════════════════════
-elif PAGE == "Melters":
-    st.title("Melter Master")
-    with st.form("melter_form", clear_on_submit=True):
-        mname = st.text_input("Melter name *", placeholder="e.g. Sachin")
-        mstatus = st.selectbox("Status", db.ACTIVE_STATUS)
-        if st.form_submit_button("Save melter", type="primary"):
-            if not mname.strip():
-                st.error("Melter name is required.")
-            else:
-                db.upsert_melter(mname.strip(), mstatus)
-                st.success(f"Saved melter **{mname.strip()}**.")
-
-    show_dataframe(df_from_rows(db.get_all_records("Melter_Master", order_by="Melter_Name")))
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# Trolleys
-# ═══════════════════════════════════════════════════════════════════════════════
-elif PAGE == "Trolleys":
-    st.title("Trolley Master")
-    with st.form("trolley_form", clear_on_submit=True):
-        t1, t2 = st.columns(2)
-        with t1:
-            tname = st.text_input("Trolley name *", placeholder="e.g. Trolley-01")
-            colour = st.text_input("Colour", placeholder="e.g. Red")
-        with t2:
-            weight = st.number_input("Weight (kg)", min_value=0.0, value=0.0, step=0.1)
-            tstatus = st.selectbox("Status", db.ACTIVE_STATUS)
-        if st.form_submit_button("Save trolley", type="primary"):
-            if not tname.strip():
-                st.error("Trolley name is required.")
-            else:
-                db.upsert_trolley(
-                    tname.strip(),
-                    colour.strip() or None,
-                    weight if weight > 0 else None,
-                    tstatus,
-                )
-                st.success(f"Saved trolley **{tname.strip()}**.")
-
-    show_dataframe(df_from_rows(db.get_all_records("Trolley_Master", order_by="Trolley_name")))
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
