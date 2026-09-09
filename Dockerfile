@@ -5,7 +5,8 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY app.py database.py neon_http.py ./
+COPY app.py database.py neon_http.py pages_common.py ./
+COPY app_pages ./app_pages
 COPY assets ./assets
 COPY .streamlit ./.streamlit
 
