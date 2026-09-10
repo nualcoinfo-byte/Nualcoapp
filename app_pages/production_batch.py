@@ -1503,122 +1503,143 @@ else:
             "**Save and create production batch**."
         )
 
-    st.markdown("#### Degassing & piece counts")
-    d1, d2, d3, d4 = st.columns(4)
-    with d1:
-        degassing_time = st.text_input(
-            "Degassing time",
-            placeholder="e.g. 14:30 or 12 min",
-            key=_pk("degassing_time"),
-            disabled=later_locked,
-        )
-    with d2:
-        sampled_pcs = empty_percent_input(
-            "Sampled pcs",
-            key=_pk("sampled_pcs"),
-            max_value=None,
-            step=1.0,
-            disabled=later_locked,
-        )
-    with d3:
-        defect_pcs = empty_percent_input(
-            "Defect pcs",
-            key=_pk("defect_pcs"),
-            max_value=None,
-            step=1.0,
-            allow_zero=True,
-            disabled=later_locked,
-        )
-    with d4:
-        st.caption("K Mold Value = Defect pcs / Sampled pcs")
-        if sampled_pcs and sampled_pcs > 0 and defect_pcs is not None:
-            k_mold = float(defect_pcs) / float(sampled_pcs)
-            css = "yield-bad" if k_mold > db.K_MOLD_MAX else "yield-ok"
-            st.markdown(
-                f'<p class="{css}">K Mold Value<br>{k_mold:.3f}</p>',
-                unsafe_allow_html=True,
+    @st.fragment
+    def _render_degassing_and_pieces() -> None:
+        st.markdown("#### Degassing & piece counts")
+        d1, d2, d3, d4 = st.columns(4)
+        with d1:
+            st.text_input(
+                "Degassing time",
+                placeholder="e.g. 14:30 or 12 min",
+                key=_pk("degassing_time"),
+                disabled=later_locked,
             )
-        else:
-            st.markdown(
-                '<p class="yield-ok">K Mold Value<br>—</p>',
-                unsafe_allow_html=True,
+        with d2:
+            sampled_pcs = empty_percent_input(
+                "Sampled pcs",
+                key=_pk("sampled_pcs"),
+                max_value=None,
+                step=1.0,
+                disabled=later_locked,
+            )
+        with d3:
+            defect_pcs = empty_percent_input(
+                "Defect pcs",
+                key=_pk("defect_pcs"),
+                max_value=None,
+                step=1.0,
+                allow_zero=True,
+                disabled=later_locked,
+            )
+        with d4:
+            st.caption("K Mold Value = Defect pcs / Sampled pcs")
+            if sampled_pcs and sampled_pcs > 0 and defect_pcs is not None:
+                k_mold = float(defect_pcs) / float(sampled_pcs)
+                css = "yield-bad" if k_mold > db.K_MOLD_MAX else "yield-ok"
+                st.markdown(
+                    f'<p class="{css}">K Mold Value<br>{k_mold:.3f}</p>',
+                    unsafe_allow_html=True,
+                )
+            else:
+                st.markdown(
+                    '<p class="yield-ok">K Mold Value<br>—</p>',
+                    unsafe_allow_html=True,
+                )
+
+    _render_degassing_and_pieces()
+    degassing_time = st.session_state.get(_pk("degassing_time")) or ""
+    sampled_pcs = st.session_state.get(_pk("sampled_pcs"))
+    defect_pcs = st.session_state.get(_pk("defect_pcs"))
+
+    @st.fragment
+    def _render_sample_results() -> None:
+        st.markdown("#### Sample results")
+        sample_opts = [sample_blank] + db.SAMPLE_OK_STATUS
+        s1, s2, s3, s4 = st.columns(4)
+        with s1:
+            st.selectbox(
+                "Top sample", sample_opts, key=_pk("top_sample"), disabled=later_locked
+            )
+        with s2:
+            st.selectbox(
+                "Middle sample",
+                sample_opts,
+                key=_pk("middle_sample"),
+                disabled=later_locked,
+            )
+        with s3:
+            st.selectbox(
+                "Bottom sample",
+                sample_opts,
+                key=_pk("bottom_sample"),
+                disabled=later_locked,
+            )
+        with s4:
+            st.selectbox(
+                "Vacum sample",
+                sample_opts,
+                key=_pk("vacum_sample"),
+                disabled=later_locked,
             )
 
-    st.markdown("#### Sample results")
-    sample_opts = [sample_blank] + db.SAMPLE_OK_STATUS
-    s1, s2, s3, s4 = st.columns(4)
-    with s1:
-        top_sample = st.selectbox(
-            "Top sample", sample_opts, key=_pk("top_sample"), disabled=later_locked
-        )
-    with s2:
-        middle_sample = st.selectbox(
-            "Middle sample",
-            sample_opts,
-            key=_pk("middle_sample"),
-            disabled=later_locked,
-        )
-    with s3:
-        bottom_sample = st.selectbox(
-            "Bottom sample",
-            sample_opts,
-            key=_pk("bottom_sample"),
-            disabled=later_locked,
-        )
-    with s4:
-        vacum_sample = st.selectbox(
-            "Vacum sample",
-            sample_opts,
-            key=_pk("vacum_sample"),
-            disabled=later_locked,
-        )
+        r1, r2, r3, r4 = st.columns(4)
+        with r1:
+            st.text_input(
+                "Remarks", key=_pk("top_sample_remarks"), disabled=later_locked
+            )
+        with r2:
+            st.text_input(
+                "Remarks", key=_pk("middle_sample_remarks"), disabled=later_locked
+            )
+        with r3:
+            st.text_input(
+                "Remarks", key=_pk("bottom_sample_remarks"), disabled=later_locked
+            )
+        with r4:
+            st.empty()
 
-    r1, r2, r3, r4 = st.columns(4)
-    with r1:
-        top_sample_remarks = st.text_input(
-            "Remarks", key=_pk("top_sample_remarks"), disabled=later_locked
-        )
-    with r2:
-        middle_sample_remarks = st.text_input(
-            "Remarks", key=_pk("middle_sample_remarks"), disabled=later_locked
-        )
-    with r3:
-        bottom_sample_remarks = st.text_input(
-            "Remarks", key=_pk("bottom_sample_remarks"), disabled=later_locked
-        )
-    with r4:
-        st.empty()
+        d1, d2, d3, d4 = st.columns(4)
+        with d1:
+            ui_datetime_input(
+                "Datetime",
+                value=None,
+                step=60,
+                key=_pk("top_sample_dt"),
+                help="Open the calendar icon to pick date and time.",
+                disabled=later_locked,
+            )
+        with d2:
+            ui_datetime_input(
+                "Datetime",
+                value=None,
+                step=60,
+                key=_pk("middle_sample_dt"),
+                help="Open the calendar icon to pick date and time.",
+                disabled=later_locked,
+            )
+        with d3:
+            ui_datetime_input(
+                "Datetime",
+                value=None,
+                step=60,
+                key=_pk("bottom_sample_dt"),
+                help="Open the calendar icon to pick date and time.",
+                disabled=later_locked,
+            )
+        with d4:
+            st.empty()
 
-    d1, d2, d3, d4 = st.columns(4)
-    with d1:
-        top_sample_dt = ui_datetime_input(
-            "Datetime",
-            value=None,
-            step=60,
-            key=_pk("top_sample_dt"),
-            help="Open the calendar icon to pick date and time.",
-            disabled=later_locked,
-        )
-    with d2:
-        middle_sample_dt = ui_datetime_input(
-            "Datetime",
-            value=None,
-            step=60,
-            key=_pk("middle_sample_dt"),
-            help="Open the calendar icon to pick date and time.",
-            disabled=later_locked,
-        )
-    with d3:
-        bottom_sample_dt = ui_datetime_input(
-            "Datetime",
-            value=None,
-            step=60,
-            key=_pk("bottom_sample_dt"),
-            help="Open the calendar icon to pick date and time.",
-            disabled=later_locked,
-        )
-    with d4:
-        st.empty()
+    _render_sample_results()
+    top_sample = st.session_state.get(_pk("top_sample")) or sample_blank
+    middle_sample = st.session_state.get(_pk("middle_sample")) or sample_blank
+    bottom_sample = st.session_state.get(_pk("bottom_sample")) or sample_blank
+    vacum_sample = st.session_state.get(_pk("vacum_sample")) or sample_blank
+    top_sample_remarks = st.session_state.get(_pk("top_sample_remarks")) or ""
+    middle_sample_remarks = st.session_state.get(_pk("middle_sample_remarks")) or ""
+    bottom_sample_remarks = st.session_state.get(_pk("bottom_sample_remarks")) or ""
+    top_sample_dt = st.session_state.get(_pk("top_sample_dt"))
+    middle_sample_dt = st.session_state.get(_pk("middle_sample_dt"))
+    bottom_sample_dt = st.session_state.get(_pk("bottom_sample_dt"))
 
     st.markdown("#### Batch chemistry (ladle / spectrometer)")
     st.caption(
@@ -1658,93 +1679,101 @@ else:
         if full_n:
             st.caption(f"Full Element_Master entry applied ({full_n} non-zero value(s)).")
 
-    def _fmt_spec_pct(v: object) -> str:
-        if v is None or v == "":
-            return "—"
-        try:
-            return f"{float(v):.4f}".rstrip("0").rstrip(".")
-        except (TypeError, ValueError):
-            return "—"
-
-    def _spec_out_of_range(value: float, spec: dict | None) -> bool:
-        if not spec or value <= 0:
-            return False
-        mn, mx = spec.get("Min_percent"), spec.get("Max_percent")
-        if mn is not None and mn != "" and value <= float(mn):
-            return True
-        if mx is not None and mx != "" and value >= float(mx):
-            return True
-        return False
-
-    def _entered_chem(sym: str) -> float:
-        if sym in batch_chem:
+    @st.fragment
+    def _render_batch_chemistry() -> None:
+        def _fmt_spec_pct(v: object) -> str:
+            if v is None or v == "":
+                return "—"
             try:
-                return float(batch_chem[sym] or 0.0)
+                return f"{float(v):.4f}".rstrip("0").rstrip(".")
+            except (TypeError, ValueError):
+                return "—"
+
+        def _spec_out_of_range(value: float, spec: dict | None) -> bool:
+            if not spec or value <= 0:
+                return False
+            mn, mx = spec.get("Min_percent"), spec.get("Max_percent")
+            if mn is not None and mn != "" and value <= float(mn):
+                return True
+            if mx is not None and mx != "" and value >= float(mx):
+                return True
+            return False
+
+        def _entered_chem(sym: str) -> float:
+            if sym in batch_chem:
+                try:
+                    return float(batch_chem[sym] or 0.0)
+                except (TypeError, ValueError):
+                    return 0.0
+            try:
+                return float(st.session_state.get(_pk(f"bchem_{sym}")) or 0.0)
             except (TypeError, ValueError):
                 return 0.0
-        try:
-            return float(st.session_state.get(_pk(f"bchem_{sym}")) or 0.0)
-        except (TypeError, ValueError):
-            return 0.0
 
-    chem_cols = st.columns(6)
-    batch_chem: dict[str, float | None] = {}
-    out_of_spec_keys: list[str] = []
-    for i, el in enumerate(entry_elements):
-        sym = el["Element_Symbol"]
-        spec = alloy_specs.get(sym)
-        with chem_cols[i % 6]:
-            if sym == "SF":
-                sludge = (
-                    1.0 * _entered_chem("Fe")
-                    + 2.0 * _entered_chem("Mn")
-                    + 3.0 * _entered_chem("Cr")
-                )
-                sf_val = round(sludge, 1)
-                st.session_state[_pk("bchem_SF")] = sf_val if sf_val > 0 else None
-                batch_chem[sym] = st.number_input(
-                    "SF %",
-                    min_value=0.0,
-                    max_value=600.0,
-                    value=None,
-                    step=0.1,
-                    key=_pk("bchem_SF"),
-                    disabled=True,
-                    placeholder="",
-                    help="Auto: Sludge Factor = Fe + 2×Mn + 3×Cr, rounded to 0.1%.",
-                )
-            else:
-                batch_chem[sym] = empty_percent_input(
-                    f"{sym} %",
-                    key=_pk(f"bchem_{sym}"),
-                    default=full_batch.get(sym),
-                    step=CHEM_PERCENT_STEP,
-                    format=CHEM_PERCENT_FORMAT,
-                    help=el["Element_Name"],
-                    disabled=later_locked,
-                )
-            entered = float(batch_chem[sym] or 0.0)
-            bad = _spec_out_of_range(entered, spec)
-            if spec:
-                spec_line = (
-                    f"Spec min {_fmt_spec_pct(spec.get('Min_percent'))} / "
-                    f"max {_fmt_spec_pct(spec.get('Max_percent'))}"
-                )
-            elif alloy_id:
-                spec_line = "No spec for this element"
-            else:
-                spec_line = "Select an alloy to see spec"
-            css = "chem-spec-bad" if bad else "chem-spec"
-            st.markdown(f'<p class="{css}">{spec_line}</p>', unsafe_allow_html=True)
-            if bad:
-                out_of_spec_keys.append(_pk(f"bchem_{sym}"))
+        chem_cols = st.columns(6)
+        batch_chem: dict[str, float | None] = {}
+        out_of_spec_keys: list[str] = []
+        for i, el in enumerate(entry_elements):
+            sym = el["Element_Symbol"]
+            spec = alloy_specs.get(sym)
+            with chem_cols[i % 6]:
+                if sym == "SF":
+                    sludge = (
+                        1.0 * _entered_chem("Fe")
+                        + 2.0 * _entered_chem("Mn")
+                        + 3.0 * _entered_chem("Cr")
+                    )
+                    sf_val = round(sludge, 1)
+                    st.session_state[_pk("bchem_SF")] = sf_val if sf_val > 0 else None
+                    batch_chem[sym] = st.number_input(
+                        "SF %",
+                        min_value=0.0,
+                        max_value=600.0,
+                        value=None,
+                        step=0.1,
+                        key=_pk("bchem_SF"),
+                        disabled=True,
+                        placeholder="",
+                        help="Auto: Sludge Factor = Fe + 2×Mn + 3×Cr, rounded to 0.1%.",
+                    )
+                else:
+                    batch_chem[sym] = empty_percent_input(
+                        f"{sym} %",
+                        key=_pk(f"bchem_{sym}"),
+                        default=full_batch.get(sym),
+                        step=CHEM_PERCENT_STEP,
+                        format=CHEM_PERCENT_FORMAT,
+                        help=el["Element_Name"],
+                        disabled=later_locked,
+                    )
+                entered = float(batch_chem[sym] or 0.0)
+                bad = _spec_out_of_range(entered, spec)
+                if spec:
+                    spec_line = (
+                        f"Spec min {_fmt_spec_pct(spec.get('Min_percent'))} / "
+                        f"max {_fmt_spec_pct(spec.get('Max_percent'))}"
+                    )
+                elif alloy_id:
+                    spec_line = "No spec for this element"
+                else:
+                    spec_line = "Select an alloy to see spec"
+                css = "chem-spec-bad" if bad else "chem-spec"
+                st.markdown(f'<p class="{css}">{spec_line}</p>', unsafe_allow_html=True)
+                if bad:
+                    out_of_spec_keys.append(_pk(f"bchem_{sym}"))
 
-    if out_of_spec_keys:
-        rules = "\n".join(
-            f"div.st-key-{key} input {{ color: #c62828 !important; font-weight: 700; }}"
-            for key in out_of_spec_keys
-        )
-        st.markdown(f"<style>{rules}</style>", unsafe_allow_html=True)
+        if out_of_spec_keys:
+            rules = "\n".join(
+                f"div.st-key-{key} input {{ color: #c62828 !important; font-weight: 700; }}"
+                for key in out_of_spec_keys
+            )
+            st.markdown(f"<style>{rules}</style>", unsafe_allow_html=True)
+
+    _render_batch_chemistry()
+    batch_chem = {
+        el["Element_Symbol"]: st.session_state.get(_pk(f"bchem_{el['Element_Symbol']}"))
+        for el in entry_elements
+    }
 
     def _sample_or_none(v: str) -> str | None:
         return None if v == sample_blank else v
@@ -1862,7 +1891,7 @@ else:
             b2.button(
                 "Mark as Completed",
                 type="primary",
-                disabled=locked or is_completed or bool(completion_gaps),
+                disabled=locked or is_completed,
                 key=_pk("complete_batch"),
                 help=(
                     "Requires degassing time, sampled/defect pcs, K Mold ≤ "
@@ -1874,7 +1903,7 @@ else:
         )
         if not is_completed and completion_gaps:
             st.caption(
-                "**Mark as Completed** stays disabled until: "
+                "**Mark as Completed** will report an error until: "
                 + "; ".join(completion_gaps)
             )
         if save_clicked:
