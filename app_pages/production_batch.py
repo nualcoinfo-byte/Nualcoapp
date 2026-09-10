@@ -1869,6 +1869,15 @@ else:
         bid = preview_id
         if mark_completed:
             db.complete_production_batch(bid)
+        # Charge lines just persisted above must not linger in the form -
+        # otherwise the next full rerun (e.g. clicking Mark as Completed
+        # right after Save changes) resubmits the same still-populated
+        # widgets as a "new" charge line, double-charging the material and
+        # double-deducting inventory.
+        for idx in range(len(furnace_charge_lines)):
+            for field in _charge_line_fields:
+                st.session_state.pop(_pk(f"{field}_{idx}"), None)
+        st.session_state.pop(pending_charges_key, None)
         drafts[furnace] = [
             {"material": "", "lot_id": None, "weight": 0.0, "notes": ""}
         ]
