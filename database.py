@@ -33,7 +33,7 @@ from typing import Any, Callable, Generator, Iterable, Optional, TypeVar
 from urllib.parse import parse_qsl, quote, unquote, urlencode, urlparse, urlunparse
 
 from sqlalchemy import Connection, CursorResult, MetaData, Table, create_engine, select
-from sqlalchemy.exc import OperationalError
+from sqlalchemy.exc import IntegrityError, OperationalError
 
 DB_PATH = Path(__file__).resolve().parent / "nualco.db"
 ENV_FILE = Path(__file__).resolve().parent / ".env.local"
@@ -5577,29 +5577,37 @@ def _insert_charge_lines(conn: Connection, batch_id: str, inputs: list[dict[str,
             """,
             (w, item["Lot_id"]),
         )
-        _exec(
-            conn,
-            """
-            INSERT INTO batch_input
-                (Batch_ID, Raw_Material_Name, Lot_id, Weight,
-                 Weighment_scale_weight, Trolley_weight, Trolley_name,
-                 Charge_time, Notes, Weighment_scale_photo, Input_photo)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                batch_id,
-                item["Raw_Material_Name"],
-                item["Lot_id"],
-                w,
-                item.get("Weighment_scale_weight"),
-                item.get("Trolley_weight"),
-                item.get("Trolley_name"),
-                item.get("Charge_time") or datetime.now().isoformat(timespec="seconds"),
-                item.get("Notes", ""),
-                item.get("Weighment_scale_photo"),
-                item.get("Input_photo"),
-            ),
-        )
+        try:
+            _exec(
+                conn,
+                """
+                INSERT INTO batch_input
+                    (Batch_ID, Raw_Material_Name, Lot_id, Weight,
+                     Weighment_scale_weight, Trolley_weight, Trolley_name,
+                     Charge_time, Notes, Weighment_scale_photo, Input_photo)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    batch_id,
+                    item["Raw_Material_Name"],
+                    item["Lot_id"],
+                    w,
+                    item.get("Weighment_scale_weight"),
+                    item.get("Trolley_weight"),
+                    item.get("Trolley_name"),
+                    item.get("Charge_time") or datetime.now().isoformat(timespec="seconds"),
+                    item.get("Notes", ""),
+                    item.get("Weighment_scale_photo"),
+                    item.get("Input_photo"),
+                ),
+            )
+        except IntegrityError as exc:
+            raise ValueError(
+                f"A charge line for {item['Raw_Material_Name']} (lot {item['Lot_id']}) "
+                "was already saved a moment ago. Remove the duplicate line from the "
+                "charge form (or refresh the page to see the saved lines) before "
+                "saving again."
+            ) from exc
 
 
 def _replace_batch_chemistry(
