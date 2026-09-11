@@ -11,7 +11,7 @@ ENV PYTHONUNBUFFERED=1
 # and pip's download/build cache below - stays warm across every push that
 # doesn't touch dependencies (i.e. almost every push to app_pages/*.py).
 COPY requirements.txt .
-RUN --mount=type=cache,target=/root/.cache/pip \
+RUN --mount=type=cache,id=pip-cache,target=/root/.cache/pip \
     pip install -r requirements.txt
 
 COPY app.py database.py neon_http.py pages_common.py ./
