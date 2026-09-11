@@ -10,8 +10,13 @@ ENV PYTHONUNBUFFERED=1
 # Only requirements.txt is copied before the install step, so this layer -
 # and pip's download/build cache below - stays warm across every push that
 # doesn't touch dependencies (i.e. almost every push to app_pages/*.py).
+#
+# Railway's builder requires cache mount ids in the form
+# `s/<service id>-<path>` (no variable substitution allowed here, so the
+# service id is hardcoded) - see https://docs.railway.com/builds/dockerfiles.
+# Service id is nualco (production): f09da96b-bae2-4384-89ff-2febcba176cb.
 COPY requirements.txt .
-RUN --mount=type=cache,id=pip-cache,target=/root/.cache/pip \
+RUN --mount=type=cache,id=s/f09da96b-bae2-4384-89ff-2febcba176cb-root-cache-pip,target=/root/.cache/pip \
     pip install -r requirements.txt
 
 COPY app.py database.py neon_http.py pages_common.py ./
