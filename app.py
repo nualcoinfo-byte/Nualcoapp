@@ -147,6 +147,7 @@ def _init_postgres() -> bool:
     db._ensure_packing_list_ready()
     db._ensure_company_ready()
     db.start_dashboard_refresh_scheduler()
+    db.start_ocr_job_worker()
     return True
 
 
