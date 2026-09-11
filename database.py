@@ -1358,6 +1358,14 @@ CREATE TABLE IF NOT EXISTS Furnace_Oil_Inventory (
     Last_updated_by TEXT,
     Last_updated_datetime TEXT
 );
+CREATE TABLE IF NOT EXISTS Service_Oil_Tank_Measurement (
+    Inch {float} PRIMARY KEY,
+    Litres {float} NOT NULL
+);
+CREATE TABLE IF NOT EXISTS Ten_KL_Tank_Measurement (
+    Centimeter {float} PRIMARY KEY,
+    Litres {float} NOT NULL
+);
 CREATE TABLE IF NOT EXISTS Electricity_Consumption (
     Consumption_date TEXT NOT NULL,
     Line TEXT NOT NULL,
@@ -11849,6 +11857,61 @@ def list_furnace_oil_inventory(limit: int = 90) -> list[dict[str, Any]]:
         """,
         (limit,),
     )
+
+
+def list_service_oil_tank_measurement() -> list[dict[str, Any]]:
+    return fetch_all(
+        """
+        SELECT Inch AS "Inch", Litres AS "Litres"
+        FROM Service_Oil_Tank_Measurement
+        ORDER BY Inch
+        """
+    )
+
+
+def list_ten_kl_tank_measurement() -> list[dict[str, Any]]:
+    return fetch_all(
+        """
+        SELECT Centimeter AS "Centimeter", Litres AS "Litres"
+        FROM Ten_KL_Tank_Measurement
+        ORDER BY Centimeter
+        """
+    )
+
+
+def _litres_from_depth(
+    rows: list[dict[str, Any]], depth_key: str, depth: float
+) -> Optional[float]:
+    """Linear interpolation between the two nearest dip-chart points.
+
+    Returns None if depth falls outside the chart's calibrated range.
+    """
+    points = sorted(
+        (float(r[depth_key]), float(r["Litres"]))
+        for r in rows
+        if r.get(depth_key) is not None and r.get("Litres") is not None
+    )
+    if not points:
+        return None
+    lo_depth, lo_litres = points[0]
+    hi_depth, hi_litres = points[-1]
+    if depth < lo_depth or depth > hi_depth:
+        return None
+    for (d0, l0), (d1, l1) in zip(points, points[1:]):
+        if d0 <= depth <= d1:
+            if d1 == d0:
+                return l0
+            frac = (depth - d0) / (d1 - d0)
+            return l0 + frac * (l1 - l0)
+    return None
+
+
+def service_oil_tank_litres(inch: float) -> Optional[float]:
+    return _litres_from_depth(list_service_oil_tank_measurement(), "Inch", inch)
+
+
+def ten_kl_tank_litres(cm: float) -> Optional[float]:
+    return _litres_from_depth(list_ten_kl_tank_measurement(), "Centimeter", cm)
 
 
 def add_furnace_oil_purchase(

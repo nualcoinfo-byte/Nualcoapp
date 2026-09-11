@@ -233,6 +233,7 @@ NAV_SECTIONS: list[tuple[str, list[str]]] = [
         [
             "Furnace Oil Purchase",
             "Furnace Oil Consumption",
+            "Tank Depth Lookup",
             "Electricity Consumption",
             "Cost of Conversion",
         ],
@@ -628,6 +629,11 @@ MIGRATED_PAGES: dict[str, st.Page] = {
         "app_pages/furnace_oil_consumption.py",
         title="Furnace Oil Consumption",
         url_path="furnace-oil-consumption",
+    ),
+    "Tank Depth Lookup": st.Page(
+        "app_pages/tank_measurement_lookup.py",
+        title="Tank Depth Lookup",
+        url_path="tank-depth-lookup",
     ),
     "Electricity Consumption": st.Page(
         "app_pages/electricity_consumption.py",
