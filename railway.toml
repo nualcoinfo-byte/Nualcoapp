@@ -1,5 +1,8 @@
 [build]
-builder = "NIXPACKS"
+# Explicit Docker builder: the app is built from ./Dockerfile, not Nixpacks
+# auto-detection, so a local `docker build .` matches what Railway deploys.
+builder = "DOCKERFILE"
+dockerfilePath = "Dockerfile"
 
 [deploy]
 # Streamlit is not a WSGI/ASGI app, so it cannot be served by Gunicorn or
