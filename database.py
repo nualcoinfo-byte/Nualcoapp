@@ -110,8 +110,10 @@ def _pg_login_status(url: str, timeout: int = 8) -> str:
             sslmode="require",
             connect_timeout=timeout,
         )
-        conn.close()
-        return "ok"
+        try:
+            return "ok"
+        finally:
+            conn.close()
     except Exception as exc:
         text = str(exc).lower()
         if "tenant" in text or "enotfound" in text:
@@ -436,7 +438,12 @@ else:
 IS_POSTGRES = ENGINE.dialect.name == "postgresql"
 
 _T = TypeVar("_T")
-_CONNECT_RETRIES = 1
+# NOTE: with retries=1, `range(1)` only ever visits attempt 0, and
+# `attempt == _CONNECT_RETRIES - 1` (0 == 0) is true on that same first
+# attempt - so every transient error raised immediately with no retry ever
+# attempted, despite the backoff/dispose scaffolding below implying
+# otherwise. 3 gives two real retries (~1.5s, ~3s) before giving up.
+_CONNECT_RETRIES = 3
 _CONNECT_BACKOFF_S = 1.5
 
 
