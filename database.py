@@ -994,6 +994,8 @@ CREATE TABLE IF NOT EXISTS Raw_Material_Inventory (
     Raw_Material_Status TEXT DEFAULT 'Awaiting Assay',
     Photo {blob},
     Cost_per_kg {float},
+    Weighment_slip_weight {float},
+    Comments TEXT,
     Source_Batch_ID TEXT REFERENCES Production_batch(Batch_ID),
     Source_Alloy_id INTEGER REFERENCES Alloy_Master(Alloy_id)
 );
@@ -1512,6 +1514,8 @@ def init_db() -> None:
             "Raw_Material_Inventory",
             [
                 ("Cost_per_kg", "DOUBLE PRECISION" if IS_POSTGRES else "REAL"),
+                ("Weighment_slip_weight", "DOUBLE PRECISION" if IS_POSTGRES else "REAL"),
+                ("Comments", "TEXT"),
             ],
         )
         _drop_columns(
@@ -4801,8 +4805,9 @@ def save_raw_material_invoice(
                 """
                 INSERT INTO Raw_Material_Inventory
                     (Purchase_id, Raw_Material_Name, Received_weight, Remaining_Weight,
-                     Storage_bay, Raw_Material_Status, Photo, Cost_per_kg)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                     Storage_bay, Raw_Material_Status, Photo, Cost_per_kg,
+                     Weighment_slip_weight, Comments)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 RETURNING Lot_id
                 """,
                 (
@@ -4814,6 +4819,8 @@ def save_raw_material_invoice(
                     status,
                     line.get("photo"),
                     line.get("cost"),
+                    line.get("weighment_slip_weight"),
+                    line.get("comments"),
                 ),
             )
             lot_ids.append(int(lot.scalar_one()))

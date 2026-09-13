@@ -152,10 +152,12 @@ if "rm_log_token" not in st.session_state:
     st.session_state.rm_log_token = 0
 line_token = st.session_state.rm_log_token
 
+WEIGHT_TOLERANCE_PCT = 0.12  # max allowed variance between invoice and weighbridge weight
+
 collected_lines: list[dict] = []
 for idx, _line in enumerate(st.session_state.rm_invoice_lines):
     st.markdown(f"**Row {idx + 1}**")
-    n1, n2, n3 = st.columns([2.2, 1.2, 1.4])
+    n1, n2, n3, n4 = st.columns([2.0, 1.0, 1.0, 1.0])
     with n1:
         if existing_materials:
             name = st.selectbox(
@@ -186,11 +188,47 @@ for idx, _line in enumerate(st.session_state.rm_invoice_lines):
             max_value=None,
             step=1.0,
         )
+    with n4:
+        wslip_weight = empty_percent_input(
+            "Weighment slip weight (kg)",
+            key=f"rm_line_wslip_weight_{line_token}_{idx}",
+            max_value=None,
+            step=1.0,
+            help="Actual weight received at the factory, per the weighbridge slip.",
+        )
+
+    diff_col, comments_col = st.columns([1.4, 2.6])
+    with diff_col:
+        if weight and wslip_weight:
+            diff = float(weight) - float(wslip_weight)
+            tolerance = float(weight) * WEIGHT_TOLERANCE_PCT / 100
+            diff_pct = (diff / float(weight) * 100) if weight else 0.0
+            diff_text = f"Weight difference: {diff:+.2f} kg ({diff_pct:+.2f}%)"
+            if diff > tolerance:
+                st.markdown(
+                    f"<span style='color:#2e7d32; font-weight:700'>{diff_text}</span>",
+                    unsafe_allow_html=True,
+                )
+            elif diff < -tolerance:
+                st.markdown(
+                    f"<span style='color:#c62828; font-weight:700'>{diff_text}</span>",
+                    unsafe_allow_html=True,
+                )
+            else:
+                st.caption(diff_text)
+    with comments_col:
+        comments = st.text_input(
+            "Comments",
+            placeholder="Reason for the weight variance, if any",
+            key=f"rm_line_comments_{line_token}_{idx}",
+        )
     collected_lines.append(
         {
             "name": (name or "").strip(),
             "cost": float(cost or 0.0),
             "weight": float(weight or 0.0),
+            "weighment_slip_weight": float(wslip_weight) if wslip_weight else None,
+            "comments": (comments or "").strip() or None,
         }
     )
 
@@ -257,6 +295,8 @@ if submitted:
                         "material": material_name,
                         "cost": ln["cost"],
                         "weight": ln["weight"],
+                        "weighment_slip_weight": ln["weighment_slip_weight"],
+                        "comments": ln["comments"],
                     }
                 )
             purchase_id, lot_ids = db.save_raw_material_invoice(
