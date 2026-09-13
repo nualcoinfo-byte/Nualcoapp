@@ -4,6 +4,19 @@ from datetime import date
 from pages_common import empty_percent_input, photo_bytes, ui_date_input
 
 
+@st.cache_data(ttl=60, show_spinner=False)
+def _cached_vendors() -> list[dict]:
+    """Vendor dropdown options, cached so picking a vendor doesn't re-query
+    on every rerun. A new vendor added on the Vendors page appears here
+    within the TTL; cleared immediately on a successful save below."""
+    return db.list_vendors()
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def _cached_raw_materials() -> list[str]:
+    return db.list_raw_materials(active_only=False)
+
+
 st.title("Raw Material Logging")
 st.caption(
     "Start with the vendor and invoice, then add every raw material on that invoice. "
@@ -12,9 +25,9 @@ st.caption(
     "Browse lots under **Raw Material Inventory**."
 )
 
-vendors = db.list_vendors()
+vendors = _cached_vendors()
 vendor_opts = {f"{v['Vendor_name']} (#{v['Vendor_code']})": v["Vendor_code"] for v in vendors}
-existing_materials = db.list_raw_materials(active_only=False)
+existing_materials = _cached_raw_materials()
 if not vendors:
     st.warning("Add at least one vendor under **Vendors** before logging material.")
 if not existing_materials:
