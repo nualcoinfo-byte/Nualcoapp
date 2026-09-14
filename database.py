@@ -4808,8 +4808,8 @@ def save_raw_material_invoice(
                 INSERT INTO Raw_Material_Inventory
                     (Purchase_id, Raw_Material_Name, Received_weight, Remaining_Weight,
                      Storage_bay, Raw_Material_Status, Photo, Cost_per_kg,
-                     Weighment_slip_weight, Comments)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     Weighment_slip_weight, Invoice_weight, Comments)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 RETURNING Lot_id
                 """,
                 (
@@ -4822,6 +4822,7 @@ def save_raw_material_invoice(
                     line.get("photo"),
                     line.get("cost"),
                     line.get("weighment_slip_weight"),
+                    line.get("invoice_weight"),
                     line.get("comments"),
                 ),
             )

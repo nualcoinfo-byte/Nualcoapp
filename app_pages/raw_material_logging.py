@@ -157,7 +157,7 @@ WEIGHT_TOLERANCE_PCT = 0.12  # max allowed variance between invoice and weighbri
 collected_lines: list[dict] = []
 for idx, _line in enumerate(st.session_state.rm_invoice_lines):
     st.markdown(f"**Row {idx + 1}**")
-    n1, n2, n3, n4 = st.columns([2.0, 1.0, 1.0, 1.0])
+    n1, n2, n3 = st.columns([2.0, 1.0, 1.0])
     with n1:
         if existing_materials:
             name = st.selectbox(
@@ -175,19 +175,21 @@ for idx, _line in enumerate(st.session_state.rm_invoice_lines):
                 key=f"rm_line_name_{line_token}_{idx}",
             )
     with n2:
+        invoice_weight = empty_percent_input(
+            "Invoice weight (kg)",
+            key=f"rm_line_invoice_weight_{line_token}_{idx}",
+            max_value=None,
+            step=1.0,
+        )
+    with n3:
         cost = empty_percent_input(
             "Cost per kg",
             key=f"rm_line_cost_{line_token}_{idx}",
             max_value=None,
             step=0.01,
         )
-    with n3:
-        weight = empty_percent_input(
-            "Received weight (kg) *",
-            key=f"rm_line_weight_{line_token}_{idx}",
-            max_value=None,
-            step=1.0,
-        )
+
+    n4, n5 = st.columns([1.0, 1.0])
     with n4:
         wslip_weight = empty_percent_input(
             "Weighment slip weight (kg)",
@@ -195,6 +197,13 @@ for idx, _line in enumerate(st.session_state.rm_invoice_lines):
             max_value=None,
             step=1.0,
             help="Actual weight received at the factory, per the weighbridge slip.",
+        )
+    with n5:
+        weight = empty_percent_input(
+            "Received weight (kg) *",
+            key=f"rm_line_weight_{line_token}_{idx}",
+            max_value=None,
+            step=1.0,
         )
 
     diff_col, comments_col = st.columns([1.4, 2.6])
@@ -227,6 +236,7 @@ for idx, _line in enumerate(st.session_state.rm_invoice_lines):
             "name": (name or "").strip(),
             "cost": float(cost or 0.0),
             "weight": float(weight or 0.0),
+            "invoice_weight": float(invoice_weight) if invoice_weight else None,
             "weighment_slip_weight": float(wslip_weight) if wslip_weight else None,
             "comments": (comments or "").strip() or None,
         }
@@ -295,6 +305,7 @@ if submitted:
                         "material": material_name,
                         "cost": ln["cost"],
                         "weight": ln["weight"],
+                        "invoice_weight": ln["invoice_weight"],
                         "weighment_slip_weight": ln["weighment_slip_weight"],
                         "comments": ln["comments"],
                     }
