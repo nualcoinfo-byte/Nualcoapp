@@ -778,6 +778,21 @@ SIDESTREAM_RM_NAMES = {
     80: "Not Ok Ingot",
 }
 RAW_MATERIAL_AVAILABILITY = ["Standard", "Spot", "Contract", "Internal"]
+RAW_MATERIAL_INVOICE_STATUS = [
+    "Pending with purchase",
+    "Pending with accounts",
+    "Approved",
+    "Cancelled",
+]
+# Purchase logs an invoice as Pending with purchase (default) or, via
+# "Submit to Accounts", straight to Pending with accounts. From there, the
+# Purchase Invoice Review page can send Pending with purchase invoices on to
+# accounts or cancel them; the Accounts Invoice Review page can approve a
+# Pending with accounts invoice. No other moves are allowed.
+_RAW_MATERIAL_INVOICE_STATUS_TRANSITIONS = {
+    "Pending with purchase": {"Pending with accounts", "Cancelled"},
+    "Pending with accounts": {"Approved"},
+}
 SHIFTS = ["A", "B"]
 MELT_NOS = [1, 2, 3, 4, 5, 6, 7, 9]
 HEAT_NOS = list(range(1, 13))
@@ -4484,6 +4499,7 @@ def list_inventory_lots(
         LEFT JOIN Production_batch b ON b.Batch_ID = i.Source_Batch_ID
         LEFT JOIN Alloy_Master oa ON oa.Alloy_id = b.Alloy_id
         WHERE i.Remaining_Weight > 0
+          AND (p.Invoice_status IS NULL OR p.Invoice_status <> 'Cancelled')
     """
     params: list[Any] = []
     if material:
@@ -4813,12 +4829,18 @@ def save_raw_material_invoice(
     invoice_document_type: Optional[str] = None,
     vehicle_photo: Optional[bytes] = None,
     weighment_slip_photo: Optional[bytes] = None,
+    invoice_status: str = "Pending with purchase",
 ) -> tuple[int, list[int]]:
     """Save one vendor invoice and its lots in a single transaction."""
     if not lines:
         raise ValueError("Add at least one raw material line.")
     if invoice_document and invoice_document_name:
         _validate_invoice_document_name(invoice_document_name)
+    if invoice_status not in ("Pending with purchase", "Pending with accounts"):
+        raise ValueError(
+            "New invoices can only be logged as Pending with purchase or "
+            "Pending with accounts."
+        )
     by_val, dt_val = audit_stamp()
     with get_connection() as conn:
         result = _exec(
@@ -4827,9 +4849,9 @@ def save_raw_material_invoice(
             INSERT INTO Raw_Material_Purchase
                 (Vendor_code, Supplier_Invoice, Supplier_invoice_date, Received_date,
                  Invoice_Document, Invoice_Document_name, Invoice_Document_type,
-                 Vehicle_photo, Weighment_slip_photo,
+                 Vehicle_photo, Weighment_slip_photo, Invoice_status,
                  Last_updated_by, Last_updated_datetime)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             RETURNING Purchase_id
             """,
             (
@@ -4842,6 +4864,7 @@ def save_raw_material_invoice(
                 invoice_document_type,
                 vehicle_photo,
                 weighment_slip_photo,
+                invoice_status,
                 by_val,
                 dt_val,
             ),
@@ -4876,6 +4899,98 @@ def save_raw_material_invoice(
             )
             lot_ids.append(int(lot.scalar_one()))
         return purchase_id, lot_ids
+
+
+def get_raw_material_purchase(purchase_id: int) -> Optional[dict[str, Any]]:
+    return fetch_one(
+        """
+        SELECT p.Purchase_id AS "Purchase_id",
+               p.Vendor_code AS "Vendor_code",
+               v.Vendor_name AS "Vendor_name",
+               p.Supplier_Invoice AS "Supplier_Invoice",
+               p.Supplier_invoice_date AS "Supplier_invoice_date",
+               p.Received_date AS "Received_date",
+               p.Invoice_status AS "Invoice_status",
+               p.Last_updated_by AS "Last_updated_by",
+               p.Last_updated_datetime AS "Last_updated_datetime"
+        FROM Raw_Material_Purchase p
+        LEFT JOIN Vendor_Master v ON v.Vendor_code = p.Vendor_code
+        WHERE p.Purchase_id = ?
+        """,
+        (purchase_id,),
+    )
+
+
+def list_raw_material_purchases_by_status(status: str) -> list[dict[str, Any]]:
+    return fetch_all(
+        """
+        SELECT p.Purchase_id AS "Purchase_id",
+               v.Vendor_name AS "Vendor_name",
+               p.Supplier_Invoice AS "Supplier_Invoice",
+               p.Supplier_invoice_date AS "Supplier_invoice_date",
+               p.Received_date AS "Received_date",
+               p.Invoice_status AS "Invoice_status",
+               p.Last_updated_by AS "Last_updated_by",
+               p.Last_updated_datetime AS "Last_updated_datetime"
+        FROM Raw_Material_Purchase p
+        LEFT JOIN Vendor_Master v ON v.Vendor_code = p.Vendor_code
+        WHERE p.Invoice_status = ?
+        ORDER BY p.Purchase_id DESC
+        """,
+        (status,),
+    )
+
+
+def list_raw_material_inventory_by_purchase(purchase_id: int) -> list[dict[str, Any]]:
+    return fetch_all(
+        """
+        SELECT Lot_id AS "Lot_id",
+               Raw_Material_Name AS "Raw_Material_Name",
+               Invoice_weight AS "Invoice_weight",
+               Weighment_slip_weight AS "Weighment_slip_weight",
+               Received_weight AS "Received_weight",
+               Cost_per_kg AS "Cost_per_kg",
+               Comments AS "Comments"
+        FROM Raw_Material_Inventory
+        WHERE Purchase_id = ?
+        ORDER BY Lot_id
+        """,
+        (purchase_id,),
+    )
+
+
+def set_raw_material_purchase_invoice_status(purchase_id: int, new_status: str) -> None:
+    """Move Invoice_status forward along its one-way workflow.
+
+    Pending with purchase -> Pending with accounts or Cancelled.
+    Pending with accounts -> Approved.
+    Any other requested move (including anything once Approved or
+    Cancelled) is rejected, e.g. to stop cancelling an invoice that
+    accounts has already picked up.
+    """
+    if new_status not in RAW_MATERIAL_INVOICE_STATUS:
+        raise ValueError(f"Invalid invoice status: {new_status}")
+    row = fetch_one(
+        'SELECT Invoice_status AS "Invoice_status" FROM Raw_Material_Purchase WHERE Purchase_id = ?',
+        (purchase_id,),
+    )
+    if not row:
+        raise ValueError(f"Purchase {purchase_id} not found.")
+    current = row.get("Invoice_status") or "Pending with purchase"
+    allowed = _RAW_MATERIAL_INVOICE_STATUS_TRANSITIONS.get(current, set())
+    if new_status not in allowed:
+        raise ValueError(
+            f"Cannot change invoice status from '{current}' to '{new_status}'."
+        )
+    by_val, dt_val = audit_stamp()
+    execute(
+        """
+        UPDATE Raw_Material_Purchase
+        SET Invoice_status = ?, Last_updated_by = ?, Last_updated_datetime = ?
+        WHERE Purchase_id = ?
+        """,
+        (new_status, by_val, dt_val, purchase_id),
+    )
 
 
 INVOICE_DOCUMENT_EXTENSIONS = (
@@ -5631,12 +5746,22 @@ def _insert_charge_lines(conn: Connection, batch_id: str, inputs: list[dict[str,
     for item in inputs:
         lot = _exec(
             conn,
-            'SELECT Remaining_Weight AS "Remaining_Weight" '
-            "FROM Raw_Material_Inventory WHERE Lot_id = ?",
+            """
+            SELECT i.Remaining_Weight AS "Remaining_Weight",
+                   p.Invoice_status AS "Invoice_status"
+            FROM Raw_Material_Inventory i
+            LEFT JOIN Raw_Material_Purchase p ON p.Purchase_id = i.Purchase_id
+            WHERE i.Lot_id = ?
+            """,
             (item["Lot_id"],),
         ).mappings().first()
         if not lot:
             raise ValueError(f"Lot {item['Lot_id']} not found.")
+        if lot["Invoice_status"] == "Cancelled":
+            raise ValueError(
+                f"Lot {item['Lot_id']} belongs to a cancelled invoice and cannot be used "
+                "for production."
+            )
         remaining = float(lot["Remaining_Weight"] or 0)
         w = float(item["Weight"])
         if w > remaining + 1e-9:

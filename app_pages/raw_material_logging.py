@@ -284,9 +284,16 @@ if rem_col.button("Remove last row", key="rm_log_rem_line") and len(
     st.session_state.rm_invoice_lines.pop()
     st.rerun()
 
-submitted = st.button("Save invoice lots", type="primary", key="rm_log_save")
+save_col, accounts_col = st.columns([1, 1])
+with save_col:
+    submitted = st.button("Save invoice lots", type="primary", key="rm_log_save")
+with accounts_col:
+    submit_to_accounts = st.button("Submit to Accounts", key="rm_log_submit_accounts")
 
-if submitted:
+if submitted or submit_to_accounts:
+    target_status = (
+        "Pending with accounts" if submit_to_accounts else "Pending with purchase"
+    )
     vendor_code = vendor_opts[vendor_label] if vendor_label else None
     invoice_no = (invoice or "").strip()
     complete = [
@@ -369,12 +376,14 @@ if submitted:
                 invoice_document_type=doc_type,
                 vehicle_photo=vehicle_photo_bytes,
                 weighment_slip_photo=weighment_slip_photo_bytes,
+                invoice_status=target_status,
             )
             names = ", ".join(ln["name"] for ln in complete)
             st.success(
                 f"Saved invoice **{invoice_no}** (purchase #{purchase_id}) "
                 f"with {len(lot_ids)} lot(s) ({names}). "
-                f"Lot IDs: {', '.join(str(i) for i in lot_ids)}."
+                f"Lot IDs: {', '.join(str(i) for i in lot_ids)}. "
+                f"Invoice status: **{target_status}**."
             )
             st.session_state.rm_invoice_lines = [
                 {"name": "", "cost": 0.0, "weight": 0.0}
@@ -384,8 +393,32 @@ if submitted:
             st.session_state.pop("rm_log_vphoto_open", None)
             st.session_state.pop("rm_log_wslip_bytes", None)
             st.session_state.pop("rm_log_wslip_open", None)
+            st.session_state["rm_log_last_purchase_id"] = purchase_id
             st.cache_data.clear()
             st.rerun()
         except Exception as exc:
             st.error(f"Could not save: {exc}")
+
+last_purchase_id = st.session_state.get("rm_log_last_purchase_id")
+if last_purchase_id:
+    last_purchase = db.get_raw_material_purchase(int(last_purchase_id))
+    if not last_purchase:
+        st.session_state.pop("rm_log_last_purchase_id", None)
+    else:
+        st.markdown("---")
+        st.markdown(
+            f"**Last saved invoice:** #{last_purchase['Purchase_id']} "
+            f"({last_purchase['Supplier_Invoice']}) — "
+            f"status: **{last_purchase['Invoice_status']}**"
+        )
+        if last_purchase["Invoice_status"] == "Pending with purchase":
+            if st.button("Cancel Invoice", key="rm_log_cancel_invoice"):
+                try:
+                    db.set_raw_material_purchase_invoice_status(
+                        int(last_purchase["Purchase_id"]), "Cancelled"
+                    )
+                    st.success(f"Invoice #{last_purchase['Purchase_id']} cancelled.")
+                    st.rerun()
+                except Exception as exc:
+                    st.error(f"Could not cancel: {exc}")
 
