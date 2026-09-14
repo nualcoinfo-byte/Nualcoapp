@@ -995,6 +995,7 @@ CREATE TABLE IF NOT EXISTS Raw_Material_Inventory (
     Photo {blob},
     Cost_per_kg {float},
     Weighment_slip_weight {float},
+    Invoice_weight {float},
     Comments TEXT,
     Source_Batch_ID TEXT REFERENCES Production_batch(Batch_ID),
     Source_Alloy_id INTEGER REFERENCES Alloy_Master(Alloy_id)
@@ -1515,6 +1516,7 @@ def init_db() -> None:
             [
                 ("Cost_per_kg", "DOUBLE PRECISION" if IS_POSTGRES else "REAL"),
                 ("Weighment_slip_weight", "DOUBLE PRECISION" if IS_POSTGRES else "REAL"),
+                ("Invoice_weight", "DOUBLE PRECISION" if IS_POSTGRES else "REAL"),
                 ("Comments", "TEXT"),
             ],
         )
