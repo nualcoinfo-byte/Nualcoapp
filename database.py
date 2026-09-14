@@ -4921,6 +4921,22 @@ def get_raw_material_purchase(purchase_id: int) -> Optional[dict[str, Any]]:
     )
 
 
+def get_raw_material_purchase_documents(purchase_id: int) -> Optional[dict[str, Any]]:
+    return fetch_one(
+        """
+        SELECT Purchase_id AS "Purchase_id",
+               Invoice_Document AS "Invoice_Document",
+               Invoice_Document_name AS "Invoice_Document_name",
+               Invoice_Document_type AS "Invoice_Document_type",
+               Vehicle_photo AS "Vehicle_photo",
+               Weighment_slip_photo AS "Weighment_slip_photo"
+        FROM Raw_Material_Purchase
+        WHERE Purchase_id = ?
+        """,
+        (purchase_id,),
+    )
+
+
 def list_raw_material_purchases_by_status(status: str) -> list[dict[str, Any]]:
     return fetch_all(
         """
