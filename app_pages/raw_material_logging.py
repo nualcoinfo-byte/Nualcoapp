@@ -200,7 +200,7 @@ for idx, _line in enumerate(st.session_state.rm_invoice_lines):
     diff_col, comments_col = st.columns([1.4, 2.6])
     with diff_col:
         if weight and wslip_weight:
-            diff = float(weight) - float(wslip_weight)
+            diff = float(wslip_weight) - float(weight)
             tolerance = float(weight) * WEIGHT_TOLERANCE_PCT / 100
             diff_pct = (diff / float(weight) * 100) if weight else 0.0
             diff_text = f"Weight difference: {diff:+.2f} kg ({diff_pct:+.2f}%)"
