@@ -176,7 +176,7 @@ for idx, _line in enumerate(st.session_state.rm_invoice_lines):
             )
     with n2:
         invoice_weight = empty_percent_input(
-            "Invoice weight (kg)",
+            "Invoice weight (kg) *",
             key=f"rm_line_invoice_weight_{line_token}_{idx}",
             max_value=None,
             step=1.0,
@@ -189,6 +189,8 @@ for idx, _line in enumerate(st.session_state.rm_invoice_lines):
             step=0.01,
         )
 
+    invoice_weight_val = float(invoice_weight) if invoice_weight else None
+
     n4, n5 = st.columns([1.0, 1.0])
     with n4:
         wslip_weight = empty_percent_input(
@@ -198,20 +200,37 @@ for idx, _line in enumerate(st.session_state.rm_invoice_lines):
             step=1.0,
             help="Actual weight received at the factory, per the weighbridge slip.",
         )
+    wslip_weight_val = float(wslip_weight) if wslip_weight else None
+
+    recv_min = 0.0
+    recv_max = invoice_weight_val
+    recv_help = "Actual weight taken into inventory. Cannot exceed the invoice weight."
+    if (
+        wslip_weight_val is not None
+        and invoice_weight_val is not None
+        and wslip_weight_val < invoice_weight_val
+    ):
+        recv_min = wslip_weight_val
+        recv_help = (
+            f"Weighbridge weight ({wslip_weight_val:g} kg) is below the invoice weight "
+            f"({invoice_weight_val:g} kg) — enter a value between the two."
+        )
     with n5:
         weight = empty_percent_input(
             "Received weight (kg) *",
             key=f"rm_line_weight_{line_token}_{idx}",
-            max_value=None,
+            min_value=recv_min,
+            max_value=recv_max,
             step=1.0,
+            help=recv_help,
         )
 
     diff_col, comments_col = st.columns([1.4, 2.6])
     with diff_col:
-        if weight and wslip_weight:
-            diff = float(wslip_weight) - float(weight)
-            tolerance = float(weight) * WEIGHT_TOLERANCE_PCT / 100
-            diff_pct = (diff / float(weight) * 100) if weight else 0.0
+        if invoice_weight_val and wslip_weight_val:
+            diff = wslip_weight_val - invoice_weight_val
+            tolerance = invoice_weight_val * WEIGHT_TOLERANCE_PCT / 100
+            diff_pct = diff / invoice_weight_val * 100
             diff_text = f"Weight difference: {diff:+.2f} kg ({diff_pct:+.2f}%)"
             if diff > tolerance:
                 st.markdown(
@@ -270,8 +289,26 @@ submitted = st.button("Save invoice lots", type="primary", key="rm_log_save")
 if submitted:
     vendor_code = vendor_opts[vendor_label] if vendor_label else None
     invoice_no = (invoice or "").strip()
-    complete = [ln for ln in collected_lines if ln["name"] and ln["weight"] > 0]
-    incomplete = [ln for ln in collected_lines if ln["name"] and ln["weight"] <= 0]
+    complete = [
+        ln
+        for ln in collected_lines
+        if ln["name"] and ln["weight"] > 0 and (ln["invoice_weight"] or 0) > 0
+    ]
+    incomplete = [
+        ln
+        for ln in collected_lines
+        if ln["name"] and (ln["weight"] <= 0 or not (ln["invoice_weight"] or 0) > 0)
+    ]
+    out_of_range = []
+    for ln in complete:
+        if ln["weight"] > ln["invoice_weight"] + 1e-9:
+            out_of_range.append(ln)
+        elif (
+            ln["weighment_slip_weight"] is not None
+            and ln["weighment_slip_weight"] < ln["invoice_weight"]
+            and ln["weight"] < ln["weighment_slip_weight"] - 1e-9
+        ):
+            out_of_range.append(ln)
     if not vendors:
         st.error("Create a vendor first.")
     elif not vendor_code:
@@ -279,9 +316,18 @@ if submitted:
     elif not invoice_no:
         st.error("Vendor invoice is required.")
     elif incomplete:
-        st.error("Each raw material row needs a received weight greater than zero.")
+        st.error(
+            "Each raw material row needs an invoice weight and a received weight, "
+            "both greater than zero."
+        )
     elif not complete:
-        st.error("Add at least one raw material with a name and received weight.")
+        st.error("Add at least one raw material with a name, invoice weight, and received weight.")
+    elif out_of_range:
+        st.error(
+            "Received weight must be at or below the invoice weight, and at or above the "
+            "weighment slip weight when it is lower than the invoice weight. "
+            f"Check: {', '.join(ln['name'] for ln in out_of_range)}."
+        )
     else:
         try:
             doc_bytes = photo_bytes(invoice_doc)
