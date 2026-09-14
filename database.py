@@ -981,6 +981,10 @@ CREATE TABLE IF NOT EXISTS Raw_Material_Purchase (
     Invoice_Document_type TEXT,
     Vehicle_photo {blob},
     Weighment_slip_photo {blob},
+    Invoice_status TEXT DEFAULT 'Pending with purchase'
+        CHECK(Invoice_status IN (
+            'Pending with purchase', 'Pending with accounts', 'Approved', 'Cancelled'
+        )),
     Last_updated_by TEXT,
     Last_updated_datetime TEXT
 );
@@ -1510,6 +1514,14 @@ def init_db() -> None:
             ],
         )
         _ensure_purchase_order_status(conn)
+        _ensure_columns(
+            conn,
+            "Raw_Material_Purchase",
+            [
+                ("Invoice_status", "TEXT DEFAULT 'Pending with purchase'"),
+            ],
+        )
+        _ensure_raw_material_purchase_invoice_status(conn)
         _ensure_columns(
             conn,
             "Raw_Material_Inventory",
@@ -2460,6 +2472,42 @@ def _ensure_purchase_order_status(conn: Connection) -> None:
                 ALTER TABLE Purchase_Order
                 ADD CONSTRAINT purchase_order_status_check
                 CHECK (Purchase_Order_Status IN ('Open', 'Closed', 'Cancelled'))
+                """,
+            )
+    else:
+        # SQLite: table-level CHECK is only on CREATE; column already has DEFAULT.
+        pass
+
+
+def _ensure_raw_material_purchase_invoice_status(conn: Connection) -> None:
+    """Backfill and enforce Invoice_status on Raw_Material_Purchase."""
+    _exec(
+        conn,
+        """
+        UPDATE Raw_Material_Purchase
+        SET Invoice_status = 'Pending with purchase'
+        WHERE Invoice_status IS NULL
+           OR TRIM(Invoice_status) = ''
+        """,
+    )
+    if IS_POSTGRES:
+        exists = _exec(
+            conn,
+            """
+            SELECT 1 AS ok
+            FROM pg_constraint
+            WHERE conname = 'raw_material_purchase_invoice_status_check'
+            """,
+        ).first()
+        if not exists:
+            _exec(
+                conn,
+                """
+                ALTER TABLE Raw_Material_Purchase
+                ADD CONSTRAINT raw_material_purchase_invoice_status_check
+                CHECK (Invoice_status IN (
+                    'Pending with purchase', 'Pending with accounts', 'Approved', 'Cancelled'
+                ))
                 """,
             )
     else:
