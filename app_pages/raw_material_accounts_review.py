@@ -69,6 +69,7 @@ else:
                     st.caption("No weighment slip photo uploaded.")
 
             lines = db.list_raw_material_inventory_by_purchase(purchase_id)
+            iw_total = rw_total = 0.0
             if lines:
                 show_dataframe(df_from_rows(lines))
 
@@ -97,14 +98,48 @@ else:
             else:
                 st.info("No raw material lines on this invoice.")
 
+            debit_note_default = lines[0].get("Debit_note_check") if lines else "No"
+            comment_default = (lines[0].get("Accounts_comment") if lines else "") or ""
+            db_col, comment_col = st.columns([1, 3])
+            with db_col:
+                debit_note_check = st.selectbox(
+                    "Debit note check",
+                    ["No", "Yes"],
+                    index=1 if debit_note_default == "Yes" else 0,
+                    key=f"accounts_review_debit_{purchase_id}",
+                )
+            with comment_col:
+                accounts_comment = st.text_input(
+                    "Accounts comment",
+                    value=comment_default,
+                    key=f"accounts_review_comment_{purchase_id}",
+                )
+
+            needs_debit_note = bool(lines) and rw_total < iw_total
+            if needs_debit_note:
+                st.warning(
+                    "Total value based on Received weight is lower than Total value based on "
+                    "Invoice weight. Check **Debit note check** or enter an **Accounts comment** "
+                    "before approving."
+                )
+
             if st.button(
                 "Approve",
                 key=f"accounts_review_approve_{purchase_id}",
                 type="primary",
             ):
-                try:
-                    db.set_raw_material_purchase_invoice_status(purchase_id, "Approved")
-                    st.success(f"Invoice #{purchase_id} approved.")
-                    st.rerun()
-                except Exception as exc:
-                    st.error(f"Could not approve: {exc}")
+                if needs_debit_note and debit_note_check != "Yes" and not accounts_comment.strip():
+                    st.error(
+                        "Check Debit note check or enter an Accounts comment before approving "
+                        "this invoice."
+                    )
+                else:
+                    try:
+                        db.set_raw_material_inventory_accounts_review(
+                            purchase_id, debit_note_check, accounts_comment
+                        )
+                        db.set_raw_material_purchase_invoice_status(purchase_id, "Approved")
+                        st.success(f"Invoice #{purchase_id} approved.")
+                        st.rerun()
+                    except Exception as exc:
+                        st.error(f"Could not approve: {exc}")

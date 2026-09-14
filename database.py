@@ -1016,6 +1016,8 @@ CREATE TABLE IF NOT EXISTS Raw_Material_Inventory (
     Weighment_slip_weight {float},
     Invoice_weight {float},
     Comments TEXT,
+    Debit_note_check TEXT DEFAULT 'No' CHECK(Debit_note_check IN ('Yes', 'No')),
+    Accounts_comment TEXT,
     Source_Batch_ID TEXT REFERENCES Production_batch(Batch_ID),
     Source_Alloy_id INTEGER REFERENCES Alloy_Master(Alloy_id)
 );
@@ -1545,8 +1547,11 @@ def init_db() -> None:
                 ("Weighment_slip_weight", "DOUBLE PRECISION" if IS_POSTGRES else "REAL"),
                 ("Invoice_weight", "DOUBLE PRECISION" if IS_POSTGRES else "REAL"),
                 ("Comments", "TEXT"),
+                ("Debit_note_check", "TEXT DEFAULT 'No'"),
+                ("Accounts_comment", "TEXT"),
             ],
         )
+        _ensure_raw_material_inventory_debit_note_check(conn)
         _drop_columns(
             conn,
             "Raw_Material_Master",
@@ -2523,6 +2528,40 @@ def _ensure_raw_material_purchase_invoice_status(conn: Connection) -> None:
                 CHECK (Invoice_status IN (
                     'Pending with purchase', 'Pending with accounts', 'Approved', 'Cancelled'
                 ))
+                """,
+            )
+    else:
+        # SQLite: table-level CHECK is only on CREATE; column already has DEFAULT.
+        pass
+
+
+def _ensure_raw_material_inventory_debit_note_check(conn: Connection) -> None:
+    """Backfill and enforce Debit_note_check on Raw_Material_Inventory."""
+    _exec(
+        conn,
+        """
+        UPDATE Raw_Material_Inventory
+        SET Debit_note_check = 'No'
+        WHERE Debit_note_check IS NULL
+           OR TRIM(Debit_note_check) = ''
+        """,
+    )
+    if IS_POSTGRES:
+        exists = _exec(
+            conn,
+            """
+            SELECT 1 AS ok
+            FROM pg_constraint
+            WHERE conname = 'raw_material_inventory_debit_note_check_check'
+            """,
+        ).first()
+        if not exists:
+            _exec(
+                conn,
+                """
+                ALTER TABLE Raw_Material_Inventory
+                ADD CONSTRAINT raw_material_inventory_debit_note_check_check
+                CHECK (Debit_note_check IN ('Yes', 'No'))
                 """,
             )
     else:
@@ -4966,12 +5005,32 @@ def list_raw_material_inventory_by_purchase(purchase_id: int) -> list[dict[str, 
                Weighment_slip_weight AS "Weighment_slip_weight",
                Received_weight AS "Received_weight",
                Cost_per_kg AS "Cost_per_kg",
-               Comments AS "Comments"
+               Comments AS "Comments",
+               Debit_note_check AS "Debit_note_check",
+               Accounts_comment AS "Accounts_comment"
         FROM Raw_Material_Inventory
         WHERE Purchase_id = ?
         ORDER BY Lot_id
         """,
         (purchase_id,),
+    )
+
+
+def set_raw_material_inventory_accounts_review(
+    purchase_id: int, debit_note_check: str, accounts_comment: Optional[str]
+) -> None:
+    """Stamp every lot on this purchase with the accounts team's debit-note
+    decision and comment (both live on Raw_Material_Inventory, one purchase
+    can have several lots, so the same review applies to all of them)."""
+    if debit_note_check not in ("Yes", "No"):
+        raise ValueError("Debit note check must be Yes or No.")
+    execute(
+        """
+        UPDATE Raw_Material_Inventory
+        SET Debit_note_check = ?, Accounts_comment = ?
+        WHERE Purchase_id = ?
+        """,
+        (debit_note_check, (accounts_comment or "").strip() or None, purchase_id),
     )
 
 
