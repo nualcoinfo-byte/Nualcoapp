@@ -1,7 +1,7 @@
 """
 Nualco — Secondary Aluminum Alloy Production Tracker
 Streamlit application for batch, chemistry, and yield tracking.
-Runs on Neon Postgres (DATABASE_URL) with local SQLite as fallback.
+Runs on Supabase Postgres (DATABASE_URL) with local SQLite as fallback.
 """
 
 from __future__ import annotations
@@ -35,9 +35,6 @@ try:
     if "DATABASE_URL" in st.secrets:
         _secret_url = str(st.secrets["DATABASE_URL"]).strip().strip('"').strip("'")
         os.environ["DATABASE_URL"] = _secret_url
-        # A leftover Neon DATABASE_URL_UNPOOLED must not override Supabase.
-        if "neon.tech" not in _secret_url.lower() and "DATABASE_URL_UNPOOLED" in os.environ:
-            os.environ.pop("DATABASE_URL_UNPOOLED", None)
 except Exception:
     pass
 
@@ -61,7 +58,7 @@ if getattr(db, "_LOADED_MTIME", None) != _db_mtime:
     db._LOADED_MTIME = _db_mtime
     st.cache_resource.clear()
 
-# Reload only when switching Neon <-> SQLite. Reloading on every rerun
+# Reload only when switching Postgres <-> SQLite. Reloading on every rerun
 # drops the engine and forces a new handshake each click.
 _want_sqlite = bool(st.session_state.get("use_sqlite"))
 if _want_sqlite:
@@ -157,10 +154,10 @@ def bootstrap() -> str:
         try:
             db.adopt_supabase_pooler()
             _init_postgres()
-            st.session_state.pop("_neon_init_error", None)
+            st.session_state.pop("_db_init_error", None)
             return "postgres"
         except Exception as exc:
-            st.session_state["_neon_init_error"] = str(exc)
+            st.session_state["_db_init_error"] = str(exc)
             try:
                 _init_postgres.clear()
             except Exception:
@@ -170,10 +167,10 @@ def bootstrap() -> str:
                 try:
                     if db.adopt_supabase_pooler():
                         _init_postgres()
-                        st.session_state.pop("_neon_init_error", None)
+                        st.session_state.pop("_db_init_error", None)
                         return "postgres"
                 except Exception as exc2:
-                    st.session_state["_neon_init_error"] = str(exc2)
+                    st.session_state["_db_init_error"] = str(exc2)
                     try:
                         _init_postgres.clear()
                     except Exception:
@@ -379,7 +376,7 @@ if not auth_employee:
             "Could not reach Supabase yet. Click **Retry**, or reboot the app."
         )
         if st.sidebar.button("Retry database connection"):
-            st.session_state.pop("_neon_init_error", None)
+            st.session_state.pop("_db_init_error", None)
             st.cache_resource.clear()
             st.rerun()
     try:
@@ -450,11 +447,11 @@ if _db_mode == "postgres-error":
         "from Manage app. Keep `DATABASE_URL` as your Supabase URI "
         "(password `@` encoded as `%40`)."
     )
-    neon_err = st.session_state.get("_neon_init_error")
-    if neon_err:
-        st.sidebar.caption(f"Database init error: {neon_err}")
+    db_err = st.session_state.get("_db_init_error")
+    if db_err:
+        st.sidebar.caption(f"Database init error: {db_err}")
     if st.sidebar.button("Retry database connection"):
-        st.session_state.pop("_neon_init_error", None)
+        st.session_state.pop("_db_init_error", None)
         st.cache_resource.clear()
         st.rerun()
 elif st.session_state.get("use_sqlite") or os.environ.get("NUALCO_FORCE_SQLITE"):
@@ -462,12 +459,12 @@ elif st.session_state.get("use_sqlite") or os.environ.get("NUALCO_FORCE_SQLITE")
         "Offline SQLite mode. Rows you save stay on this PC and are not "
         "written to the shared database."
     )
-    neon_err = st.session_state.get("_neon_init_error")
-    if neon_err:
-        st.sidebar.caption(f"Database init error: {neon_err}")
+    db_err = st.session_state.get("_db_init_error")
+    if db_err:
+        st.sidebar.caption(f"Database init error: {db_err}")
     if st.sidebar.button("Reconnect to database"):
         st.session_state.pop("use_sqlite", None)
-        st.session_state.pop("_neon_init_error", None)
+        st.session_state.pop("_db_init_error", None)
         os.environ.pop("NUALCO_FORCE_SQLITE", None)
         st.cache_resource.clear()
         st.rerun()
@@ -476,7 +473,7 @@ elif not db.IS_POSTGRES:
         "Not connected to the database. In Streamlit Cloud go to "
         "**Manage app → Settings → Secrets** and set:\n\n"
         '```\nDATABASE_URL = "postgresql://..."\n```\n\n'
-        "Remove any leftover `DATABASE_URL_UNPOOLED` Neon URL, then reboot the app."
+        "Then reboot the app."
     )
 
 

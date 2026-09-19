@@ -2,10 +2,8 @@
 Database layer for Nualco Aluminum Alloy Manufacturing Tracker.
 
 Runs on Postgres when DATABASE_URL is available (from the environment or
-.env.local), otherwise falls back to the local SQLite file. Native Postgres
-on port 5432 is preferred; if that path is blocked and the host is Neon,
-queries go over Neon's HTTPS SQL endpoint instead. All SQL is written in the portable subset both
-dialects support:
+.env.local), otherwise falls back to the local SQLite file. All SQL is written
+in the portable subset both dialects support:
 
 - placeholders use `?` and are translated to `%s` for Postgres
 - upserts use `ON CONFLICT` (supported by both Postgres and SQLite 3.24+)
@@ -23,7 +21,6 @@ import os
 import re
 import secrets
 import socket
-import struct
 import sys
 import threading
 import time
@@ -250,11 +247,6 @@ def _prepare_postgres_url(url: str) -> str:
     )
 
 
-def _is_neon_pooler_url(url: str) -> bool:
-    host = (urlparse(_quote_pg_password(url)).hostname or "").lower()
-    return "neon.tech" in host and "-pooler." in host
-
-
 def _database_url() -> str | None:
     if _force_sqlite():
         return None
@@ -266,7 +258,6 @@ def _database_url() -> str | None:
         return text or None
 
     primary: str | None = None
-    unpooled: str | None = None
 
     def _take_primary(value: str | None) -> None:
         nonlocal primary
@@ -274,21 +265,10 @@ def _database_url() -> str | None:
         if url:
             primary = url
 
-    def _take_unpooled(value: str | None) -> None:
-        nonlocal unpooled
-        url = _clean(value)
-        if url:
-            unpooled = url
-
     def _take_secret_key(secrets: Any, key: str) -> None:
-        if key not in secrets:
-            return
-        if key.lower() in {"database_url_unpooled"}:
-            _take_unpooled(secrets[key])
-        else:
+        if key in secrets:
             _take_primary(secrets[key])
 
-    _take_unpooled(os.environ.get("DATABASE_URL_UNPOOLED"))
     _take_primary(os.environ.get("DATABASE_URL"))
 
     # Streamlit Cloud / local .streamlit/secrets.toml
@@ -299,28 +279,16 @@ def _database_url() -> str | None:
             import streamlit as st  # type: ignore
 
             secrets = st.secrets
-            for section in ("postgres", "neon", "db"):
+            for section in ("postgres", "db"):
                 if section not in secrets:
                     continue
                 block = secrets[section]
-                for key in (
-                    "DATABASE_URL_UNPOOLED",
-                    "database_url_unpooled",
-                    "DATABASE_URL",
-                    "database_url",
-                    "url",
-                    "uri",
-                ):
+                for key in ("DATABASE_URL", "database_url", "url", "uri"):
                     try:
                         _take_secret_key(block, key)
                     except Exception:
                         pass
-            for key in (
-                "DATABASE_URL_UNPOOLED",
-                "database_url_unpooled",
-                "DATABASE_URL",
-                "database_url",
-            ):
+            for key in ("DATABASE_URL", "database_url"):
                 _take_secret_key(secrets, key)
         except Exception:
             pass
@@ -331,22 +299,12 @@ def _database_url() -> str | None:
             if not line or line.startswith("#") or "=" not in line:
                 continue
             key, _, raw = line.partition("=")
-            name = key.strip()
-            if name == "DATABASE_URL_UNPOOLED":
-                _take_unpooled(raw)
-            elif name == "DATABASE_URL":
+            if key.strip() == "DATABASE_URL":
                 _take_primary(raw)
 
-    # DATABASE_URL is the app's chosen database. The Neon unpooled URL is
-    # only a substitute when DATABASE_URL is the Neon pooler, which drops
-    # idle Streamlit connections.
-    if primary and (not _is_neon_pooler_url(primary) or not unpooled):
-        chosen = primary
-    else:
-        chosen = unpooled or primary
-    if chosen:
-        chosen = _rewrite_supabase_ipv4(chosen)
-    return _prepare_postgres_url(chosen) if chosen else None
+    if primary:
+        primary = _rewrite_supabase_ipv4(primary)
+    return _prepare_postgres_url(primary) if primary else None
 
 
 def _postgres_label(url: str) -> str:
@@ -356,48 +314,17 @@ def _postgres_label(url: str) -> str:
         return f"Supabase Postgres ({match.group(1)})"
     if "supabase.co" in host or "supabase.com" in host:
         return "Supabase Postgres"
-    if "neon.tech" in host:
-        return "Neon Postgres"
     return "Postgres"
 
 
-def _is_neon_host(url: str) -> bool:
-    return "neon.tech" in (urlparse(url).hostname or "").lower()
-
-
-def _postgres_ssl_ready(url: str, timeout: float = 4.0) -> bool:
-    """True only if the host answers the Postgres SSLRequest. TCP-open is not enough."""
-    parsed = urlparse(url)
-    host = parsed.hostname
-    port = parsed.port or 5432
-    if not host:
-        return False
-    sock = None
-    try:
-        sock = socket.create_connection((host, port), timeout=timeout)
-        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-        sock.settimeout(timeout)
-        sock.sendall(struct.pack("!ii", 8, 80877103))
-        return sock.recv(1) == b"S"
-    except OSError:
-        return False
-    finally:
-        if sock is not None:
-            try:
-                sock.close()
-            except OSError:
-                pass
-
-
 _URL = _database_url()
-_USE_NEON_HTTP = False
 _CONNECT_TIMEOUT = 20 if _should_probe_pooler() else 8
 _PG_CONNECT_ARGS = {
     "connect_timeout": _CONNECT_TIMEOUT,
     "sslmode": "require",
     "gssencmode": "disable",
 }
-if _URL and not _is_neon_host(_URL):
+if _URL:
     ENGINE = create_engine(
         _URL,
         pool_pre_ping=True,
@@ -406,27 +333,6 @@ if _URL and not _is_neon_host(_URL):
         max_overflow=5,
         connect_args=_PG_CONNECT_ARGS,
     )
-    DB_LABEL = _postgres_label(_URL)
-elif _URL and _postgres_ssl_ready(_URL):
-    # Neon compute can scale to zero. Recycle before the typical 5-minute
-    # suspend, ping before checkout, and disable GSS (Windows libpq can hang
-    # for minutes on gssencmode=prefer).
-    ENGINE = create_engine(
-        _URL,
-        pool_pre_ping=True,
-        pool_recycle=280,
-        pool_size=5,
-        max_overflow=5,
-        connect_args=_PG_CONNECT_ARGS,
-    )
-    DB_LABEL = _postgres_label(_URL)
-elif _URL and _is_neon_host(_URL):
-    # Port 5432 often times out on this Windows network (TCP open, SSL never
-    # completes). Neon SQL-over-HTTPS on 443 still works.
-    from neon_http import HttpEngine
-
-    _USE_NEON_HTTP = True
-    ENGINE = HttpEngine(_URL)
     DB_LABEL = _postgres_label(_URL)
 else:
     # check_same_thread=False because Streamlit reruns scripts on worker
@@ -450,14 +356,13 @@ _CONNECT_BACKOFF_S = 1.5
 
 
 def _rebind_postgres_engine(url: str) -> None:
-    global ENGINE, DB_LABEL, IS_POSTGRES, _URL, _USE_NEON_HTTP
+    global ENGINE, DB_LABEL, IS_POSTGRES, _URL
     prepared = _prepare_postgres_url(url)
     try:
         ENGINE.dispose()
     except Exception:
         pass
     _URL = prepared
-    _USE_NEON_HTTP = False
     ENGINE = create_engine(
         prepared,
         pool_pre_ping=True,
@@ -488,14 +393,13 @@ def adopt_supabase_pooler() -> bool:
 
 
 def switch_to_sqlite() -> None:
-    """Drop the Neon engine and keep using a local SQLite file."""
-    global ENGINE, DB_LABEL, IS_POSTGRES, _URL, _USE_NEON_HTTP
+    """Drop the Postgres engine and keep using a local SQLite file."""
+    global ENGINE, DB_LABEL, IS_POSTGRES, _URL
     try:
         ENGINE.dispose()
     except Exception:
         pass
     _URL = None
-    _USE_NEON_HTTP = False
     ENGINE = create_engine(
         f"sqlite:///{DB_PATH}",
         connect_args={"check_same_thread": False},
@@ -523,7 +427,7 @@ def _is_transient_db_error(exc: BaseException) -> bool:
 
 
 def _retry_on_disconnect(op: Callable[[], _T]) -> _T:
-    """Retry a connect/query after Neon scale-to-zero or a dropped pooler socket."""
+    """Retry a connect/query after a dropped pooler socket."""
     delay = _CONNECT_BACKOFF_S
     last: OperationalError | None = None
     for attempt in range(_CONNECT_RETRIES):
@@ -2006,12 +1910,6 @@ def _ensure_raw_material_purchase_header(conn: Connection) -> None:
 
     if IS_POSTGRES:
         def _try_ddl(sql: str) -> None:
-            if _USE_NEON_HTTP:
-                try:
-                    _exec(conn, sql)
-                except Exception:
-                    pass
-                return
             _exec(conn, "SAVEPOINT rm_purchase_ddl")
             try:
                 _exec(conn, sql)
@@ -3552,12 +3450,6 @@ def get_all_records(table_name: str, order_by: str | None = None) -> list[dict[s
         table_name = table_name.lower()
         order_by = order_by.lower() if order_by else None
     def _run() -> list[dict[str, Any]]:
-        if _USE_NEON_HTTP:
-            sql = f"SELECT * FROM {table_name}"
-            if order_by is not None:
-                sql += f" ORDER BY {order_by}"
-            with ENGINE.connect() as conn:
-                return [dict(r) for r in _exec(conn, sql).mappings()]
         table = Table(table_name, MetaData(), autoload_with=ENGINE)
         stmt = select(table)
         if order_by is not None:
@@ -6513,7 +6405,7 @@ def _ensure_numeric_employee_ids(conn: Connection) -> None:
     # A foreign key that still points at an old ID would block the rename. Keep the
     # whole migration in one savepoint so a blocked rename leaves IDs as they were
     # instead of failing startup and dropping the app to SQLite.
-    use_savepoint = IS_POSTGRES and not _USE_NEON_HTTP
+    use_savepoint = IS_POSTGRES
     if use_savepoint:
         _exec(conn, "SAVEPOINT employee_id_migration")
     try:

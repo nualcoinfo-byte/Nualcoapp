@@ -19,7 +19,7 @@ COPY requirements.txt .
 RUN --mount=type=cache,id=s/f09da96b-bae2-4384-89ff-2febcba176cb-root-cache-pip,target=/root/.cache/pip \
     pip install -r requirements.txt
 
-COPY app.py database.py neon_http.py pages_common.py ./
+COPY app.py database.py pages_common.py ./
 COPY app_pages ./app_pages
 COPY assets ./assets
 COPY .streamlit ./.streamlit
