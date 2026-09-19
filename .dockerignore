@@ -8,5 +8,4 @@ nualco.db
 .env.local
 __pycache__
 *.pyc
-.neon
 agent-transcripts
