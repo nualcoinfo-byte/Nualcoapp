@@ -967,3 +967,116 @@ def _render_dashboard_refresh_bar(*, key_prefix: str) -> None:
                 db.refresh_dashboard_materialized_views()
             st.rerun()
 
+
+def tank_reading_rows(
+    key_prefix: str,
+    *,
+    default_tank: str,
+    consumption: bool = False,
+) -> tuple[list[dict], dict]:
+    """Rows for entering tank dip readings, with the litres worked out from each tank's chart.
+
+    The first row starts on `default_tank`; a second row (up to one per tank) starts on the
+    other tank. `consumption` picks the direction: oil used lowers the reading (starting above
+    ending), oil received raises it. Returns (the rows entered, the result of
+    calculate_furnace_oil_tank_fill / calculate_furnace_oil_tank_consumption) so the page can
+    save the rows and use the total. Session keys all start with `key_prefix`.
+    """
+    tank_types = db.FURNACE_OIL_TANK_TYPES
+    rows_key = f"{key_prefix}_rows"
+
+    def option_label(tank_type: str) -> str:
+        if not tank_type:
+            return "Select tank"
+        return f"{db.FURNACE_OIL_TANK_LABELS[tank_type]} ({tank_type})"
+
+    def add_row() -> None:
+        st.session_state[rows_key] = min(st.session_state.get(rows_key, 1) + 1, len(tank_types))
+
+    def remove_row() -> None:
+        n = st.session_state.get(rows_key, 1)
+        if n > 1:
+            for part in ("type", "start", "end"):
+                st.session_state.pop(f"{key_prefix}_{part}_{n - 1}", None)
+            st.session_state[rows_key] = n - 1
+
+    row_count = st.session_state.setdefault(rows_key, 1)
+    entered: list[dict] = []
+    for i in range(row_count):
+        type_key = f"{key_prefix}_type_{i}"
+        chosen_above = {st.session_state.get(f"{key_prefix}_type_{j}") for j in range(i)}
+        if type_key not in st.session_state:
+            preferred = default_tank if i == 0 else ""
+            if preferred in chosen_above or not preferred:
+                preferred = next((t for t in tank_types if t not in chosen_above), "")
+            st.session_state[type_key] = preferred
+        own_choice = st.session_state.get(type_key)
+        options = [""] + [t for t in tank_types if t not in chosen_above or t == own_choice]
+        c1, c2, c3 = st.columns([4, 2, 2])
+        with c1:
+            tank_type = st.selectbox(
+                "Oil tank type",
+                options=options,
+                format_func=option_label,
+                key=type_key,
+            )
+        unit = db.FURNACE_OIL_TANK_READING_UNITS.get(tank_type, "")
+        unit_label = f" ({unit})" if unit else ""
+        with c2:
+            start = empty_percent_input(
+                f"Starting reading{unit_label}",
+                key=f"{key_prefix}_start_{i}",
+                max_value=None,
+                step=0.5,
+            )
+        with c3:
+            end = empty_percent_input(
+                f"Ending reading{unit_label}",
+                key=f"{key_prefix}_end_{i}",
+                max_value=None,
+                step=0.5,
+            )
+        entered.append(
+            {"Oil_tank_type": tank_type, "Starting_reading": start, "Ending_reading": end}
+        )
+    add_col, remove_col, _spacer = st.columns([1, 1, 4])
+    add_col.button(
+        "Add tank row",
+        key=f"{key_prefix}_add",
+        on_click=add_row,
+        disabled=row_count >= len(tank_types),
+    )
+    remove_col.button(
+        "Remove last row",
+        key=f"{key_prefix}_remove",
+        on_click=remove_row,
+        disabled=row_count <= 1,
+    )
+
+    result = (
+        db.calculate_furnace_oil_tank_consumption(entered)
+        if consumption
+        else db.calculate_furnace_oil_tank_fill(entered)
+    )
+    for row in result["rows"]:
+        if row["status"] == "error":
+            st.error(row["error"])
+        elif row["status"] == "incomplete":
+            st.caption(f"Waiting for input: {row['error']}")
+    ok_rows = [r for r in result["rows"] if r["status"] == "ok"]
+    if ok_rows:
+        moved_label = "Litres consumed" if consumption else "Litres filled"
+        show_dataframe(
+            df_from_rows(
+                [
+                    {
+                        "Oil tank": option_label(r["Oil_tank_type"]),
+                        "Starting litres": r["Starting_litres"],
+                        "Ending litres": r["Ending_litres"],
+                        moved_label: r["Litres"],
+                    }
+                    for r in ok_rows
+                ]
+            )
+        )
+    return entered, result

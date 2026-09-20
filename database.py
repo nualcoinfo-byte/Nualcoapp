@@ -1587,6 +1587,7 @@ def init_db() -> None:
         )
         _ensure_sidestream_remelt_inventory(conn)
         _ensure_furnace_oil_purchase_tank(conn)
+        _ensure_furnace_oil_consumption_tank(conn)
         _ensure_packing_list(conn)
         _ensure_company_profile(conn)
         _ensure_employees(conn)
@@ -3673,7 +3674,10 @@ EDITABLE_TABLES: list[dict[str, Any]] = [
         "pk": ["consumption_date"],
         "order_by": "consumption_date",
         "identity": [],
-        "allow_add": True,
+        # Quantity is calculated from the tank readings entered on the Furnace Oil
+        # Consumption page, so it cannot be typed here, and a day cannot be added without them.
+        "readonly": ["quantity"],
+        "allow_add": False,
     },
     {
         "key": "furnace_oil_inventory",
@@ -7137,7 +7141,8 @@ def _ensure_row_level_security(conn: Connection) -> None:
                     'batch_input_return',
                     'batch_output','batch_chemical_composition','furnace_master',
                     'crucible_master','melter_master','trolley_master',
-                    'furnace_oil_consumption','furnace_oil_inventory',
+                    'furnace_oil_consumption','furnace_oil_consumption_tank',
+                    'furnace_oil_inventory',
                     'furnace_oil_consumption__daily','electricity_consumption',
                     'electricity_consumption__lines','alloy_master',
                     'alloy_master_spec','element_master','build_of_material',
@@ -7781,7 +7786,7 @@ def _ensure_furnace_oil_purchase_tank(conn: Connection) -> None:
         CREATE TABLE IF NOT EXISTS Furnace_Oil_Purchase_Tank (
             Purchase_id INTEGER NOT NULL
                 REFERENCES Furnace_Oil_Purchase(Purchase_id) ON DELETE CASCADE,
-            Oil_tank_type TEXT NOT NULL
+            Oil_tank_type TEXT NOT NULL DEFAULT '{FURNACE_OIL_PURCHASE_DEFAULT_TANK}'
                 CHECK(Oil_tank_type IN ({tank_types})),
             Litres_in_tank {float_type},
             Starting_reading {float_type},
@@ -7789,6 +7794,66 @@ def _ensure_furnace_oil_purchase_tank(conn: Connection) -> None:
             PRIMARY KEY (Purchase_id, Oil_tank_type)
         )
         """,
+    )
+    _ensure_column_default(
+        conn,
+        "furnace_oil_purchase_tank",
+        "oil_tank_type",
+        FURNACE_OIL_PURCHASE_DEFAULT_TANK,
+    )
+
+
+def _ensure_column_default(
+    conn: Connection, table: str, column: str, default_text: str
+) -> None:
+    """Give a text column a default on a table created before the default existed (Postgres)."""
+    if not IS_POSTGRES:
+        return  # SQLite cannot alter a default; new tables are created with it
+    current = _exec(
+        conn,
+        """
+        SELECT column_default FROM information_schema.columns
+        WHERE table_schema = 'public' AND table_name = ? AND column_name = ?
+        """,
+        (table, column),
+    ).scalar()
+    if current is None or default_text not in str(current):
+        _exec(
+            conn,
+            f"ALTER TABLE {table} ALTER COLUMN {column} SET DEFAULT {_sql_literal(default_text)}",
+        )
+
+
+def _ensure_furnace_oil_consumption_tank(conn: Connection) -> None:
+    """Child of Furnace_Oil_Consumption: the tank dip readings behind a day's consumption.
+
+    One row per consumption date and tank. Furnace_Oil_Consumption.Quantity is calculated from
+    these rows: for each tank, the litres at Starting_reading minus the litres at Ending_reading
+    (from the tank's dip chart), added up. Litres_consumed keeps each tank's share, so it does
+    not change if the dip charts are later corrected.
+    """
+    float_type = _DIALECT_TYPES[IS_POSTGRES]["float"]
+    tank_types = ", ".join(f"'{t}'" for t in FURNACE_OIL_TANK_TYPES)
+    _exec(
+        conn,
+        f"""
+        CREATE TABLE IF NOT EXISTS Furnace_Oil_Consumption_Tank (
+            Consumption_date TEXT NOT NULL
+                REFERENCES Furnace_Oil_Consumption(Consumption_date) ON DELETE CASCADE,
+            Oil_tank_type TEXT NOT NULL DEFAULT '{FURNACE_OIL_CONSUMPTION_DEFAULT_TANK}'
+                CHECK(Oil_tank_type IN ({tank_types})),
+            Litres_consumed {float_type},
+            Starting_reading {float_type},
+            Ending_reading {float_type},
+            PRIMARY KEY (Consumption_date, Oil_tank_type)
+        )
+        """,
+    )
+    _ensure_column_default(
+        conn,
+        "furnace_oil_consumption_tank",
+        "oil_tank_type",
+        FURNACE_OIL_CONSUMPTION_DEFAULT_TANK,
     )
 
 
@@ -7807,6 +7872,7 @@ def _ensure_packing_list_ready() -> None:
         _ensure_batch_input_return(conn)
         _ensure_ocr_extraction_job(conn)
         _ensure_furnace_oil_purchase_tank(conn)
+        _ensure_furnace_oil_consumption_tank(conn)
         _ensure_packing_list(conn)
         _ensure_company_profile(conn)
         _ensure_employees(conn)
@@ -12185,6 +12251,10 @@ FURNACE_OIL_TANK_READING_UNITS = {
     "ten_kl_tank_measurement": "cm",
     "service_oil_tank_measurement": "inch",
 }
+# Oil is bought into the 10 KL tank and drawn for the furnace from the service oil tank, so
+# these are the tanks each entry starts with.
+FURNACE_OIL_PURCHASE_DEFAULT_TANK = "ten_kl_tank_measurement"
+FURNACE_OIL_CONSUMPTION_DEFAULT_TANK = "service_oil_tank_measurement"
 
 
 def _furnace_oil_tank_chart(tank_type: str) -> tuple[list[dict[str, Any]], str]:
@@ -12196,18 +12266,25 @@ def _furnace_oil_tank_chart(tank_type: str) -> tuple[list[dict[str, Any]], str]:
     raise ValueError(f"Unknown oil tank type: {tank_type!r}")
 
 
-def calculate_furnace_oil_tank_fill(rows: list[dict[str, Any]]) -> dict[str, Any]:
-    """Litres added to each tank from its dip readings, and the total.
+def _calculate_furnace_oil_tank_movement(
+    rows: list[dict[str, Any]], *, consumption: bool
+) -> dict[str, Any]:
+    """Litres moved in or out of each tank from its dip readings, and the total.
 
     Each row is {"Oil_tank_type", "Starting_reading", "Ending_reading"} (the reading is in
     cm for the 10 KL tank and inch for the service oil tank). Litres come from the tank's
-    dip chart, interpolating between chart points:
+    dip chart, interpolating between chart points. Oil added raises the level:
 
-        Litres_in_tank = litres at the ending reading - litres at the starting reading
+        litres filled   = litres at the ending reading - litres at the starting reading
 
-    Completely blank rows are ignored. Every other row gets a "status": "ok", "incomplete"
-    (a tank or reading is missing) or "error"; "error" carries the message to show. Only
-    "ok" rows are added into "total".
+    and oil used lowers it:
+
+        litres consumed = litres at the starting reading - litres at the ending reading
+
+    Rows with neither reading entered are ignored. Every other row gets a "status": "ok",
+    "incomplete" (a tank or reading is missing) or "error"; "error" carries the message to
+    show. "Litres" (always positive) is set on "ok" rows, which are the only ones added
+    into "total".
     """
     charts: dict[str, tuple[list[dict[str, Any]], str]] = {}
     seen: set[str] = set()
@@ -12216,7 +12293,7 @@ def calculate_furnace_oil_tank_fill(rows: list[dict[str, Any]]) -> dict[str, Any
     for raw in rows:
         tank = str(raw.get("Oil_tank_type") or "").strip()
         start, end = raw.get("Starting_reading"), raw.get("Ending_reading")
-        if not tank and start is None and end is None:
+        if start is None and end is None:
             continue
         row: dict[str, Any] = {
             "Oil_tank_type": tank,
@@ -12224,7 +12301,7 @@ def calculate_furnace_oil_tank_fill(rows: list[dict[str, Any]]) -> dict[str, Any
             "Ending_reading": end,
             "Starting_litres": None,
             "Ending_litres": None,
-            "Litres_in_tank": None,
+            "Litres": None,
             "status": "ok",
             "error": None,
         }
@@ -12253,7 +12330,10 @@ def calculate_furnace_oil_tank_fill(rows: list[dict[str, Any]]) -> dict[str, Any
         except (TypeError, ValueError):
             fail("error", f"{label}: readings must be numbers.")
             continue
-        if end <= start:
+        if consumption and end >= start:
+            fail("error", f"{label}: the ending reading must be lower than the starting reading.")
+            continue
+        if not consumption and end <= start:
             fail("error", f"{label}: the ending reading must be higher than the starting reading.")
             continue
         if tank not in charts:
@@ -12269,9 +12349,32 @@ def calculate_furnace_oil_tank_fill(rows: list[dict[str, Any]]) -> dict[str, Any
             continue
         row["Starting_litres"] = round(start_l, 2)
         row["Ending_litres"] = round(end_l, 2)
-        row["Litres_in_tank"] = round(end_l - start_l, 2)
-        total += row["Litres_in_tank"]
+        row["Litres"] = round(start_l - end_l if consumption else end_l - start_l, 2)
+        total += row["Litres"]
     return {"rows": out, "total": round(total, 2)}
+
+
+def calculate_furnace_oil_tank_fill(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    """Litres added to each tank on a purchase (ending reading above the starting one).
+
+    Rows also carry the amount as "Litres_in_tank", the Furnace_Oil_Purchase_Tank column.
+    """
+    result = _calculate_furnace_oil_tank_movement(rows, consumption=False)
+    for row in result["rows"]:
+        row["Litres_in_tank"] = row["Litres"]
+    return result
+
+
+def calculate_furnace_oil_tank_consumption(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    """Litres drawn from each tank in a day (ending reading below the starting one).
+
+    Rows also carry the amount as "Litres_consumed", the Furnace_Oil_Consumption_Tank
+    column; "total" is the day's Furnace_Oil_Consumption.Quantity.
+    """
+    result = _calculate_furnace_oil_tank_movement(rows, consumption=True)
+    for row in result["rows"]:
+        row["Litres_consumed"] = row["Litres"]
+    return result
 
 
 def add_furnace_oil_purchase(
@@ -12402,17 +12505,50 @@ def get_furnace_oil_consumption_row(consumption_date: str) -> Optional[dict[str,
     )
 
 
+def list_furnace_oil_consumption_tanks(consumption_date: str) -> list[dict[str, Any]]:
+    """The tank dip readings saved with one day's furnace oil consumption."""
+    return fetch_all(
+        """
+        SELECT Consumption_date AS "Consumption_date",
+               Oil_tank_type AS "Oil_tank_type",
+               Starting_reading AS "Starting_reading",
+               Ending_reading AS "Ending_reading",
+               Litres_consumed AS "Litres_consumed"
+        FROM Furnace_Oil_Consumption_Tank
+        WHERE Consumption_date = ?
+        ORDER BY Oil_tank_type
+        """,
+        (consumption_date,),
+    )
+
+
 def add_furnace_oil_consumption(
     consumption_date: str,
-    quantity: float,
+    tank_readings: list[dict[str, Any]],
     notes: Optional[str] = None,
-) -> None:
-    qty = _oil_qty(quantity)
-    if qty <= 0:
-        raise ValueError("Consumption (litres) must be greater than zero.")
+) -> float:
+    """Save one day's furnace oil consumption from the tank dip readings; returns the quantity.
+
+    tank_readings rows are {"Oil_tank_type", "Starting_reading", "Ending_reading"}. The day's
+    Quantity is not passed in: it is the total litres drawn from the tanks (litres at the
+    starting reading minus litres at the ending reading, per tank; see
+    calculate_furnace_oil_tank_consumption). Saving the same date again replaces that day's
+    row and its tank rows together.
+    """
     day = _as_effective_date(consumption_date)
     if not day:
         raise ValueError("Consumption date is required.")
+    fill = calculate_furnace_oil_tank_consumption(tank_readings or [])
+    problems = [r["error"] for r in fill["rows"] if r["status"] != "ok"]
+    if problems:
+        raise ValueError(" ".join(problems))
+    if not fill["rows"]:
+        raise ValueError(
+            "Enter the tank readings; the quantity consumed is calculated from them."
+        )
+    qty = fill["total"]
+    if qty <= 0:
+        raise ValueError("Consumption (litres) must be greater than zero.")
     existing = get_furnace_oil_consumption_row(day)
     available = get_furnace_oil_stock() + _oil_qty(existing.get("Quantity") if existing else 0)
     if qty > available + 1e-9:
@@ -12420,20 +12556,45 @@ def add_furnace_oil_consumption(
             f"Consumption {qty:g} L exceeds available stock {available:g} L."
         )
     by_val, dt_val = audit_stamp()
-    execute(
-        """
-        INSERT INTO Furnace_Oil_Consumption
-            (Consumption_date, Quantity, Notes, Last_updated_by, Last_updated_datetime)
-        VALUES (?, ?, ?, ?, ?)
-        ON CONFLICT(Consumption_date) DO UPDATE SET
-            Quantity=excluded.Quantity,
-            Notes=excluded.Notes,
-            Last_updated_by=excluded.Last_updated_by,
-            Last_updated_datetime=excluded.Last_updated_datetime
-        """,
-        (day, qty, (notes or "").strip() or None, by_val, dt_val),
-    )
+    with get_connection() as conn:
+        _exec(
+            conn,
+            """
+            INSERT INTO Furnace_Oil_Consumption
+                (Consumption_date, Quantity, Notes, Last_updated_by, Last_updated_datetime)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(Consumption_date) DO UPDATE SET
+                Quantity=excluded.Quantity,
+                Notes=excluded.Notes,
+                Last_updated_by=excluded.Last_updated_by,
+                Last_updated_datetime=excluded.Last_updated_datetime
+            """,
+            (day, qty, (notes or "").strip() or None, by_val, dt_val),
+        )
+        _exec(
+            conn,
+            "DELETE FROM Furnace_Oil_Consumption_Tank WHERE Consumption_date = ?",
+            (day,),
+        )
+        for tank in fill["rows"]:
+            _exec(
+                conn,
+                """
+                INSERT INTO Furnace_Oil_Consumption_Tank
+                    (Consumption_date, Oil_tank_type, Litres_consumed,
+                     Starting_reading, Ending_reading)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    day,
+                    tank["Oil_tank_type"],
+                    tank["Litres_consumed"],
+                    float(tank["Starting_reading"]),
+                    float(tank["Ending_reading"]),
+                ),
+            )
     rebuild_furnace_oil_inventory()
+    return qty
 
 
 def furnace_oil_month_totals(year: int, month: int) -> dict[str, float]:

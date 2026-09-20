@@ -112,6 +112,11 @@ else:
     st.caption(
         f"Showing **{len(filter_df)}** of **{len(full_df)}** rows. "
         f"Locked key column(s): `{', '.join(pk_cols)}`."
+        + (
+            f" Calculated, read-only column(s): `{', '.join(meta['readonly'])}`."
+            if meta.get("readonly")
+            else ""
+        )
         + (" New rows: use the dedicated entry pages for auto-IDs." if identity_cols else "")
     )
     if table_key == "employees":
@@ -127,7 +132,8 @@ else:
     original_key = f"data_browser_{table_key}_original_{st.session_state[state_token]}"
     st.session_state[original_key] = full_df.copy()
 
-    disabled = [c for c in pk_cols if c in filter_df.columns]
+    locked_cols = list(pk_cols) + list(meta.get("readonly") or [])
+    disabled = [c for c in locked_cols if c in filter_df.columns]
     column_config = {}
     for c in filter_df.columns:
         if (

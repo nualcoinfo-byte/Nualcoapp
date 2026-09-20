@@ -1,7 +1,14 @@
 import streamlit as st
 import database as db
 from datetime import date
-from pages_common import df_from_rows, empty_percent_input, photo_bytes, show_dataframe, ui_date_input
+from pages_common import (
+    df_from_rows,
+    empty_percent_input,
+    photo_bytes,
+    show_dataframe,
+    tank_reading_rows,
+    ui_date_input,
+)
 
 
 # Clearing the form after a save has to happen before its widgets are created: Streamlit
@@ -91,99 +98,11 @@ st.caption(
 )
 
 
-def _tank_option(tank_type: str) -> str:
-    if not tank_type:
-        return "Select tank"
-    return f"{db.FURNACE_OIL_TANK_LABELS[tank_type]} ({tank_type})"
-
-
-def _add_tank_row() -> None:
-    n = st.session_state.get("fo_tank_rows", 1)
-    st.session_state["fo_tank_rows"] = min(n + 1, len(db.FURNACE_OIL_TANK_TYPES))
-
-
-def _remove_tank_row() -> None:
-    n = st.session_state.get("fo_tank_rows", 1)
-    if n > 1:
-        for prefix in ("fo_tank_type_", "fo_tank_start_", "fo_tank_end_"):
-            st.session_state.pop(f"{prefix}{n - 1}", None)
-        st.session_state["fo_tank_rows"] = n - 1
-
-
-tank_row_count = st.session_state.setdefault("fo_tank_rows", 1)
-tank_inputs: list[dict] = []
-for i in range(tank_row_count):
-    chosen_above = {st.session_state.get(f"fo_tank_type_{j}") for j in range(i)}
-    own_choice = st.session_state.get(f"fo_tank_type_{i}")
-    tank_options = [""] + [
-        t for t in db.FURNACE_OIL_TANK_TYPES if t not in chosen_above or t == own_choice
-    ]
-    r1, r2, r3 = st.columns([4, 2, 2])
-    with r1:
-        tank_type = st.selectbox(
-            "Oil tank type",
-            options=tank_options,
-            format_func=_tank_option,
-            key=f"fo_tank_type_{i}",
-        )
-    unit = db.FURNACE_OIL_TANK_READING_UNITS.get(tank_type, "")
-    unit_label = f" ({unit})" if unit else ""
-    with r2:
-        tank_start = empty_percent_input(
-            f"Starting reading{unit_label}",
-            key=f"fo_tank_start_{i}",
-            max_value=None,
-            step=0.5,
-        )
-    with r3:
-        tank_end = empty_percent_input(
-            f"Ending reading{unit_label}",
-            key=f"fo_tank_end_{i}",
-            max_value=None,
-            step=0.5,
-        )
-    tank_inputs.append(
-        {
-            "Oil_tank_type": tank_type,
-            "Starting_reading": tank_start,
-            "Ending_reading": tank_end,
-        }
-    )
-add_col, remove_col, _spacer = st.columns([1, 1, 4])
-add_col.button(
-    "Add tank row",
-    key="fo_tank_add",
-    on_click=_add_tank_row,
-    disabled=tank_row_count >= len(db.FURNACE_OIL_TANK_TYPES),
+tank_inputs, tank_fill = tank_reading_rows(
+    "fo_tank", default_tank=db.FURNACE_OIL_PURCHASE_DEFAULT_TANK
 )
-remove_col.button(
-    "Remove last row",
-    key="fo_tank_remove",
-    on_click=_remove_tank_row,
-    disabled=tank_row_count <= 1,
-)
-
-tank_fill = db.calculate_furnace_oil_tank_fill(tank_inputs)
 tank_ok_rows = [r for r in tank_fill["rows"] if r["status"] == "ok"]
-for tank_row in tank_fill["rows"]:
-    if tank_row["status"] == "error":
-        st.error(tank_row["error"])
-    elif tank_row["status"] == "incomplete":
-        st.caption(f"Waiting for input: {tank_row['error']}")
 if tank_ok_rows:
-    show_dataframe(
-        df_from_rows(
-            [
-                {
-                    "Oil tank": _tank_option(r["Oil_tank_type"]),
-                    "Starting litres": r["Starting_litres"],
-                    "Ending litres": r["Ending_litres"],
-                    "Litres filled": r["Litres_in_tank"],
-                }
-                for r in tank_ok_rows
-            ]
-        )
-    )
     tank_total = tank_fill["total"]
     qty_entered = float(qty or 0)
     m1, m2 = st.columns(2)
