@@ -21,8 +21,29 @@ _BRAND_INK = "#1A1A1A"
 # Sidebar marker so a stale Railway replica is obvious on the login page.
 APP_BUILD = "2026-09-03-dashboard-produce"
 
+def _environment_label() -> str | None:
+    """Name of the non-production environment this process runs in, else None.
+
+    APP_ENV wins; on Railway the platform's own environment name is used. An
+    unknown value on Railway is treated as production (no banner), so a live
+    deployment can never be mislabelled; a run off Railway with nothing set is
+    a local development run.
+    """
+    on_railway = bool(os.environ.get("RAILWAY_PROJECT_ID"))
+    env = (
+        os.environ.get("APP_ENV") or os.environ.get("RAILWAY_ENVIRONMENT_NAME") or ""
+    ).strip().lower()
+    if env in ("production", "prod"):
+        return None
+    if not env:
+        return None if on_railway else "development"
+    return env
+
+
+_ENV_LABEL = _environment_label()
+
 st.set_page_config(
-    page_title="Nualco Alloy Tracker",
+    page_title=("[" + _ENV_LABEL.upper() + "] " if _ENV_LABEL else "") + "Nualco Alloy Tracker",
     page_icon=str(LOGO_PATH) if LOGO_PATH.exists() else "🏭",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -127,6 +148,13 @@ st.markdown(
     """,
     unsafe_allow_html=True,
 )
+
+
+if _ENV_LABEL:
+    st.warning(
+        f"**{_ENV_LABEL.upper()} environment.** This is a test copy, not the live "
+        "system. Anything you enter here does not reach production."
+    )
 
 
 def _on_streamlit_cloud() -> bool:
@@ -385,6 +413,7 @@ if not auth_employee:
         st.error(f"Could not load the login page: {exc}")
     st.sidebar.markdown(
         f"**DB:** `{db.DB_LABEL}`  \n`build {APP_BUILD}`"
+        + (f"  \n**ENV:** `{_ENV_LABEL}`" if _ENV_LABEL else "")
     )
     st.stop()
 
@@ -440,6 +469,7 @@ st.sidebar.markdown(
     f"**Yield target:** {db.YIELD_TARGET_PCT:.0f}%  \n"
     f"**DB:** `{db.DB_LABEL}`  \n"
     f"`build {APP_BUILD}`"
+    + (f"  \n**ENV:** `{_ENV_LABEL}`" if _ENV_LABEL else "")
 )
 if _db_mode == "postgres-error":
     st.sidebar.error(
