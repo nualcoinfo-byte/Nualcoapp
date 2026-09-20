@@ -190,9 +190,9 @@ if tank_ok_rows:
     m1.metric("Total litres filled (tanks)", f"{tank_total:,.1f}")
     m2.metric("Quantity entered (L)", f"{qty_entered:,.1f}")
     if qty_entered > 0:
-        # Quantity at or above the tank total: green. Below it: red.
-        qty_ok = qty_entered + 1e-9 >= tank_total
-        colour, tint = ("#16a34a", "#dcfce7") if qty_ok else ("#dc2626", "#fee2e2")
+        # Quantity at or above the tank total: red. Below it: green.
+        qty_at_or_above = qty_entered + 1e-9 >= tank_total
+        colour, tint = ("#dc2626", "#fee2e2") if qty_at_or_above else ("#16a34a", "#dcfce7")
         st.markdown(
             f"""
             <style>
@@ -206,7 +206,7 @@ if tank_ok_rows:
             """,
             unsafe_allow_html=True,
         )
-        if qty_ok:
+        if qty_at_or_above:
             st.caption(
                 f"Quantity {qty_entered:,.1f} L is equal to or above the tank total "
                 f"{tank_total:,.1f} L."
