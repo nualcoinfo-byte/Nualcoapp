@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import inspect
 import json
 import os
 import re
@@ -6956,169 +6957,244 @@ def _apply_rls_session(conn: Connection) -> None:
             pass
 
 
+def _apply_rls_to_table(
+    conn: Connection, raw_name: str, has_anon: bool, has_authenticated: bool
+) -> None:
+    """Enable RLS on one table, (re)create its policy and set its role grants."""
+    ident = _sql_ident(raw_name)
+    _exec(conn, f"ALTER TABLE {ident} ENABLE ROW LEVEL SECURITY")
+    _exec(conn, f"DROP POLICY IF EXISTS nualco_all ON {ident}")
+    if raw_name == "employees":
+        _exec(
+            conn,
+            f"""
+            CREATE POLICY nualco_all ON {ident}
+            FOR ALL
+            USING (
+                public.nualco_is_privileged()
+                OR employee_id = NULLIF(
+                    current_setting('nualco.employee_id', true), ''
+                )
+            )
+            WITH CHECK (
+                public.nualco_is_privileged()
+                OR employee_id = NULLIF(
+                    current_setting('nualco.employee_id', true), ''
+                )
+            )
+            """,
+        )
+    else:
+        lit = _sql_literal(raw_name)
+        _exec(
+            conn,
+            f"""
+            CREATE POLICY nualco_all ON {ident}
+            FOR ALL
+            USING (public.nualco_table_allowed({lit}))
+            WITH CHECK (public.nualco_table_allowed({lit}))
+            """,
+        )
+    _exec(conn, f"REVOKE ALL ON TABLE {ident} FROM PUBLIC")
+    if has_anon:
+        _exec(conn, f"REVOKE ALL ON TABLE {ident} FROM anon")
+    if has_authenticated:
+        _exec(
+            conn,
+            f"GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE {ident} TO authenticated",
+        )
+
+
+# Per-table state, read for every table in one query so startup does not have
+# to re-issue the RLS statements for tables that are already correct.
+_RLS_TABLE_STATE_SQL = """
+    SELECT c.relname AS "name",
+           c.relrowsecurity AS "rls",
+           EXISTS (
+               SELECT 1 FROM pg_policy p
+               WHERE p.polrelid = c.oid AND p.polname = 'nualco_all'
+           ) AS "policy",
+           EXISTS (
+               SELECT 1 FROM aclexplode(c.relacl) a WHERE a.grantee = 0
+           ) AS "public_priv",
+           EXISTS (
+               SELECT 1 FROM aclexplode(c.relacl) a
+               JOIN pg_roles r ON r.oid = a.grantee
+               WHERE r.rolname = 'anon'
+           ) AS "anon_priv",
+           (
+               SELECT count(DISTINCT a.privilege_type)
+               FROM aclexplode(c.relacl) a
+               JOIN pg_roles r ON r.oid = a.grantee
+               WHERE r.rolname = 'authenticated'
+                 AND a.privilege_type IN ('SELECT', 'INSERT', 'UPDATE', 'DELETE')
+           ) = 4 AS "auth_full"
+    FROM pg_class c
+    JOIN pg_namespace n ON n.oid = c.relnamespace
+    WHERE n.nspname = 'public' AND c.relkind = 'r'
+    ORDER BY 1
+"""
+
+
+def _rls_stamp() -> str:
+    """Fingerprint of the RLS code itself, stored on the database after a full apply.
+
+    Any edit to the two functions below changes it, so the next startup
+    re-applies everything once. If the source is unavailable the stamp is
+    unique each time, which forces a full (safe) re-apply.
+    """
+    try:
+        source = inspect.getsource(_ensure_row_level_security) + inspect.getsource(
+            _apply_rls_to_table
+        )
+    except (OSError, TypeError):
+        return f"nualco-rls:unversioned:{time.time_ns()}"
+    return "nualco-rls:" + hashlib.sha256(source.encode("utf-8")).hexdigest()[:16]
+
+
 def _ensure_row_level_security(conn: Connection) -> None:
-    """Enable RLS on every public table and install role-based policies."""
+    """Enable RLS on every public table and install role-based policies.
+
+    Startup calls this on every boot, so it first checks the current state
+    (one query for the functions' stamp, one for all tables) and only issues
+    DDL where something is missing or the RLS code has changed since the last
+    full apply. Tables that are already correct cost no statements.
+    """
     if not IS_POSTGRES:
         return
-    _exec(
-        conn,
-        """
-        CREATE OR REPLACE FUNCTION public.nualco_role_name()
-        RETURNS text
-        LANGUAGE sql
-        STABLE
-        PARALLEL SAFE
-        AS $fn$
-          SELECT lower(btrim(COALESCE(
-            NULLIF(current_setting('nualco.role_name', true), ''),
-            ''
-          )))
-        $fn$
-        """,
-    )
-    _exec(
-        conn,
-        """
-        CREATE OR REPLACE FUNCTION public.nualco_is_privileged()
-        RETURNS boolean
-        LANGUAGE sql
-        STABLE
-        PARALLEL SAFE
-        AS $fn$
-          SELECT public.nualco_role_name() IN ('admin', 'management', 'system')
-        $fn$
-        """,
-    )
-    _exec(
-        conn,
-        """
-        CREATE OR REPLACE FUNCTION public.nualco_table_allowed(p_table text)
-        RETURNS boolean
-        LANGUAGE sql
-        STABLE
-        PARALLEL SAFE
-        AS $fn$
-          SELECT
-            public.nualco_is_privileged()
-            OR (
-              public.nualco_role_name() = 'purchase'
-              AND p_table = ANY (ARRAY[
-                'vendor_master','raw_material_purchase','raw_material_inventory',
-                'raw_material_master','raw_material_spec','isri_code_table',
-                'purchase_order','furnace_oil_purchase','customer_master',
-                'state_city_master','month_code','element_master','alloy_master',
-                'alloy_master_spec','company_profile','roles'
-              ])
-            )
-            OR (
-              public.nualco_role_name() = 'production'
-              AND p_table = ANY (ARRAY[
-                'production_batch','production_supervisor','batch_input',
-                'batch_input_return',
-                'batch_output','batch_chemical_composition','furnace_master',
-                'crucible_master','melter_master','trolley_master',
-                'furnace_oil_consumption','furnace_oil_inventory',
-                'furnace_oil_consumption__daily','electricity_consumption',
-                'electricity_consumption__lines','alloy_master',
-                'alloy_master_spec','element_master','build_of_material',
-                'cost_of_conversion','raw_material_inventory',
-                'raw_material_master','raw_material_spec','isri_code_table',
-                'finished_goods_inventory','company_profile',
-                'alloy_data_checker','roles'
-              ])
-            )
-            OR (
-              public.nualco_role_name() = 'inventory'
-              AND p_table = ANY (ARRAY[
-                'raw_material_inventory','raw_material_master','raw_material_spec',
-                'isri_code_table','finished_goods_inventory','packing_list',
-                'packing_list_batch','packing_list_certificate',
-                'packing_list_certificate_line','packing_list_certificate_source',
-                'packing_list_visual_inspection','customer_master','alloy_master',
-                'alloy_master_spec','element_master','company_profile',
-                'vendor_master','state_city_master','trolley_master','roles'
-              ])
-            )
-            OR (
-              public.nualco_role_name() = 'accounts'
-              AND p_table = ANY (ARRAY[
-                'packing_list','packing_list_batch','packing_list_certificate',
-                'packing_list_certificate_line','packing_list_certificate_source',
-                'packing_list_visual_inspection','purchase_order',
-                'customer_master','company_profile','finished_goods_inventory',
-                'vendor_master','alloy_master','element_master',
-                'state_city_master','month_code','roles'
-              ])
-            )
-        $fn$
-        """,
-    )
-    has_anon = bool(
-        _exec(conn, "SELECT 1 FROM pg_roles WHERE rolname = 'anon'").first()
-    )
-    has_authenticated = bool(
-        _exec(conn, "SELECT 1 FROM pg_roles WHERE rolname = 'authenticated'").first()
-    )
-    tables = [
+    roles = {
         str(row[0])
         for row in _exec(
             conn,
+            "SELECT rolname FROM pg_roles WHERE rolname IN ('anon', 'authenticated')",
+        )
+    }
+    has_anon = "anon" in roles
+    has_authenticated = "authenticated" in roles
+    stamp = _rls_stamp()
+    stored = _exec(
+        conn,
+        "SELECT obj_description(to_regprocedure('public.nualco_table_allowed(text)'), 'pg_proc')",
+    ).scalar()
+    current = stored == stamp
+    if not current:
+        _exec(
+            conn,
             """
-            SELECT c.relname
-            FROM pg_class c
-            JOIN pg_namespace n ON n.oid = c.relnamespace
-            WHERE n.nspname = 'public' AND c.relkind = 'r'
-            ORDER BY 1
+            CREATE OR REPLACE FUNCTION public.nualco_role_name()
+            RETURNS text
+            LANGUAGE sql
+            STABLE
+            PARALLEL SAFE
+            AS $fn$
+              SELECT lower(btrim(COALESCE(
+                NULLIF(current_setting('nualco.role_name', true), ''),
+                ''
+              )))
+            $fn$
             """,
         )
-    ]
-    for raw_name in tables:
-        ident = _sql_ident(raw_name)
-        _exec(conn, f"ALTER TABLE {ident} ENABLE ROW LEVEL SECURITY")
-        _exec(conn, f"DROP POLICY IF EXISTS nualco_all ON {ident}")
-        if raw_name == "employees":
-            _exec(
-                conn,
-                f"""
-                CREATE POLICY nualco_all ON {ident}
-                FOR ALL
-                USING (
-                    public.nualco_is_privileged()
-                    OR employee_id = NULLIF(
-                        current_setting('nualco.employee_id', true), ''
-                    )
+        _exec(
+            conn,
+            """
+            CREATE OR REPLACE FUNCTION public.nualco_is_privileged()
+            RETURNS boolean
+            LANGUAGE sql
+            STABLE
+            PARALLEL SAFE
+            AS $fn$
+              SELECT public.nualco_role_name() IN ('admin', 'management', 'system')
+            $fn$
+            """,
+        )
+        _exec(
+            conn,
+            """
+            CREATE OR REPLACE FUNCTION public.nualco_table_allowed(p_table text)
+            RETURNS boolean
+            LANGUAGE sql
+            STABLE
+            PARALLEL SAFE
+            AS $fn$
+              SELECT
+                public.nualco_is_privileged()
+                OR (
+                  public.nualco_role_name() = 'purchase'
+                  AND p_table = ANY (ARRAY[
+                    'vendor_master','raw_material_purchase','raw_material_inventory',
+                    'raw_material_master','raw_material_spec','isri_code_table',
+                    'purchase_order','furnace_oil_purchase','customer_master',
+                    'state_city_master','month_code','element_master','alloy_master',
+                    'alloy_master_spec','company_profile','roles'
+                  ])
                 )
-                WITH CHECK (
-                    public.nualco_is_privileged()
-                    OR employee_id = NULLIF(
-                        current_setting('nualco.employee_id', true), ''
-                    )
+                OR (
+                  public.nualco_role_name() = 'production'
+                  AND p_table = ANY (ARRAY[
+                    'production_batch','production_supervisor','batch_input',
+                    'batch_input_return',
+                    'batch_output','batch_chemical_composition','furnace_master',
+                    'crucible_master','melter_master','trolley_master',
+                    'furnace_oil_consumption','furnace_oil_inventory',
+                    'furnace_oil_consumption__daily','electricity_consumption',
+                    'electricity_consumption__lines','alloy_master',
+                    'alloy_master_spec','element_master','build_of_material',
+                    'cost_of_conversion','raw_material_inventory',
+                    'raw_material_master','raw_material_spec','isri_code_table',
+                    'finished_goods_inventory','company_profile',
+                    'alloy_data_checker','roles'
+                  ])
                 )
-                """,
-            )
-        else:
-            lit = _sql_literal(raw_name)
-            _exec(
-                conn,
-                f"""
-                CREATE POLICY nualco_all ON {ident}
-                FOR ALL
-                USING (public.nualco_table_allowed({lit}))
-                WITH CHECK (public.nualco_table_allowed({lit}))
-                """,
-            )
-        _exec(conn, f"REVOKE ALL ON TABLE {ident} FROM PUBLIC")
-        if has_anon:
-            _exec(conn, f"REVOKE ALL ON TABLE {ident} FROM anon")
+                OR (
+                  public.nualco_role_name() = 'inventory'
+                  AND p_table = ANY (ARRAY[
+                    'raw_material_inventory','raw_material_master','raw_material_spec',
+                    'isri_code_table','finished_goods_inventory','packing_list',
+                    'packing_list_batch','packing_list_certificate',
+                    'packing_list_certificate_line','packing_list_certificate_source',
+                    'packing_list_visual_inspection','customer_master','alloy_master',
+                    'alloy_master_spec','element_master','company_profile',
+                    'vendor_master','state_city_master','trolley_master','roles'
+                  ])
+                )
+                OR (
+                  public.nualco_role_name() = 'accounts'
+                  AND p_table = ANY (ARRAY[
+                    'packing_list','packing_list_batch','packing_list_certificate',
+                    'packing_list_certificate_line','packing_list_certificate_source',
+                    'packing_list_visual_inspection','purchase_order',
+                    'customer_master','company_profile','finished_goods_inventory',
+                    'vendor_master','alloy_master','element_master',
+                    'state_city_master','month_code','roles'
+                  ])
+                )
+            $fn$
+            """,
+        )
+    stale = []
+    for row in _exec(conn, _RLS_TABLE_STATE_SQL).mappings():
+        if (
+            not current
+            or not row["rls"]
+            or not row["policy"]
+            or row["public_priv"]
+            or (has_anon and row["anon_priv"])
+            or (has_authenticated and not row["auth_full"])
+        ):
+            stale.append(str(row["name"]))
+    for raw_name in stale:
+        _apply_rls_to_table(conn, raw_name, has_anon, has_authenticated)
+    if stale or not current:
         if has_authenticated:
-            _exec(
-                conn,
-                f"GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE {ident} TO authenticated",
-            )
-    if has_authenticated:
-        _exec(conn, "GRANT USAGE ON SCHEMA public TO authenticated")
-    if has_anon:
-        _exec(conn, "GRANT USAGE ON SCHEMA public TO anon")
+            _exec(conn, "GRANT USAGE ON SCHEMA public TO authenticated")
+        if has_anon:
+            _exec(conn, "GRANT USAGE ON SCHEMA public TO anon")
+    if not current:
+        _exec(
+            conn,
+            "COMMENT ON FUNCTION public.nualco_table_allowed(text) IS "
+            + _sql_literal(stamp),
+        )
 
 
 def _ensure_batch_input_return(conn: Connection) -> None:
