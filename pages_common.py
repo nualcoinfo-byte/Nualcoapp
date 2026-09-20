@@ -905,6 +905,9 @@ def show_dataframe(data, **kwargs):
 
 def ui_date_input(label: str, value="today", **kwargs):
     kwargs.setdefault("format", UI_DATE_WIDGET_FORMAT)
+    if isinstance(value, str) and value == "today":
+        # Streamlit's own "today" is the server's clock (UTC on Railway); use India's date.
+        value = db.today_ist()
     return st.date_input(label, value=value, **kwargs)
 
 
@@ -914,7 +917,7 @@ def _parse_master_date(value: object) -> date:
         return parsed.date()
     if isinstance(parsed, date):
         return parsed
-    return date.today()
+    return db.today_ist()
 
 
 def merge_percent_composition(
@@ -933,7 +936,7 @@ def merge_percent_composition(
     return merged
 
 
-_IST = timezone(timedelta(hours=5, minutes=30))
+_IST = db.IST
 
 
 def _render_dashboard_refresh_bar(*, key_prefix: str) -> None:

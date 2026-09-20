@@ -14,7 +14,7 @@ st.caption(
     "(production month if that month is on file, otherwise the previous available month)."
 )
 
-today = date.today()
+today = db.today_ist()
 ycol, mcol = st.columns(2)
 with ycol:
     year = st.selectbox(

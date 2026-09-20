@@ -830,9 +830,27 @@ def get_acting_role_id() -> int | None:
     return _ACTING_ROLE_ID
 
 
+# The app is used in India, so every date and time it stamps, defaults to or displays is Indian
+# Standard Time (UTC+05:30, no daylight saving) whatever the server's own clock says: Railway runs
+# in UTC, which is 5.5 hours behind. Never call now_ist() / today_ist() for app dates; use
+# these. Stored times are naive IST wall-clock strings (no offset), as they always have been.
+IST = timezone(timedelta(hours=5, minutes=30), "IST")
+DB_TIME_ZONE = "Asia/Kolkata"  # the same clock for the database's own defaults (CURRENT_TIMESTAMP)
+
+
+def now_ist() -> datetime:
+    """The current Indian Standard Time as a naive datetime."""
+    return datetime.now(IST).replace(tzinfo=None)
+
+
+def today_ist() -> date:
+    """Today's date in India."""
+    return now_ist().date()
+
+
 def audit_stamp() -> tuple[str, str]:
-    """Return (Last_updated_by, Last_updated_datetime) for the current actor."""
-    return get_acting_user(), datetime.now().isoformat(timespec="seconds")
+    """Return (Last_updated_by, Last_updated_datetime) for the current actor (IST)."""
+    return get_acting_user(), now_ist().isoformat(timespec="seconds")
 
 
 # ---------- Schema ----------
@@ -1342,7 +1360,7 @@ _DIALECT_TYPES = {
         "pct4": "NUMERIC(10, 4)",
         "blob": "BLOB",
         "autopk": "INTEGER PRIMARY KEY AUTOINCREMENT",
-        "now": "CURRENT_TIMESTAMP",
+        "now": "(datetime('now', '+5 hours', '30 minutes'))",  # IST
     },
 }
 
@@ -5117,7 +5135,7 @@ def add_alloy(
                 family,
                 alloy_group,
                 created_by,
-                datetime.now().isoformat(timespec="seconds"),
+                now_ist().isoformat(timespec="seconds"),
                 colour_code,
                 bis_designation,
                 revision_datetime,
@@ -5768,7 +5786,7 @@ def _insert_charge_lines(conn: Connection, batch_id: str, inputs: list[dict[str,
                     item.get("Weighment_scale_weight"),
                     item.get("Trolley_weight"),
                     item.get("Trolley_name"),
-                    item.get("Charge_time") or datetime.now().isoformat(timespec="seconds"),
+                    item.get("Charge_time") or now_ist().isoformat(timespec="seconds"),
                     item.get("Notes", ""),
                     item.get("Weighment_scale_photo"),
                     item.get("Input_photo"),
@@ -6739,7 +6757,7 @@ def set_employee_password(
     if not emp:
         raise ValueError("Employee not found.")
     hashed = hash_password(_validate_new_password(password))
-    stamp = datetime.now().isoformat(timespec="seconds")
+    stamp = now_ist().isoformat(timespec="seconds")
     execute(
         """
         UPDATE employees
@@ -6953,11 +6971,23 @@ def _apply_rls_session(conn: Connection) -> None:
                 )
                 if acc and acc.get("Access"):
                     role_name = str(acc["Access"])
-        _exec(conn, "SELECT set_config('nualco.role_name', ?, true)", (role_name,))
-        _exec(conn, "SELECT set_config('nualco.employee_id', ?, true)", (employee_id,))
+        # One statement: the role for RLS, and the IST clock for this transaction (transaction-local,
+        # so it is safe behind Supabase's transaction pooler). It makes CURRENT_TIMESTAMP column
+        # defaults and any date maths in SQL follow India time.
+        _exec(
+            conn,
+            "SELECT set_config('nualco.role_name', ?, true), "
+            "set_config('nualco.employee_id', ?, true), set_config('TimeZone', ?, true)",
+            (role_name, employee_id, DB_TIME_ZONE),
+        )
     except Exception:
         try:
-            _exec(conn, "SELECT set_config('nualco.role_name', 'system', true)")
+            _exec(
+                conn,
+                "SELECT set_config('nualco.role_name', 'system', true), "
+                "set_config('TimeZone', ?, true)",
+                (DB_TIME_ZONE,),
+            )
         except Exception:
             pass
 
@@ -7651,7 +7681,9 @@ def _requeue_stale_ocr_jobs() -> None:
             conn,
             "SELECT job_id, updated_at FROM ocr_extraction_job WHERE status = 'processing'",
         ).mappings().all()
-        cutoff = datetime.utcnow() - timedelta(minutes=_OCR_JOB_STALE_PROCESSING_MINUTES)
+        # updated_at is stamped by CURRENT_TIMESTAMP: IST on Postgres (see _apply_rls_session), UTC on SQLite.
+        clock_now = now_ist() if IS_POSTGRES else datetime.utcnow()
+        cutoff = clock_now - timedelta(minutes=_OCR_JOB_STALE_PROCESSING_MINUTES)
         for row in rows:
             updated = _parse_db_timestamp(row["updated_at"])
             if updated is not None and updated > cutoff:
@@ -9807,7 +9839,7 @@ def issue_packing_list_certificate(
         issued_date=issued_date,
     )
     by_val, dt_val = audit_stamp()
-    date_val = (issued_date or "").strip() or date.today().isoformat()
+    date_val = (issued_date or "").strip() or today_ist().isoformat()
     with get_connection() as conn:
         _exec(
             conn,
@@ -10237,7 +10269,7 @@ def save_batch_input_return(
                 qty,
                 kind,
                 (notes or "").strip(),
-                datetime.now().isoformat(timespec="seconds"),
+                now_ist().isoformat(timespec="seconds"),
                 by_val,
                 dt_val,
             ),
@@ -10363,7 +10395,7 @@ def conversion_cutoff_for_batch(batch_id: str) -> date:
         (batch_id,),
     )
     month = _as_month_start(row["Production_Date"] if row else None)
-    return month or date.today().replace(day=1)
+    return month or today_ist().replace(day=1)
 
 
 def _conversion_cutoff_on_conn(conn: Connection, batch_id: str) -> date:
@@ -10377,7 +10409,7 @@ def _conversion_cutoff_on_conn(conn: Connection, batch_id: str) -> date:
         .first()
     )
     month = _as_month_start(row["Production_Date"] if row else None)
-    return month or date.today().replace(day=1)
+    return month or today_ist().replace(day=1)
 
 
 def get_latest_cost_of_conversion(
@@ -10389,10 +10421,10 @@ def get_latest_cost_of_conversion(
     (typical in the first week), the previous available month is used.
     """
     if as_of is None:
-        as_of_iso = date.today().replace(day=1).isoformat()
+        as_of_iso = today_ist().replace(day=1).isoformat()
     else:
         month = _as_month_start(as_of)
-        as_of_iso = (month or date.today().replace(day=1)).isoformat()
+        as_of_iso = (month or today_ist().replace(day=1)).isoformat()
     return fetch_one(
         """
         SELECT id AS "id",
@@ -10416,7 +10448,7 @@ def get_latest_cost_of_conversion(
 def _latest_conversion_on_conn(
     conn: Connection, as_of: date
 ) -> tuple[float, Optional[str]]:
-    cutoff = _as_month_start(as_of) or date.today().replace(day=1)
+    cutoff = _as_month_start(as_of) or today_ist().replace(day=1)
     row = (
         _exec(
             conn,
@@ -10578,7 +10610,7 @@ def estimate_batch_input_cost(
             master.setdefault(str(row["Raw_Material_Name"]).lower(), dict(row))
 
         conversion_rate, conversion_month = _latest_conversion_on_conn(
-            conn, as_of or date.today()
+            conn, as_of or today_ist()
         )
 
     detail: list[dict[str, Any]] = []
@@ -11459,7 +11491,7 @@ def save_batch_outputs(
             }
         )
 
-    stamp = datetime.now().isoformat(timespec="seconds")
+    stamp = now_ist().isoformat(timespec="seconds")
     with get_connection() as conn:
         _exec(conn, "DELETE FROM batch_output WHERE Batch_ID = ?", (batch_id,))
         for row in cleaned:
@@ -11520,7 +11552,7 @@ def _sqlite_internal_remelt_purchase_id(conn: Connection) -> int:
         VALUES (NULL, 'INTERNAL-REMELT', NULL, ?, ?, ?)
         RETURNING Purchase_id
         """,
-        (date.today().isoformat(), by_val, dt_val),
+        (today_ist().isoformat(), by_val, dt_val),
     )
     return int(result.scalar_one())
 
@@ -12956,4 +12988,4 @@ def add_bom_line(
 
 
 def today_str() -> str:
-    return date.today().isoformat()
+    return today_ist().isoformat()

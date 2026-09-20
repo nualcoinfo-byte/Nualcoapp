@@ -13,7 +13,7 @@ st.caption(
 )
 
 default_day = (
-    date.today() - timedelta(days=1) if datetime.now().hour < 12 else date.today()
+    db.today_ist() - timedelta(days=1) if db.now_ist().hour < 12 else db.today_ist()
 )
 summary_date = ui_date_input("Date", value=default_day, key="dbs_date")
 

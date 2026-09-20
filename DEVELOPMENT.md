@@ -59,3 +59,16 @@ Setting a variable redeploys that service from its branch. Always pass `--servic
 Supabase gives the `anon` role access to everything created in `public`; the app's own setup revokes it on tables, but not
 on materialized views, sequences or functions. `HARDEN_SQL` in `scripts/refresh_staging_db.py` covers those (and the default
 privileges for future objects). Apply it to any new Supabase project, and keep it applied after a database is rebuilt.
+
+## Dates and times: always Indian Standard Time
+The app is used in India, and the Railway servers run in UTC (5.5 hours behind). Every date and time the app stamps,
+defaults to or displays is IST (UTC+05:30, no daylight saving).
+- In Python use `db.now_ist()` and `db.today_ist()` (in `database.py`). **Never** call `datetime.now()`, `date.today()` or
+  `datetime.utcnow()` for an app date, and don't rely on Streamlit's `"today"` (`ui_date_input` already maps it to IST).
+- Stored times are naive IST strings (`2026-09-21T01:13:01`, no offset), as `audit_stamp()` writes them.
+- Every Postgres transaction has its clock set to `Asia/Kolkata` (`_apply_rls_session`), so `CURRENT_TIMESTAMP` column
+  defaults are IST too and are written with a `+05:30` offset. A bare connection (psql, the Supabase SQL editor) is still UTC.
+- Check before releasing: `grep -n -E "datetime\.now\(|date\.today\(|utcnow" app.py pages_common.py app_pages/*.py` should
+  print nothing; in `database.py` only the IST helper and the deliberately timezone-aware dashboard timestamps remain.
+- Rows stamped before this rule (Railway's UTC clock, or a developer PC's clock) were deliberately **not** converted: the app
+  was still in development then, and their provenance is mixed. IST applies from the release that introduced it onward.

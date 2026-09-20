@@ -55,8 +55,8 @@ else:
     h1, h2, h3 = st.columns(3)
     with h1:
         po_no = st.text_input("Customer PO No *", placeholder="e.g. PO-2026-001")
-        order_date = ui_date_input("Order date", value=date.today())
-        delivery_date = ui_date_input("Delivery date", value=date.today())
+        order_date = ui_date_input("Order date", value=db.today_ist())
+        delivery_date = ui_date_input("Delivery date", value=db.today_ist())
     with h2:
         st.text_input(
             "Customer name",

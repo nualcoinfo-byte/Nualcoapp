@@ -564,7 +564,7 @@ else:
         elif isinstance(parsed_date, date):
             prod_date = parsed_date
         else:
-            prod_date = date.today()
+            prod_date = db.today_ist()
         shift = str(existing_batch.get("Shift") or "").strip().upper()
         if shift not in db.SHIFTS:
             shift = db.SHIFTS[0]
@@ -617,7 +617,7 @@ else:
         else:
             prod_date = ui_date_input(
                 "Production date",
-                value=date.today(),
+                value=db.today_ist(),
                 key=_pk("prod_date"),
                 disabled=locked,
                 help=(
@@ -1095,7 +1095,7 @@ else:
                         "Notes": n,
                         "Weighment_scale_photo": scale_photo_bytes,
                         "Input_photo": input_photo_bytes,
-                        "Charge_time": datetime.now().isoformat(timespec="seconds"),
+                        "Charge_time": db.now_ist().isoformat(timespec="seconds"),
                     }
                 )
 

@@ -174,10 +174,10 @@ def _pda_render_card(
 d1, d2, d3 = st.columns([1, 1, 1.6])
 with d1:
     start_date = ui_date_input(
-        "From date", value=date.today() - timedelta(days=30), key="pda_start"
+        "From date", value=db.today_ist() - timedelta(days=30), key="pda_start"
     )
 with d2:
-    end_date = ui_date_input("To date", value=date.today(), key="pda_end")
+    end_date = ui_date_input("To date", value=db.today_ist(), key="pda_end")
 with d3:
     all_furnaces = db.list_furnaces(active_only=False)
     furnace_filter = st.multiselect(

@@ -323,7 +323,7 @@ r1c1, r1c2, r1c3 = st.columns(3)
 with r1c1:
     invoice_date = ui_date_input(
         "Invoice date *",
-        value=date.today(),
+        value=db.today_ist(),
         key="pl_invoice_date",
     )
 with r1c2:

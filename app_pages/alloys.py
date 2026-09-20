@@ -124,7 +124,7 @@ with a2:
     )
     rev_dt = st.text_input(
         "Revision datetime",
-        value=format_ui_date(datetime.now(), with_time=True),
+        value=format_ui_date(db.now_ist(), with_time=True),
         key="alloy_rev_dt",
     )
     remarks = st.text_area("Remarks", key="alloy_remarks")

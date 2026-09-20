@@ -981,7 +981,7 @@ if "tc_cert_no" not in st.session_state or st.session_state.get("tc_cert_no_for"
     st.session_state["tc_cert_no_for"] = packing_list_id
     issued_raw = cert.get("Issued_date")
     st.session_state["tc_issued_date"] = (
-        _parse_master_date(issued_raw) if issued_raw else date.today()
+        _parse_master_date(issued_raw) if issued_raw else db.today_ist()
     )
 
 h1, h2, h3 = st.columns(3)

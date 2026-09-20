@@ -50,7 +50,7 @@ vendor_label = st.selectbox(
 p1, p2, p3 = st.columns(3)
 with p1:
     invoice_date = ui_date_input(
-        "Supplier invoice date *", value=date.today(), key="fo_pur_invoice_date"
+        "Supplier invoice date *", value=db.today_ist(), key="fo_pur_invoice_date"
     )
 with p2:
     invoice = st.text_input(
@@ -60,7 +60,7 @@ with p2:
     )
 with p3:
     received = ui_date_input(
-        "Received date *", value=date.today(), key="fo_pur_received"
+        "Received date *", value=db.today_ist(), key="fo_pur_received"
     )
 q1, q2, q3, q4 = st.columns(4)
 with q1:

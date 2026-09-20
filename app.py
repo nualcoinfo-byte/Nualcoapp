@@ -794,7 +794,7 @@ if PAGE == "Dashboard":
         "Dispatch is verified packing-list weight."
     )
     _render_dashboard_refresh_bar(key_prefix="dash")
-    today = date.today()
+    today = db.today_ist()
     try:
         supply_rows = db.list_po_supply_status()
         overview = _dashboard_overview_data(today.year, today.month)

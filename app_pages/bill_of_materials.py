@@ -16,7 +16,7 @@ with st.form("bom_form", clear_on_submit=True):
     b1, b2 = st.columns(2)
     with b1:
         bom_id = st.number_input("BOM ID *", min_value=1.0, value=1.0, step=1.0)
-        eff = ui_date_input("Effective date", value=date.today())
+        eff = ui_date_input("Effective date", value=db.today_ist())
         customer = st.selectbox("Customer", [""] + list(cust_opts.keys()))
         alloy_name = st.selectbox("Alloy name", [""] + alloys)
     with b2:

@@ -36,7 +36,7 @@ for _flash_key in ("fo_open_saved_message", "fo_cons_saved_message"):
         st.success(_flash)
 
 stock = db.get_furnace_oil_stock()
-month_tot = db.furnace_oil_month_totals(date.today().year, date.today().month)
+month_tot = db.furnace_oil_month_totals(db.today_ist().year, db.today_ist().month)
 m1, m2, m3, m4 = st.columns(4)
 m1.metric("Current stock (L)", f"{stock:,.1f}")
 m2.metric("Purchased this month (L)", f"{month_tot['purchased']:,.1f}")
@@ -51,7 +51,7 @@ with st.expander("Set opening stock", expanded=stock <= 0 and not db.list_furnac
     o1, o2 = st.columns(2)
     with o1:
         open_date = ui_date_input(
-            "Opening date", value=date.today(), key="fo_open_date"
+            "Opening date", value=db.today_ist(), key="fo_open_date"
         )
     with o2:
         open_qty = empty_percent_input(
@@ -87,7 +87,7 @@ st.markdown("#### Daily consumption")
 c1, c2 = st.columns(2)
 with c1:
     cons_date = ui_date_input(
-        "Consumption date *", value=date.today(), key="fo_cons_date"
+        "Consumption date *", value=db.today_ist(), key="fo_cons_date"
     )
 with c2:
     qty_slot = st.empty()  # filled in below, once the tank readings are known

@@ -21,7 +21,7 @@ line = st.radio(
     help="The plant has two EB connections. Readings are stored separately for each line.",
 )
 
-month_tot = db.electricity_month_totals(date.today().year, date.today().month)
+month_tot = db.electricity_month_totals(db.today_ist().year, db.today_ist().month)
 by_line = month_tot.get("by_line") or {}
 latest = db.list_electricity_consumption(limit=1, line=line)
 last_close = latest[0]["Closing_reading"] if latest else None
@@ -41,7 +41,7 @@ m4.metric(
 )
 
 cons_date = ui_date_input(
-    "Consumption date *", value=date.today(), key="elec_date"
+    "Consumption date *", value=db.today_ist(), key="elec_date"
 )
 day = cons_date.isoformat()
 existing = db.get_electricity_consumption(day, line)
