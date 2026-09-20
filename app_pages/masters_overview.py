@@ -76,6 +76,7 @@ with tab4:
         | 31 | Packing_list_certificate_source | Maps each printed TC line back to packing_list_batch |
         | 32 | Packing_list_visual_inspection | OK / NOT OK + Verified checks required before generating a test certificate |
         | 33 | Company_profile | Our company (issuer) — legal, contact, GST/CIN/MSME, and bank details |
+        | 34 | Furnace_Oil_Purchase_Tank | Tank dip readings for a furnace oil purchase (child of Furnace_Oil_Purchase; key is Purchase_id + Oil_tank_type); litres filled are checked against the purchase quantity |
 
         Extra production columns: sample fields, `Production_supervisor`.
         """

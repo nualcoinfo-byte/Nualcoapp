@@ -1586,6 +1586,7 @@ def init_db() -> None:
             ],
         )
         _ensure_sidestream_remelt_inventory(conn)
+        _ensure_furnace_oil_purchase_tank(conn)
         _ensure_packing_list(conn)
         _ensure_company_profile(conn)
         _ensure_employees(conn)
@@ -7123,7 +7124,8 @@ def _ensure_row_level_security(conn: Connection) -> None:
                   AND p_table = ANY (ARRAY[
                     'vendor_master','raw_material_purchase','raw_material_inventory',
                     'raw_material_master','raw_material_spec','isri_code_table',
-                    'purchase_order','furnace_oil_purchase','customer_master',
+                    'purchase_order','furnace_oil_purchase',
+                'furnace_oil_purchase_tank','customer_master',
                     'state_city_master','month_code','element_master','alloy_master',
                     'alloy_master_spec','company_profile','roles'
                   ])
@@ -7764,6 +7766,32 @@ def get_ocr_extraction_job(job_id: int) -> dict | None:
     return rows[0] if rows else None
 
 
+def _ensure_furnace_oil_purchase_tank(conn: Connection) -> None:
+    """Child of Furnace_Oil_Purchase: the dip readings taken in each tank when oil is received.
+
+    One row per purchase and tank. Litres_in_tank is the litres added to that tank (the
+    tank chart's litres at Ending_reading minus at Starting_reading), used to check the
+    purchase's Quantity.
+    """
+    float_type = _DIALECT_TYPES[IS_POSTGRES]["float"]
+    tank_types = ", ".join(f"'{t}'" for t in FURNACE_OIL_TANK_TYPES)
+    _exec(
+        conn,
+        f"""
+        CREATE TABLE IF NOT EXISTS Furnace_Oil_Purchase_Tank (
+            Purchase_id INTEGER NOT NULL
+                REFERENCES Furnace_Oil_Purchase(Purchase_id) ON DELETE CASCADE,
+            Oil_tank_type TEXT NOT NULL
+                CHECK(Oil_tank_type IN ({tank_types})),
+            Litres_in_tank {float_type},
+            Starting_reading {float_type},
+            Ending_reading {float_type},
+            PRIMARY KEY (Purchase_id, Oil_tank_type)
+        )
+        """,
+    )
+
+
 def _ensure_packing_list_ready() -> None:
     with get_connection() as conn:
         _ensure_columns(
@@ -7778,6 +7806,7 @@ def _ensure_packing_list_ready() -> None:
         )
         _ensure_batch_input_return(conn)
         _ensure_ocr_extraction_job(conn)
+        _ensure_furnace_oil_purchase_tank(conn)
         _ensure_packing_list(conn)
         _ensure_company_profile(conn)
         _ensure_employees(conn)
@@ -12040,6 +12069,7 @@ def list_furnace_oil_purchases(limit: int = 50) -> list[dict[str, Any]]:
                p.Supplier_invoice_date AS "Supplier_invoice_date",
                p.Received_date AS "Received_date",
                p.Quantity AS "Quantity",
+               t.Tank_litres AS "Tank_litres",
                p.Weight_in_kgs AS "Weight_in_kgs",
                p.Rate_per_litre AS "Rate_per_litre",
                p.Storage_tank AS "Storage_tank",
@@ -12048,6 +12078,11 @@ def list_furnace_oil_purchases(limit: int = 50) -> list[dict[str, Any]]:
                p.Notes AS "Notes"
         FROM Furnace_Oil_Purchase p
         LEFT JOIN Vendor_Master v ON v.Vendor_code = p.Vendor_code
+        LEFT JOIN (
+            SELECT Purchase_id, SUM(Litres_in_tank) AS Tank_litres
+            FROM Furnace_Oil_Purchase_Tank
+            GROUP BY Purchase_id
+        ) t ON t.Purchase_id = p.Purchase_id
         ORDER BY p.Received_date DESC, p.Purchase_id DESC
         LIMIT ?
         """,
@@ -12140,6 +12175,105 @@ def ten_kl_tank_litres(cm: float) -> Optional[float]:
     return _litres_from_depth(list_ten_kl_tank_measurement(), "Centimeter", cm)
 
 
+# Furnace_Oil_Purchase_Tank.Oil_tank_type values: the dip chart table each reading is looked up in.
+FURNACE_OIL_TANK_TYPES = ("ten_kl_tank_measurement", "service_oil_tank_measurement")
+FURNACE_OIL_TANK_LABELS = {
+    "ten_kl_tank_measurement": "10 KL tank",
+    "service_oil_tank_measurement": "Service oil tank",
+}
+FURNACE_OIL_TANK_READING_UNITS = {
+    "ten_kl_tank_measurement": "cm",
+    "service_oil_tank_measurement": "inch",
+}
+
+
+def _furnace_oil_tank_chart(tank_type: str) -> tuple[list[dict[str, Any]], str]:
+    """(dip chart rows, depth column) for a tank type."""
+    if tank_type == "ten_kl_tank_measurement":
+        return list_ten_kl_tank_measurement(), "Centimeter"
+    if tank_type == "service_oil_tank_measurement":
+        return list_service_oil_tank_measurement(), "Inch"
+    raise ValueError(f"Unknown oil tank type: {tank_type!r}")
+
+
+def calculate_furnace_oil_tank_fill(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    """Litres added to each tank from its dip readings, and the total.
+
+    Each row is {"Oil_tank_type", "Starting_reading", "Ending_reading"} (the reading is in
+    cm for the 10 KL tank and inch for the service oil tank). Litres come from the tank's
+    dip chart, interpolating between chart points:
+
+        Litres_in_tank = litres at the ending reading - litres at the starting reading
+
+    Completely blank rows are ignored. Every other row gets a "status": "ok", "incomplete"
+    (a tank or reading is missing) or "error"; "error" carries the message to show. Only
+    "ok" rows are added into "total".
+    """
+    charts: dict[str, tuple[list[dict[str, Any]], str]] = {}
+    seen: set[str] = set()
+    out: list[dict[str, Any]] = []
+    total = 0.0
+    for raw in rows:
+        tank = str(raw.get("Oil_tank_type") or "").strip()
+        start, end = raw.get("Starting_reading"), raw.get("Ending_reading")
+        if not tank and start is None and end is None:
+            continue
+        row: dict[str, Any] = {
+            "Oil_tank_type": tank,
+            "Starting_reading": start,
+            "Ending_reading": end,
+            "Starting_litres": None,
+            "Ending_litres": None,
+            "Litres_in_tank": None,
+            "status": "ok",
+            "error": None,
+        }
+        out.append(row)
+
+        def fail(status: str, message: str, _row: dict[str, Any] = row) -> None:
+            _row["status"], _row["error"] = status, message
+
+        if not tank:
+            fail("incomplete", "Select the oil tank.")
+            continue
+        if tank not in FURNACE_OIL_TANK_TYPES:
+            fail("error", f"Unknown oil tank type: {tank}.")
+            continue
+        label = FURNACE_OIL_TANK_LABELS[tank]
+        unit = FURNACE_OIL_TANK_READING_UNITS[tank]
+        if tank in seen:
+            fail("error", f"{label} is entered more than once; use one row per tank.")
+            continue
+        seen.add(tank)
+        if start is None or end is None:
+            fail("incomplete", f"{label}: enter both the starting and the ending reading.")
+            continue
+        try:
+            start, end = float(start), float(end)
+        except (TypeError, ValueError):
+            fail("error", f"{label}: readings must be numbers.")
+            continue
+        if end <= start:
+            fail("error", f"{label}: the ending reading must be higher than the starting reading.")
+            continue
+        if tank not in charts:
+            charts[tank] = _furnace_oil_tank_chart(tank)
+        chart, depth_key = charts[tank]
+        start_l = _litres_from_depth(chart, depth_key, start)
+        end_l = _litres_from_depth(chart, depth_key, end)
+        if start_l is None or end_l is None:
+            depths = [float(r[depth_key]) for r in chart if r.get(depth_key) is not None]
+            bad = start if start_l is None else end
+            span = f" ({min(depths):g}-{max(depths):g} {unit})" if depths else ""
+            fail("error", f"{label}: reading {bad:g} {unit} is outside the tank chart{span}.")
+            continue
+        row["Starting_litres"] = round(start_l, 2)
+        row["Ending_litres"] = round(end_l, 2)
+        row["Litres_in_tank"] = round(end_l - start_l, 2)
+        total += row["Litres_in_tank"]
+    return {"rows": out, "total": round(total, 2)}
+
+
 def add_furnace_oil_purchase(
     vendor_code: Optional[int],
     invoice: str,
@@ -12157,7 +12291,13 @@ def add_furnace_oil_purchase(
     weighment_slip_name: Optional[str] = None,
     weighment_slip_type: Optional[str] = None,
     purchase_type: str = "Purchase",
+    tank_readings: Optional[list[dict[str, Any]]] = None,
 ) -> int:
+    """Insert a furnace oil purchase, plus its per-tank dip readings (optional) in one transaction.
+
+    tank_readings rows are {"Oil_tank_type", "Starting_reading", "Ending_reading"}; see
+    calculate_furnace_oil_tank_fill. The tank litres do not have to match Quantity.
+    """
     qty = _oil_qty(quantity)
     if qty <= 0:
         raise ValueError("Quantity (litres) must be greater than zero.")
@@ -12170,6 +12310,12 @@ def add_furnace_oil_purchase(
         _validate_invoice_document_name(invoice_document_name)
     if weighment_slip and weighment_slip_name:
         _validate_invoice_document_name(weighment_slip_name)
+    tank_rows: list[dict[str, Any]] = []
+    if tank_readings:
+        tank_rows = calculate_furnace_oil_tank_fill(tank_readings)["rows"]
+        problems = [r["error"] for r in tank_rows if r["status"] != "ok"]
+        if problems:
+            raise ValueError(" ".join(problems))
     weight = _oil_qty(weight_in_kgs) or None
     by_val, dt_val = audit_stamp()
     with get_connection() as conn:
@@ -12207,8 +12353,42 @@ def add_furnace_oil_purchase(
             ),
         )
         purchase_id = int(result.scalar_one())
+        for tank in tank_rows:
+            _exec(
+                conn,
+                """
+                INSERT INTO Furnace_Oil_Purchase_Tank
+                    (Purchase_id, Oil_tank_type, Litres_in_tank,
+                     Starting_reading, Ending_reading)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    purchase_id,
+                    tank["Oil_tank_type"],
+                    tank["Litres_in_tank"],
+                    float(tank["Starting_reading"]),
+                    float(tank["Ending_reading"]),
+                ),
+            )
     rebuild_furnace_oil_inventory()
     return purchase_id
+
+
+def list_furnace_oil_purchase_tanks(purchase_id: int) -> list[dict[str, Any]]:
+    """The tank dip readings saved with one furnace oil purchase."""
+    return fetch_all(
+        """
+        SELECT Purchase_id AS "Purchase_id",
+               Oil_tank_type AS "Oil_tank_type",
+               Starting_reading AS "Starting_reading",
+               Ending_reading AS "Ending_reading",
+               Litres_in_tank AS "Litres_in_tank"
+        FROM Furnace_Oil_Purchase_Tank
+        WHERE Purchase_id = ?
+        ORDER BY Oil_tank_type
+        """,
+        (purchase_id,),
+    )
 
 
 def get_furnace_oil_consumption_row(consumption_date: str) -> Optional[dict[str, Any]]:
