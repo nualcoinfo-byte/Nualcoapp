@@ -1,0 +1,3 @@
+# One-off import scripts only (scripts/*.py). Not installed in the Railway image.
+# Install alongside the app requirements: pip install -r requirements.txt -r scripts/requirements.txt
+openpyxl==3.1.5
