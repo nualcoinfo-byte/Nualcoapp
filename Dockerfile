@@ -7,17 +7,16 @@ ENV STREAMLIT_SERVER_HEADLESS=true
 ENV STREAMLIT_BROWSER_GATHER_USAGE_STATS=false
 ENV PYTHONUNBUFFERED=1
 
-# Only requirements.txt is copied before the install step, so this layer -
-# and pip's download/build cache below - stays warm across every push that
-# doesn't touch dependencies (i.e. almost every push to app_pages/*.py).
+# Only requirements.txt is copied before the install step, so this layer stays
+# cached across every push that doesn't touch dependencies (i.e. almost every
+# push to app_pages/*.py).
 #
-# Railway's builder requires cache mount ids in the form
-# `s/<service id>-<path>` (no variable substitution allowed here, so the
-# service id is hardcoded) - see https://docs.railway.com/builds/dockerfiles.
-# Service id is nualco (production): f09da96b-bae2-4384-89ff-2febcba176cb.
+# No BuildKit cache mount on purpose: Railway only accepts cache mount ids of
+# the form `s/<service id>-<path>` with no variable substitution, so a
+# hardcoded id ties the Dockerfile to a single service and fails the build for
+# every other one (e.g. the staging environment).
 COPY requirements.txt .
-RUN --mount=type=cache,id=s/f09da96b-bae2-4384-89ff-2febcba176cb-root-cache-pip,target=/root/.cache/pip \
-    pip install -r requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app.py database.py pages_common.py ./
 COPY app_pages ./app_pages
