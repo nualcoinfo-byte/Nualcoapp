@@ -1,28 +1,61 @@
 # Development and release workflow
 
-| Tier | App | Database |
-|---|---|---|
-| Local | `streamlit run app.py` on your PC | Supabase **Mumbai** project (development / staging) |
-| Staging | Railway `staging` environment | Same Mumbai project |
-| Production | Railway `production` environment | Supabase **Singapore** project (`nualco-sg`) |
+| Tier | App | Branch | Database |
+|---|---|---|---|
+| Local | `streamlit run app.py` on your PC | any | Supabase **Mumbai** project (development / staging) |
+| Staging | Railway `staging` environment, service `nualco-staging`: https://nualco-staging-staging.up.railway.app | `main` | Same Mumbai project |
+| Production | Railway `production` environment, service `nualco`: https://nualco-production.up.railway.app | `production` | Supabase **Singapore** project (`nualco-sg`) |
 
 Non-production runs show a yellow banner, a `[DEVELOPMENT]` / `[STAGING]` browser-tab prefix and an `ENV:` line in the
-sidebar. Production never shows them (Railway's `RAILWAY_ENVIRONMENT_NAME=production`).
+sidebar. Production never shows them (Railway's `RAILWAY_ENVIRONMENT_NAME=production`; an unknown name on Railway is
+treated as production too). Staging sleeps when idle, so the first visit after a quiet spell is slower.
+
+Supabase project ids: Mumbai starts `wdbeyyfg...`, production (`nualco-sg`) starts `oryswtvr...`. Check the id before
+changing anything in the Supabase dashboard.
 
 ## Env files (all gitignored)
-- `.env.local`: the **development** database. `DATABASE_URL` = Mumbai, `APP_ENV=development`. Never put the production URL here.
+- `.env.local`: the **development** database. `DATABASE_URL` = Mumbai (session pooler, port 5432), `APP_ENV=development`.
+  Never put the production URL here.
 - `.env.production.local`: `PRODUCTION_DATABASE_URL`. Not read by the app. Used only as the read-only source for the refresh script.
-- Production credentials otherwise live only in Railway's variables.
+- Deployed services get their credentials from Railway's variables, using the **transaction pooler (port 6543)**.
 
 ## Day to day
 1. Work on a branch and run it locally against the Mumbai database.
 2. Before testing anything that changes the schema, refresh Mumbai with a copy of production:
-   `python scripts/refresh_staging_db.py --yes` (about a minute). It only reads production and refuses to write to it.
-3. Merge to `main`; the Railway `staging` environment deploys from `main`. Test the UI and the migration there.
-4. Release to users when nobody is active: `git push origin main:production` (production deploys from the `production` branch).
-5. Roll back by pushing the previous commit to `production`, or use "Redeploy" on an older Railway deployment.
+   `python scripts/refresh_staging_db.py --yes` (about a minute). It only reads production, and refuses to run unless the
+   target is a different Supabase project with `APP_ENV=development|staging`.
+3. Merge to `main`. Only **staging** rebuilds. Test the UI and the migration there (the app applies its own schema
+   changes at startup, so staging is the rehearsal against real data).
+4. Release to users when nobody is active: `git push origin main:production`. Production redeploys and everyone is logged out.
+   Never commit directly on `production`; it only ever moves by pushing `main` to it.
+5. Roll back by pushing an older commit to `production`, or use "Redeploy" on an older deployment in Railway.
 
-## Railway staging environment (one-time setup)
-Create it **without** the production `DATABASE_URL`: a duplicate of production copies its variables, including the
-production database URL. Set `DATABASE_URL` (Mumbai, session pooler) and `APP_ENV=staging` on the staging service
-before its first deploy, and turn on app sleeping so it costs almost nothing when idle.
+## Changing Railway variables (without printing secrets)
+Pass URLs through stdin so passwords never appear on a command line or in a log:
+
+    python -c "print(url)" | railway variables --set-from-stdin DATABASE_URL --service nualco-staging --environment staging
+
+Setting a variable redeploys that service from its branch. Always pass `--service` and `--environment` explicitly.
+
+## Rotating the Mumbai (development) database password
+1. Supabase, Mumbai project: Database -> Settings -> Reset database password (letters and digits only).
+2. Put the new password in `.env.local`.
+3. Copy the new URL into the staging service's `DATABASE_URL` (port 6543, `?sslmode=require`) as above.
+
+## Railway notes
+- **No pip cache mount in the `Dockerfile`.** Railway only accepts cache mount ids of the form `s/<service id>-<path>`, so a
+  hardcoded id breaks the build for every other service (this is what first broke staging).
+- **Creating another environment:** create it *empty* (`railway environment new <name>`), then add the service from the repo
+  with no `DATABASE_URL`, then set its variables. A duplicate of production copies production's `DATABASE_URL`.
+- **The CLI acts on the linked environment and service.** After `railway environment link staging`, relink with
+  `railway environment link production` and `railway service link nualco`.
+- **`railway environment edit --service-config` cannot change a service's source branch or `sleepApplication`.**
+  It reports "No changes to apply" and does nothing. Use `railway api` instead: `serviceConnect(id, input: {repo, branch})`
+  for the branch, `serviceInstanceUpdate(serviceId, environmentId, input: {sleepApplication: true})` for sleeping.
+  Read the stored config back with `railway environment config -e <env> --json` (variable values are in that output).
+- Railway cannot scale a service to zero regions: removing the last region creates a deployment in a default region.
+
+## Database permissions
+Supabase gives the `anon` role access to everything created in `public`; the app's own setup revokes it on tables, but not
+on materialized views, sequences or functions. `HARDEN_SQL` in `scripts/refresh_staging_db.py` covers those (and the default
+privileges for future objects). Apply it to any new Supabase project, and keep it applied after a database is rebuilt.
