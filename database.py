@@ -1606,6 +1606,7 @@ def init_db() -> None:
         _ensure_sidestream_remelt_inventory(conn)
         _ensure_furnace_oil_purchase_tank(conn)
         _ensure_furnace_oil_consumption_tank(conn)
+        _ensure_heat_no_counter_start(conn)
         _ensure_packing_list(conn)
         _ensure_company_profile(conn)
         _ensure_employees(conn)
@@ -3679,6 +3680,14 @@ EDITABLE_TABLES: list[dict[str, Any]] = [
         "allow_add": False,
     },
     {
+        "key": "heat_no_counter_start",
+        "label": "Heat number start",
+        "pk": ["heat_prefix"],
+        "order_by": "heat_prefix",
+        "identity": [],
+        "allow_add": True,
+    },
+    {
         "key": "furnace_oil_purchase",
         "label": "Furnace oil purchases",
         "pk": ["purchase_id"],
@@ -5553,9 +5562,17 @@ def _next_heat_no_on_conn(
         suffix = heat[len(prefix) :]
         if suffix.isdigit() and len(suffix) == 3:
             max_n = max(max_n, int(suffix))
-    if max_n >= 999:
+    # Heat_no_counter_start can move a furnace-month's next number up (e.g. to continue a
+    # count kept elsewhere); it never moves it down, so numbers already issued stay safe.
+    start_no = _exec(
+        conn,
+        'SELECT Start_no AS "Start_no" FROM Heat_no_counter_start WHERE Heat_prefix = ?',
+        (prefix,),
+    ).scalar()
+    next_n = max(max_n + 1, int(start_no or 1))
+    if next_n > 999:
         raise ValueError(f"All heat numbers for {prefix} are used (001–999).")
-    return f"{prefix}{max_n + 1:03d}"
+    return f"{prefix}{next_n:03d}"
 
 
 def preview_next_heat_no(furnace: str, production_date: object) -> str:
@@ -7167,7 +7184,7 @@ def _ensure_row_level_security(conn: Connection) -> None:
                 OR (
                   public.nualco_role_name() = 'production'
                   AND p_table = ANY (ARRAY[
-                    'production_batch','production_supervisor','batch_input',
+                    'production_batch','heat_no_counter_start','production_supervisor','batch_input',
                     'batch_input_return',
                     'batch_output','batch_chemical_composition','furnace_master',
                     'crucible_master','melter_master','trolley_master',
@@ -7889,6 +7906,27 @@ def _ensure_furnace_oil_consumption_tank(conn: Connection) -> None:
     )
 
 
+def _ensure_heat_no_counter_start(conn: Connection) -> None:
+    """Optional starting number for a furnace-month's heat numbers.
+
+    Heat_prefix is the YY-furnace+month-code part of a Heat_no (26-1K for furnace 1 in September
+    2026). When a row exists, the next heat number for that prefix is at least Start_no; with no
+    row the count simply continues from the highest number already used (001 for a new month).
+    """
+    _exec(
+        conn,
+        """
+        CREATE TABLE IF NOT EXISTS Heat_no_counter_start (
+            Heat_prefix TEXT PRIMARY KEY,
+            Start_no INTEGER NOT NULL CHECK(Start_no BETWEEN 1 AND 999),
+            Notes TEXT,
+            Last_updated_by TEXT,
+            Last_updated_datetime TEXT
+        )
+        """,
+    )
+
+
 def _ensure_packing_list_ready() -> None:
     with get_connection() as conn:
         _ensure_columns(
@@ -7905,6 +7943,7 @@ def _ensure_packing_list_ready() -> None:
         _ensure_ocr_extraction_job(conn)
         _ensure_furnace_oil_purchase_tank(conn)
         _ensure_furnace_oil_consumption_tank(conn)
+        _ensure_heat_no_counter_start(conn)
         _ensure_packing_list(conn)
         _ensure_company_profile(conn)
         _ensure_employees(conn)

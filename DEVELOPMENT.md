@@ -72,3 +72,10 @@ defaults to or displays is IST (UTC+05:30, no daylight saving).
   print nothing; in `database.py` only the IST helper and the deliberately timezone-aware dashboard timestamps remain.
 - Rows stamped before this rule (Railway's UTC clock, or a developer PC's clock) were deliberately **not** converted: the app
   was still in development then, and their provenance is mixed. IST applies from the release that introduced it onward.
+
+## Heat numbers and their starting number
+A `Heat_no` is `YY-<furnace><month code><NNN>`, e.g. `26-1K005` (furnace 1, September 2026). The next number for a furnace-month is
+the highest suffix already used plus one, so it restarts at `001` every month. To make a furnace-month continue from a
+higher number (as at go-live, when the count started at 200), add a row to **Data Browser -> Heat number start**
+(`Heat_no_counter_start`: `Heat_prefix` such as `26-1K`, and `Start_no`). It only ever raises the next number, never lowers it,
+and never changes heat numbers already issued. It applies to that prefix only, so the next month is unaffected.
