@@ -122,6 +122,15 @@ st.markdown(
         color: {_BRAND_INK};
         opacity: 0.75;
     }}
+    /* Keep the sidebar's collapse arrow in view while the menu is scrolled: the header
+       that holds it sits inside the sidebar's scroll area, so pin it to the top. */
+    [data-testid="stSidebarContent"] {{ background-color: inherit; }}
+    [data-testid="stSidebarHeader"] {{
+        position: sticky;
+        top: 0;
+        z-index: 1000;
+        background-color: inherit;
+    }}
     h1 {{
         color: {_BRAND_INK};
         border-bottom: 2px solid {_BRAND_ORANGE};
