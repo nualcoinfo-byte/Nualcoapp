@@ -2,7 +2,7 @@ import html
 import streamlit as st
 import database as db
 from datetime import date, datetime
-from pages_common import CHEM_PERCENT_FORMAT, CHEM_PERCENT_STEP, UI_DATE_WIDGET_FORMAT, df_from_rows, dialog_all_element_percentages, empty_percent_input, format_ui_date, merge_percent_composition, parse_any_date, photo_bytes, show_dataframe, ui_date_input
+from pages_common import CHEM_PERCENT_FORMAT, CHEM_PERCENT_STEP, UI_DATE_WIDGET_FORMAT, df_from_rows, dialog_all_element_percentages, element_input_grid, empty_percent_input, format_ui_date, merge_percent_composition, parse_any_date, photo_bytes, show_dataframe, ui_date_input
 
 
 def draft_banner(label: str, has_draft: bool, on_discard) -> None:
@@ -1792,13 +1792,14 @@ else:
             except (TypeError, ValueError):
                 return 0.0
 
-        chem_cols = st.columns(6)
+        # One grid, fields in Element_Master serial order, so Tab goes Si -> Fe -> Cu -> ... and not down a column.
+        chem_grid = element_input_grid(_pk("chem_grid"), columns=6)
         batch_chem: dict[str, float | None] = {}
         out_of_spec_keys: list[str] = []
-        for i, el in enumerate(entry_elements):
+        for el in entry_elements:
             sym = el["Element_Symbol"]
             spec = alloy_specs.get(sym)
-            with chem_cols[i % 6]:
+            with chem_grid.container():
                 if sym == "SF":
                     sludge = (
                         1.0 * _entered_chem("Fe")
@@ -1815,8 +1816,7 @@ else:
                         step=0.1,
                         key=_pk("bchem_SF"),
                         disabled=True,
-                        placeholder="",
-                        help="Auto: Sludge Factor = Fe + 2×Mn + 3×Cr, rounded to 0.1%.",
+                        placeholder="Fe + 2×Mn + 3×Cr",
                     )
                 else:
                     batch_chem[sym] = empty_percent_input(
@@ -1825,7 +1825,7 @@ else:
                         default=full_batch.get(sym),
                         step=CHEM_PERCENT_STEP,
                         format=CHEM_PERCENT_FORMAT,
-                        help=el["Element_Name"],
+                        placeholder=el["Element_Name"],
                         disabled=later_locked,
                     )
                 entered = float(batch_chem[sym] or 0.0)

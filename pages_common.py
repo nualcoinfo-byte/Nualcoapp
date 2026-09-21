@@ -243,8 +243,13 @@ def empty_percent_input(
     disabled: bool = False,
     format: str | None = None,
     allow_zero: bool = False,
+    placeholder: str | None = None,
 ) -> float | None:
-    """Number input that starts blank instead of 0.00."""
+    """Number input that starts blank instead of 0.00.
+
+    `placeholder` is grey text shown while the box is empty. Prefer it to `help=` on fast keyboard-entry
+    grids: the "?" tooltip button is an extra Tab stop in front of every field.
+    """
     if key not in st.session_state:
         st.session_state[key] = _optional_percent(default, allow_zero=allow_zero)
     kwargs: dict[str, object] = {
@@ -253,7 +258,7 @@ def empty_percent_input(
         "key": key,
         "help": help,
         "disabled": disabled,
-        "placeholder": "",
+        "placeholder": placeholder or "",
     }
     if max_value is not None:
         kwargs["max_value"] = max_value
@@ -721,6 +726,39 @@ def render_batch_output_editor(batch: dict, *, key_prefix: str) -> None:
             )
 
 
+def element_input_grid(key: str, columns: int = 6):
+    """A container that shows its children `columns` per row, left to right, in the order they are created.
+
+    st.columns() puts every column's fields in a block of their own, so Tab walks DOWN one column before
+    it moves across: on a grid of element fields that reads Si, Ni, Zr, Fe ... instead of Si, Fe, Cu ...
+    Here all the fields sit in ONE block in the order they are created, so Tab follows that order, and CSS
+    lays the block out as a grid (fewer columns on narrower screens). If the CSS were ever lost the fields
+    would simply stack in the same order, so Tab would still be right.
+    """
+    safe = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in str(key))
+    mid, small = min(columns, 3), min(columns, 2)
+    st.markdown(
+        f"""
+        <style>
+        .st-key-{safe} {{
+            display: grid !important;
+            grid-template-columns: repeat({columns}, minmax(0, 1fr));
+            gap: 1rem;
+            align-items: start;
+        }}
+        @media (max-width: 900px) {{
+            .st-key-{safe} {{ grid-template-columns: repeat({mid}, minmax(0, 1fr)); }}
+        }}
+        @media (max-width: 600px) {{
+            .st-key-{safe} {{ grid-template-columns: repeat({small}, minmax(0, 1fr)); }}
+        }}
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+    return st.container(key=safe)
+
+
 @st.dialog("All elements — chemical composition (%)", width="large")
 def dialog_all_element_percentages(
     state_key: str,
@@ -741,17 +779,17 @@ def dialog_all_element_percentages(
         )
     )
     values: dict[str, float | None] = {}
-    cols = st.columns(4)
-    for i, el in enumerate(elements):
+    grid = element_input_grid(f"{state_key}_dlg_grid", columns=4)
+    for el in elements:
         sym = el["Element_Symbol"]
-        with cols[i % 4]:
+        with grid.container():
             values[sym] = empty_percent_input(
                 f"{sym} %",
                 key=f"{state_key}_dlg_{sym}",
                 default=stored.get(sym, defaults.get(sym)),
                 step=CHEM_PERCENT_STEP,
                 format=CHEM_PERCENT_FORMAT,
-                help=el["Element_Name"],
+                placeholder=el["Element_Name"],
             )
     b1, b2 = st.columns(2)
     with b1:
