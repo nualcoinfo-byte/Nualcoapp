@@ -5732,6 +5732,62 @@ def list_furnace_batches(furnace: str) -> list[dict[str, Any]]:
     )
 
 
+def list_furnace_batches_detailed(furnace: str) -> list[dict[str, Any]]:
+    """A furnace's saved batches with the fields the batch search filters on, newest first."""
+    return fetch_all(
+        """
+        SELECT Batch_ID AS "Batch_ID", Heat_no AS "Heat_no",
+               Production_Date AS "Production_Date", Shift AS "Shift",
+               Melt_No AS "Melt_No"
+        FROM Production_batch
+        WHERE Furnace = ?
+        ORDER BY Production_Date DESC, Batch_ID DESC
+        """,
+        (str(furnace),),
+    )
+
+
+def filter_furnace_batches(
+    rows: list[dict[str, Any]],
+    *,
+    production_date: object = None,
+    melt_no: object = None,
+    shift: object = None,
+) -> list[dict[str, Any]]:
+    """Keep the batches matching every filter that is set (None or blank means "any").
+
+    production_date is an exact day; melt_no an integer; shift "A" or "B" (any case).
+    Order is preserved.
+    """
+    wanted_day = None
+    if production_date not in (None, ""):
+        wanted_day = _coerce_production_date(production_date)
+    wanted_melt = None
+    if melt_no not in (None, ""):
+        wanted_melt = int(melt_no)
+    wanted_shift = str(shift or "").strip().upper() or None
+
+    def matches(row: dict[str, Any]) -> bool:
+        if wanted_day is not None:
+            try:
+                if _coerce_production_date(row.get("Production_Date")) != wanted_day:
+                    return False
+            except ValueError:
+                return False
+        if wanted_melt is not None:
+            try:
+                if int(row.get("Melt_No")) != wanted_melt:
+                    return False
+            except (TypeError, ValueError):
+                return False
+        if wanted_shift is not None:
+            if str(row.get("Shift") or "").strip().upper() != wanted_shift:
+                return False
+        return True
+
+    return [row for row in rows if matches(row)]
+
+
 def list_furnace_batch_ids(furnace: str) -> list[str]:
     return [
         str(r["Batch_ID"])

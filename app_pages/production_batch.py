@@ -38,12 +38,37 @@ def _furnace_key_prefix(furnace: str) -> str:
     return _furnace_form_key(furnace, "")
 
 
-def _production_batch_option_label(batch_id: object, heat_no: object) -> str:
+def _production_batch_option_label(
+    batch_id: object,
+    heat_no: object,
+    production_date: object = None,
+    shift: object = None,
+    melt_no: object = None,
+) -> str:
+    """Batch ID - Heat no, plus the date, shift and melt no when known (what the search filters on)."""
     bid = str(batch_id or "").strip()
     heat = str(heat_no or "").strip()
-    if bid and heat:
-        return f"{bid} - {heat}"
-    return bid
+    base = f"{bid} - {heat}" if bid and heat else bid
+    details = []
+    day = format_ui_date(production_date) if production_date not in (None, "") else ""
+    if day:
+        details.append(day)
+    shift_txt = str(shift or "").strip().upper()
+    if shift_txt:
+        details.append(f"shift {shift_txt}")
+    try:
+        details.append(f"melt {int(melt_no)}")
+    except (TypeError, ValueError):
+        pass
+    return f"{base}  |  {', '.join(details)}" if details else base
+
+
+def _clear_batch_filters(furnace: str) -> None:
+    """Reset the saved-batch search for one furnace (also in its stored draft, or restore would undo it)."""
+    for name in ("find_date", "find_melt", "find_shift"):
+        key = _furnace_form_key(furnace, name)
+        st.session_state.pop(key, None)
+        (st.session_state.get("batch_drafts") or {}).get(str(furnace), {}).pop(key, None)
 
 
 def _is_ephemeral_widget_key(key: object) -> bool:
@@ -478,16 +503,65 @@ else:
 
     sample_blank = "— not set —"
     NEW_BATCH = "New production batch"
-    furnace_rows = db.list_furnace_batches(furnace)
+    furnace_rows = db.list_furnace_batches_detailed(furnace)
+
+    # Optional search: narrow the saved batches offered below by date, melt no and shift.
+    st.markdown("**Find a saved batch** (optional)")
+    fd, fm, fs, fc = st.columns([2, 1, 1, 1], gap="small", vertical_alignment="bottom")
+    with fd:
+        find_date = ui_date_input(
+            "Search by production date",
+            value=None,
+            key=_pk("find_date"),
+            help="Show only batches produced on this date. Clear the box to ignore the date.",
+        )
+    with fm:
+        find_melt = st.selectbox(
+            "Search by melt no", ["Any"] + list(db.MELT_NOS), key=_pk("find_melt")
+        )
+    with fs:
+        find_shift = st.selectbox(
+            "Search by shift", ["Any"] + list(db.SHIFTS), key=_pk("find_shift")
+        )
+    with fc:
+        st.button(
+            "Clear filters",
+            key=_pk("find_clear_btn"),
+            on_click=_clear_batch_filters,
+            args=(furnace,),
+        )
+    filters_on = find_date is not None or find_melt != "Any" or find_shift != "Any"
+    matching_rows = db.filter_furnace_batches(
+        furnace_rows,
+        production_date=find_date,
+        melt_no=None if find_melt == "Any" else find_melt,
+        shift=None if find_shift == "Any" else find_shift,
+    )
+    matching_ids = {str(r.get("Batch_ID") or "").strip() for r in matching_rows}
+    if filters_on:
+        st.caption(
+            f"{len(matching_rows)} of {len(furnace_rows)} saved batches on furnace "
+            f"{furnace} match."
+        )
+        if not matching_rows:
+            st.info("No saved batch matches these filters. Clear a filter to see more.")
+
     label_to_batch_id: dict[str, str | None] = {NEW_BATCH: None}
     work_opts = [NEW_BATCH]
     for row in furnace_rows:
         bid = str(row.get("Batch_ID") or "").strip()
         if not bid:
             continue
-        label = _production_batch_option_label(bid, row.get("Heat_no"))
+        label = _production_batch_option_label(
+            bid,
+            row.get("Heat_no"),
+            row.get("Production_Date"),
+            row.get("Shift"),
+            row.get("Melt_No"),
+        )
         label_to_batch_id[label] = bid
-        work_opts.append(label)
+        if not filters_on or bid in matching_ids:
+            work_opts.append(label)
     wb_key = _pk("working_batch")
     pending_batch = st.session_state.pop("_pb_select_batch", None)
     if pending_batch:
@@ -499,13 +573,20 @@ else:
         if pending_label is None:
             created = db.get_batch(pending_id)
             pending_label = _production_batch_option_label(
-                pending_id, (created or {}).get("Heat_no")
+                pending_id,
+                (created or {}).get("Heat_no"),
+                (created or {}).get("Production_Date"),
+                (created or {}).get("Shift"),
+                (created or {}).get("Melt_No"),
             )
             if pending_label not in work_opts:
                 work_opts.append(pending_label)
                 label_to_batch_id[pending_label] = pending_id
         st.session_state[wb_key] = pending_label
     current_choice = st.session_state.get(wb_key)
+    if current_choice in label_to_batch_id and current_choice not in work_opts:
+        # A filter must never silently deselect the batch that is open.
+        work_opts.append(current_choice)
     if current_choice not in work_opts:
         mapped = next(
             (
@@ -521,8 +602,9 @@ else:
         options=work_opts,
         key=wb_key,
         help=(
-            "Start a new heat, or pick an existing heat shown as "
-            "Batch ID - Heat no (e.g. 2708261A9 - 26-1H001)."
+            "Start a new heat, or pick a saved heat shown as Batch ID - Heat no | "
+            "date, shift, melt no (e.g. 2708261A9 - 26-1H001 | 27-AUG-2026, shift A, "
+            "melt 9). Use Find a saved batch above to narrow the list."
         ),
     )
     working_batch_id = label_to_batch_id.get(working_label)
