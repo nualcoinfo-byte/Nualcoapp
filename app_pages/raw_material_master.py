@@ -1,6 +1,6 @@
 import streamlit as st
 import database as db
-from pages_common import CHEM_PERCENT_FORMAT, CHEM_PERCENT_STEP, _optional_percent, _parse_master_date, df_from_rows, dialog_all_element_percentages, empty_percent_input, format_ui_date, merge_percent_composition, photo_bytes, show_dataframe, ui_date_input
+from pages_common import CHEM_PERCENT_FORMAT, CHEM_PERCENT_STEP, _optional_percent, _parse_master_date, df_from_rows, dialog_all_element_percentages, element_input_grid, empty_percent_input, format_ui_date, merge_percent_composition, photo_bytes, show_dataframe, ui_date_input
 
 
 def _option_label(options: dict, value: object) -> str:
@@ -157,17 +157,18 @@ if show_form:
         )
 
     spec_values: dict[str, float | None] = {}
-    spec_cols = st.columns(6)
-    for i, el in enumerate(entry_elements):
+    # One grid, fields in serial order, so Tab goes Si -> Fe -> Cu -> ... and not down a column.
+    spec_grid = element_input_grid(f"{prefix}_spec_grid", columns=6)
+    for el in entry_elements:
         sym = el["Element_Symbol"]
-        with spec_cols[i % 6]:
+        with spec_grid.container():
             spec_values[sym] = empty_percent_input(
                 f"{sym} %",
                 key=f"{prefix}_spec_{sym}",
                 default=spec_defaults.get(sym),
                 step=CHEM_PERCENT_STEP,
                 format=CHEM_PERCENT_FORMAT,
-                help=el["Element_Name"],
+                placeholder=el["Element_Name"],
             )
 
     sync_spec = {
