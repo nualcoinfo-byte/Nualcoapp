@@ -864,7 +864,10 @@ else:
         st.caption("Charge lines cannot be edited on a Completed heat.")
     elif existing_batch:
         st.markdown("##### Additional charge lines")
-        st.caption("Saved lines above stay as-is. Use this to charge more metal.")
+        st.caption(
+            "Saved lines above stay as-is. Use this to charge more metal, "
+            "then **Save changes** below without scrolling to the bottom."
+        )
 
     _charge_line_fields = (
         "mat", "lot", "trolley", "trolley_w", "_prev_trolley_label",
@@ -1186,7 +1189,11 @@ else:
             st.session_state[pending_charges_key] = charge_inputs
         saved_pending_charges = st.session_state.get(pending_charges_key) or []
 
-        add_col, rem_col, _ = st.columns([1, 1, 4])
+        if existing_batch:
+            add_col, rem_col, save_col, _ = st.columns([1, 1, 1, 3])
+        else:
+            add_col, rem_col, _ = st.columns([1, 1, 4])
+            save_col = None
         if _button_clicked(
             add_col.button(
                 "Add charge line", key=_pk("add_charge"), disabled=locked
@@ -1205,6 +1212,31 @@ else:
         ) and len(drafts[furnace]) > 1:
             drafts[furnace].pop()
             st.rerun()
+        if save_col is not None:
+            # This fragment cannot call _save_chemistry_page itself: that function is
+            # defined later in the script, outside this fragment, so it does not exist
+            # yet at the point this fragment runs. st.rerun() defaults to scope="app"
+            # even from inside a fragment (unlike the automatic rerun Streamlit queues
+            # for a plain widget edit, which stays fragment-scoped), so the pattern
+            # here is the same one the Add/Remove buttons above already rely on: flag
+            # the click in session_state, force a full-app rerun, and let the save
+            # handling further down the script (where _save_chemistry_page exists)
+            # pick the flag up — exactly like the "Save changes" shortcut above the
+            # header already does via top_save_clicked.
+            if _button_clicked(
+                save_col.button(
+                    "Save history correction" if is_completed else "Save changes",
+                    key=_pk("save_batch_charges"),
+                    disabled=locked,
+                    help=(
+                        "Save alloy, notes, and any new charge lines entered "
+                        "above, without scrolling to the bottom."
+                    ),
+                ),
+                _pk("save_batch_charges"),
+            ):
+                st.session_state[_pk("save_batch_charges_pending")] = True
+                st.rerun()
 
         display_charges = charge_inputs or saved_pending_charges
         saved_in = sum(float(c.get("Weight") or 0) for c in saved_charges)
@@ -1347,6 +1379,11 @@ else:
     # this is always current for what follows.
     pending_charges_key = _pk("pending_charges")
     pending_charges = st.session_state.get(pending_charges_key) or []
+    # Set by the "Save changes" button inside the charge-lines fragment above,
+    # right before it forced this full rerun. Consumed once here.
+    charge_section_save_clicked = st.session_state.pop(
+        _pk("save_batch_charges_pending"), False
+    )
 
     if existing_batch:
         try:
@@ -1977,7 +2014,7 @@ else:
                 key=_pk("save_batch"),
             ),
             _pk("save_batch"),
-        ) or top_save_clicked
+        ) or top_save_clicked or charge_section_save_clicked
         complete_clicked = _button_clicked(
             b2.button(
                 "Mark as Completed",
