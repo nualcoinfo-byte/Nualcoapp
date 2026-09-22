@@ -644,7 +644,9 @@ def _render_tc_spec_and_deviation(packing_list_id: int, *, locked: bool) -> tupl
                 "Batch_ID": row.get("Batch_ID"),
                 "Heat_no": row.get("Heat_no"),
                 "Element": row.get("Element_symbol"),
-                "Actual %": row.get("Percentage"),
+                "Actual %": db.format_chem_percent(
+                    row.get("Percentage"), row.get("Less_than")
+                ),
                 "Spec": row.get("Spec"),
                 "Status": (
                     f"Out of spec — {row.get('Reason')}"
@@ -1193,7 +1195,9 @@ if selected_nos:
                 chem_rows.append(
                     {
                         "Element": symbol,
-                        "Actual %": pct,
+                        "Actual %": db.format_chem_percent(
+                            pct, row.get("Less_than")
+                        ),
                         "Spec": (
                             db.format_alloy_spec_percent(
                                 spec.get("Min_percent"),

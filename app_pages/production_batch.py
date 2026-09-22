@@ -352,6 +352,7 @@ def _hydrate_production_batch_form(
         full[str(sym)] = val
         if str(sym) != "SF":
             st.session_state[pk(f"bchem_{sym}")] = val if val > 0 else None
+            st.session_state[pk(f"bchem_lt_{sym}")] = bool(row.get("Less_than"))
     st.session_state[pk("full_chem")] = full
 
     drafts = st.session_state.setdefault("charge_lines_by_furnace", {})
@@ -1865,6 +1866,16 @@ else:
                         placeholder=el["Element_Name"],
                         disabled=later_locked,
                     )
+                    st.checkbox(
+                        "< (below detection limit)",
+                        key=_pk(f"bchem_lt_{sym}"),
+                        disabled=later_locked,
+                        help=(
+                            "The spectrometer could not resolve a value this low. "
+                            "The number above is the reported ceiling; the test "
+                            "certificate prints it as e.g. <0.0050."
+                        ),
+                    )
                 entered = float(batch_chem[sym] or 0.0)
                 bad = _spec_out_of_range(entered, spec)
                 if spec:
@@ -1899,6 +1910,12 @@ else:
 
     merged_chem = merge_percent_composition(batch_chem, full_chem_key)
     composition = {k: v for k, v in merged_chem.items() if v and v > 0}
+    # Only the main grid carries a "<" checkbox (elements added only via Open all
+    # elements... default to False); .get(..., False) covers that automatically.
+    composition_less_than = {
+        sym: bool(st.session_state.get(_pk(f"bchem_lt_{sym}")))
+        for sym in composition
+    }
     completion_gaps = db.production_batch_completion_gaps(
         degassing_time=degassing_time,
         sampled_pcs=sampled_pcs,
@@ -1942,6 +1959,7 @@ else:
             melting_team=melting_team,
             notes=notes.strip(),
             composition=composition,
+            composition_less_than=composition_less_than,
             degassing_time=degassing_time.strip() or None,
             sampled_pcs=(
                 sampled_pcs if sampled_pcs and sampled_pcs > 0 else None

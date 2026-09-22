@@ -1607,6 +1607,11 @@ def init_db() -> None:
         _ensure_furnace_oil_purchase_tank(conn)
         _ensure_furnace_oil_consumption_tank(conn)
         _ensure_heat_no_counter_start(conn)
+        _ensure_columns(
+            conn,
+            "Batch_Chemical_Composition",
+            [("Less_than", "INTEGER NOT NULL DEFAULT 0")],
+        )
         _ensure_packing_list(conn)
         _ensure_company_profile(conn)
         _ensure_employees(conn)
@@ -5875,8 +5880,16 @@ def _insert_charge_lines(conn: Connection, batch_id: str, inputs: list[dict[str,
 
 
 def _replace_batch_chemistry(
-    conn: Connection, batch_id: str, composition: dict[str, float]
+    conn: Connection,
+    batch_id: str,
+    composition: dict[str, float],
+    less_than: dict[str, bool] | None = None,
 ) -> None:
+    """Less_than marks a reading as below the spectrometer's detection limit: the
+    stored Percentage is still the reported ceiling (e.g. 0.0050), never blank, so
+    spec checks, SF, and averaging keep using a real number. Only display formatting
+    (format_chem_percent) needs to know about the flag."""
+    less_than = less_than or {}
     _exec(
         conn,
         "DELETE FROM Batch_Chemical_Composition WHERE Batch_ID = ?",
@@ -5889,10 +5902,10 @@ def _replace_batch_chemistry(
         _exec(
             conn,
             """
-            INSERT INTO Batch_Chemical_Composition (Batch_ID, Element_symbol, Percentage)
-            VALUES (?, ?, ?)
+            INSERT INTO Batch_Chemical_Composition (Batch_ID, Element_symbol, Percentage, Less_than)
+            VALUES (?, ?, ?, ?)
             """,
-            (batch_id, sym, rounded),
+            (batch_id, sym, rounded, 1 if less_than.get(sym) else 0),
         )
 
 
@@ -5929,6 +5942,7 @@ def create_batch(
     notes: str,
     inputs: list[dict[str, Any]],
     composition: dict[str, float],
+    composition_less_than: dict[str, bool] | None = None,
     degassing_time: Optional[str] = None,
     sampled_pcs: Optional[float] = None,
     defect_pcs: Optional[float] = None,
@@ -6004,7 +6018,7 @@ def create_batch(
             ),
         )
         _insert_charge_lines(conn, batch_id, inputs)
-        _replace_batch_chemistry(conn, batch_id, composition)
+        _replace_batch_chemistry(conn, batch_id, composition, composition_less_than)
 
     return batch_id
 
@@ -6020,6 +6034,7 @@ def update_production_batch_input(
     notes: str,
     extra_inputs: list[dict[str, Any]],
     composition: dict[str, float],
+    composition_less_than: dict[str, bool] | None = None,
     degassing_time: Optional[str] = None,
     sampled_pcs: Optional[float] = None,
     defect_pcs: Optional[float] = None,
@@ -6105,7 +6120,7 @@ def update_production_batch_input(
         )
         if extra_inputs:
             _insert_charge_lines(conn, batch_id, extra_inputs)
-        _replace_batch_chemistry(conn, batch_id, composition)
+        _replace_batch_chemistry(conn, batch_id, composition, composition_less_than)
 
 
 def complete_production_batch(batch_id: str) -> None:
@@ -8000,6 +8015,11 @@ def _ensure_packing_list_ready() -> None:
         _ensure_furnace_oil_purchase_tank(conn)
         _ensure_furnace_oil_consumption_tank(conn)
         _ensure_heat_no_counter_start(conn)
+        _ensure_columns(
+            conn,
+            "Batch_Chemical_Composition",
+            [("Less_than", "INTEGER NOT NULL DEFAULT 0")],
+        )
         _ensure_packing_list(conn)
         _ensure_company_profile(conn)
         _ensure_employees(conn)
@@ -8914,9 +8934,16 @@ def split_certificate_line(
 
 
 def blended_certificate_chemistry(sources: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Weighted-average chemistry of source batches (weight = packed kg)."""
+    """Weighted-average chemistry of source batches (weight = packed kg).
+
+    An element's blend is marked Less_than if ANY contributing batch reported that
+    element as below the spectrometer's detection limit: since that source's true
+    value is unknown (only a reported ceiling), the blended number is only ever an
+    upper bound too, never an exact average.
+    """
     totals: dict[str, float] = {}
     serials: dict[str, int] = {}
+    any_less_than: dict[str, bool] = {}
     total_w = 0.0
     for src in sources or []:
         weight = float(src.get("Source_weight") or 0)
@@ -8932,6 +8959,8 @@ def blended_certificate_chemistry(sources: list[dict[str, Any]]) -> list[dict[st
                 continue
             pct = float(row.get("Percentage") or 0)
             totals[sym] = totals.get(sym, 0.0) + pct * weight
+            if row.get("Less_than"):
+                any_less_than[sym] = True
             try:
                 serials[sym] = int(row.get("Serial_no") or 9999)
             except (TypeError, ValueError):
@@ -8939,7 +8968,11 @@ def blended_certificate_chemistry(sources: list[dict[str, Any]]) -> list[dict[st
     if total_w <= 0:
         return []
     return [
-        {"Element_symbol": sym, "Percentage": totals[sym] / total_w}
+        {
+            "Element_symbol": sym,
+            "Percentage": totals[sym] / total_w,
+            "Less_than": any_less_than.get(sym, False),
+        }
         for sym in sorted(totals, key=lambda symbol: (serials.get(symbol, 9999), symbol))
     ]
 
@@ -9292,7 +9325,7 @@ def get_test_certificate_print_payload(
     heats: list[dict[str, Any]] = []
     for line in printed:
         sources = line.get("sources") or []
-        chem_by_symbol: dict[str, object] = {}
+        chem_by_symbol: dict[str, str] = {}
         batch_id = ""
         for src in sources:
             bid = str(src.get("Batch_ID") or "").strip()
@@ -9301,7 +9334,9 @@ def get_test_certificate_print_payload(
                 for chem in get_batch_chemistry(bid):
                     symbol = str(chem.get("Element_symbol") or "").strip().upper()
                     if symbol and symbol not in chem_by_symbol:
-                        chem_by_symbol[symbol] = chem.get("Percentage")
+                        chem_by_symbol[symbol] = format_chem_percent(
+                            chem.get("Percentage"), chem.get("Less_than")
+                        )
                 break
         source_kg = sum(float(src.get("Source_weight") or 0) for src in sources)
         source_pcs = sum(int(float(src.get("Source_pieces") or 0)) for src in sources)
@@ -9324,8 +9359,9 @@ def get_test_certificate_print_payload(
             if spec.get("Is_remainder"):
                 actuals.append("Remainder")
             else:
+                # chem_by_symbol already carries the '<' prefix (format_chem_percent).
                 raw = heat["actuals"].get(symbol)
-                actuals.append(_format_cert_number(raw) if raw is not None else "—")
+                actuals.append(raw if raw else "—")
         element_rows.append(
             {
                 "Element_Name": spec["Element_Name"],
@@ -9633,6 +9669,7 @@ def list_packing_list_chemistry_vs_spec(packing_list_id: int) -> list[dict[str, 
                     "Element_symbol": symbol,
                     "Element_Name": spec.get("Element_Name") or symbol,
                     "Percentage": pct,
+                    "Less_than": bool(rec.get("Less_than")),
                     "Min_percent": spec.get("Min_percent"),
                     "Max_percent": spec.get("Max_percent"),
                     "Spec": format_alloy_spec_percent(
@@ -11766,6 +11803,7 @@ def get_batch_chemistry(batch_id: str) -> list[dict[str, Any]]:
     return fetch_all(
         """
         SELECT s.Element_symbol AS "Element_symbol", s.Percentage AS "Percentage",
+               s.Less_than AS "Less_than",
                COALESCE(_el.Serial_no, 9999) AS "Serial_no"
         FROM Batch_Chemical_Composition s
         LEFT JOIN Element_Master _el ON _el.Element_Symbol = s.Element_symbol
@@ -11774,6 +11812,15 @@ def get_batch_chemistry(batch_id: str) -> list[dict[str, Any]]:
         """,
         (batch_id,),
     )
+
+
+def format_chem_percent(value: object, less_than: object = False) -> str:
+    """'<0.0050' when the reading was below the spectrometer's detection limit,
+    else the plain number ('0.5' etc, same rules as the printed certificate)."""
+    text = _format_cert_number(value)
+    if not text:
+        return text
+    return f"<{text}" if less_than else text
 
 
 def list_batches(production_date: object = None) -> list[dict[str, Any]]:
