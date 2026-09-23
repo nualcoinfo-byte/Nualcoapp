@@ -830,7 +830,12 @@ else:
     saved_charges = db.get_batch_inputs(preview_id) if existing_batch else []
     if saved_charges:
         st.caption("Saved charge lines")
-        show_dataframe(df_from_rows(saved_charges))
+        saved_df = df_from_rows(saved_charges)
+        if "Lot_id" in saved_df.columns:
+            saved_df = saved_df[
+                [c for c in saved_df.columns if c != "Lot_id"] + ["Lot_id"]
+            ]
+        show_dataframe(saved_df)
 
     trolleys = _pb_ref["trolleys"]
     trolley_by_name = {t["Trolley_name"]: float(t["Weight"] or 0) for t in trolleys}
