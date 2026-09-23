@@ -200,7 +200,6 @@ def _clear_production_entry_fields(furnace: str, sample_blank: str) -> None:
     # restore cannot put the previous heat’s material/trolley back.
     for idx in indices:
         st.session_state[pk(f"mat_{idx}")] = ""
-        st.session_state[pk(f"lot_{idx}")] = ""
         st.session_state[pk(f"trolley_{idx}")] = ""
         st.session_state[pk(f"trolley_w_{idx}")] = 0.0
         st.session_state[pk(f"_prev_trolley_label_{idx}")] = ""
@@ -876,7 +875,7 @@ else:
         )
 
     _charge_line_fields = (
-        "mat", "lot", "trolley", "trolley_w", "_prev_trolley_label",
+        "mat", "trolley", "trolley_w", "_prev_trolley_label",
         "scale_w", "wsp_open", "wsp_cam", "wsp_file", "wsp_bytes",
         "wt", "ln", "inp_open", "inp_cam", "inp_file", "inp_bytes",
     )
@@ -884,8 +883,6 @@ else:
     def _charge_draft_has_input() -> bool:
         for idx in range(len(furnace_charge_lines)):
             if st.session_state.get(_pk(f"mat_{idx}")):
-                return True
-            if st.session_state.get(_pk(f"lot_{idx}")):
                 return True
             if st.session_state.get(_pk(f"trolley_{idx}")):
                 return True
@@ -947,6 +944,8 @@ else:
                 ).append(lot)
 
         charge_inputs: list[dict] = []
+        # Stock earlier draft lines on this page already claimed, per lot.
+        fifo_taken: dict[int, float] = {}
         for idx, line in enumerate(furnace_charge_lines):
             st.markdown(f"**Charge line {idx + 1}**")
             r1c1, r1c2, r1c3 = st.columns([2, 2, 2])
@@ -956,30 +955,25 @@ else:
                     options=[""] + materials,
                     key=_pk(f"mat_{idx}"),
                 )
-            lots = lots_by_material.get(mat.lower(), []) if mat else []
-            lot_opts = {}
-            lot_cost_by_label = {}
-            for lot in lots:
-                rem = float(lot.get("Remaining_Weight") or 0)
-                status = lot.get("Raw_Material_Status") or ""
-                src = lot.get("Source_Batch_ID")
-                origin = lot.get("Origin_Alloy_name")
-                if src:
-                    origin_bit = f" {origin}" if origin else ""
-                    label = (
-                        f"Lot {lot['Lot_id']} — rem {rem:.1f} kg | "
-                        f"from {src}{origin_bit} ({status})"
-                    )
-                else:
-                    label = f"Lot {lot['Lot_id']} — rem {rem:.1f} kg ({status})"
-                lot_opts[label] = lot["Lot_id"]
-                lot_cost_by_label[label] = lot.get("Cost_per_kg")
-            with r1c2:
-                lot_label = st.selectbox(
-                    "Lot",
-                    options=[""] + list(lot_opts.keys()),
-                    key=_pk(f"lot_{idx}"),
+            lots = [
+                dict(
+                    lot,
+                    Remaining_Weight=float(lot.get("Remaining_Weight") or 0)
+                    - fifo_taken.get(int(lot["Lot_id"]), 0.0),
                 )
+                for lot in (lots_by_material.get(mat.lower(), []) if mat else [])
+            ]
+            lots.sort(key=lambda l: int(l["Lot_id"]))
+            open_lots = [l for l in lots if l["Remaining_Weight"] > 1e-9]
+            with r1c2:
+                if mat:
+                    stock = sum(l["Remaining_Weight"] for l in open_lots)
+                    st.markdown(
+                        f"<div style='margin-top:1.9rem'>In stock: <b>{stock:,.1f} kg</b>"
+                        f" in {len(open_lots)} lot(s)</div>",
+                        unsafe_allow_html=True,
+                    )
+                    st.caption("Lots are picked automatically, oldest first (FIFO).")
             with r1c3:
                 # Style from current selection (session) so highlight updates on rerun
                 _pending_label = st.session_state.get(_pk(f"trolley_{idx}"), "") or ""
@@ -1048,12 +1042,9 @@ else:
                     mat.lower(), {}
                 )
                 recovery_val = master_row.get("Recovery")
-                lot_cost_val = lot_cost_by_label.get(lot_label) if lot_label else None
                 st.caption(
                     "Recovery: "
                     + (f"{float(recovery_val):.1f}%" if recovery_val is not None else "—")
-                    + "  |  Cost/kg: "
-                    + (f"₹{float(lot_cost_val):,.2f}" if lot_cost_val is not None else "—")
                 )
 
             trolley_name = trolley_label_to_name.get(trolley_label) if trolley_label else None
@@ -1174,11 +1165,48 @@ else:
                 if input_photo_bytes:
                     st.caption(f"Charge line {idx + 1}: Material Photo attached.")
 
-            if mat and lot_label and trolley_name and scale_val > 0 and net_w > 0:
+            # FIFO preview for this line. The save re-runs the allocation
+            # against live stock, so this only drives the display and estimate.
+            fifo_parts: list[dict] = []
+            fifo_short = 0.0
+            if mat and net_w > 0:
+                fifo_parts, fifo_short = db.allocate_fifo(open_lots, net_w)
+                for part in fifo_parts:
+                    fifo_taken[part["Lot_id"]] = (
+                        fifo_taken.get(part["Lot_id"], 0.0) + part["Weight"]
+                    )
+                if fifo_parts:
+                    st.caption(
+                        "FIFO: "
+                        + ", ".join(
+                            f"{p['Weight']:,.1f} kg from Lot {p['Lot_id']}"
+                            + (
+                                f" (₹{float(p['Cost_per_kg']):,.2f}/kg)"
+                                if p.get("Cost_per_kg") is not None
+                                else ""
+                            )
+                            for p in fifo_parts
+                        )
+                    )
+                if fifo_short > 1e-6:
+                    st.error(
+                        f"Not enough {mat} in stock: {fifo_short:,.1f} kg short. "
+                        "This line can't be saved until the weight fits the stock."
+                    )
+
+            if (
+                mat
+                and trolley_name
+                and scale_val > 0
+                and net_w > 0
+                and fifo_parts
+                and fifo_short <= 1e-6
+            ):
                 charge_inputs.append(
                     {
                         "Raw_Material_Name": mat,
-                        "Lot_id": lot_opts[lot_label],
+                        # No lot: the save splits this line across lots FIFO.
+                        "Lot_id": None,
                         "Weight": net_w,
                         "Weighment_scale_weight": scale_val,
                         "Trolley_weight": tare_w,
@@ -1187,6 +1215,7 @@ else:
                         "Weighment_scale_photo": scale_photo_bytes,
                         "Input_photo": input_photo_bytes,
                         "Charge_time": db.now_ist().isoformat(timespec="seconds"),
+                        "_fifo_parts": fifo_parts,
                     }
                 )
 
@@ -1255,7 +1284,15 @@ else:
             f"Total net input weight: **{total_in:,.2f} kg** across {total_lines} charge line(s)."
         )
 
-        estimate_lines = list(saved_charges) + list(display_charges)
+        estimate_lines = list(saved_charges) + [
+            {
+                "Raw_Material_Name": c["Raw_Material_Name"],
+                "Lot_id": part["Lot_id"],
+                "Weight": part["Weight"],
+            }
+            for c in display_charges
+            for part in (c.get("_fifo_parts") or [c])
+        ]
         estimate = (
             db.estimate_batch_input_cost(
                 estimate_lines,

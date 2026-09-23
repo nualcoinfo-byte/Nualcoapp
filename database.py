@@ -5811,8 +5811,116 @@ def make_batch_id(
     return build_production_batch_id(furnace, production_date, shift, melt_no)
 
 
-def _insert_charge_lines(conn: Connection, batch_id: str, inputs: list[dict[str, Any]]) -> None:
+def allocate_fifo(
+    lots: list[dict[str, Any]], weight: float
+) -> tuple[list[dict[str, Any]], float]:
+    """Split `weight` across `lots` oldest first (lowest Lot_id first).
+
+    Returns ([{"Lot_id", "Weight", "Cost_per_kg"}, ...], shortfall_kg). A
+    shortfall above zero means the lots don't hold enough stock.
+    """
+    parts: list[dict[str, Any]] = []
+    left = float(weight or 0)
+    for lot in sorted(lots, key=lambda l: int(l["Lot_id"])):
+        if left <= 1e-9:
+            break
+        rem = float(lot.get("Remaining_Weight") or 0)
+        if rem <= 1e-9:
+            continue
+        take = min(rem, left)
+        parts.append(
+            {
+                "Lot_id": int(lot["Lot_id"]),
+                "Weight": round(take, 4),
+                "Cost_per_kg": lot.get("Cost_per_kg"),
+            }
+        )
+        left -= take
+    return parts, max(round(left, 4), 0.0)
+
+
+def _expand_fifo_charge_lines(
+    conn: Connection, inputs: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Turn charge lines with no Lot_id into one line per lot, picked FIFO.
+
+    Allocation reads current stock inside the save transaction, and lines for
+    the same material in one save draw from the stock left by earlier lines.
+    The weighment (scale, tare, photos) stays on the first lot's row, so it is
+    recorded once per physical weighing.
+    """
+    out: list[dict[str, Any]] = []
+    taken: dict[int, float] = {}
     for item in inputs:
+        if item.get("Lot_id") not in (None, ""):
+            out.append(item)
+            continue
+        material = item["Raw_Material_Name"]
+        lots = [
+            dict(r)
+            for r in _exec(
+                conn,
+                """
+                SELECT i.Lot_id AS "Lot_id", i.Remaining_Weight AS "Remaining_Weight"
+                FROM Raw_Material_Inventory i
+                LEFT JOIN Raw_Material_Purchase p ON p.Purchase_id = i.Purchase_id
+                WHERE i.Raw_Material_Name = ?
+                  AND i.Remaining_Weight > 0
+                  AND (p.Invoice_status IS NULL OR p.Invoice_status <> 'Cancelled')
+                """,
+                (material,),
+            ).mappings()
+        ]
+        for lot in lots:
+            lot["Remaining_Weight"] = float(lot["Remaining_Weight"] or 0) - taken.get(
+                int(lot["Lot_id"]), 0.0
+            )
+        need = float(item["Weight"])
+        parts, short = allocate_fifo(lots, need)
+        if short > 1e-6:
+            have = need - short
+            raise ValueError(
+                f"Not enough {material} in stock: need {need:,.2f} kg, "
+                f"have {have:,.2f} kg across all open lots."
+            )
+        for n, part in enumerate(parts):
+            taken[part["Lot_id"]] = taken.get(part["Lot_id"], 0.0) + part["Weight"]
+            row = dict(item, Lot_id=part["Lot_id"], Weight=part["Weight"])
+            if n > 0:
+                row.update(
+                    Weighment_scale_weight=None,
+                    Trolley_weight=None,
+                    Weighment_scale_photo=None,
+                    Input_photo=None,
+                )
+            out.append(row)
+    return out
+
+
+def _unique_charge_time(
+    item: dict[str, Any], used: set[tuple[str, int, str]]
+) -> str:
+    """Charge_time unique per (material, lot) within one save.
+
+    batch_input's key includes Charge_time to the second, so two trolleys of
+    the same material landing on the same FIFO lot in one save would collide.
+    """
+    ts = item.get("Charge_time") or now_ist().isoformat(timespec="seconds")
+    key = (str(item["Raw_Material_Name"]).lower(), int(item["Lot_id"]), ts)
+    while key in used:
+        ts = (datetime.fromisoformat(ts) + timedelta(seconds=1)).isoformat(
+            timespec="seconds"
+        )
+        key = (key[0], key[1], ts)
+    used.add(key)
+    return ts
+
+
+def _insert_charge_lines(conn: Connection, batch_id: str, inputs: list[dict[str, Any]]) -> None:
+    inputs = _expand_fifo_charge_lines(conn, inputs)
+    used_times: set[tuple[str, int, str]] = set()
+    for item in inputs:
+        item = dict(item, Charge_time=_unique_charge_time(item, used_times))
         lot = _exec(
             conn,
             """
