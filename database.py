@@ -8106,7 +8106,31 @@ def _ensure_heat_no_counter_start(conn: Connection) -> None:
     )
 
 
+# Schema setup that has already succeeded in this process, keyed by
+# (helper, IS_POSTGRES). The helpers below are called from ordinary page reads
+# (19 call sites), and their ALTER TABLEs take ACCESS EXCLUSIVE locks: rerun on
+# every request, two page loads (or a page load and another user's query)
+# deadlock each other. The schema only needs checking once per process.
+_SCHEMA_READY: set[tuple[str, bool]] = set()
+_SCHEMA_READY_LOCK = threading.Lock()
+
+
+def _run_schema_setup_once(name: str, setup: Callable[[], None]) -> None:
+    key = (name, IS_POSTGRES)
+    if key in _SCHEMA_READY:
+        return
+    with _SCHEMA_READY_LOCK:
+        if key in _SCHEMA_READY:
+            return
+        setup()
+        _SCHEMA_READY.add(key)
+
+
 def _ensure_packing_list_ready() -> None:
+    _run_schema_setup_once("packing_list", _ensure_packing_list_schema)
+
+
+def _ensure_packing_list_schema() -> None:
     with get_connection() as conn:
         _ensure_columns(
             conn,
@@ -8136,6 +8160,10 @@ def _ensure_packing_list_ready() -> None:
 
 
 def _ensure_company_ready() -> None:
+    _run_schema_setup_once("company", _ensure_company_schema)
+
+
+def _ensure_company_schema() -> None:
     with get_connection() as conn:
         _ensure_company_profile(conn)
         _ensure_employees(conn)
