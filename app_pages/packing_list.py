@@ -61,7 +61,13 @@ def _packing_summary_from_form() -> dict:
         "alloy_name": alloy_name,
         "colour_code": colour_code,
         "vehicle_no": str(st.session_state.get("pl_vehicle") or "").strip(),
-        "status": str(st.session_state.get("pl_status") or "").strip(),
+        "status": (
+            (db.get_packing_list(int(st.session_state["pl_edit_id"])) or {}).get(
+                "Packing_list_status"
+            )
+            if st.session_state.get("pl_edit_id")
+            else "New"
+        ) or "",
         "batches": batches,
     }
 
@@ -258,10 +264,12 @@ st.title("Packing List")
 st.caption(
     "Enter invoice details, then select **batch_id**s from Available finished goods. "
     "A heat can be packed in part: enter only the kg and pieces on this list. "
-    "Saving as **Verified** subtracts that quantity from finished-goods inventory; "
-    "the remainder stays Available. **Cancel packing list** returns packed qty to "
-    "finished goods. After the test certificate is **Issued**, dispatch is final "
-    "and only an Admin can reverse it. Avg piece is packed weight ÷ pieces; typical "
+    "**Save** keeps the list **In-Progress** and takes that quantity out of "
+    "finished goods straight away; the remainder stays Available. **Cancel "
+    "packing list** returns it. **Approve** hands the list to the **Test "
+    "Certificate** page as a Draft, after which it can no longer be edited here. "
+    "Packing lists are created and approved by Inventory, Management and Admin "
+    "users. Avg piece is packed weight ÷ pieces; typical "
     f"product alloy pieces are **{db.ALLOY_PIECE_KG_MIN:g}–{db.ALLOY_PIECE_KG_MAX:g} kg** "
     "and show in red if outside that range."
 )
@@ -285,27 +293,42 @@ def _alloy_label(row: dict) -> str:
 existing_lists = db.list_packing_lists()
 po_numbers = db.list_packing_po_numbers()
 editing_id = st.session_state.get("pl_edit_id")
-edit_cert = (
-    db.get_packing_list_certificate(int(editing_id)) if editing_id else None
+_employee = st.session_state.get("auth_employee") or {}
+can_pack = db.role_allowed(
+    _employee.get("role_name"), _employee.get("role_id"), db.PACKING_ROLES
 )
-issued_locked = bool(
-    edit_cert and edit_cert.get("Status") == db.CERT_STATUS_ISSUED
+saved_row = next(
+    (r for r in existing_lists if editing_id and int(r["Packing_list_id"]) == int(editing_id)),
+    None,
 )
+saved_status = (saved_row or {}).get("Packing_list_status") or ""
+# Only a new or In-Progress list can change; Approved lists belong to the certificate.
+editable = can_pack and (not editing_id or saved_status == db.PACKING_STATUS_IN_PROGRESS)
 
 top1, top2, top3 = st.columns([3, 1, 1])
 with top1:
+    if not can_pack:
+        st.info(
+            "View only: packing lists are created and approved by Inventory, "
+            "Management and Admin users."
+        )
     if editing_id:
-        if issued_locked:
+        if saved_status == db.PACKING_STATUS_APPROVED:
+            cert_status = (saved_row or {}).get("Certificate_status") or "Draft"
             st.warning(
-                f"Packing list **#{editing_id}** has issued test certificate "
-                f"**{edit_cert.get('Certificate_no') or ''}**. Dispatch is final. "
-                "Packed batches cannot be changed or cancelled here. An Admin "
-                "can reverse this from **Admin → Cancel issued certificate**."
+                f"Packing list **#{editing_id}** is **Approved** and can no longer be "
+                f"edited. Its test certificate is **{cert_status}**; continue on the "
+                "**Test Certificate** page."
+            )
+        elif saved_status == db.PACKING_STATUS_CANCELLED:
+            st.warning(
+                f"Packing list **#{editing_id}** is **Cancelled**; its quantity is back "
+                "in finished goods. Start a new packing list to dispatch again."
             )
         else:
             st.info(
-                f"Editing packing list **#{editing_id}**. "
-                "Save to update, or start a new list."
+                f"Editing packing list **#{editing_id}** (In-Progress). "
+                "Save to update, Approve when it is ready, or start a new list."
             )
     else:
         st.markdown("#### New packing list")
@@ -446,15 +469,17 @@ r3c1, r3c2, r3c3 = st.columns(3)
 with r3c1:
     vehicle_no = st.text_input("Vehicle No", key="pl_vehicle")
 with r3c2:
-    status = st.selectbox(
-        "Packing list status *",
-        options=db.PACKING_LIST_STATUS,
-        key="pl_status",
-        disabled=issued_locked,
-        help="In-Progress does not take stock. Verified subtracts packed kg and pieces from finished goods.",
+    st.text_input(
+        "Packing list status",
+        value=saved_status or f"New (saved as {db.PACKING_STATUS_IN_PROGRESS})",
+        disabled=True,
+        help=(
+            "In-Progress: saved, packed qty is out of finished goods. Approved: "
+            "handed to the test certificate. Cancelled: qty returned to finished goods."
+        ),
     )
 with r3c3:
-    if editing_id and status == db.PACKING_STATUS_VERIFIED:
+    if editing_id and saved_status == db.PACKING_STATUS_APPROVED:
         if st.button("Open test certificate", key="pl_open_tc"):
             st.session_state.nav_page = "Test Certificate"
             st.session_state["tc_packing_list_id"] = int(editing_id)
@@ -498,7 +523,7 @@ if alloy_id not in (None, ""):
             match_group=bool(match_group),
             include_batch_ids=include_ids,
             packing_list_id=int(editing_id) if editing_id else None,
-            packing_list_status=status,
+            packing_list_status=saved_status,
         )
     except Exception as exc:
         st.error(str(exc))
@@ -519,8 +544,8 @@ else:
     if dispatchable:
         st.caption(
             "Tick each heat and enter the **kg** and **pieces** to pack. "
-            "On-hand is what is still in finished goods. Saving as **Verified** "
-            "subtracts the packed quantity; leftover kg and pieces stay in inventory. "
+            "On-hand is what is still in finished goods. Saving subtracts the "
+            "packed quantity; leftover kg and pieces stay in inventory. "
             f"Avg piece outside **{db.ALLOY_PIECE_KG_MIN:g}–{db.ALLOY_PIECE_KG_MAX:g} kg** "
             "is shown in red."
         )
@@ -732,31 +757,37 @@ st.session_state["pl_batch_qty"] = {
     for r in selected_lines
 }
 
-save_col, cancel_col = st.columns(2)
-can_cancel_list = bool(
-    editing_id
-    and not issued_locked
-    and status == db.PACKING_STATUS_VERIFIED
-)
+save_col, approve_col, cancel_col = st.columns(3)
+is_in_progress = bool(editing_id) and saved_status == db.PACKING_STATUS_IN_PROGRESS
 with save_col:
     save_clicked = st.button(
         "Save packing list",
         type="primary",
         key="pl_save",
-        disabled=issued_locked,
+        disabled=not editable,
+        help="Saves the list as In-Progress and takes the packed qty out of finished goods.",
+    )
+with approve_col:
+    approve_clicked = st.button(
+        "Approve packing list",
+        key="pl_approve",
+        disabled=not (editable and is_in_progress),
+        help=(
+            "Saves any changes, then approves the list and opens its test "
+            "certificate as a Draft. The list can't be edited after this."
+        ),
     )
 with cancel_col:
     cancel_list_clicked = st.button(
         "Cancel packing list",
         key="pl_cancel_list",
-        disabled=not can_cancel_list,
-        help="Returns packed kg and pieces to finished goods and sets the list to In-Progress.",
+        disabled=not (editable and is_in_progress),
+        help="Returns the packed kg and pieces to finished goods and marks the list Cancelled.",
     )
 
 if cancel_list_clicked and editing_id:
     try:
         cancelled = db.cancel_packing_list(int(editing_id))
-        st.session_state["pl_status"] = db.PACKING_STATUS_IN_PROGRESS
         st.success(
             f"Packing list **#{cancelled.get('Packing_list_id')}** cancelled. "
             "Packed quantity is back in finished goods."
@@ -765,54 +796,80 @@ if cancel_list_clicked and editing_id:
     except Exception as exc:
         st.error(str(exc))
 
-if save_clicked:
+
+def _save_form() -> int | None:
+    """Validate and save the form; returns the packing list id, or None after showing an error."""
     if not invoice_number.strip():
         st.error("Invoice number is required.")
-    elif not po_no:
+        return None
+    if not po_no:
         st.error("P.O. Number is required.")
-    elif not cust_code:
+        return None
+    if not cust_code:
         st.error("Customer name is required.")
-    elif alloy_id in (None, ""):
+        return None
+    if alloy_id in (None, ""):
         st.error("Alloy Name is required.")
-    else:
-        over_max = []
-        for line in selected_lines:
-            cand = by_id.get(line["Batch_ID"]) or {}
-            max_w = float(cand.get("Max_weight") or 0)
-            max_p = int(float(cand.get("Max_pieces") or 0))
-            if line["Weight"] - max_w > 0.0005 or line["Pieces"] > max_p:
-                over_max.append(
-                    f"{line['Batch_ID']} (max {max_w:g} kg / {max_p} pieces)"
-                )
-        if over_max:
-            st.error(
-                "Packed quantity exceeds remaining finished goods: "
-                + "; ".join(over_max)
+        return None
+    over_max = []
+    for line in selected_lines:
+        cand = by_id.get(line["Batch_ID"]) or {}
+        max_w = float(cand.get("Max_weight") or 0)
+        max_p = int(float(cand.get("Max_pieces") or 0))
+        if line["Weight"] - max_w > 0.0005 or line["Pieces"] > max_p:
+            over_max.append(
+                f"{line['Batch_ID']} (max {max_w:g} kg / {max_p} pieces)"
             )
-        else:
-            try:
-                pid = db.save_packing_list(
-                    packing_list_id=int(editing_id) if editing_id else None,
-                    invoice_date=to_storage_date(invoice_date),
-                    invoice_number=invoice_number,
-                    customer_po_no=po_no,
-                    cust_code=cust_code,
-                    customer_name=customer_name,
-                    alloy_id=int(alloy_id),
-                    colour_code=colour_code or None,
-                    vehicle_no=vehicle_no,
-                    packing_list_status=status,
-                    batch_lines=selected_lines,
-                )
-                st.session_state["pl_edit_id"] = pid
-                st.success(
-                    f"Saved packing list **#{pid}** as **{status}** "
-                    f"({len(selected_batch_ids)} batch"
-                    f"{'' if len(selected_batch_ids) == 1 else 'es'})."
-                )
-                st.rerun()
-            except Exception as exc:
-                st.error(str(exc))
+    if over_max:
+        st.error(
+            "Packed quantity exceeds remaining finished goods: "
+            + "; ".join(over_max)
+        )
+        return None
+    try:
+        pid = db.save_packing_list(
+            packing_list_id=int(editing_id) if editing_id else None,
+            invoice_date=to_storage_date(invoice_date),
+            invoice_number=invoice_number,
+            customer_po_no=po_no,
+            cust_code=cust_code,
+            customer_name=customer_name,
+            alloy_id=int(alloy_id),
+            colour_code=colour_code or None,
+            vehicle_no=vehicle_no,
+            batch_lines=selected_lines,
+        )
+    except Exception as exc:
+        st.error(str(exc))
+        return None
+    st.session_state["pl_edit_id"] = pid
+    return pid
+
+
+if save_clicked:
+    pid = _save_form()
+    if pid:
+        st.success(
+            f"Saved packing list **#{pid}** as **{db.PACKING_STATUS_IN_PROGRESS}** "
+            f"({len(selected_batch_ids)} batch"
+            f"{'' if len(selected_batch_ids) == 1 else 'es'}). The packed quantity "
+            "is out of finished goods."
+        )
+        st.rerun()
+
+if approve_clicked:
+    pid = _save_form()
+    if pid:
+        try:
+            cert = db.approve_packing_list(pid)
+            st.success(
+                f"Approved packing list **#{pid}**. Test certificate "
+                f"**{cert.get('Certificate_no')}** is open as a Draft on the "
+                "**Test Certificate** page."
+            )
+            st.rerun()
+        except Exception as exc:
+            st.error(str(exc))
 
 st.divider()
 st.markdown("#### Existing packing lists")
@@ -875,9 +932,6 @@ else:
             )
             st.session_state["pl_alloy_seen"] = aid
             st.session_state["pl_vehicle"] = header.get("Vehicle_no") or ""
-            st.session_state["pl_status"] = (
-                header.get("Packing_list_status") or db.PACKING_STATUS_IN_PROGRESS
-            )
             loaded_batches = header.get("batches") or []
             st.session_state["pl_batches"] = [
                 str(r["Batch_ID"]) for r in loaded_batches if r.get("Batch_ID")

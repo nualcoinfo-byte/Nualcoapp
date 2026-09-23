@@ -800,7 +800,7 @@ if PAGE == "Dashboard":
         "Produce lines with a **To produce** quantity first. "
         "Finished goods are shared across every open PO for that alloy, "
         "allocated to earlier delivery dates first. "
-        "Dispatch is verified packing-list weight."
+        "Dispatched is packing-list weight whose test certificate is Issued."
     )
     _render_dashboard_refresh_bar(key_prefix="dash")
     today = db.today_ist()

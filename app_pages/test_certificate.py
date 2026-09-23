@@ -737,22 +737,32 @@ def _render_tc_spec_and_deviation(packing_list_id: int, *, locked: bool) -> tupl
 
 st.title("Test Certificate")
 st.caption(
-    "Print dispatch weights from a **Verified** packing list. Complete **Visual "
-    "inspection** first (OK / NOT OK and Verified on every item). Merge heats onto "
-    "one printed line and round **up** total kg by at most "
-    f"**{db.CERT_WEIGHT_ROUND_MAX_PCT:g}%**. Pieces must stay exact. "
-    "**Issue** is the final dispatch step. After that, packed inventory cannot be "
-    "reversed here — only an Admin can cancel an issued certificate."
+    "Approving a packing list opens its test certificate as a **Draft**. Inventory, "
+    "Management and Admin users merge heats onto one printed line and round **up** "
+    f"total kg by at most **{db.CERT_WEIGHT_ROUND_MAX_PCT:g}%** (pieces must stay "
+    "exact), then **Submit for verification**. Production, Management and Admin "
+    "users complete the **Visual inspection** and **Verify** it, **Return it to "
+    "draft** for corrections, or **Reject** it (the packed quantity goes back to "
+    "finished goods and the packing list is cancelled). A Verified certificate is "
+    "**Issued** as the final dispatch step; only an Admin can cancel it after that."
+)
+
+_employee = st.session_state.get("auth_employee") or {}
+can_pack = db.role_allowed(
+    _employee.get("role_name"), _employee.get("role_id"), db.PACKING_ROLES
+)
+can_verify = db.role_allowed(
+    _employee.get("role_name"), _employee.get("role_id"), db.CERT_VERIFIER_ROLES
 )
 
 try:
-    verified_lists = db.list_packing_lists_for_certificate()
+    cert_lists = db.list_packing_lists_for_certificate()
 except Exception as exc:
     _show_db_connection_error(exc)
     st.stop()
 
-if not verified_lists:
-    st.info("Verify a packing list first, then open it here.")
+if not cert_lists:
+    st.info("Approve a packing list first; its test certificate then opens here.")
     st.stop()
 
 list_opts = {
@@ -761,7 +771,7 @@ list_opts = {
         f"{r.get('Customer_name') or '—'}  |  "
         f"{r.get('Certificate_status') or 'no certificate'}"
     ): int(r["Packing_list_id"])
-    for r in verified_lists
+    for r in cert_lists
 }
 preset_id = st.session_state.get("tc_packing_list_id")
 labels = list(list_opts.keys())
@@ -772,7 +782,7 @@ if preset_id:
             default_ix = i
             break
 pick = st.selectbox(
-    "Verified packing list",
+    "Packing list",
     options=labels,
     index=default_ix,
     key="tc_list_pick",
@@ -783,7 +793,6 @@ if st.session_state.get("tc_packing_list_id") != packing_list_id:
     st.session_state.pop("tc_lines", None)
     st.session_state.pop("tc_loaded_id", None)
     st.session_state.pop("tc_show_print", None)
-    st.session_state.pop("tc_show_void", None)
 
 header = db.get_packing_list(packing_list_id)
 if not header:
@@ -791,7 +800,10 @@ if not header:
     st.stop()
 
 cert = db.get_packing_list_certificate(packing_list_id)
-if st.session_state.get("tc_show_print") and cert:
+if not cert:
+    st.error("This packing list has no test certificate.")
+    st.stop()
+if st.session_state.get("tc_show_print"):
     if (
         st.session_state.get("tc_loaded_id") != packing_list_id
         or "tc_lines" not in st.session_state
@@ -833,6 +845,13 @@ if st.session_state.get("tc_show_print") and cert:
             )
     st.stop()
 
+cert_status = cert.get("Status") or ""
+is_draft = cert_status == db.CERT_STATUS_DRAFT
+is_pending = cert_status == db.CERT_STATUS_PENDING
+draft_editable = is_draft and can_pack
+insp_editable = is_pending and can_verify
+dev_editable = (is_draft or is_pending) and (can_pack or can_verify)
+
 packed_batches = list(header.get("batches") or [])
 packed_w = sum(float(r.get("Weight") or 0) for r in packed_batches)
 packed_p = sum(int(float(r.get("Pieces") or 0)) for r in packed_batches)
@@ -845,135 +864,48 @@ m4.metric("Alloy", header.get("Alloy_name") or "—")
 st.caption(
     f"Customer: {header.get('Customer_name') or '—'}  ·  "
     f"PO: {header.get('Customer_PO_No') or '—'}  ·  "
-    f"Vehicle: {header.get('Vehicle_no') or '—'}"
+    f"Vehicle: {header.get('Vehicle_no') or '—'}  ·  "
+    f"Packing list: {header.get('Packing_list_status') or '—'}"
 )
 
-insp_locked = bool(cert and cert.get("Status") == db.CERT_STATUS_ISSUED)
-try:
-    inspection = db.get_visual_inspection(packing_list_id)
-except Exception as exc:
-    st.error(str(exc))
-    inspection = [
-        {
-            "Question_no": index,
-            "Question_text": text,
-            "Answer": "",
-            "Verified": 0,
-        }
-        for index, text in enumerate(db.VISUAL_INSPECTION_QUESTIONS, start=1)
-    ]
-
-st.markdown("#### Visual inspection")
-st.caption(
-    "Complete every check as **OK** or **NOT OK**, then tick **Verified**. "
-    "All items must be OK and Verified before the test certificate can be generated."
-)
-answer_choices = ["", *db.SAMPLE_OK_STATUS]
-inspection_rows: list[dict] = []
-for row in inspection:
-    qno = int(row.get("Question_no") or 0)
-    text = str(row.get("Question_text") or "")
-    saved_answer = str(row.get("Answer") or "").strip()
-    q_col, a_col, v_col = st.columns([5.0, 2.4, 1.8])
-    q_col.markdown(f"**{qno}.** {text}")
-    answer = a_col.selectbox(
-        f"Answer {qno}",
-        options=answer_choices,
-        index=(
-            answer_choices.index(saved_answer)
-            if saved_answer in answer_choices
-            else 0
-        ),
-        format_func=lambda value: "Answer" if value == "" else value,
-        key=f"tc_insp_ans_{packing_list_id}_{qno}",
-        disabled=insp_locked,
-        label_visibility="collapsed",
+if is_draft:
+    st.info(
+        "**Draft**: merge, split and round the printed lines, then **Submit for "
+        "verification**."
+        + ("" if can_pack else " Only Inventory, Management and Admin users can edit it.")
     )
-    verified = v_col.checkbox(
-        "Verified",
-        value=bool(row.get("Verified")),
-        key=f"tc_insp_ver_{packing_list_id}_{qno}",
-        disabled=insp_locked,
+elif is_pending:
+    st.info(
+        "**Pending verification**: complete the visual inspection and check the printed "
+        "lines, then **Verify**, **Return to draft** or **Reject**."
+        + ("" if can_verify else " Only Production, Management and Admin users can verify it.")
     )
-    inspection_rows.append(
-        {
-            "Question_no": qno,
-            "Question_text": text,
-            "Answer": str(answer or "").strip(),
-            "Verified": 1 if verified else 0,
-        }
+elif cert_status == db.CERT_STATUS_VERIFIED:
+    st.success(
+        "**Verified**: the test certificate can be generated. **Issue certificate** is "
+        "the final dispatch step."
+        + ("" if can_pack else " Only Inventory, Management and Admin users can issue it.")
     )
-insp_errors = db.visual_inspection_errors(inspection_rows)
-insp_ready = not insp_errors
-if insp_errors:
-    for msg in insp_errors:
-        st.warning(msg)
-else:
-    st.success("Visual inspection is complete. You can generate the test certificate.")
-
-if not insp_locked:
-    if st.button("Save inspection", key="tc_insp_save"):
-        try:
-            db.save_visual_inspection(packing_list_id, inspection_rows)
-            st.success("Visual inspection saved.")
-            st.rerun()
-        except Exception as exc:
-            st.error(str(exc))
-
-has_deviations, has_letter = _render_tc_spec_and_deviation(
-    packing_list_id,
-    locked=insp_locked,
-)
-spec_blocked = has_deviations and not has_letter
-
-if cert is None or cert.get("Status") == db.CERT_STATUS_VOID:
-    label = (
-        "Create new draft from packed batches"
-        if cert and cert.get("Status") == db.CERT_STATUS_VOID
-        else "Create draft from packed batches"
+elif cert_status == db.CERT_STATUS_ISSUED:
+    st.info(
+        "This certificate is **Issued**. Dispatch is final. An Admin can cancel it "
+        "from **Admin → Cancel issued certificate**."
     )
-    if st.button(
-        label,
-        type="primary",
-        key="tc_create",
-        disabled=not insp_ready or spec_blocked,
-    ):
-        try:
-            db.save_visual_inspection(packing_list_id, inspection_rows)
-            cert = db.create_packing_list_certificate_draft(packing_list_id)
-            st.session_state["tc_lines"] = cert.get("lines") or []
-            st.session_state["tc_loaded_id"] = packing_list_id
-            st.session_state["tc_editor_n"] = (
-                int(st.session_state.get("tc_editor_n") or 0) + 1
-            )
-            st.success(f"Draft **{cert.get('Certificate_no')}** created.")
-            st.rerun()
-        except Exception as exc:
-            st.error(str(exc))
-    if not insp_ready:
-        st.info("Finish visual inspection before generating the test certificate.")
-    elif spec_blocked:
-        st.info(
-            "Upload the customer acceptance of deviation letter before "
-            "generating the test certificate."
-        )
-    if cert is None:
-        st.stop()
-    st.caption(
-        f"Previous certificate {cert.get('Certificate_no')} is **Void**. "
-        "Create a new draft to edit again."
+elif cert_status == db.CERT_STATUS_REJECTED:
+    st.warning(
+        "This certificate was **Rejected**. Its packed quantity is back in finished "
+        "goods and the packing list is cancelled."
     )
-    if cert.get("Status") == db.CERT_STATUS_VOID and not st.session_state.get("tc_show_void"):
-        if st.button("View voided certificate", key="tc_view_void"):
-            st.session_state["tc_show_void"] = True
-            st.session_state["tc_show_print"] = True
-            st.rerun()
-        st.stop()
+elif cert_status == db.CERT_STATUS_VOID:
+    st.warning(
+        "This certificate was cancelled by an Admin (**Void**). Its packed quantity is "
+        "back in finished goods and the packing list is cancelled."
+    )
 
-locked = cert.get("Status") in {db.CERT_STATUS_ISSUED, db.CERT_STATUS_VOID}
 if (
     st.session_state.get("tc_loaded_id") != packing_list_id
     or "tc_lines" not in st.session_state
+    or not draft_editable
 ):
     st.session_state["tc_lines"] = [dict(row) for row in (cert.get("lines") or [])]
     st.session_state["tc_loaded_id"] = packing_list_id
@@ -991,20 +923,20 @@ with h1:
     certificate_no = st.text_input(
         "Certificate no",
         key="tc_cert_no",
-        disabled=locked,
+        disabled=not draft_editable,
     )
 with h2:
     issued_date = ui_date_input(
         "Issued date",
         key="tc_issued_date",
-        disabled=locked,
+        disabled=not (draft_editable or (cert_status == db.CERT_STATUS_VERIFIED and can_pack)),
     )
 with h3:
     st.text_input(
         "Status",
-        value=cert.get("Status") or "",
+        value=cert_status,
         disabled=True,
-        key="tc_status_display",
+        key=f"tc_status_display_{packing_list_id}_{cert_status}",
     )
 
 lines = list(st.session_state.get("tc_lines") or [])
@@ -1030,7 +962,7 @@ for line in lines:
     )
 editor_df = pd.DataFrame(editor_rows)
 editor_key = (
-    f"tc_editor_{packing_list_id}_"
+    f"tc_editor_{packing_list_id}_{cert_status}_"
     f"{int(st.session_state.get('tc_editor_n') or 0)}_h2"
 )
 edited = st.data_editor(
@@ -1039,20 +971,20 @@ edited = st.data_editor(
         "Select": st.column_config.CheckboxColumn(
             "Select",
             help="Tick lines to merge, or one merged line to split.",
-            disabled=locked,
+            disabled=not draft_editable,
         ),
         "Line_no": st.column_config.NumberColumn("Line", format="%d"),
         "Heat no": st.column_config.TextColumn(
             "Heat no",
             help="Printed heat number on the test certificate.",
-            disabled=locked,
+            disabled=not draft_editable,
         ),
         "Source kg": st.column_config.NumberColumn(format="%.2f"),
         "Printed kg": st.column_config.NumberColumn(
             format="%.2f",
             min_value=0.0,
             help="May be rounded up. Total round-up capped at 0.15%.",
-            disabled=locked,
+            disabled=not draft_editable,
         ),
         "Pieces": st.column_config.NumberColumn(format="%d"),
     },
@@ -1100,7 +1032,7 @@ if errors:
 selected_nos = [
     int(row["Line_no"]) for row in lines if row.get("_selected")
 ]
-if not locked:
+if draft_editable:
     st.markdown("#### Merge or split printed lines")
     allow_blend = st.checkbox(
         "Allow blended chemistry (different heat numbers on one printed line)",
@@ -1221,63 +1153,196 @@ if selected_nos:
         else:
             st.info("No chemistry saved on the source batches yet.")
 
-a1, a2, a3 = st.columns(3)
-with a1:
-    if st.button("View / print", key="tc_view_print"):
-        st.session_state["tc_show_print"] = True
-        st.rerun()
-with a2:
-    save_clicked = st.button(
-        "Save draft",
-        key="tc_save",
-        disabled=locked,
-        type="primary" if not locked else "secondary",
+try:
+    inspection = db.get_visual_inspection(packing_list_id)
+except Exception as exc:
+    st.error(str(exc))
+    inspection = [
+        {
+            "Question_no": index,
+            "Question_text": text,
+            "Answer": "",
+            "Verified": 0,
+        }
+        for index, text in enumerate(db.VISUAL_INSPECTION_QUESTIONS, start=1)
+    ]
+
+st.markdown("#### Visual inspection")
+st.caption(
+    "Done by Production, Management or Admin users while the certificate is "
+    "**Pending verification**. Answer every check **OK** or **NOT OK** and tick "
+    "**Verified**; all items must be OK and Verified before the certificate can be "
+    "verified."
+)
+answer_choices = ["", *db.SAMPLE_OK_STATUS]
+inspection_rows: list[dict] = []
+for row in inspection:
+    qno = int(row.get("Question_no") or 0)
+    text = str(row.get("Question_text") or "")
+    saved_answer = str(row.get("Answer") or "").strip()
+    q_col, a_col, v_col = st.columns([5.0, 2.4, 1.8])
+    q_col.markdown(f"**{qno}.** {text}")
+    answer = a_col.selectbox(
+        f"Answer {qno}",
+        options=answer_choices,
+        index=(
+            answer_choices.index(saved_answer)
+            if saved_answer in answer_choices
+            else 0
+        ),
+        format_func=lambda value: "Answer" if value == "" else value,
+        key=f"tc_insp_ans_{packing_list_id}_{qno}",
+        disabled=not insp_editable,
+        label_visibility="collapsed",
     )
-with a3:
-    issue_clicked = st.button(
+    verified = v_col.checkbox(
+        "Verified",
+        value=bool(row.get("Verified")),
+        key=f"tc_insp_ver_{packing_list_id}_{qno}",
+        disabled=not insp_editable,
+    )
+    inspection_rows.append(
+        {
+            "Question_no": qno,
+            "Question_text": text,
+            "Answer": str(answer or "").strip(),
+            "Verified": 1 if verified else 0,
+        }
+    )
+insp_errors = db.visual_inspection_errors(inspection_rows)
+insp_ready = not insp_errors
+if is_pending:
+    if insp_errors:
+        for msg in insp_errors:
+            st.warning(msg)
+    else:
+        st.success("Visual inspection is complete.")
+if insp_editable:
+    if st.button("Save inspection", key="tc_insp_save"):
+        try:
+            db.save_visual_inspection(packing_list_id, inspection_rows)
+            st.success("Visual inspection saved.")
+            st.rerun()
+        except Exception as exc:
+            st.error(str(exc))
+
+has_deviations, has_letter = _render_tc_spec_and_deviation(
+    packing_list_id,
+    locked=not dev_editable,
+)
+spec_blocked = has_deviations and not has_letter
+
+st.divider()
+if st.button("View / print", key="tc_view_print"):
+    st.session_state["tc_show_print"] = True
+    st.rerun()
+
+if is_draft:
+    a1, a2, _a3 = st.columns(3)
+    save_clicked = a1.button(
+        "Save draft", key="tc_save", disabled=not draft_editable, type="primary"
+    )
+    submit_clicked = a2.button(
+        "Submit for verification", key="tc_submit", disabled=not draft_editable
+    )
+    if save_clicked:
+        try:
+            saved = db.save_packing_list_certificate_draft(
+                packing_list_id,
+                lines,
+                certificate_no=certificate_no,
+                issued_date=to_storage_date(issued_date),
+            )
+            st.session_state["tc_lines"] = saved.get("lines") or []
+            st.success(f"Saved draft **{saved.get('Certificate_no')}**.")
+            st.rerun()
+        except Exception as exc:
+            st.error(str(exc))
+    if submit_clicked:
+        try:
+            submitted = db.submit_certificate_for_verification(
+                packing_list_id,
+                lines,
+                certificate_no=certificate_no,
+                issued_date=to_storage_date(issued_date),
+            )
+            st.success(
+                f"**{submitted.get('Certificate_no')}** submitted for verification."
+            )
+            st.rerun()
+        except Exception as exc:
+            st.error(str(exc))
+elif is_pending:
+    if spec_blocked:
+        st.info(
+            "Upload the customer acceptance of deviation letter before verifying "
+            "the test certificate."
+        )
+    v1, v2, v3 = st.columns(3)
+    verify_clicked = v1.button(
+        "Verify",
+        key="tc_verify",
+        type="primary",
+        disabled=not can_verify or not insp_ready or spec_blocked or bool(errors),
+    )
+    return_clicked = v2.button(
+        "Return to draft",
+        key="tc_return",
+        disabled=not can_verify,
+        help="Sends it back to the packing team for corrections; stock stays held.",
+    )
+    confirm_reject = v3.checkbox(
+        "Confirm reject",
+        key=f"tc_reject_confirm_{packing_list_id}",
+        disabled=not can_verify,
+        help="Rejecting returns the packed quantity to finished goods and cancels the packing list.",
+    )
+    reject_clicked = v3.button(
+        "Reject",
+        key="tc_reject",
+        disabled=not can_verify or not confirm_reject,
+    )
+    if verify_clicked:
+        try:
+            db.save_visual_inspection(packing_list_id, inspection_rows)
+            done = db.verify_packing_list_certificate(packing_list_id)
+            st.success(f"**{done.get('Certificate_no')}** verified.")
+            st.rerun()
+        except Exception as exc:
+            st.error(str(exc))
+    if return_clicked:
+        try:
+            db.return_certificate_to_draft(packing_list_id)
+            st.success("Returned to draft for corrections.")
+            st.rerun()
+        except Exception as exc:
+            st.error(str(exc))
+    if reject_clicked:
+        try:
+            db.reject_packing_list_certificate(packing_list_id)
+            st.success(
+                "Certificate rejected. The packed quantity is back in finished goods "
+                "and the packing list is cancelled."
+            )
+            st.rerun()
+        except Exception as exc:
+            st.error(str(exc))
+elif cert_status == db.CERT_STATUS_VERIFIED:
+    if st.button(
         "Issue certificate",
         key="tc_issue",
-        disabled=locked or not insp_ready or spec_blocked,
-    )
-if cert.get("Status") == db.CERT_STATUS_ISSUED:
-    st.info(
-        "This certificate is issued. Dispatch is final. Packed inventory "
-        "cannot be reversed here. An Admin can cancel it from "
-        "**Admin → Cancel issued certificate**."
-    )
-if spec_blocked and not locked:
-    st.info(
-        "Upload the customer acceptance of deviation letter before issuing "
-        "the test certificate."
-    )
-
-if save_clicked:
-    try:
-        saved = db.save_packing_list_certificate_draft(
-            packing_list_id,
-            lines,
-            certificate_no=certificate_no,
-            issued_date=to_storage_date(issued_date),
-        )
-        st.session_state["tc_lines"] = saved.get("lines") or []
-        st.success(f"Saved draft **{saved.get('Certificate_no')}**.")
-        st.rerun()
-    except Exception as exc:
-        st.error(str(exc))
-if issue_clicked:
-    try:
-        db.save_visual_inspection(packing_list_id, inspection_rows)
-        issued = db.issue_packing_list_certificate(
-            packing_list_id,
-            lines,
-            certificate_no=certificate_no,
-            issued_date=to_storage_date(issued_date),
-        )
-        st.session_state["tc_lines"] = issued.get("lines") or []
-        st.success(f"Issued **{issued.get('Certificate_no')}**. Printed lines are locked.")
-        st.rerun()
-    except Exception as exc:
-        st.error(str(exc))
+        type="primary",
+        disabled=not can_pack,
+    ):
+        try:
+            issued = db.issue_packing_list_certificate(
+                packing_list_id,
+                issued_date=to_storage_date(issued_date),
+            )
+            st.success(f"Issued **{issued.get('Certificate_no')}**. Dispatch is final.")
+            st.rerun()
+        except Exception as exc:
+            st.error(str(exc))
 
 st.divider()
 st.markdown("#### Packed baseline (not editable)")

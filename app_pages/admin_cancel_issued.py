@@ -10,7 +10,7 @@ st.title("Cancel issued certificate")
 st.caption(
     "Issue is the final dispatch step. Use this page only to reverse a "
     "shipment that should not have been issued. Cancelling voids the "
-    "certificate, sets the packing list back to **In-Progress**, and "
+    "certificate, sets the packing list to **Cancelled**, and "
     "returns packed kg and pieces to finished-goods inventory."
 )
 try:
@@ -96,7 +96,7 @@ if st.button(
         voided = db.cancel_issued_test_certificate(packing_list_id)
         st.success(
             f"Cancelled **{voided.get('Certificate_no')}**. "
-            "The packing list is In-Progress and packed quantity is back "
+            "The packing list is Cancelled and packed quantity is back "
             "in finished goods."
         )
         st.rerun()

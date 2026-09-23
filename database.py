@@ -577,13 +577,36 @@ ACTIVE_STATUS = ["Active", "Inactive"]
 CRUCIBLE_STATUS = ["Available", "Damaged"]
 PURCHASE_ORDER_STATUS = ["Open", "Closed", "Cancelled"]
 SAMPLE_OK_STATUS = ["OK", "NOT OK"]
+# Dispatch workflow. Saving a packing list (In-Progress) takes its packed qty out of
+# finished goods; Cancelled puts it back. Approved hands the list to the test
+# certificate: Draft -> Pending verification -> Verified -> Issued (final dispatch).
+# Rejected (by quality) and Void (Admin cancel of an Issued certificate) return the
+# qty to finished goods and cancel the packing list.
 PACKING_STATUS_IN_PROGRESS = "In-Progress"
-PACKING_STATUS_VERIFIED = "Verified"
-PACKING_LIST_STATUS = [PACKING_STATUS_IN_PROGRESS, PACKING_STATUS_VERIFIED]
+PACKING_STATUS_APPROVED = "Approved"
+PACKING_STATUS_CANCELLED = "Cancelled"
+PACKING_LIST_STATUS = [
+    PACKING_STATUS_IN_PROGRESS,
+    PACKING_STATUS_APPROVED,
+    PACKING_STATUS_CANCELLED,
+]
 CERT_STATUS_DRAFT = "Draft"
+CERT_STATUS_PENDING = "Pending verification"
+CERT_STATUS_REJECTED = "Rejected"
+CERT_STATUS_VERIFIED = "Verified"
 CERT_STATUS_ISSUED = "Issued"
 CERT_STATUS_VOID = "Void"
-CERT_STATUSES = [CERT_STATUS_DRAFT, CERT_STATUS_ISSUED, CERT_STATUS_VOID]
+CERT_STATUSES = [
+    CERT_STATUS_DRAFT,
+    CERT_STATUS_PENDING,
+    CERT_STATUS_REJECTED,
+    CERT_STATUS_VERIFIED,
+    CERT_STATUS_ISSUED,
+    CERT_STATUS_VOID,
+]
+# Roles (besides Admin, which can do everything) allowed at each dispatch step.
+PACKING_ROLES = ("Inventory", "Management")  # packing lists, certificate drafts, issue
+CERT_VERIFIER_ROLES = ("Production", "Management")  # visual inspection, verify / reject
 # Max round-up of printed certificate kg vs packed packing_list_batch kg.
 CERT_WEIGHT_ROUND_MAX_PCT = 0.15
 CERT_WEIGHT_ROUND_MAX_RATIO = CERT_WEIGHT_ROUND_MAX_PCT / 100.0
@@ -1098,7 +1121,7 @@ CREATE TABLE IF NOT EXISTS Packing_list (
     Colour_code TEXT,
     Vehicle_no TEXT,
     Packing_list_status TEXT NOT NULL DEFAULT 'In-Progress'
-        CHECK (Packing_list_status IN ('In-Progress', 'Verified')),
+        CHECK (Packing_list_status IN ('In-Progress', 'Approved', 'Cancelled')),
     Last_updated_by TEXT,
     Last_updated_datetime TEXT
 );
@@ -1114,7 +1137,7 @@ CREATE TABLE IF NOT EXISTS Packing_list_certificate (
     Certificate_no TEXT NOT NULL UNIQUE,
     Issued_date TEXT,
     Status TEXT NOT NULL DEFAULT 'Draft'
-        CHECK (Status IN ('Draft', 'Issued', 'Void')),
+        CHECK (Status IN ('Draft', 'Pending verification', 'Rejected', 'Verified', 'Issued', 'Void')),
     Source_weight {float} NOT NULL DEFAULT 0,
     Source_pieces INTEGER NOT NULL DEFAULT 0,
     Last_updated_by TEXT,
@@ -2612,9 +2635,10 @@ def _backfill_packing_list_line_quantities(conn: Connection) -> None:
                        COALESCE(SUM(lb.Pieces), 0) AS "Pieces"
                 FROM Packing_list_batch lb
                 JOIN Packing_list p ON p.Packing_list_id = lb.Packing_list_id
-                WHERE lb.Batch_ID = ? AND p.Packing_list_status = ?
+                WHERE lb.Batch_ID = ?
+                  AND p.Packing_list_status IN ('Verified', 'Approved')
                 """,
-                (row["Batch_ID"], PACKING_STATUS_VERIFIED),
+                (row["Batch_ID"],),
             )
             .mappings()
             .first()
@@ -2658,7 +2682,7 @@ def _ensure_packing_list(conn: Connection) -> None:
             Colour_code TEXT,
             Vehicle_no TEXT,
             Packing_list_status TEXT NOT NULL DEFAULT 'In-Progress'
-                CHECK (Packing_list_status IN ('In-Progress', 'Verified')),
+                CHECK (Packing_list_status IN ('In-Progress', 'Approved', 'Cancelled')),
             Last_updated_by TEXT,
             Last_updated_datetime TEXT,
             Deviation_letter {blob_sql},
@@ -2709,6 +2733,136 @@ def _ensure_packing_list(conn: Connection) -> None:
     )
     _backfill_packing_list_line_quantities(conn)
     _ensure_packing_list_certificate(conn)
+    _migrate_dispatch_statuses(conn)
+
+
+def _check_constraint_on_conn(
+    conn: Connection, table: str, column: str
+) -> tuple[Optional[str], str]:
+    """(name, definition) of the CHECK constraint on `table` that mentions `column`."""
+    for name, definition in _exec(
+        conn,
+        f"""
+        SELECT conname, pg_get_constraintdef(oid)
+        FROM pg_constraint
+        WHERE conrelid = '{table}'::regclass AND contype = 'c'
+        """,
+    ):
+        if column.lower() in str(definition).lower():
+            return str(name), str(definition)
+    return None, ""
+
+
+def _migrate_dispatch_statuses(conn: Connection) -> None:
+    """Move existing rows and CHECK constraints onto the Approved / Pending
+    verification workflow. Each step only runs while the old constraint is
+    still in place, so this is a no-op once applied.
+
+    Postgres only: SQLite can't alter a CHECK constraint, and the offline
+    SQLite fallback has no dispatch history worth converting.
+    """
+    if not IS_POSTGRES:
+        return
+    name, definition = _check_constraint_on_conn(
+        conn, "packing_list", "packing_list_status"
+    )
+    if "'Approved'" not in definition:
+        if name:
+            _exec(conn, f'ALTER TABLE Packing_list DROP CONSTRAINT "{name}"')
+        # Old In-Progress lists never took stock; the new In-Progress does. Take
+        # it now, or cancel a list whose batches no longer have the stock.
+        legacy = [
+            int(r[0])
+            for r in _exec(
+                conn,
+                "SELECT Packing_list_id FROM Packing_list WHERE Packing_list_status = ?",
+                (PACKING_STATUS_IN_PROGRESS,),
+            )
+        ]
+        for pid in legacy:
+            lines = [
+                {"Batch_ID": r[0], "Weight": r[1], "Pieces": r[2]}
+                for r in _exec(
+                    conn,
+                    "SELECT Batch_ID, Weight, Pieces FROM Packing_list_batch "
+                    "WHERE Packing_list_id = ?",
+                    (pid,),
+                )
+            ]
+            _exec(conn, "SAVEPOINT legacy_packing_list")
+            try:
+                if not lines:
+                    raise ValueError("no batches")
+                _apply_packing_lines_to_fg(conn, lines, restore=False)
+                _exec(conn, "RELEASE SAVEPOINT legacy_packing_list")
+            except ValueError:
+                _exec(conn, "ROLLBACK TO SAVEPOINT legacy_packing_list")
+                _set_packing_list_status_on_conn(conn, pid, PACKING_STATUS_CANCELLED)
+        _exec(
+            conn,
+            "UPDATE Packing_list SET Packing_list_status = ? "
+            "WHERE Packing_list_status = 'Verified'",
+            (PACKING_STATUS_APPROVED,),
+        )
+        _exec(
+            conn,
+            "ALTER TABLE Packing_list ADD CONSTRAINT packing_list_packing_list_status_check "
+            "CHECK (Packing_list_status IN ('In-Progress', 'Approved', 'Cancelled'))",
+        )
+        # An Approved list always has a certificate to work on.
+        for pid in [
+            int(r[0])
+            for r in _exec(
+                conn,
+                """
+                SELECT p.Packing_list_id FROM Packing_list p
+                LEFT JOIN Packing_list_certificate c
+                    ON c.Packing_list_id = p.Packing_list_id
+                WHERE p.Packing_list_status = ? AND c.Packing_list_id IS NULL
+                """,
+                (PACKING_STATUS_APPROVED,),
+            )
+        ]:
+            batches = [
+                {"Batch_ID": r[0], "Weight": r[1], "Pieces": r[2], "Heat_no": r[3]}
+                for r in _exec(
+                    conn,
+                    """
+                    SELECT lb.Batch_ID, lb.Weight, lb.Pieces, b.Heat_no
+                    FROM Packing_list_batch lb
+                    LEFT JOIN Production_batch b ON b.Batch_ID = lb.Batch_ID
+                    WHERE lb.Packing_list_id = ?
+                    ORDER BY lb.Batch_ID
+                    """,
+                    (pid,),
+                )
+            ]
+            if batches:
+                _write_certificate_draft_on_conn(conn, pid, batches)
+
+    name, definition = _check_constraint_on_conn(
+        conn, "packing_list_certificate", "status"
+    )
+    if "'Pending verification'" not in definition:
+        if name:
+            _exec(conn, f'ALTER TABLE Packing_list_certificate DROP CONSTRAINT "{name}"')
+        _exec(
+            conn,
+            "ALTER TABLE Packing_list_certificate ADD CONSTRAINT "
+            "packing_list_certificate_status_check CHECK (Status IN "
+            "('Draft', 'Pending verification', 'Rejected', 'Verified', 'Issued', 'Void'))",
+        )
+
+    # mv_po_supply_status counts Dispatched from Issued certificates now. It is
+    # created with IF NOT EXISTS, so drop an old definition for
+    # _ensure_dashboard_materialized_views to rebuild.
+    old_view = _exec(
+        conn,
+        "SELECT definition FROM pg_matviews "
+        "WHERE schemaname = current_schema() AND matviewname = 'mv_po_supply_status'",
+    ).scalar()
+    if old_view and "packing_list_certificate" not in str(old_view).lower():
+        _exec(conn, "DROP MATERIALIZED VIEW mv_po_supply_status")
 
 
 def _ensure_packing_list_certificate(conn: Connection) -> None:
@@ -2727,7 +2881,7 @@ def _ensure_packing_list_certificate(conn: Connection) -> None:
             Certificate_no TEXT NOT NULL UNIQUE,
             Issued_date TEXT,
             Status TEXT NOT NULL DEFAULT 'Draft'
-                CHECK (Status IN ('Draft', 'Issued', 'Void')),
+                CHECK (Status IN ('Draft', 'Pending verification', 'Rejected', 'Verified', 'Issued', 'Void')),
             Source_weight REAL NOT NULL DEFAULT 0,
             Source_pieces INTEGER NOT NULL DEFAULT 0,
             Last_updated_by TEXT,
@@ -5361,6 +5515,22 @@ def _require_admin() -> None:
         )
 
 
+def role_allowed(
+    role_name: object, role_id: object, roles: Iterable[str]
+) -> bool:
+    """True for Admin, or when role_name is one of `roles` (case-insensitive)."""
+    if role_is_admin(role_name, role_id):
+        return True
+    return _normalize_role_name(role_name) in {_normalize_role_name(r) for r in roles}
+
+
+def _require_role(roles: Iterable[str], action: str) -> None:
+    roles = tuple(roles)
+    if role_allowed(get_acting_role_name(), get_acting_role_id(), roles) or is_admin_user():
+        return
+    raise ValueError(f"Only {', '.join(roles)} or Admin users can {action}.")
+
+
 def k_mold_value(sampled_pcs: object, defect_pcs: object) -> float | None:
     """Defect pcs / sampled pcs. None when sampled pcs is missing or zero."""
     try:
@@ -6463,11 +6633,33 @@ def _sync_finished_goods_from_output(conn: Connection, batch_id: str) -> Optiona
     weight, pieces = _product_output_totals_on_conn(conn, batch_id, batch["Alloy_id"])
     if weight <= 0:
         return None
-    status = (
-        FG_STATUS_AVAILABLE
-        if batch.get("Production_status") == BATCH_STATUS_COMPLETED
-        else FG_STATUS_UNDER_TESTING
-    )
+    # Qty on packing lists that still hold stock is out of finished goods: without
+    # this, re-syncing a partly packed heat put its packed kg back on the shelf.
+    held = (
+        _exec(
+            conn,
+            """
+            SELECT COALESCE(SUM(lb.Weight), 0) AS "Weight",
+                   COALESCE(SUM(lb.Pieces), 0) AS "Pieces"
+            FROM Packing_list_batch lb
+            JOIN Packing_list p ON p.Packing_list_id = lb.Packing_list_id
+            WHERE lb.Batch_ID = ?
+              AND p.Packing_list_status IN ('In-Progress', 'Approved', 'Verified')
+            """,
+            (batch_id,),
+        )
+        .mappings()
+        .first()
+    ) or {}
+    weight = max(weight - float(held.get("Weight") or 0), 0.0)
+    if pieces is not None:
+        pieces = max(pieces - int(float(held.get("Pieces") or 0)), 0)
+    if weight <= 0.0005:
+        status = FG_STATUS_DISPATCHED
+    elif batch.get("Production_status") == BATCH_STATUS_COMPLETED:
+        status = FG_STATUS_AVAILABLE
+    else:
+        status = FG_STATUS_UNDER_TESTING
     existing = list(
         _exec(
             conn,
@@ -7615,15 +7807,18 @@ def _ensure_dashboard_materialized_views(conn: Connection) -> None:
         LEFT JOIN (
             SELECT pl.Customer_PO_No AS po_no,
                    pl.Alloy_id AS alloy_id,
-                   SUM(CASE WHEN pl.Packing_list_status = 'Verified'
+                   SUM(CASE WHEN pc.Status = 'Issued'
                             THEN COALESCE(lb.Weight, 0) ELSE 0 END)
                        AS Dispatched_Qty,
-                   SUM(CASE WHEN pl.Packing_list_status = 'In-Progress'
+                   SUM(CASE WHEN pl.Packing_list_status IN ('In-Progress', 'Approved')
+                             AND COALESCE(pc.Status, '') <> 'Issued'
                             THEN COALESCE(lb.Weight, 0) ELSE 0 END)
                        AS In_packing_Qty
             FROM Packing_list pl
             JOIN Packing_list_batch lb
                 ON lb.Packing_list_id = pl.Packing_list_id
+            LEFT JOIN Packing_list_certificate pc
+                ON pc.Packing_list_id = pl.Packing_list_id
             GROUP BY pl.Customer_PO_No, pl.Alloy_id
         ) d ON d.po_no = p.Customer_PO_No AND d.alloy_id = p.Alloy_Id
         LEFT JOIN (
@@ -8279,8 +8474,11 @@ def list_packing_batch_candidates(
             (int(packing_list_id),),
         ):
             this_packed[str(row["Batch_ID"])] = row
-    editing_verified = (
-        str(packing_list_status or "").strip() == PACKING_STATUS_VERIFIED
+    # A saved In-Progress or Approved list already took its qty out of finished
+    # goods, so its own packed qty counts as available when re-editing it.
+    holds_stock = bool(packing_list_id) and str(packing_list_status or "").strip() in (
+        PACKING_STATUS_IN_PROGRESS,
+        PACKING_STATUS_APPROVED,
     )
     rows = fetch_all(
         """
@@ -8321,7 +8519,7 @@ def list_packing_batch_candidates(
         fg_p = int(float(item.get("Output_pieces") or 0))
         on_hand_w = fg_w if status in FG_DISPATCHABLE_STATUSES else 0.0
         on_hand_p = fg_p if status in FG_DISPATCHABLE_STATUSES else 0
-        if editing_verified:
+        if holds_stock:
             max_w = on_hand_w + packed_w
             max_p = on_hand_p + packed_p
         else:
@@ -8575,17 +8773,18 @@ def save_packing_list(
     alloy_id: int,
     colour_code: Optional[str],
     vehicle_no: Optional[str],
-    packing_list_status: str,
     batch_lines: Optional[list[dict[str, Any]]] = None,
     batch_ids: Optional[list[str]] = None,
 ) -> int:
-    """Create or update a packing list. Verified lists subtract packed qty from FG."""
+    """Create or update an In-Progress packing list.
+
+    Saving takes the packed qty out of finished goods straight away (an edit
+    first puts the list's previous qty back). Only In-Progress lists can be
+    edited: once Approved the list belongs to its test certificate.
+    """
     _ensure_packing_list_ready()
-    status = (packing_list_status or "").strip()
-    if status not in PACKING_LIST_STATUS:
-        raise ValueError(
-            f"Packing_list_status must be one of {', '.join(PACKING_LIST_STATUS)}."
-        )
+    _require_role(PACKING_ROLES, "create or edit packing lists")
+    status = PACKING_STATUS_IN_PROGRESS
     invoice = (invoice_number or "").strip()
     if not invoice:
         raise ValueError("Invoice number is required.")
@@ -8599,8 +8798,8 @@ def save_packing_list(
             f"Alloy {aid} is not on purchase order {po_no}."
         )
     unique_lines = _normalize_packing_lines(batch_lines, batch_ids)
-    if status == PACKING_STATUS_VERIFIED and not unique_lines:
-        raise ValueError("Select at least one batch_id before marking Verified.")
+    if not unique_lines:
+        raise ValueError("Select at least one batch_id to pack.")
     for line in unique_lines:
         if float(line["Weight"] or 0) <= 0 or int(line["Pieces"] or 0) <= 0:
             raise ValueError(
@@ -8611,40 +8810,16 @@ def save_packing_list(
     if packing_list_id and not previous:
         raise ValueError(f"Packing list {packing_list_id} was not found.")
     previous_status = (previous or {}).get("Packing_list_status")
-    previous_lines = []
-    for row in (previous or {}).get("batches") or []:
-        previous_lines.append(
-            {
-                "Batch_ID": str(row["Batch_ID"]),
-                "Weight": float(row.get("Weight") or 0),
-                "Pieces": int(float(row.get("Pieces") or 0)),
-            }
+    if previous and previous_status != PACKING_STATUS_IN_PROGRESS:
+        raise ValueError(
+            f"Packing list {packing_list_id} is {previous_status} and can no longer "
+            "be edited. Only In-Progress packing lists can be changed."
         )
+    previous_lines = _packed_lines_from_header(previous or {})
     by_val, dt_val = audit_stamp()
-    cert = (
-        get_packing_list_certificate(int(packing_list_id))
-        if packing_list_id
-        else None
-    )
-    lines_changed = not _packing_lines_qty_equal(previous_lines, unique_lines)
-    status_changed = (previous_status or "") != status
-    if cert and cert.get("Status") == CERT_STATUS_ISSUED:
-        if lines_changed or status_changed:
-            raise ValueError(
-                "This packing list has an issued test certificate. Dispatch is "
-                "final. Ask an Admin to cancel the issued certificate before "
-                "changing packed batches or packing-list status."
-            )
 
     with get_connection() as conn:
-        if (
-            cert
-            and cert.get("Status") == CERT_STATUS_DRAFT
-            and packing_list_id
-            and (lines_changed or status_changed)
-        ):
-            _delete_certificate_rows_on_conn(conn, int(packing_list_id))
-        if previous_status == PACKING_STATUS_VERIFIED:
+        if previous:
             _apply_packing_lines_to_fg(conn, previous_lines, restore=True)
         for line in unique_lines:
             row = _fg_bundle_on_conn(conn, line["Batch_ID"])
@@ -8738,25 +8913,8 @@ def save_packing_list(
                 """,
                 (pid, line["Batch_ID"], line["Weight"], line["Pieces"]),
             )
-        if status == PACKING_STATUS_VERIFIED:
-            _apply_packing_lines_to_fg(conn, unique_lines, restore=False)
+        _apply_packing_lines_to_fg(conn, unique_lines, restore=False)
     return pid
-
-
-def _packing_lines_qty_equal(
-    left: list[dict[str, Any]], right: list[dict[str, Any]]
-) -> bool:
-    def _key(lines: list[dict[str, Any]]) -> list[tuple[str, float, int]]:
-        return sorted(
-            (
-                str(row.get("Batch_ID") or ""),
-                round(float(row.get("Weight") or 0), 4),
-                int(float(row.get("Pieces") or 0)),
-            )
-            for row in lines
-        )
-
-    return _key(left) == _key(right)
 
 
 def _scalar_id(row: Any) -> int:
@@ -9113,30 +9271,6 @@ def blended_certificate_chemistry(sources: list[dict[str, Any]]) -> list[dict[st
     ]
 
 
-def _delete_certificate_rows_on_conn(conn: Connection, packing_list_id: int) -> None:
-    _exec(
-        conn,
-        """
-        DELETE FROM Packing_list_certificate_source
-        WHERE Packing_list_id = ?
-        """,
-        (packing_list_id,),
-    )
-    _exec(
-        conn,
-        """
-        DELETE FROM Packing_list_certificate_line
-        WHERE Packing_list_id = ?
-        """,
-        (packing_list_id,),
-    )
-    _exec(
-        conn,
-        "DELETE FROM Packing_list_certificate WHERE Packing_list_id = ?",
-        (packing_list_id,),
-    )
-
-
 def _replace_certificate_lines_on_conn(
     conn: Connection,
     packing_list_id: int,
@@ -9200,7 +9334,7 @@ def _replace_certificate_lines_on_conn(
 
 
 def list_packing_lists_for_certificate() -> list[dict[str, Any]]:
-    """Verified packing lists with current certificate status, if any."""
+    """Packing lists that have a test certificate (every Approved list has one)."""
     _ensure_packing_list_ready()
     return fetch_all(
         """
@@ -9221,10 +9355,9 @@ def list_packing_lists_for_certificate() -> list[dict[str, Any]]:
         LEFT JOIN Alloy_Master a ON a.Alloy_id = p.Alloy_id
         LEFT JOIN Packing_list_certificate c
             ON c.Packing_list_id = p.Packing_list_id
-        WHERE p.Packing_list_status = ?
+        WHERE c.Packing_list_id IS NOT NULL
         ORDER BY p.Packing_list_id DESC
-        """,
-        (PACKING_STATUS_VERIFIED,),
+        """
     )
 
 
@@ -9648,10 +9781,12 @@ def save_visual_inspection(
     header = get_packing_list(packing_list_id)
     if not header:
         raise ValueError(f"Packing list {packing_list_id} was not found.")
+    _require_role(CERT_VERIFIER_ROLES, "record visual inspection")
     cert = get_packing_list_certificate(packing_list_id)
-    if cert and cert.get("Status") == CERT_STATUS_ISSUED:
+    if not cert or cert.get("Status") != CERT_STATUS_PENDING:
         raise ValueError(
-            "Issued test certificates lock visual inspection. Void it first."
+            "Visual inspection is recorded while the test certificate is "
+            f"{CERT_STATUS_PENDING}."
         )
     normalized = _normalize_visual_inspection_rows(rows)
     by_val, dt_val = audit_stamp()
@@ -9877,6 +10012,20 @@ def get_packing_list_deviation_letter(packing_list_id: int) -> Optional[dict[str
     )
 
 
+def _require_deviation_letter_editable(packing_list_id: int) -> None:
+    _require_role(
+        tuple(dict.fromkeys(PACKING_ROLES + CERT_VERIFIER_ROLES)),
+        "change the deviation letter",
+    )
+    cert = get_packing_list_certificate(packing_list_id)
+    status = (cert or {}).get("Status")
+    if status not in (CERT_STATUS_DRAFT, CERT_STATUS_PENDING):
+        raise ValueError(
+            "The deviation letter can only change while the test certificate is "
+            f"{CERT_STATUS_DRAFT} or {CERT_STATUS_PENDING}."
+        )
+
+
 def save_packing_list_deviation_letter(
     packing_list_id: int,
     file_bytes: bytes,
@@ -9891,11 +10040,7 @@ def save_packing_list_deviation_letter(
     header = get_packing_list(packing_list_id)
     if not header:
         raise ValueError(f"Packing list {packing_list_id} was not found.")
-    cert = get_packing_list_certificate(packing_list_id)
-    if cert and cert.get("Status") == CERT_STATUS_ISSUED:
-        raise ValueError(
-            "Issued test certificates cannot change the deviation letter. Void it first."
-        )
+    _require_deviation_letter_editable(packing_list_id)
     by_val, dt_val = audit_stamp()
     execute(
         """
@@ -9910,11 +10055,7 @@ def save_packing_list_deviation_letter(
 
 def clear_packing_list_deviation_letter(packing_list_id: int) -> None:
     _ensure_packing_list_ready()
-    cert = get_packing_list_certificate(packing_list_id)
-    if cert and cert.get("Status") == CERT_STATUS_ISSUED:
-        raise ValueError(
-            "Issued test certificates cannot change the deviation letter. Void it first."
-        )
+    _require_deviation_letter_editable(packing_list_id)
     by_val, dt_val = audit_stamp()
     execute(
         """
@@ -9938,8 +10079,123 @@ def _require_deviation_letter_if_needed(packing_list_id: int) -> None:
     raise ValueError(
         f"{count} packed-batch element(s) are outside the alloy specification "
         "(at or below min, or at or above max). Upload the customer "
-        "acceptance of deviation letter before creating or issuing the test certificate."
+        "acceptance of deviation letter before verifying the test certificate."
     )
+
+
+def _write_certificate_draft_on_conn(
+    conn: Connection,
+    packing_list_id: int,
+    batches: list[dict[str, Any]],
+    *,
+    certificate_no: Optional[str] = None,
+    existing: Optional[dict[str, Any]] = None,
+) -> None:
+    """Write a Draft certificate with one printed line per packed batch."""
+    packed_w, packed_p = _packed_totals(batches)
+    number = (certificate_no or "").strip() or (
+        (existing or {}).get("Certificate_no") or f"TC-{int(packing_list_id):04d}"
+    )
+    by_val, dt_val = audit_stamp()
+    if existing:
+        _exec(
+            conn,
+            """
+            UPDATE Packing_list_certificate SET
+                Certificate_no = ?, Issued_date = NULL, Status = ?,
+                Source_weight = ?, Source_pieces = ?,
+                Last_updated_by = ?, Last_updated_datetime = ?
+            WHERE Packing_list_id = ?
+            """,
+            (number, CERT_STATUS_DRAFT, packed_w, packed_p, by_val, dt_val, packing_list_id),
+        )
+    else:
+        _exec(
+            conn,
+            """
+            INSERT INTO Packing_list_certificate (
+                Packing_list_id, Certificate_no, Issued_date, Status,
+                Source_weight, Source_pieces,
+                Last_updated_by, Last_updated_datetime
+            )
+            VALUES (?, ?, NULL, ?, ?, ?, ?, ?)
+            """,
+            (packing_list_id, number, CERT_STATUS_DRAFT, packed_w, packed_p, by_val, dt_val),
+        )
+    _replace_certificate_lines_on_conn(
+        conn, packing_list_id, _certificate_lines_from_packed(batches)
+    )
+
+
+def _set_certificate_status_on_conn(
+    conn: Connection,
+    packing_list_id: int,
+    status: str,
+    *,
+    issued_date: Optional[str] = None,
+) -> None:
+    by_val, dt_val = audit_stamp()
+    if issued_date is None:
+        _exec(
+            conn,
+            """
+            UPDATE Packing_list_certificate SET
+                Status = ?, Last_updated_by = ?, Last_updated_datetime = ?
+            WHERE Packing_list_id = ?
+            """,
+            (status, by_val, dt_val, packing_list_id),
+        )
+    else:
+        _exec(
+            conn,
+            """
+            UPDATE Packing_list_certificate SET
+                Status = ?, Issued_date = ?, Last_updated_by = ?, Last_updated_datetime = ?
+            WHERE Packing_list_id = ?
+            """,
+            (status, issued_date, by_val, dt_val, packing_list_id),
+        )
+
+
+def _certificate_in_status(
+    packing_list_id: int, allowed: tuple[str, ...], action: str
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """(packing list header, certificate), or ValueError unless its status is allowed."""
+    header = get_packing_list(packing_list_id)
+    if not header:
+        raise ValueError(f"Packing list {packing_list_id} was not found.")
+    cert = get_packing_list_certificate(packing_list_id)
+    if not cert:
+        raise ValueError("This packing list has no test certificate. Approve it first.")
+    status = cert.get("Status") or ""
+    if status not in allowed:
+        raise ValueError(f"Cannot {action}: the test certificate is {status}.")
+    return header, cert
+
+
+def approve_packing_list(packing_list_id: int) -> dict[str, Any]:
+    """In-Progress -> Approved, and open its test certificate as a Draft."""
+    _ensure_packing_list_ready()
+    _require_role(PACKING_ROLES, "approve packing lists")
+    header = get_packing_list(packing_list_id)
+    if not header:
+        raise ValueError(f"Packing list {packing_list_id} was not found.")
+    status = header.get("Packing_list_status") or ""
+    if status != PACKING_STATUS_IN_PROGRESS:
+        raise ValueError(
+            f"Only an In-Progress packing list can be approved (this one is {status})."
+        )
+    batches = list(header.get("batches") or [])
+    if not batches:
+        raise ValueError("The packing list has no packed batches.")
+    existing = get_packing_list_certificate(packing_list_id)
+    with get_connection() as conn:
+        _set_packing_list_status_on_conn(conn, packing_list_id, PACKING_STATUS_APPROVED)
+        _write_certificate_draft_on_conn(conn, packing_list_id, batches, existing=existing)
+    created = get_packing_list_certificate(packing_list_id)
+    if not created:
+        raise ValueError("Could not create the test certificate.")
+    return created
 
 
 def create_packing_list_certificate_draft(
@@ -9947,113 +10203,42 @@ def create_packing_list_certificate_draft(
     *,
     certificate_no: Optional[str] = None,
 ) -> dict[str, Any]:
-    """Create a Draft certificate copied 1:1 from packing_list_batch."""
+    """Reset a Draft certificate to one printed line per packed batch."""
     _ensure_packing_list_ready()
+    _require_role(PACKING_ROLES, "edit test certificate drafts")
     header = get_packing_list(packing_list_id)
     if not header:
         raise ValueError(f"Packing list {packing_list_id} was not found.")
-    if (header.get("Packing_list_status") or "") != PACKING_STATUS_VERIFIED:
-        raise ValueError("Verify the packing list before creating a test certificate.")
-    _require_visual_inspection_complete(packing_list_id)
-    _require_deviation_letter_if_needed(packing_list_id)
+    if (header.get("Packing_list_status") or "") != PACKING_STATUS_APPROVED:
+        raise ValueError("Approve the packing list before working on its test certificate.")
     existing = get_packing_list_certificate(packing_list_id)
-    if existing and existing.get("Status") == CERT_STATUS_ISSUED:
+    if existing and existing.get("Status") != CERT_STATUS_DRAFT:
         raise ValueError(
-            "This packing list already has an issued test certificate. "
-            "Ask an Admin to cancel it before creating a new draft."
+            f"The test certificate is {existing.get('Status')}; only a Draft can be reset."
         )
     batches = list(header.get("batches") or [])
     if not batches:
         raise ValueError("The packing list has no packed batches.")
-    packed_w, packed_p = _packed_totals(batches)
-    lines = _certificate_lines_from_packed(batches)
-    number = (certificate_no or "").strip() or (
-        (existing or {}).get("Certificate_no") or f"TC-{int(packing_list_id):04d}"
-    )
-    by_val, dt_val = audit_stamp()
     with get_connection() as conn:
-        if existing:
-            _exec(
-                conn,
-                """
-                DELETE FROM Packing_list_certificate_source
-                WHERE Packing_list_id = ?
-                """,
-                (packing_list_id,),
-            )
-            _exec(
-                conn,
-                """
-                DELETE FROM Packing_list_certificate_line
-                WHERE Packing_list_id = ?
-                """,
-                (packing_list_id,),
-            )
-            _exec(
-                conn,
-                """
-                UPDATE Packing_list_certificate SET
-                    Certificate_no = ?, Issued_date = NULL, Status = ?,
-                    Source_weight = ?, Source_pieces = ?,
-                    Last_updated_by = ?, Last_updated_datetime = ?
-                WHERE Packing_list_id = ?
-                """,
-                (
-                    number,
-                    CERT_STATUS_DRAFT,
-                    packed_w,
-                    packed_p,
-                    by_val,
-                    dt_val,
-                    packing_list_id,
-                ),
-            )
-        else:
-            _exec(
-                conn,
-                """
-                INSERT INTO Packing_list_certificate (
-                    Packing_list_id, Certificate_no, Issued_date, Status,
-                    Source_weight, Source_pieces,
-                    Last_updated_by, Last_updated_datetime
-                )
-                VALUES (?, ?, NULL, ?, ?, ?, ?, ?)
-                """,
-                (
-                    packing_list_id,
-                    number,
-                    CERT_STATUS_DRAFT,
-                    packed_w,
-                    packed_p,
-                    by_val,
-                    dt_val,
-                ),
-            )
-        _replace_certificate_lines_on_conn(conn, packing_list_id, lines)
+        _write_certificate_draft_on_conn(
+            conn, packing_list_id, batches, certificate_no=certificate_no, existing=existing
+        )
     created = get_packing_list_certificate(packing_list_id)
     if not created:
         raise ValueError("Could not create the test certificate.")
     return created
 
 
-def save_packing_list_certificate_draft(
+def _save_certificate_lines(
     packing_list_id: int,
+    header: dict[str, Any],
+    existing: dict[str, Any],
     lines: list[dict[str, Any]],
     *,
-    certificate_no: Optional[str] = None,
-    issued_date: Optional[str] = None,
+    certificate_no: Optional[str],
+    issued_date: Optional[str],
+    status: str,
 ) -> dict[str, Any]:
-    _ensure_packing_list_ready()
-    existing = get_packing_list_certificate(packing_list_id)
-    if not existing:
-        raise ValueError("Create a draft test certificate first.")
-    if existing.get("Status") == CERT_STATUS_ISSUED:
-        raise ValueError(
-            "Issued test certificates cannot be edited. Dispatch is final."
-        )
-    header = get_packing_list(packing_list_id)
-    if not header or (header.get("Packing_list_status") or "") != PACKING_STATUS_VERIFIED:
-        raise ValueError("The packing list must stay Verified.")
     packed = list(header.get("batches") or [])
     errors = validate_certificate_lines(packed, lines)
     if errors:
@@ -10073,16 +10258,7 @@ def save_packing_list_certificate_draft(
                 Last_updated_by = ?, Last_updated_datetime = ?
             WHERE Packing_list_id = ?
             """,
-            (
-                number,
-                issued_date,
-                CERT_STATUS_DRAFT,
-                packed_w,
-                packed_p,
-                by_val,
-                dt_val,
-                packing_list_id,
-            ),
+            (number, issued_date, status, packed_w, packed_p, by_val, dt_val, packing_list_id),
         )
         _replace_certificate_lines_on_conn(conn, packing_list_id, lines)
     saved = get_packing_list_certificate(packing_list_id)
@@ -10091,49 +10267,127 @@ def save_packing_list_certificate_draft(
     return saved
 
 
-def issue_packing_list_certificate(
+def save_packing_list_certificate_draft(
     packing_list_id: int,
     lines: list[dict[str, Any]],
     *,
     certificate_no: Optional[str] = None,
     issued_date: Optional[str] = None,
 ) -> dict[str, Any]:
-    _require_visual_inspection_complete(packing_list_id)
-    _require_deviation_letter_if_needed(packing_list_id)
-    saved = save_packing_list_certificate_draft(
+    _ensure_packing_list_ready()
+    _require_role(PACKING_ROLES, "edit test certificate drafts")
+    header, existing = _certificate_in_status(
+        packing_list_id, (CERT_STATUS_DRAFT,), "edit the certificate"
+    )
+    return _save_certificate_lines(
         packing_list_id,
+        header,
+        existing,
         lines,
         certificate_no=certificate_no,
         issued_date=issued_date,
+        status=CERT_STATUS_DRAFT,
     )
-    by_val, dt_val = audit_stamp()
-    date_val = (issued_date or "").strip() or today_ist().isoformat()
+
+
+def submit_certificate_for_verification(
+    packing_list_id: int,
+    lines: list[dict[str, Any]],
+    *,
+    certificate_no: Optional[str] = None,
+    issued_date: Optional[str] = None,
+) -> dict[str, Any]:
+    """Draft -> Pending verification (saves the printed lines first)."""
+    _ensure_packing_list_ready()
+    _require_role(PACKING_ROLES, "submit test certificates for verification")
+    header, existing = _certificate_in_status(
+        packing_list_id, (CERT_STATUS_DRAFT,), "submit the certificate"
+    )
+    return _save_certificate_lines(
+        packing_list_id,
+        header,
+        existing,
+        lines,
+        certificate_no=certificate_no,
+        issued_date=issued_date,
+        status=CERT_STATUS_PENDING,
+    )
+
+
+def return_certificate_to_draft(packing_list_id: int) -> dict[str, Any]:
+    """Pending verification -> Draft, so the packing team can correct it. Stock stays held."""
+    _ensure_packing_list_ready()
+    _require_role(CERT_VERIFIER_ROLES, "return test certificates to draft")
+    _certificate_in_status(
+        packing_list_id, (CERT_STATUS_PENDING,), "return the certificate to draft"
+    )
     with get_connection() as conn:
-        _exec(
-            conn,
-            """
-            UPDATE Packing_list_certificate SET
-                Status = ?, Issued_date = ?,
-                Last_updated_by = ?, Last_updated_datetime = ?
-            WHERE Packing_list_id = ?
-            """,
-            (CERT_STATUS_ISSUED, date_val, by_val, dt_val, packing_list_id),
-        )
-    issued = get_packing_list_certificate(packing_list_id)
-    return issued or saved
+        _set_certificate_status_on_conn(conn, packing_list_id, CERT_STATUS_DRAFT)
+    return get_packing_list_certificate(packing_list_id) or {}
 
 
-def _void_certificate_on_conn(conn: Connection, packing_list_id: int) -> None:
-    by_val, dt_val = audit_stamp()
-    _exec(
-        conn,
-        """
-        UPDATE Packing_list_certificate SET
-            Status = ?, Last_updated_by = ?, Last_updated_datetime = ?
-        WHERE Packing_list_id = ?
-        """,
-        (CERT_STATUS_VOID, by_val, dt_val, packing_list_id),
+def verify_packing_list_certificate(packing_list_id: int) -> dict[str, Any]:
+    """Pending verification -> Verified, once the printed lines, visual inspection
+    and any deviation letter check out."""
+    _ensure_packing_list_ready()
+    _require_role(CERT_VERIFIER_ROLES, "verify test certificates")
+    header, cert = _certificate_in_status(
+        packing_list_id, (CERT_STATUS_PENDING,), "verify the certificate"
     )
+    errors = validate_certificate_lines(
+        list(header.get("batches") or []), list(cert.get("lines") or [])
+    )
+    if errors:
+        raise ValueError(" ".join(errors))
+    _require_visual_inspection_complete(packing_list_id)
+    _require_deviation_letter_if_needed(packing_list_id)
+    with get_connection() as conn:
+        _set_certificate_status_on_conn(conn, packing_list_id, CERT_STATUS_VERIFIED)
+    return get_packing_list_certificate(packing_list_id) or {}
+
+
+def reject_packing_list_certificate(packing_list_id: int) -> dict[str, Any]:
+    """Pending verification -> Rejected: the packed qty goes back to finished
+    goods and the packing list is Cancelled."""
+    _ensure_packing_list_ready()
+    _require_role(CERT_VERIFIER_ROLES, "reject test certificates")
+    header, _cert = _certificate_in_status(
+        packing_list_id, (CERT_STATUS_PENDING,), "reject the certificate"
+    )
+    with get_connection() as conn:
+        if (header.get("Packing_list_status") or "") in (
+            PACKING_STATUS_IN_PROGRESS,
+            PACKING_STATUS_APPROVED,
+        ):
+            _apply_packing_lines_to_fg(
+                conn, _packed_lines_from_header(header), restore=True
+            )
+        _set_packing_list_status_on_conn(conn, packing_list_id, PACKING_STATUS_CANCELLED)
+        _set_certificate_status_on_conn(conn, packing_list_id, CERT_STATUS_REJECTED)
+    return get_packing_list_certificate(packing_list_id) or {}
+
+
+def issue_packing_list_certificate(
+    packing_list_id: int,
+    *,
+    issued_date: Optional[str] = None,
+) -> dict[str, Any]:
+    """Verified -> Issued: the final dispatch step."""
+    _ensure_packing_list_ready()
+    _require_role(PACKING_ROLES, "issue test certificates")
+    _header, cert = _certificate_in_status(
+        packing_list_id, (CERT_STATUS_VERIFIED,), "issue the certificate"
+    )
+    date_val = (
+        (issued_date or "").strip()
+        or str(cert.get("Issued_date") or "").strip()
+        or today_ist().isoformat()
+    )
+    with get_connection() as conn:
+        _set_certificate_status_on_conn(
+            conn, packing_list_id, CERT_STATUS_ISSUED, issued_date=date_val
+        )
+    return get_packing_list_certificate(packing_list_id) or cert
 
 
 def _set_packing_list_status_on_conn(
@@ -10170,30 +10424,21 @@ def _packed_lines_from_header(header: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def cancel_packing_list(packing_list_id: int) -> dict[str, Any]:
-    """Return packed qty to FG and set the list back to In-Progress.
-
-    Blocked when the test certificate is Issued.
-    """
+    """In-Progress -> Cancelled: the packed qty goes back to finished goods."""
     _ensure_packing_list_ready()
+    _require_role(PACKING_ROLES, "cancel packing lists")
     header = get_packing_list(packing_list_id)
     if not header:
         raise ValueError(f"Packing list {packing_list_id} was not found.")
-    cert = get_packing_list_certificate(packing_list_id)
-    if cert and cert.get("Status") == CERT_STATUS_ISSUED:
-        raise ValueError(
-            "This packing list has an issued test certificate. Dispatch is "
-            "final. Ask an Admin to cancel the issued certificate."
-        )
-    packed = _packed_lines_from_header(header)
     status = header.get("Packing_list_status") or ""
-    with get_connection() as conn:
-        if status == PACKING_STATUS_VERIFIED:
-            _apply_packing_lines_to_fg(conn, packed, restore=True)
-        _set_packing_list_status_on_conn(
-            conn, packing_list_id, PACKING_STATUS_IN_PROGRESS
+    if status != PACKING_STATUS_IN_PROGRESS:
+        raise ValueError(
+            f"Only an In-Progress packing list can be cancelled (this one is {status}). "
+            "An Approved list is cancelled by rejecting its test certificate."
         )
-        if cert and cert.get("Status") == CERT_STATUS_DRAFT:
-            _delete_certificate_rows_on_conn(conn, packing_list_id)
+    with get_connection() as conn:
+        _apply_packing_lines_to_fg(conn, _packed_lines_from_header(header), restore=True)
+        _set_packing_list_status_on_conn(conn, packing_list_id, PACKING_STATUS_CANCELLED)
     updated = get_packing_list(packing_list_id)
     if not updated:
         raise ValueError("Could not cancel the packing list.")
@@ -10230,7 +10475,8 @@ def list_issued_certificates() -> list[dict[str, Any]]:
 
 
 def cancel_issued_test_certificate(packing_list_id: int) -> dict[str, Any]:
-    """Admin-only: void an issued certificate and return packed qty to FG."""
+    """Admin-only: void an issued certificate, return packed qty to FG and
+    cancel the packing list."""
     _require_admin()
     _ensure_packing_list_ready()
     header = get_packing_list(packing_list_id)
@@ -10243,12 +10489,13 @@ def cancel_issued_test_certificate(packing_list_id: int) -> dict[str, Any]:
         raise ValueError("Only an issued test certificate can be cancelled here.")
     packed = _packed_lines_from_header(header)
     with get_connection() as conn:
-        if (header.get("Packing_list_status") or "") == PACKING_STATUS_VERIFIED:
+        if (header.get("Packing_list_status") or "") in (
+            PACKING_STATUS_IN_PROGRESS,
+            PACKING_STATUS_APPROVED,
+        ):
             _apply_packing_lines_to_fg(conn, packed, restore=True)
-        _set_packing_list_status_on_conn(
-            conn, packing_list_id, PACKING_STATUS_IN_PROGRESS
-        )
-        _void_certificate_on_conn(conn, packing_list_id)
+        _set_packing_list_status_on_conn(conn, packing_list_id, PACKING_STATUS_CANCELLED)
+        _set_certificate_status_on_conn(conn, packing_list_id, CERT_STATUS_VOID)
     voided = get_packing_list_certificate(packing_list_id)
     if not voided:
         raise ValueError("Could not cancel the issued test certificate.")
@@ -12092,15 +12339,18 @@ def list_po_supply_status() -> list[dict[str, Any]]:
         LEFT JOIN (
             SELECT pl.Customer_PO_No AS po_no,
                    pl.Alloy_id AS alloy_id,
-                   SUM(CASE WHEN pl.Packing_list_status = 'Verified'
+                   SUM(CASE WHEN pc.Status = 'Issued'
                             THEN COALESCE(lb.Weight, 0) ELSE 0 END)
                        AS Dispatched_Qty,
-                   SUM(CASE WHEN pl.Packing_list_status = 'In-Progress'
+                   SUM(CASE WHEN pl.Packing_list_status IN ('In-Progress', 'Approved')
+                             AND COALESCE(pc.Status, '') <> 'Issued'
                             THEN COALESCE(lb.Weight, 0) ELSE 0 END)
                        AS In_packing_Qty
             FROM Packing_list pl
             JOIN Packing_list_batch lb
                 ON lb.Packing_list_id = pl.Packing_list_id
+            LEFT JOIN Packing_list_certificate pc
+                ON pc.Packing_list_id = pl.Packing_list_id
             GROUP BY pl.Customer_PO_No, pl.Alloy_id
         ) d ON d.po_no = p.Customer_PO_No AND d.alloy_id = p.Alloy_Id
         LEFT JOIN (

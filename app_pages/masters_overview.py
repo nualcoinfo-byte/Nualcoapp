@@ -69,12 +69,12 @@ with tab4:
         | 24 | Furnace_Oil_Inventory | Daily opening / purchase / consumption / closing ledger |
         | 25 | Electricity_Consumption | Daily opening/closing power readings per EB Line 1 / EB Line 2 |
         | 26 | Cost_of_conversion | Monthly conversion rates per kg (oil, electricity, labour, salaries, consumables, overheads) |
-        | 27 | Packing_list | Dispatch header (invoice, PO, customer, alloy, vehicle; status In-Progress / Verified) |
-        | 28 | Packing_list_batch | Batch IDs on a packing list; Verified lists subtract packed kg/pieces from FG |
-        | 29 | Packing_list_certificate | Test-certificate header (Draft / Issued / Void); 1:1 with a Verified packing list |
+        | 27 | Packing_list | Dispatch header (invoice, PO, customer, alloy, vehicle; status In-Progress / Approved / Cancelled) |
+        | 28 | Packing_list_batch | Batch IDs on a packing list; saving (In-Progress) subtracts packed kg/pieces from FG, Cancelled returns them |
+        | 29 | Packing_list_certificate | Test-certificate header (Draft / Pending verification / Rejected / Verified / Issued / Void); created when a packing list is Approved |
         | 30 | Packing_list_certificate_line | Printed TC lines (may merge heats; weight may round up ≤ 0.15%) |
         | 31 | Packing_list_certificate_source | Maps each printed TC line back to packing_list_batch |
-        | 32 | Packing_list_visual_inspection | OK / NOT OK + Verified checks required before generating a test certificate |
+        | 32 | Packing_list_visual_inspection | OK / NOT OK + Verified checks, done by quality before a test certificate is Verified |
         | 33 | Company_profile | Our company (issuer) — legal, contact, GST/CIN/MSME, and bank details |
         | 34 | Furnace_Oil_Purchase_Tank | Tank dip readings for a furnace oil purchase (child of Furnace_Oil_Purchase; key is Purchase_id + Oil_tank_type); litres filled are checked against the purchase quantity |
         | 35 | Furnace_Oil_Consumption_Tank | Tank dip readings for a day's furnace oil consumption (child of Furnace_Oil_Consumption; key is Consumption_date + Oil_tank_type); Furnace_Oil_Consumption.Quantity is calculated from them |
