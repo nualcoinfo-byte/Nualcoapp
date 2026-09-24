@@ -1266,7 +1266,11 @@ if draft_editable:
             except Exception as exc:
                 st.error(str(exc))
 
-if st.button(
+# The packing team works above the visual inspection and quality below it, so
+# Submit sits here with View summary. It is handled further down, once the
+# visual inspection selection (saved with it) has been read.
+sum_col, submit_col, _sp = st.columns([1, 1, 2])
+if sum_col.button(
     "View summary",
     key="tc_view_summary",
     help="Printable overview of the printed lines and the source batches they are "
@@ -1274,6 +1278,14 @@ if st.button(
 ):
     st.session_state["tc_show_summary"] = True
     st.rerun()
+submit_clicked = is_draft and submit_col.button(
+    "Submit for verification",
+    key="tc_submit",
+    type="primary",
+    disabled=not draft_editable,
+    help="Saves the draft and the visual inspection checks it includes, and sends "
+    "it to quality for verification.",
+)
 
 if selected_nos:
     st.markdown("#### Chemistry for selected line")
@@ -1435,12 +1447,8 @@ if st.button("View / print", key="tc_view_print"):
     st.rerun()
 
 if is_draft:
-    a1, a2, _a3 = st.columns(3)
-    save_clicked = a1.button(
+    save_clicked = st.button(
         "Save draft", key="tc_save", disabled=not draft_editable, type="primary"
-    )
-    submit_clicked = a2.button(
-        "Submit for verification", key="tc_submit", disabled=not draft_editable
     )
     if save_clicked:
         try:
