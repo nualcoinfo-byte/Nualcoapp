@@ -6003,7 +6003,9 @@ def allocate_fifo(
         parts.append(
             {
                 "Lot_id": int(lot["Lot_id"]),
-                "Weight": round(take, 4),
+                # A lot used up takes its exact stored remainder: rounding it could
+                # ask for a hair more than the lot holds.
+                "Weight": rem if take >= rem else round(take, 4),
                 "Cost_per_kg": lot.get("Cost_per_kg"),
             }
         )
@@ -6117,14 +6119,21 @@ def _insert_charge_lines(conn: Connection, batch_id: str, inputs: list[dict[str,
             raise ValueError(
                 f"Insufficient stock on Lot {item['Lot_id']}: need {w}, have {remaining}."
             )
+        # Stored weights are floats, so emptying a lot can land a hair below
+        # zero (e.g. -2.8e-14) and trip rm_remaining_weight_non_negative; the
+        # check above already allows 1e-9 kg of that. Call anything under a
+        # milligram left zero.
         _exec(
             conn,
             """
             UPDATE Raw_Material_Inventory
-            SET Remaining_Weight = Remaining_Weight - ?
+            SET Remaining_Weight = CASE
+                WHEN Remaining_Weight - ? < 0.000001 THEN 0
+                ELSE Remaining_Weight - ?
+            END
             WHERE Lot_id = ?
             """,
-            (w, item["Lot_id"]),
+            (w, w, item["Lot_id"]),
         )
         try:
             _exec(
