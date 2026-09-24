@@ -64,11 +64,16 @@ def _production_batch_option_label(
 
 
 def _clear_batch_filters(furnace: str) -> None:
-    """Reset the saved-batch search for one furnace (also in its stored draft, or restore would undo it)."""
-    for name in ("find_date", "find_melt", "find_shift"):
+    """Reset the saved-batch search for one furnace (also in its stored draft, or restore would undo it).
+
+    Assign the blank values: only deleting a widget's key lets the browser's
+    last choice come straight back on the rerun.
+    """
+    draft = (st.session_state.get("batch_drafts") or {}).get(str(furnace), {})
+    for name, blank in (("find_date", None), ("find_melt", "Any"), ("find_shift", "Any")):
         key = _furnace_form_key(furnace, name)
-        st.session_state.pop(key, None)
-        (st.session_state.get("batch_drafts") or {}).get(str(furnace), {}).pop(key, None)
+        st.session_state[key] = blank
+        draft.pop(key, None)
 
 
 def _is_ephemeral_widget_key(key: object) -> bool:
