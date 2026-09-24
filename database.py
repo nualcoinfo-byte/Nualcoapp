@@ -8395,6 +8395,25 @@ def list_packing_po_numbers() -> list[str]:
     return [str(r["Customer_PO_No"]) for r in rows if r.get("Customer_PO_No")]
 
 
+def list_packing_po_customer_names() -> dict[str, str]:
+    """{PO number: its customer name(s), comma-joined} for the PO dropdown label."""
+    names: dict[str, list[str]] = {}
+    for row in fetch_all(
+        """
+        SELECT DISTINCT p.Customer_PO_No AS "Customer_PO_No",
+               COALESCE(c.Customer_name, p.Customer_name) AS "Customer_name"
+        FROM Purchase_Order p
+        LEFT JOIN Customer_Master c ON LOWER(c.Cust_code) = LOWER(p.Cust_code)
+        WHERE COALESCE(p.Purchase_Order_Status, 'Open') <> 'Cancelled'
+        ORDER BY 1, 2
+        """
+    ):
+        name = str(row.get("Customer_name") or "").strip()
+        if row.get("Customer_PO_No") and name:
+            names.setdefault(str(row["Customer_PO_No"]), []).append(name)
+    return {po: ", ".join(dict.fromkeys(n)) for po, n in names.items()}
+
+
 def list_packing_po_customers(po_no: str) -> list[dict[str, Any]]:
     """Customers on a PO, names taken from Customer_Master when possible."""
     return fetch_all(

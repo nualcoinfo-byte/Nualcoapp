@@ -292,6 +292,7 @@ def _alloy_label(row: dict) -> str:
 
 existing_lists = db.list_packing_lists()
 po_numbers = db.list_packing_po_numbers()
+po_customer_names = db.list_packing_po_customer_names()
 editing_id = st.session_state.get("pl_edit_id")
 _employee = st.session_state.get("auth_employee") or {}
 can_pack = db.role_allowed(
@@ -356,7 +357,11 @@ with r1c3:
         "P.O. Number *",
         options=[""] + po_numbers,
         key="pl_po",
-        help="Customer PO numbers from purchase_order.customer_po_no (not Cancelled).",
+        format_func=lambda po: (
+            f"{po}  |  {po_customer_names[po]}" if po in po_customer_names else po
+        ),
+        help="Customer PO numbers from purchase_order.customer_po_no (not Cancelled), "
+        "shown with the customer on each.",
     )
 
 if st.session_state.get("pl_po_seen") != po_no:
