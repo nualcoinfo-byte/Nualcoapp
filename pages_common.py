@@ -941,6 +941,49 @@ def show_dataframe(data, **kwargs):
     return st.dataframe(data, **kwargs)
 
 
+_REAR_CAMERA_JS = """
+<script>
+// st.camera_input always opens the front ("user") camera first; it has no
+// option for the back one. Swap user <-> environment in the camera request so
+// phones open the back camera, and Streamlit's own "Switch camera" button
+// still flips to the front. A one-camera laptop still gets its only camera.
+(function () {
+  const w = window.parent;
+  const md = w && w.navigator && w.navigator.mediaDevices;
+  if (!md || w.__nualcoRearCamera) return;
+  w.__nualcoRearCamera = true;
+  const original = md.getUserMedia.bind(md);
+  const swap = (v) => v === "user" ? "environment" : v === "environment" ? "user" : v;
+  md.getUserMedia = function (constraints) {
+    try {
+      const video = constraints && constraints.video;
+      if (video && typeof video === "object" && video.facingMode) {
+        const fm = video.facingMode;
+        if (typeof fm === "string") {
+          video.facingMode = swap(fm);
+        } else if (typeof fm === "object") {
+          for (const k of ["exact", "ideal"]) if (fm[k]) fm[k] = swap(fm[k]);
+        }
+      }
+    } catch (e) {}
+    return original(constraints);
+  };
+})();
+</script>
+"""
+
+
+def prefer_rear_camera() -> None:
+    """Make photo capture (st.camera_input) open the phone's back camera.
+
+    Call once per run, early (app shell), so the camera request is patched
+    before anyone opens a camera. Renders an empty, zero-height frame.
+    """
+    import streamlit.components.v1 as components
+
+    components.html(_REAR_CAMERA_JS, height=0)
+
+
 def ui_date_input(label: str, value="today", **kwargs):
     kwargs.setdefault("format", UI_DATE_WIDGET_FORMAT)
     if isinstance(value, str) and value == "today":

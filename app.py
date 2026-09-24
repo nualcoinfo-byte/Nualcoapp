@@ -93,6 +93,7 @@ elif st.session_state.pop("_offline_sqlite", False):
 
 from pages_common import (  # noqa: E402
     df_from_rows,
+    prefer_rear_camera,
     _show_db_connection_error,
     parse_any_date,
     show_dataframe,
@@ -439,6 +440,8 @@ st.sidebar.markdown(
     f"`{html.escape(str(auth_employee.get('employee_id') or ''))}` · "
     f"{html.escape(str(auth_employee.get('role_name') or '—'))}"
 )
+with st.sidebar:
+    prefer_rear_camera()
 if st.sidebar.button("Log out"):
     st.session_state.pop("auth_employee", None)
     db.clear_session_actor()
