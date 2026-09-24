@@ -41,7 +41,8 @@ else:
         st.info("No batches for this furnace.")
     else:
         labels = {
-            f"{b['Batch_ID']}  |  Shift {b.get('Shift') or '—'}  |  "
+            f"{b['Batch_ID']}  |  Heat {b.get('Heat_no') or '—'}  |  "
+            f"Shift {b.get('Shift') or '—'}  |  "
             f"Melt {b.get('Melt_No') or '—'}  |  {b.get('Alloy_name') or '—'}  |  "
             f"in={float(b.get('Input_Weight') or 0):.0f} kg  |  "
             f"out={float(b.get('Output_Weight') or 0):.0f} kg": b["Batch_ID"]
