@@ -9639,7 +9639,7 @@ def get_test_certificate_print_payload(
             if spec.get("Is_remainder"):
                 actuals.append("Remainder")
             else:
-                # chem_by_symbol already carries the '<' prefix (format_chem_percent).
+                # chem_by_symbol already carries the '<=' prefix (format_chem_percent).
                 raw = heat["actuals"].get(symbol)
                 actuals.append(raw if raw else "—")
         element_rows.append(
@@ -12286,12 +12286,12 @@ def get_batch_chemistry(batch_id: str) -> list[dict[str, Any]]:
 
 
 def format_chem_percent(value: object, less_than: object = False) -> str:
-    """'<0.0050' when the reading was below the spectrometer's detection limit,
+    """'<=0.0050' when the reading was below the spectrometer's detection limit,
     else the plain number ('0.5' etc, same rules as the printed certificate)."""
     text = _format_cert_number(value)
     if not text:
         return text
-    return f"<{text}" if less_than else text
+    return f"<={text}" if less_than else text
 
 
 def list_batches(production_date: object = None) -> list[dict[str, Any]]:

@@ -1918,13 +1918,13 @@ else:
                         disabled=later_locked,
                     )
                     st.checkbox(
-                        "< (below detection limit)",
+                        "<= (below detection limit)",
                         key=_pk(f"bchem_lt_{sym}"),
                         disabled=later_locked,
                         help=(
                             "The spectrometer could not resolve a value this low. "
                             "The number above is the reported ceiling; the test "
-                            "certificate prints it as e.g. <0.0050."
+                            "certificate prints it as e.g. <=0.0050."
                         ),
                     )
                 entered = float(batch_chem[sym] or 0.0)
@@ -1961,7 +1961,7 @@ else:
 
     merged_chem = merge_percent_composition(batch_chem, full_chem_key)
     composition = {k: v for k, v in merged_chem.items() if v and v > 0}
-    # Only the main grid carries a "<" checkbox (elements added only via Open all
+    # Only the main grid carries a "<=" checkbox (elements added only via Open all
     # elements... default to False); .get(..., False) covers that automatically.
     composition_less_than = {
         sym: bool(st.session_state.get(_pk(f"bchem_lt_{sym}")))
