@@ -1824,7 +1824,7 @@ else:
         "Use **Open all elements…** for the full list. "
         "Each field shows this alloy’s min/max from Alloy_Master_spec. "
         "An entered % is highlighted in red if it is at or below min, or at or above max. "
-        "**SF %** is calculated as Fe + 2×Mn + 3×Cr, rounded to the nearest tenth."
+        "**SF %** is calculated as Fe + 2×Mn + 3×Cr, rounded to two decimal places."
     )
     if not alloy_id:
         st.info("Select an alloy above to display spec ranges and validate ladle chemistry.")
@@ -1900,14 +1900,15 @@ else:
                         + 2.0 * _entered_chem("Mn")
                         + 3.0 * _entered_chem("Cr")
                     )
-                    sf_val = round(sludge, 1)
+                    sf_val = round(sludge, 2)
                     st.session_state[_pk("bchem_SF")] = sf_val if sf_val > 0 else None
                     batch_chem[sym] = st.number_input(
                         "SF %",
                         min_value=0.0,
                         max_value=600.0,
                         value=None,
-                        step=0.1,
+                        step=0.01,
+                        format="%.2f",
                         key=_pk("bchem_SF"),
                         disabled=True,
                         placeholder="Fe + 2×Mn + 3×Cr",
