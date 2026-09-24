@@ -593,6 +593,42 @@ def render_batch_output_editor(batch: dict, *, key_prefix: str) -> None:
             }
         )
 
+    # A whole heat saved as Broken Ingot / Furnace Empty / Not Ok Ingot sends
+    # nothing to Finished Goods; it has been done by mistake several times, so
+    # make the user confirm it. Checked on the lines on screen (Save) and on
+    # the saved lines (Mark Output as Completed).
+    def _remelt_only(lines: list[dict]) -> bool:
+        weighed = [ln for ln in lines if float(ln.get("Weight") or 0) > 0]
+        return bool(weighed) and not any(
+            product_id and int(ln.get("Alloy_id") or 0) == int(product_id)
+            for ln in weighed
+        )
+
+    screen_remelt_only = _remelt_only(collected)
+    saved_remelt_only = _remelt_only(db.get_batch_outputs(bid))
+    remelt_confirmed = True
+    if not locked and (screen_remelt_only or (saved_remelt_only and not output_completed)):
+        product_name = next(
+            (lbl for lbl, aid in label_to_id.items() if product_id and aid == int(product_id)),
+            None,
+        )
+        st.warning(
+            "**Every output line on this heat is a remelt type** (Broken Ingot, "
+            "Furnace Empty or Not Ok Ingot). None of it will go to **Finished "
+            "Goods**; it goes back into raw material stock as a remelt lot instead. "
+            + (
+                f"If this heat produced **{product_name}**, change the output alloy "
+                "to it before saving."
+                if product_name
+                else "This batch has **no alloy** set: set it on **Production Batch "
+                "& Chemistry** (Correct history) first, then choose it here."
+            )
+        )
+        remelt_confirmed = st.checkbox(
+            "Yes, this heat's entire output really is remelt material.",
+            key=f"{key_prefix}_{bid}_remelt_ok",
+        )
+
     add_c, rem_c, save_c, complete_c = st.columns([1, 1, 1.6, 1.8])
     if add_c.button(
         "Add output line", key=f"{key_prefix}_{bid}_add", disabled=locked
@@ -614,7 +650,12 @@ def render_batch_output_editor(batch: dict, *, key_prefix: str) -> None:
         key=f"{key_prefix}_{bid}_save",
         disabled=locked,
     ):
-        if missing_stand:
+        if screen_remelt_only and not remelt_confirmed:
+            st.error(
+                "Not saved: every output line is a remelt type. Change the output "
+                "alloy to the product, or tick the confirmation above."
+            )
+        elif missing_stand:
             lines = ", ".join(str(n) for n in missing_stand)
             st.error(
                 f"Stand weight is missing on output line {lines}. Enter the stand "
@@ -644,15 +685,22 @@ def render_batch_output_editor(batch: dict, *, key_prefix: str) -> None:
             "Inventory. Requires at least one output line."
         ),
     ):
-        try:
-            db.complete_batch_output(bid)
-            st.success(
-                f"Output for **{bid}** is **Completed** and locked. It is now "
-                "posted to **Finished Goods Inventory**."
+        if saved_remelt_only and not remelt_confirmed:
+            st.error(
+                "Not completed: every saved output line is a remelt type, so nothing "
+                "would reach Finished Goods. Fix the output alloy and save, or tick "
+                "the confirmation above."
             )
-            st.rerun()
-        except Exception as exc:
-            st.error(str(exc))
+        else:
+            try:
+                db.complete_batch_output(bid)
+                st.success(
+                    f"Output for **{bid}** is **Completed** and locked. It is now "
+                    "posted to **Finished Goods Inventory**."
+                )
+                st.rerun()
+            except Exception as exc:
+                st.error(str(exc))
     if not output_completed and output_gaps:
         st.caption(
             "**Mark Output as Completed** stays disabled until: "
