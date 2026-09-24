@@ -2978,6 +2978,8 @@ def _ensure_packing_list_certificate(conn: Connection) -> None:
             ("Question_text", "TEXT"),
             ("Answer", "TEXT"),
             ("Verified", "INTEGER DEFAULT 0"),
+            # 0 = the customer doesn't need this check: not answered, not printed.
+            ("Included", "INTEGER NOT NULL DEFAULT 1"),
             ("Last_updated_by", "TEXT"),
             ("Last_updated_datetime", "TEXT"),
         ],
@@ -9659,9 +9661,13 @@ def get_test_certificate_print_payload(
         "colour_code": colour or "—",
         "heats": heats,
         "elements": element_rows,
-        "inspection": _normalize_visual_inspection_rows(
-            inspection if inspection is not None else get_visual_inspection(packing_list_id)
-        ),
+        "inspection": [
+            row
+            for row in _normalize_visual_inspection_rows(
+                inspection if inspection is not None else get_visual_inspection(packing_list_id)
+            )
+            if row["Included"]
+        ],
         "analysis_method": CERT_ANALYSIS_METHOD,
         "instrument": CERT_INSTRUMENT,
         "instrument_make": CERT_INSTRUMENT_MAKE,
@@ -9678,6 +9684,7 @@ def _blank_visual_inspection_rows() -> list[dict[str, Any]]:
                 "Question_text": text,
                 "Answer": "",
                 "Verified": 0,
+                "Included": 1,
             }
         )
     return rows
@@ -9694,14 +9701,17 @@ def _normalize_visual_inspection_rows(
             continue
         if number < 1 or number > len(VISUAL_INSPECTION_QUESTIONS):
             continue
+        included = raw.get("Included")
+        included = 1 if included is None or included == "" or bool(int(included)) else 0
         answer = str(raw.get("Answer") or "").strip()
-        if answer not in SAMPLE_OK_STATUS:
+        if answer not in SAMPLE_OK_STATUS or not included:
             answer = ""
         by_no[number] = {
             "Question_no": number,
             "Question_text": VISUAL_INSPECTION_QUESTIONS[number - 1],
             "Answer": answer,
-            "Verified": 1 if raw.get("Verified") else 0,
+            "Verified": 1 if raw.get("Verified") and included else 0,
+            "Included": included,
         }
     out = []
     for index, text in enumerate(VISUAL_INSPECTION_QUESTIONS, start=1):
@@ -9713,6 +9723,7 @@ def _normalize_visual_inspection_rows(
                     "Question_text": text,
                     "Answer": "",
                     "Verified": 0,
+                    "Included": 1,
                 },
             )
         )
@@ -9720,8 +9731,13 @@ def _normalize_visual_inspection_rows(
 
 
 def visual_inspection_errors(rows: list[dict[str, Any]] | None) -> list[str]:
-    """Blocking reasons the test certificate must not be generated yet."""
-    normalized = _normalize_visual_inspection_rows(rows)
+    """Blocking reasons the test certificate must not be generated yet.
+
+    Only the checks included for this customer count.
+    """
+    normalized = [
+        row for row in _normalize_visual_inspection_rows(rows) if row["Included"]
+    ]
     unanswered = [
         str(row["Question_no"])
         for row in normalized
@@ -9764,7 +9780,8 @@ def get_visual_inspection(packing_list_id: int) -> list[dict[str, Any]]:
         SELECT Question_no AS "Question_no",
                Question_text AS "Question_text",
                Answer AS "Answer",
-               Verified AS "Verified"
+               Verified AS "Verified",
+               Included AS "Included"
         FROM Packing_list_visual_inspection
         WHERE Packing_list_id = ?
         ORDER BY Question_no
@@ -9774,49 +9791,99 @@ def get_visual_inspection(packing_list_id: int) -> list[dict[str, Any]]:
     return _normalize_visual_inspection_rows(saved)
 
 
+def _write_visual_inspection_on_conn(
+    conn: Connection, packing_list_id: int, rows: list[dict[str, Any]]
+) -> None:
+    by_val, dt_val = audit_stamp()
+    _exec(
+        conn,
+        "DELETE FROM Packing_list_visual_inspection WHERE Packing_list_id = ?",
+        (packing_list_id,),
+    )
+    for row in _normalize_visual_inspection_rows(rows):
+        _exec(
+            conn,
+            """
+            INSERT INTO Packing_list_visual_inspection (
+                Packing_list_id, Question_no, Question_text,
+                Answer, Verified, Included, Last_updated_by, Last_updated_datetime
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                packing_list_id,
+                int(row["Question_no"]),
+                row["Question_text"],
+                row["Answer"] or None,
+                1 if row["Verified"] else 0,
+                1 if row["Included"] else 0,
+                by_val,
+                dt_val,
+            ),
+        )
+
+
 def save_visual_inspection(
     packing_list_id: int, rows: list[dict[str, Any]]
 ) -> list[dict[str, Any]]:
+    """Draft: the packing team picks which checks this customer needs
+    (Included only; answers are kept). Pending verification: quality records
+    the answers and can still adjust the selection."""
     _ensure_packing_list_ready()
     header = get_packing_list(packing_list_id)
     if not header:
         raise ValueError(f"Packing list {packing_list_id} was not found.")
-    _require_role(CERT_VERIFIER_ROLES, "record visual inspection")
     cert = get_packing_list_certificate(packing_list_id)
-    if not cert or cert.get("Status") != CERT_STATUS_PENDING:
+    status = (cert or {}).get("Status")
+    if status == CERT_STATUS_DRAFT:
+        _require_role(PACKING_ROLES, "choose the visual inspection checks")
+        included = {
+            int(r.get("Question_no") or 0): r.get("Included") for r in rows or []
+        }
+        rows = [
+            dict(row, Included=included.get(row["Question_no"], row["Included"]))
+            for row in get_visual_inspection(packing_list_id)
+        ]
+    elif status == CERT_STATUS_PENDING:
+        _require_role(CERT_VERIFIER_ROLES, "record visual inspection")
+    else:
         raise ValueError(
-            "Visual inspection is recorded while the test certificate is "
-            f"{CERT_STATUS_PENDING}."
+            "Visual inspection can only change while the test certificate is "
+            f"{CERT_STATUS_DRAFT} or {CERT_STATUS_PENDING}."
         )
-    normalized = _normalize_visual_inspection_rows(rows)
-    by_val, dt_val = audit_stamp()
     with get_connection() as conn:
-        _exec(
-            conn,
-            "DELETE FROM Packing_list_visual_inspection WHERE Packing_list_id = ?",
-            (packing_list_id,),
-        )
-        for row in normalized:
-            _exec(
-                conn,
-                """
-                INSERT INTO Packing_list_visual_inspection (
-                    Packing_list_id, Question_no, Question_text,
-                    Answer, Verified, Last_updated_by, Last_updated_datetime
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    packing_list_id,
-                    int(row["Question_no"]),
-                    row["Question_text"],
-                    row["Answer"] or None,
-                    1 if row["Verified"] else 0,
-                    by_val,
-                    dt_val,
-                ),
-            )
+        _write_visual_inspection_on_conn(conn, packing_list_id, rows)
     return get_visual_inspection(packing_list_id)
+
+
+def _default_inspection_for_customer_on_conn(
+    conn: Connection, packing_list_id: int, cust_code: object
+) -> Optional[list[dict[str, Any]]]:
+    """The checks included on this customer's most recent other packing list,
+    so a repeat customer starts with the same checklist. None if there's none."""
+    if cust_code in (None, ""):
+        return None
+    previous = _exec(
+        conn,
+        """
+        SELECT MAX(p.Packing_list_id)
+        FROM Packing_list p
+        JOIN Packing_list_visual_inspection v ON v.Packing_list_id = p.Packing_list_id
+        WHERE p.Cust_code = ? AND p.Packing_list_id <> ?
+        """,
+        (cust_code, packing_list_id),
+    ).scalar()
+    if not previous:
+        return None
+    return [
+        {"Question_no": r[0], "Included": r[1]}
+        for r in _exec(
+            conn,
+            "SELECT Question_no, Included FROM Packing_list_visual_inspection "
+            "WHERE Packing_list_id = ?",
+            (int(previous),),
+        )
+    ]
 
 
 def _require_visual_inspection_complete(packing_list_id: int) -> None:
@@ -10189,9 +10256,21 @@ def approve_packing_list(packing_list_id: int) -> dict[str, Any]:
     if not batches:
         raise ValueError("The packing list has no packed batches.")
     existing = get_packing_list_certificate(packing_list_id)
+    has_inspection = bool(
+        fetch_one(
+            "SELECT 1 AS \"x\" FROM Packing_list_visual_inspection WHERE Packing_list_id = ?",
+            (packing_list_id,),
+        )
+    )
     with get_connection() as conn:
         _set_packing_list_status_on_conn(conn, packing_list_id, PACKING_STATUS_APPROVED)
         _write_certificate_draft_on_conn(conn, packing_list_id, batches, existing=existing)
+        if not has_inspection:
+            default = _default_inspection_for_customer_on_conn(
+                conn, packing_list_id, header.get("Cust_code")
+            )
+            if default:
+                _write_visual_inspection_on_conn(conn, packing_list_id, default)
     created = get_packing_list_certificate(packing_list_id)
     if not created:
         raise ValueError("Could not create the test certificate.")

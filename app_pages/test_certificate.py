@@ -319,31 +319,32 @@ def _certificate_pdf_bytes(payload: dict) -> bytes:
         pdf.cell(page_w - label_w, 6, _pdf_safe_text(value))
         pdf.set_y(y1 + 6)
 
-    _section("VISUAL INSPECTIONS : CUSTOMER REQUIREMENT STATUS")
-    q_w, s_w, v_w = page_w * 0.76, page_w * 0.12, page_w * 0.12
-    pdf.set_font("Helvetica", "B", 7)
-    pdf.set_fill_color(243, 243, 243)
-    pdf.cell(q_w, 6, "Requirement", border=1, align="C", fill=True)
-    pdf.cell(s_w, 6, "STATUS", border=1, align="C", fill=True)
-    pdf.cell(v_w, 6, "VERIFY", border=1, align="C", fill=True, new_x="LMARGIN", new_y="NEXT")
-    insp_h = 5.3
-    for row in inspection:
-        y1 = pdf.get_y()
-        answer = str(row.get("Answer") or "").strip()
-        status = "Ok" if answer.upper() == "OK" else (answer or "-")
-        verify = "Yes" if row.get("Verified") else ""
-        pdf.set_font("Helvetica", "", 7)
-        pdf.rect(left, y1, q_w, insp_h)
-        pdf.set_xy(left, y1)
-        pdf.cell(q_w, insp_h, _fit(str(row.get("Question_text") or ""), q_w, 7))
+    if inspection:
+        _section("VISUAL INSPECTIONS : CUSTOMER REQUIREMENT STATUS")
+        q_w, s_w, v_w = page_w * 0.76, page_w * 0.12, page_w * 0.12
         pdf.set_font("Helvetica", "B", 7)
-        pdf.rect(left + q_w, y1, s_w, insp_h)
-        pdf.set_xy(left + q_w, y1)
-        pdf.cell(s_w, insp_h, _pdf_safe_text(status), align="C")
-        pdf.rect(left + q_w + s_w, y1, v_w, insp_h)
-        pdf.set_xy(left + q_w + s_w, y1)
-        pdf.cell(v_w, insp_h, _pdf_safe_text(verify), align="C")
-        pdf.set_y(y1 + insp_h)
+        pdf.set_fill_color(243, 243, 243)
+        pdf.cell(q_w, 6, "Requirement", border=1, align="C", fill=True)
+        pdf.cell(s_w, 6, "STATUS", border=1, align="C", fill=True)
+        pdf.cell(v_w, 6, "VERIFY", border=1, align="C", fill=True, new_x="LMARGIN", new_y="NEXT")
+        insp_h = 5.3
+        for row in inspection:
+            y1 = pdf.get_y()
+            answer = str(row.get("Answer") or "").strip()
+            status = "Ok" if answer.upper() == "OK" else (answer or "-")
+            verify = "Yes" if row.get("Verified") else ""
+            pdf.set_font("Helvetica", "", 7)
+            pdf.rect(left, y1, q_w, insp_h)
+            pdf.set_xy(left, y1)
+            pdf.cell(q_w, insp_h, _fit(str(row.get("Question_text") or ""), q_w, 7))
+            pdf.set_font("Helvetica", "B", 7)
+            pdf.rect(left + q_w, y1, s_w, insp_h)
+            pdf.set_xy(left + q_w, y1)
+            pdf.cell(s_w, insp_h, _pdf_safe_text(status), align="C")
+            pdf.rect(left + q_w + s_w, y1, v_w, insp_h)
+            pdf.set_xy(left + q_w + s_w, y1)
+            pdf.cell(v_w, insp_h, _pdf_safe_text(verify), align="C")
+            pdf.set_y(y1 + insp_h)
 
     pdf.ln(3)
     pdf.set_font("Helvetica", "B", 10)
@@ -460,6 +461,15 @@ def _render_certificate_print(
             f"<td class='tc-insp-verify'>{verify}</td>"
             "</tr>"
         )
+    # Only the checks included for this customer print; none -> no section.
+    insp_section = (
+        '<div class="tc-section">VISUAL INSPECTIONS : CUSTOMER REQUIREMENT STATUS</div>'
+        '<table class="tc-table tc-insp"><thead><tr>'
+        "<th>Requirement</th><th>STATUS</th><th>VERIFY</th>"
+        f"</tr></thead><tbody>{insp_body}</tbody></table>"
+        if insp_body
+        else ""
+    )
     st.markdown(
         f"""
         <style>
@@ -587,17 +597,7 @@ def _render_certificate_print(
                     <tr><td>Instrument Make</td><td>{esc(str(payload.get("instrument_make") or ""))}</td></tr>
                 </tbody>
             </table>
-            <div class="tc-section">VISUAL INSPECTIONS : CUSTOMER REQUIREMENT STATUS</div>
-            <table class="tc-table tc-insp">
-                <thead>
-                    <tr>
-                        <th>Requirement</th>
-                        <th>STATUS</th>
-                        <th>VERIFY</th>
-                    </tr>
-                </thead>
-                <tbody>{insp_body}</tbody>
-            </table>
+            {insp_section}
             <p class="tc-approve">Approved by : {esc(str(payload.get("approved_by") or ""))}</p>
         </div>
         """,
@@ -1353,19 +1353,29 @@ except Exception as exc:
 
 st.markdown("#### Visual inspection")
 st.caption(
-    "Done by Production, Management or Admin users while the certificate is "
-    "**Pending verification**. Answer every check **OK** or **NOT OK** and tick "
-    "**Verified**; all items must be OK and Verified before the certificate can be "
-    "verified."
+    "Tick **Include** for the checks this customer needs; only those are answered "
+    "and printed on the certificate (a customer's last selection is suggested). The "
+    "packing team sets them while the certificate is a **Draft** (saved with **Save "
+    "draft**). Production, Management or Admin users then answer each included check "
+    "**OK** or **NOT OK** and tick **Verified** while it is **Pending verification**; "
+    "every included check must be OK and Verified before the certificate can be verified."
 )
+select_editable = (is_draft and can_pack) or insp_editable
 answer_choices = ["", *db.SAMPLE_OK_STATUS]
 inspection_rows: list[dict] = []
 for row in inspection:
     qno = int(row.get("Question_no") or 0)
     text = str(row.get("Question_text") or "")
     saved_answer = str(row.get("Answer") or "").strip()
-    q_col, a_col, v_col = st.columns([5.0, 2.4, 1.8])
-    q_col.markdown(f"**{qno}.** {text}")
+    i_col, q_col, a_col, v_col = st.columns([1.0, 5.0, 2.4, 1.8])
+    included = i_col.checkbox(
+        f"Include {qno}",
+        value=bool(row.get("Included", 1)),
+        key=f"tc_insp_inc_{packing_list_id}_{qno}",
+        disabled=not select_editable,
+        help="Include this check on the test certificate.",
+    )
+    q_col.markdown(f"**{qno}.** {text}" if included else f":gray[{qno}. ~~{text}~~]")
     answer = a_col.selectbox(
         f"Answer {qno}",
         options=answer_choices,
@@ -1376,23 +1386,26 @@ for row in inspection:
         ),
         format_func=lambda value: "Answer" if value == "" else value,
         key=f"tc_insp_ans_{packing_list_id}_{qno}",
-        disabled=not insp_editable,
+        disabled=not (insp_editable and included),
         label_visibility="collapsed",
     )
     verified = v_col.checkbox(
         "Verified",
         value=bool(row.get("Verified")),
         key=f"tc_insp_ver_{packing_list_id}_{qno}",
-        disabled=not insp_editable,
+        disabled=not (insp_editable and included),
     )
     inspection_rows.append(
         {
             "Question_no": qno,
             "Question_text": text,
-            "Answer": str(answer or "").strip(),
-            "Verified": 1 if verified else 0,
+            "Answer": str(answer or "").strip() if included else "",
+            "Verified": 1 if verified and included else 0,
+            "Included": 1 if included else 0,
         }
     )
+if not any(r["Included"] for r in inspection_rows):
+    st.caption("No visual inspection checks are included; none will print on the certificate.")
 insp_errors = db.visual_inspection_errors(inspection_rows)
 insp_ready = not insp_errors
 if is_pending:
@@ -1431,6 +1444,7 @@ if is_draft:
     )
     if save_clicked:
         try:
+            db.save_visual_inspection(packing_list_id, inspection_rows)
             saved = db.save_packing_list_certificate_draft(
                 packing_list_id,
                 lines,
@@ -1444,6 +1458,7 @@ if is_draft:
             st.error(str(exc))
     if submit_clicked:
         try:
+            db.save_visual_inspection(packing_list_id, inspection_rows)
             submitted = db.submit_certificate_for_verification(
                 packing_list_id,
                 lines,
