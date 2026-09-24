@@ -240,6 +240,8 @@ def _clear_production_entry_fields(furnace: str, sample_blank: str) -> None:
     st.session_state[pk("bottom_sample_dt")] = None
     st.session_state[pk("full_chem")] = {}
     st.session_state[pk("notes")] = ""
+    st.session_state[pk("prod_date")] = None
+    st.session_state[pk("alloy")] = ""
     _snapshot_furnace_widgets(furnace)
 
 
@@ -290,7 +292,7 @@ def _hydrate_production_batch_form(
     st.session_state[pk("notes")] = batch.get("Notes") or ""
 
     alloy_id = batch.get("Alloy_id")
-    alloy_label = "— none —"
+    alloy_label = ""
     if alloy_id not in (None, ""):
         for label, stored in alloy_labels.items():
             if stored == alloy_id or str(stored) == str(alloy_id):
@@ -698,8 +700,8 @@ else:
             st.caption(identity_lock_note)
         else:
             prod_date = ui_date_input(
-                "Production date",
-                value=db.today_ist(),
+                "Production date *",
+                value=None,
                 key=_pk("prod_date"),
                 disabled=locked,
                 help=(
@@ -728,10 +730,11 @@ else:
     with h3:
         with st.container(gap="small", key="prod_crew_fields"):
             alloy_label = st.selectbox(
-                "Alloy",
-                options=["— none —"] + list(alloy_labels.keys()),
+                "Alloy *",
+                options=[""] + list(alloy_labels.keys()),
                 key=_pk("alloy"),
                 disabled=locked,
+                format_func=lambda label: label or "Select alloy",
             )
             melting_team = st.selectbox(
                 "Melter name *", melters, key=_pk("melter"), disabled=locked
@@ -743,7 +746,7 @@ else:
                 disabled=locked,
             )
 
-    alloy_id = None if alloy_label == "— none —" else alloy_labels[alloy_label]
+    alloy_id = alloy_labels.get(alloy_label) if alloy_label else None
 
     preview_error = None
     duplicate_id = None
@@ -751,6 +754,8 @@ else:
     if existing_batch:
         preview_id = str(existing_batch["Batch_ID"])
         heat_no_preview = str(existing_batch.get("Heat_no") or "")
+    elif prod_date is None:
+        preview_id = ""
     else:
         try:
             preview_id = db.build_production_batch_id(
@@ -1575,6 +1580,10 @@ else:
                     raise ValueError(
                         "No crucible available for the respective furnace."
                     )
+                if prod_date is None:
+                    raise ValueError("Production date is required.")
+                if not alloy_id:
+                    raise ValueError("Alloy is required.")
                 inputs_to_save = list(pending_charges)
                 total_save_weight = sum(
                     float(c.get("Weight") or 0) for c in inputs_to_save
@@ -2037,6 +2046,8 @@ else:
             raise ValueError(
                 "Create the production batch before saving degassing, samples, or chemistry."
             )
+        if not alloy_id:
+            raise ValueError("Alloy is required.")
         db.update_production_batch_input(
             preview_id,
             extra_inputs=pending_charges,
