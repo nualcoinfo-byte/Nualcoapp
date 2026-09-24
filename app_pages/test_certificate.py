@@ -610,7 +610,6 @@ def _render_certificate_summary(
     header: dict,
     cert: dict,
     lines: list[dict],
-    inspection: list[dict],
 ) -> None:
     """Plain, printable summary of the certificate as it stands (unsaved draft
     edits included) for looking things up during the physical inspection."""
@@ -722,18 +721,6 @@ def _render_certificate_summary(
     else:
         weight_note = esc(weight_note)
 
-    insp_rows = ""
-    for row in inspection:
-        answer = str(row.get("Answer") or "").strip() or "—"
-        insp_rows += (
-            "<tr>"
-            f"<td>{int(row.get('Question_no') or 0)}</td>"
-            f"<td>{esc(str(row.get('Question_text') or ''))}</td>"
-            f"<td>{esc(answer)}</td>"
-            f"<td>{'Yes' if row.get('Verified') else '—'}</td>"
-            "</tr>"
-        )
-
     st.markdown(
         f"""
         <div class="tc-summary-wrap">
@@ -756,11 +743,6 @@ def _render_certificate_summary(
                 </tr></tfoot>
             </table>
             <p class="tc-summary-note">{weight_note}{pieces_note}</p>
-            <p class="tc-summary-h"><b>Visual inspection</b></p>
-            <table class="tc-summary-table tc-summary-lines">
-                <thead><tr><th>#</th><th>Check</th><th>Answer</th><th>Verified</th></tr></thead>
-                <tbody>{insp_rows}</tbody>
-            </table>
             <p class="tc-summary-note">
                 Source kg is the packed weight from the packing list; printed kg is what the
                 certificate shows. Check the physical bundles against the source batches.
@@ -1100,7 +1082,6 @@ if st.session_state.get("tc_show_summary"):
         header,
         summary_cert,
         list(st.session_state.get("tc_lines") or []),
-        db.get_visual_inspection(packing_list_id),
     )
     st.stop()
 
@@ -1285,6 +1266,15 @@ if draft_editable:
             except Exception as exc:
                 st.error(str(exc))
 
+if st.button(
+    "View summary",
+    key="tc_view_summary",
+    help="Printable overview of the printed lines and the source batches they are "
+    "made of, for the physical check.",
+):
+    st.session_state["tc_show_summary"] = True
+    st.rerun()
+
 if selected_nos:
     st.markdown("#### Chemistry for selected line")
     focus = next(
@@ -1427,16 +1417,7 @@ has_deviations, has_letter = _render_tc_spec_and_deviation(
 spec_blocked = has_deviations and not has_letter
 
 st.divider()
-p1, p2, _p3 = st.columns([1, 1, 2])
-if p1.button(
-    "View summary",
-    key="tc_view_summary",
-    help="Printable overview of the printed lines, their source batches and the "
-    "visual inspection, for the physical check.",
-):
-    st.session_state["tc_show_summary"] = True
-    st.rerun()
-if p2.button("View / print", key="tc_view_print"):
+if st.button("View / print", key="tc_view_print"):
     st.session_state["tc_show_print"] = True
     st.rerun()
 
