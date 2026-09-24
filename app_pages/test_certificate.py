@@ -6,7 +6,7 @@ from pathlib import Path
 import pandas as pd
 import streamlit as st
 import database as db
-from pages_common import _as_photo_bytes, _is_blank_date, _pandas_styler, _parse_master_date, _show_db_connection_error, df_from_rows, parse_any_date, show_dataframe, to_storage_date, ui_date_input
+from pages_common import _as_photo_bytes, _is_blank_date, _pandas_styler, _parse_master_date, _show_db_connection_error, df_from_rows, format_ui_date, parse_any_date, show_dataframe, to_storage_date, ui_date_input
 
 LOGO_PATH = Path(__file__).resolve().parent.parent / "assets" / "nualco_logo.png"
 ISO_LOGO_PATH = Path(__file__).resolve().parent.parent / "assets" / "iso_9001_2015.png"
@@ -606,6 +606,184 @@ def _render_certificate_print(
     return payload
 
 
+def _render_certificate_summary(
+    header: dict,
+    cert: dict,
+    lines: list[dict],
+    inspection: list[dict],
+) -> None:
+    """Plain, printable summary of the certificate as it stands (unsaved draft
+    edits included) for looking things up during the physical inspection."""
+    st.markdown(
+        f"""
+        <style>
+        .tc-summary-wrap {{
+            border: 1px solid #ddd; border-radius: 6px; padding: 1.25rem 1.5rem;
+            background: #fff; color: {_BRAND_INK};
+        }}
+        .tc-summary-title {{
+            margin: 0 0 0.25rem 0; color: {_BRAND_INK};
+            border-bottom: 2px solid {_BRAND_ORANGE}; padding-bottom: 0.35rem;
+        }}
+        .tc-summary-table {{
+            width: 100%; border-collapse: collapse; margin: 0.75rem 0 0 0; font-size: 0.95rem;
+        }}
+        .tc-summary-table th, .tc-summary-table td {{
+            border: 1px solid #bdbdbd; padding: 0.5rem 0.65rem; text-align: left;
+            vertical-align: top;
+        }}
+        .tc-summary-meta td:first-child {{ width: 30%; font-weight: 600; background: #f7f7f7; }}
+        .tc-summary-lines th {{ background: #f0f0f0; font-weight: 700; }}
+        .tc-summary-lines td.num, .tc-summary-lines th.num {{ text-align: right; }}
+        .tc-summary-lines tr.src td {{ color: #555; font-size: 0.88rem; background: #fcfcfc; }}
+        .tc-summary-lines tfoot td {{ font-weight: 700; background: #fafafa; }}
+        .tc-summary-h {{ margin: 1.1rem 0 0 0; font-size: 1.05rem; }}
+        .tc-summary-bad {{ color: #c62828; font-weight: 700; }}
+        .tc-summary-note {{ margin-top: 0.75rem; font-size: 0.85rem; color: #555; }}
+        @media print {{
+            [data-testid="stSidebar"], [data-testid="stToolbar"], footer, header,
+            .no-print {{ display: none !important; }}
+            .block-container {{ max-width: 100% !important; padding: 0.25rem !important; }}
+            .tc-summary-wrap {{ border: none; padding: 0; }}
+        }}
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+    esc = html.escape
+    packed = list(header.get("batches") or [])
+    packed_w = sum(float(r.get("Weight") or 0) for r in packed)
+    packed_p = sum(int(float(r.get("Pieces") or 0)) for r in packed)
+    printed_w = sum(float(r.get("Weight") or 0) for r in lines)
+    printed_p = sum(int(float(r.get("Pieces") or 0)) for r in lines)
+    weights = db.certificate_weight_summary(packed_w, printed_w)
+    heat_by_batch = {str(r.get("Batch_ID")): r.get("Heat_no") for r in packed}
+
+    meta_rows = [
+        ("Certificate no", cert.get("Certificate_no") or "—"),
+        ("Certificate status", cert.get("Status") or "—"),
+        ("Issued date", format_ui_date(cert.get("Issued_date"), empty="—")),
+        ("Packing list", f"#{header.get('Packing_list_id')} ({header.get('Packing_list_status') or '—'})"),
+        ("Invoice", f"{header.get('Invoice_number') or '—'}  ·  "
+                    f"{format_ui_date(header.get('Invoice_date'), empty='—')}"),
+        ("P.O. Number", header.get("Customer_PO_No") or "—"),
+        ("Customer name", header.get("Customer_name") or "—"),
+        ("Alloy name", header.get("Alloy_name") or "—"),
+        ("Colour code", header.get("Colour_code") or "—"),
+        ("Vehicle No", header.get("Vehicle_no") or "—"),
+    ]
+    meta_html = "".join(
+        f"<tr><td>{esc(label)}</td><td>{esc(str(value))}</td></tr>"
+        for label, value in meta_rows
+    )
+
+    line_rows = ""
+    for line in lines:
+        sources = line.get("sources") or []
+        source_kg = sum(float(s.get("Source_weight") or 0) for s in sources)
+        printed_kg = float(line.get("Weight") or 0)
+        extra = printed_kg - source_kg
+        line_rows += (
+            "<tr>"
+            f"<td>{int(line.get('Line_no') or 0)}</td>"
+            f"<td><b>{esc(db.certificate_display_heat_no(line.get('Display_heat_no')) or '—')}</b>"
+            f"{' (blended)' if line.get('Is_blended') else ''}</td>"
+            f"<td class='num'>{source_kg:,.2f}</td>"
+            f"<td class='num'><b>{printed_kg:,.2f}</b></td>"
+            f"<td class='num'>{extra:+,.2f}</td>"
+            f"<td class='num'>{int(float(line.get('Pieces') or 0)):,}</td>"
+            "</tr>"
+        )
+        for src in sources:
+            bid = str(src.get("Batch_ID") or "—")
+            heat = src.get("Heat_no") or heat_by_batch.get(bid) or "—"
+            line_rows += (
+                "<tr class='src'>"
+                "<td></td>"
+                f"<td>&nbsp;&nbsp;↳ {esc(bid)} · heat {esc(str(heat))}</td>"
+                f"<td class='num'>{float(src.get('Source_weight') or 0):,.2f}</td>"
+                "<td></td><td></td>"
+                f"<td class='num'>{int(float(src.get('Source_pieces') or 0)):,}</td>"
+                "</tr>"
+            )
+    if not line_rows:
+        line_rows = "<tr><td colspan='6' style='text-align:center;color:#666'>No printed lines</td></tr>"
+
+    pieces_note = (
+        "" if printed_p == packed_p
+        else f" <span class='tc-summary-bad'>Pieces differ from packed ({packed_p:,}).</span>"
+    )
+    weight_note = (
+        f"Round-up {weights['delta_kg']:+,.2f} kg ({weights['delta_pct']:+.3f}%), "
+        f"allowed up to {weights['allowed_kg']:,.2f} kg (+{weights['max_pct']:g}%)."
+    )
+    if not weights["ok"]:
+        weight_note = f"<span class='tc-summary-bad'>{esc(weight_note)} Outside the allowed round-up.</span>"
+    else:
+        weight_note = esc(weight_note)
+
+    insp_rows = ""
+    for row in inspection:
+        answer = str(row.get("Answer") or "").strip() or "—"
+        insp_rows += (
+            "<tr>"
+            f"<td>{int(row.get('Question_no') or 0)}</td>"
+            f"<td>{esc(str(row.get('Question_text') or ''))}</td>"
+            f"<td>{esc(answer)}</td>"
+            f"<td>{'Yes' if row.get('Verified') else '—'}</td>"
+            "</tr>"
+        )
+
+    st.markdown(
+        f"""
+        <div class="tc-summary-wrap">
+            <h2 class="tc-summary-title">Test Certificate Summary — {esc(str(cert.get('Certificate_no') or ''))}</h2>
+            <table class="tc-summary-table tc-summary-meta"><tbody>{meta_html}</tbody></table>
+            <p class="tc-summary-h"><b>Printed lines</b> (batches under each line are what it is made of)</p>
+            <table class="tc-summary-table tc-summary-lines">
+                <thead><tr>
+                    <th>Line</th><th>Printed heat no / source batches</th>
+                    <th class="num">Source kg</th><th class="num">Printed kg</th>
+                    <th class="num">Round-up kg</th><th class="num">Pieces</th>
+                </tr></thead>
+                <tbody>{line_rows}</tbody>
+                <tfoot><tr>
+                    <td colspan="2">Total ({len(lines)} printed line{'s' if len(lines) != 1 else ''})</td>
+                    <td class="num">{packed_w:,.2f}</td>
+                    <td class="num">{printed_w:,.2f}</td>
+                    <td class="num">{printed_w - packed_w:+,.2f}</td>
+                    <td class="num">{printed_p:,}</td>
+                </tr></tfoot>
+            </table>
+            <p class="tc-summary-note">{weight_note}{pieces_note}</p>
+            <p class="tc-summary-h"><b>Visual inspection</b></p>
+            <table class="tc-summary-table tc-summary-lines">
+                <thead><tr><th>#</th><th>Check</th><th>Answer</th><th>Verified</th></tr></thead>
+                <tbody>{insp_rows}</tbody>
+            </table>
+            <p class="tc-summary-note">
+                Source kg is the packed weight from the packing list; printed kg is what the
+                certificate shows. Check the physical bundles against the source batches.
+            </p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    c1, c2, _c3 = st.columns([1, 1, 2])
+    with c1:
+        if st.button("Back to certificate", key="tc_summary_back"):
+            st.session_state.pop("tc_show_summary", None)
+            st.rerun()
+    with c2:
+        st.markdown(
+            '<button class="no-print" onclick="window.print()" '
+            'style="padding:0.45rem 1rem;border:1px solid #ccc;border-radius:0.5rem;'
+            'background:#fff;cursor:pointer;font-size:0.9rem;">Print summary</button>',
+            unsafe_allow_html=True,
+        )
+
+
 def _style_spec_check_table(data: pd.DataFrame):
     """Highlight rows whose Status starts with Out of spec."""
 
@@ -793,6 +971,7 @@ if st.session_state.get("tc_packing_list_id") != packing_list_id:
     st.session_state.pop("tc_lines", None)
     st.session_state.pop("tc_loaded_id", None)
     st.session_state.pop("tc_show_print", None)
+    st.session_state.pop("tc_show_summary", None)
 
 header = db.get_packing_list(packing_list_id)
 if not header:
@@ -909,6 +1088,21 @@ if (
 ):
     st.session_state["tc_lines"] = [dict(row) for row in (cert.get("lines") or [])]
     st.session_state["tc_loaded_id"] = packing_list_id
+
+if st.session_state.get("tc_show_summary"):
+    # Shows the lines as they stand on screen, so unsaved draft merges show too.
+    summary_cert = dict(cert)
+    if draft_editable and st.session_state.get("tc_cert_no_for") == packing_list_id:
+        summary_cert["Certificate_no"] = (
+            st.session_state.get("tc_cert_no") or cert.get("Certificate_no")
+        )
+    _render_certificate_summary(
+        header,
+        summary_cert,
+        list(st.session_state.get("tc_lines") or []),
+        db.get_visual_inspection(packing_list_id),
+    )
+    st.stop()
 
 if "tc_cert_no" not in st.session_state or st.session_state.get("tc_cert_no_for") != packing_list_id:
     st.session_state["tc_cert_no"] = cert.get("Certificate_no") or f"TC-{packing_list_id:04d}"
@@ -1233,7 +1427,16 @@ has_deviations, has_letter = _render_tc_spec_and_deviation(
 spec_blocked = has_deviations and not has_letter
 
 st.divider()
-if st.button("View / print", key="tc_view_print"):
+p1, p2, _p3 = st.columns([1, 1, 2])
+if p1.button(
+    "View summary",
+    key="tc_view_summary",
+    help="Printable overview of the printed lines, their source batches and the "
+    "visual inspection, for the physical check.",
+):
+    st.session_state["tc_show_summary"] = True
+    st.rerun()
+if p2.button("View / print", key="tc_view_print"):
     st.session_state["tc_show_print"] = True
     st.rerun()
 
