@@ -12,6 +12,19 @@ LOGO_PATH = Path(__file__).resolve().parent.parent / "assets" / "nualco_logo.png
 ISO_LOGO_PATH = Path(__file__).resolve().parent.parent / "assets" / "iso_9001_2015.png"
 _BRAND_ORANGE = "#F15A22"
 _BRAND_INK = "#1A1A1A"
+# The chemical analysis table fits 5 heat columns on an A4 page; more heats
+# continue on further pages that repeat everything above and below the table.
+CERT_HEATS_PER_PAGE = 5
+
+
+def _heat_pages(heats: list[dict]) -> list[tuple[int, list[dict]]]:
+    """(offset of the first heat, heats) for each certificate page; at least one page."""
+    if not heats:
+        return [(0, [])]
+    return [
+        (start, heats[start : start + CERT_HEATS_PER_PAGE])
+        for start in range(0, len(heats), CERT_HEATS_PER_PAGE)
+    ]
 
 
 def format_cert_print_date(value: object, empty: str = "—") -> str:
@@ -133,226 +146,235 @@ def _certificate_pdf_bytes(payload: dict) -> bytes:
     # content inside a typical desktop printer's unprintable edge.
     pdf.set_auto_page_break(auto=False)
     pdf.set_margins(10, 10, 10)
-    pdf.add_page()
-    pdf.set_text_color(*ink)
-    pdf.set_draw_color(*line)
-    page_w = pdf.w - pdf.l_margin - pdf.r_margin
-    left = pdf.l_margin
-    y = pdf.get_y()
-    side = 24
+    def _draw_page(chunk: list[dict], offset: int, page_no: int, page_count: int) -> None:
+        pdf.add_page()
+        pdf.set_text_color(*ink)
+        pdf.set_draw_color(*line)
+        page_w = pdf.w - pdf.l_margin - pdf.r_margin
+        left = pdf.l_margin
+        y = pdf.get_y()
+        side = 24
 
-    if LOGO_PATH.exists():
-        pdf.image(str(LOGO_PATH), x=left, y=y, w=20)
-    if ISO_LOGO_PATH.exists():
-        pdf.image(str(ISO_LOGO_PATH), x=left + page_w - 20, y=y, w=20)
+        if LOGO_PATH.exists():
+            pdf.image(str(LOGO_PATH), x=left, y=y, w=20)
+        if ISO_LOGO_PATH.exists():
+            pdf.image(str(ISO_LOGO_PATH), x=left + page_w - 20, y=y, w=20)
 
-    pdf.set_xy(left + side, y)
-    pdf.set_font("Helvetica", "B", 13)
-    pdf.cell(
-        page_w - 2 * side,
-        6,
-        _pdf_safe_text(letterhead["name"]),
-        align="C",
-        new_x="LMARGIN",
-        new_y="NEXT",
-    )
-    pdf.set_font("Helvetica", "", 8)
-    for line_text in (
-        letterhead["address"],
-        letterhead["contact"],
-        letterhead["gst"],
-    ):
-        if line_text:
-            pdf.set_x(left + side)
-            pdf.cell(
-                page_w - 2 * side,
-                4,
-                _pdf_safe_text(line_text),
-                align="C",
-                new_x="LMARGIN",
-                new_y="NEXT",
-            )
-    pdf.set_y(max(pdf.get_y(), y + 24) + 2)
-
-    pdf.set_font("Helvetica", "B", 12)
-    pdf.cell(page_w, 7, "TEST CERTIFICATE", border=1, align="C", new_x="LMARGIN", new_y="NEXT")
-
-    def _fit(text: str, width: float, size: int = 7) -> str:
-        pdf.set_font("Helvetica", "", size)
-        out = _pdf_safe_text(text)
-        while out and pdf.get_string_width(out) > width - 1.4:
-            out = out[:-1]
-        return out
-
-    def _meta_row(cells: list[tuple[str, float, bool]]) -> None:
-        h = 5.6
-        x = left
-        y0 = pdf.get_y()
-        for text, width, is_label in cells:
-            pdf.set_xy(x, y0)
-            pdf.set_font("Helvetica", "B" if is_label else "", 8)
-            if is_label:
-                pdf.set_fill_color(*fill)
-            shown = _pdf_safe_text(text) if is_label else _fit(str(text), width, 8)
-            pdf.cell(width, h, shown, border=1, align="L", fill=is_label)
-            x += width
-        pdf.set_y(y0 + h)
-
-    lw, vw = page_w * 0.16, page_w * 0.34
-    meta_pairs = [
-        ("Report No.", payload.get("certificate_no") or "—"),
-        ("Grade", payload.get("grade") or "—"),
-        ("Report Date", format_cert_print_date(payload.get("issued_date"))),
-        ("Colour Code", payload.get("colour_code") or "—"),
-        ("Customer", payload.get("customer_name") or "—"),
-        ("Customer Reference", payload.get("cust_code") or "—"),
-        ("Invoice No", payload.get("invoice_no") or "—"),
-        ("Invoice Date", format_cert_print_date(payload.get("invoice_date"))),
-        ("P.O No", payload.get("po_no") or "—"),
-        ("P.O Date", format_cert_print_date(payload.get("po_date"))),
-    ]
-    for i in range(0, len(meta_pairs), 2):
-        left_label, left_value = meta_pairs[i]
-        right_label, right_value = meta_pairs[i + 1]
-        _meta_row(
-            [
-                (str(left_label), lw, True),
-                (str(left_value), vw, False),
-                (str(right_label), lw, True),
-                (str(right_value), vw, False),
-            ]
-        )
-    doc_id = str(payload.get("document_id") or "").strip()
-    total_w = f"{db._format_cert_number(payload.get('total_weight'))} Kgs"
-    _meta_row(
-        [
-            ("Total Weight", lw, True),
-            (total_w, vw, False),
-            (doc_id, lw + vw, False),
-        ]
-    )
-
-    def _section(title: str) -> None:
-        pdf.set_fill_color(*orange)
-        pdf.set_text_color(255, 255, 255)
-        pdf.set_font("Helvetica", "B", 9)
+        pdf.set_xy(left + side, y)
+        pdf.set_font("Helvetica", "B", 13)
         pdf.cell(
-            page_w,
+            page_w - 2 * side,
             6,
-            _pdf_safe_text(title),
-            border=1,
+            _pdf_safe_text(letterhead["name"]),
             align="C",
-            fill=True,
             new_x="LMARGIN",
             new_y="NEXT",
         )
-        pdf.set_text_color(*ink)
-
-    _section("CHEMICAL ANALYSIS REPORT")
-    heat_count = max(len(heats), 1)
-    elem_w, spec_w = 42.0, 30.0
-    heat_w = (page_w - elem_w - spec_w) / heat_count
-    head_h = 15.0
-    row_h = 5.0
-    y0 = pdf.get_y()
-    pdf.set_font("Helvetica", "B", 7)
-    pdf.set_fill_color(243, 243, 243)
-    pdf.rect(left, y0, elem_w, head_h, style="DF")
-    pdf.rect(left + elem_w, y0, spec_w, head_h, style="DF")
-    pdf.set_xy(left, y0 + 5)
-    pdf.cell(elem_w, 5, "ELEMENTS", align="C")
-    pdf.set_xy(left + elem_w, y0 + 5)
-    pdf.cell(spec_w, 5, "SPECIFICATION %", align="C")
-    for index, heat in enumerate(heats or [{"Heat_no": "—", "Kgs": "", "Pieces": ""}]):
-        x = left + elem_w + spec_w + index * heat_w
-        pdf.rect(x, y0, heat_w, 5, style="DF")
-        pdf.rect(x, y0 + 5, heat_w, 5, style="DF")
-        pdf.rect(x, y0 + 10, heat_w, 5, style="DF")
-        pdf.set_xy(x, y0)
-        pdf.cell(heat_w, 5, _fit(f"Heat No : {heat.get('Heat_no') or '—'}", heat_w), align="C")
-        pdf.set_xy(x, y0 + 5)
-        kgs = db._format_cert_number(heat.get("Kgs"))
-        pcs = str(int(float(heat.get("Pieces") or 0)))
-        pdf.cell(heat_w, 5, _fit(f"Kgs : {kgs}   Pcs : {pcs}", heat_w), align="C")
-        pdf.set_xy(x, y0 + 10)
-        pdf.cell(heat_w, 5, "ACTUAL %", align="C")
-    pdf.set_y(y0 + head_h)
-
-    if not elements:
         pdf.set_font("Helvetica", "", 8)
-        pdf.cell(page_w, row_h, "No customer specification found for this alloy.", border=1, align="C", new_x="LMARGIN", new_y="NEXT")
-    for row in elements:
-        y1 = pdf.get_y()
-        pdf.set_font("Helvetica", "", 7)
-        pdf.rect(left, y1, elem_w, row_h)
-        pdf.rect(left + elem_w, y1, spec_w, row_h)
-        pdf.set_xy(left, y1)
-        pdf.cell(elem_w, row_h, _fit(str(row.get("Display_label") or row.get("Element_Name") or ""), elem_w))
-        pdf.set_xy(left + elem_w, y1)
-        pdf.cell(spec_w, row_h, _fit(str(row.get("Spec_text") or ""), spec_w), align="C")
-        actuals = row.get("actuals") or ["—"] * heat_count
-        for index in range(heat_count):
-            x = left + elem_w + spec_w + index * heat_w
-            pdf.rect(x, y1, heat_w, row_h)
-            pdf.set_xy(x, y1)
-            value = actuals[index] if index < len(actuals) else "—"
-            pdf.cell(heat_w, row_h, _fit(str(value), heat_w), align="C")
-        pdf.set_y(y1 + row_h)
+        for line_text in (
+            letterhead["address"],
+            letterhead["contact"],
+            letterhead["gst"],
+        ):
+            if line_text:
+                pdf.set_x(left + side)
+                pdf.cell(
+                    page_w - 2 * side,
+                    4,
+                    _pdf_safe_text(line_text),
+                    align="C",
+                    new_x="LMARGIN",
+                    new_y="NEXT",
+                )
+        pdf.set_y(max(pdf.get_y(), y + 24) + 2)
 
-    _section("INSTRUMENT DETAILS")
-    inst_rows = [
-        ("Analysis Method", payload.get("analysis_method") or ""),
-        ("Instrument", payload.get("instrument") or ""),
-        ("Instrument Make", payload.get("instrument_make") or ""),
-    ]
-    label_w = page_w * 0.28
-    for label, value in inst_rows:
-        y1 = pdf.get_y()
-        pdf.set_fill_color(*fill)
-        pdf.set_font("Helvetica", "B", 8)
-        pdf.rect(left, y1, label_w, 6, style="DF")
-        pdf.set_xy(left, y1)
-        pdf.cell(label_w, 6, _pdf_safe_text(label))
-        pdf.set_font("Helvetica", "", 8)
-        pdf.rect(left + label_w, y1, page_w - label_w, 6)
-        pdf.set_xy(left + label_w, y1)
-        pdf.cell(page_w - label_w, 6, _pdf_safe_text(value))
-        pdf.set_y(y1 + 6)
+        pdf.set_font("Helvetica", "B", 12)
+        pdf.cell(page_w, 7, "TEST CERTIFICATE", border=1, align="C", new_x="LMARGIN", new_y="NEXT")
 
-    if inspection:
-        _section("VISUAL INSPECTIONS : CUSTOMER REQUIREMENT STATUS")
-        q_w, s_w, v_w = page_w * 0.76, page_w * 0.12, page_w * 0.12
+        def _fit(text: str, width: float, size: int = 7) -> str:
+            pdf.set_font("Helvetica", "", size)
+            out = _pdf_safe_text(text)
+            while out and pdf.get_string_width(out) > width - 1.4:
+                out = out[:-1]
+            return out
+
+        def _meta_row(cells: list[tuple[str, float, bool]]) -> None:
+            h = 5.6
+            x = left
+            y0 = pdf.get_y()
+            for text, width, is_label in cells:
+                pdf.set_xy(x, y0)
+                pdf.set_font("Helvetica", "B" if is_label else "", 8)
+                if is_label:
+                    pdf.set_fill_color(*fill)
+                shown = _pdf_safe_text(text) if is_label else _fit(str(text), width, 8)
+                pdf.cell(width, h, shown, border=1, align="L", fill=is_label)
+                x += width
+            pdf.set_y(y0 + h)
+
+        lw, vw = page_w * 0.16, page_w * 0.34
+        meta_pairs = [
+            ("Report No.", payload.get("certificate_no") or "—"),
+            ("Grade", payload.get("grade") or "—"),
+            ("Report Date", format_cert_print_date(payload.get("issued_date"))),
+            ("Colour Code", payload.get("colour_code") or "—"),
+            ("Customer", payload.get("customer_name") or "—"),
+            ("Customer Reference", payload.get("cust_code") or "—"),
+            ("Invoice No", payload.get("invoice_no") or "—"),
+            ("Invoice Date", format_cert_print_date(payload.get("invoice_date"))),
+            ("P.O No", payload.get("po_no") or "—"),
+            ("P.O Date", format_cert_print_date(payload.get("po_date"))),
+        ]
+        for i in range(0, len(meta_pairs), 2):
+            left_label, left_value = meta_pairs[i]
+            right_label, right_value = meta_pairs[i + 1]
+            _meta_row(
+                [
+                    (str(left_label), lw, True),
+                    (str(left_value), vw, False),
+                    (str(right_label), lw, True),
+                    (str(right_value), vw, False),
+                ]
+            )
+        doc_id = str(payload.get("document_id") or "").strip()
+        total_w = f"{db._format_cert_number(payload.get('total_weight'))} Kgs"
+        _meta_row(
+            [
+                ("Total Weight", lw, True),
+                (total_w, vw, False),
+                (doc_id, lw + vw, False),
+            ]
+        )
+
+        def _section(title: str) -> None:
+            pdf.set_fill_color(*orange)
+            pdf.set_text_color(255, 255, 255)
+            pdf.set_font("Helvetica", "B", 9)
+            pdf.cell(
+                page_w,
+                6,
+                _pdf_safe_text(title),
+                border=1,
+                align="C",
+                fill=True,
+                new_x="LMARGIN",
+                new_y="NEXT",
+            )
+            pdf.set_text_color(*ink)
+
+        _section("CHEMICAL ANALYSIS REPORT")
+        heat_count = max(len(chunk), 1)
+        elem_w, spec_w = 42.0, 30.0
+        heat_w = (page_w - elem_w - spec_w) / heat_count
+        head_h = 15.0
+        row_h = 5.0
+        y0 = pdf.get_y()
         pdf.set_font("Helvetica", "B", 7)
         pdf.set_fill_color(243, 243, 243)
-        pdf.cell(q_w, 6, "Requirement", border=1, align="C", fill=True)
-        pdf.cell(s_w, 6, "STATUS", border=1, align="C", fill=True)
-        pdf.cell(v_w, 6, "VERIFY", border=1, align="C", fill=True, new_x="LMARGIN", new_y="NEXT")
-        insp_h = 5.3
-        for row in inspection:
-            y1 = pdf.get_y()
-            answer = str(row.get("Answer") or "").strip()
-            status = "Ok" if answer.upper() == "OK" else (answer or "-")
-            verify = "Yes" if row.get("Verified") else ""
-            pdf.set_font("Helvetica", "", 7)
-            pdf.rect(left, y1, q_w, insp_h)
-            pdf.set_xy(left, y1)
-            pdf.cell(q_w, insp_h, _fit(str(row.get("Question_text") or ""), q_w, 7))
-            pdf.set_font("Helvetica", "B", 7)
-            pdf.rect(left + q_w, y1, s_w, insp_h)
-            pdf.set_xy(left + q_w, y1)
-            pdf.cell(s_w, insp_h, _pdf_safe_text(status), align="C")
-            pdf.rect(left + q_w + s_w, y1, v_w, insp_h)
-            pdf.set_xy(left + q_w + s_w, y1)
-            pdf.cell(v_w, insp_h, _pdf_safe_text(verify), align="C")
-            pdf.set_y(y1 + insp_h)
+        pdf.rect(left, y0, elem_w, head_h, style="DF")
+        pdf.rect(left + elem_w, y0, spec_w, head_h, style="DF")
+        pdf.set_xy(left, y0 + 5)
+        pdf.cell(elem_w, 5, "ELEMENTS", align="C")
+        pdf.set_xy(left + elem_w, y0 + 5)
+        pdf.cell(spec_w, 5, "SPECIFICATION %", align="C")
+        for index, heat in enumerate(chunk or [{"Heat_no": "—", "Kgs": "", "Pieces": ""}]):
+            x = left + elem_w + spec_w + index * heat_w
+            pdf.rect(x, y0, heat_w, 5, style="DF")
+            pdf.rect(x, y0 + 5, heat_w, 5, style="DF")
+            pdf.rect(x, y0 + 10, heat_w, 5, style="DF")
+            pdf.set_xy(x, y0)
+            pdf.cell(heat_w, 5, _fit(f"Heat No : {heat.get('Heat_no') or '—'}", heat_w), align="C")
+            pdf.set_xy(x, y0 + 5)
+            kgs = db._format_cert_number(heat.get("Kgs"))
+            pcs = str(int(float(heat.get("Pieces") or 0)))
+            pdf.cell(heat_w, 5, _fit(f"Kgs : {kgs}   Pcs : {pcs}", heat_w), align="C")
+            pdf.set_xy(x, y0 + 10)
+            pdf.cell(heat_w, 5, "ACTUAL %", align="C")
+        pdf.set_y(y0 + head_h)
 
-    pdf.ln(3)
-    pdf.set_font("Helvetica", "B", 10)
-    pdf.cell(
-        page_w,
-        6,
-        _pdf_safe_text(f"Approved by : {payload.get('approved_by') or ''}"),
-    )
+        if not elements:
+            pdf.set_font("Helvetica", "", 8)
+            pdf.cell(page_w, row_h, "No customer specification found for this alloy.", border=1, align="C", new_x="LMARGIN", new_y="NEXT")
+        for row in elements:
+            y1 = pdf.get_y()
+            pdf.set_font("Helvetica", "", 7)
+            pdf.rect(left, y1, elem_w, row_h)
+            pdf.rect(left + elem_w, y1, spec_w, row_h)
+            pdf.set_xy(left, y1)
+            pdf.cell(elem_w, row_h, _fit(str(row.get("Display_label") or row.get("Element_Name") or ""), elem_w))
+            pdf.set_xy(left + elem_w, y1)
+            pdf.cell(spec_w, row_h, _fit(str(row.get("Spec_text") or ""), spec_w), align="C")
+            actuals = row.get("actuals") or ["—"] * heat_count
+            for index in range(heat_count):
+                x = left + elem_w + spec_w + index * heat_w
+                pdf.rect(x, y1, heat_w, row_h)
+                pdf.set_xy(x, y1)
+                col = offset + index
+                value = actuals[col] if col < len(actuals) else "—"
+                pdf.cell(heat_w, row_h, _fit(str(value), heat_w), align="C")
+            pdf.set_y(y1 + row_h)
+
+        _section("INSTRUMENT DETAILS")
+        inst_rows = [
+            ("Analysis Method", payload.get("analysis_method") or ""),
+            ("Instrument", payload.get("instrument") or ""),
+            ("Instrument Make", payload.get("instrument_make") or ""),
+        ]
+        label_w = page_w * 0.28
+        for label, value in inst_rows:
+            y1 = pdf.get_y()
+            pdf.set_fill_color(*fill)
+            pdf.set_font("Helvetica", "B", 8)
+            pdf.rect(left, y1, label_w, 6, style="DF")
+            pdf.set_xy(left, y1)
+            pdf.cell(label_w, 6, _pdf_safe_text(label))
+            pdf.set_font("Helvetica", "", 8)
+            pdf.rect(left + label_w, y1, page_w - label_w, 6)
+            pdf.set_xy(left + label_w, y1)
+            pdf.cell(page_w - label_w, 6, _pdf_safe_text(value))
+            pdf.set_y(y1 + 6)
+
+        if inspection:
+            _section("VISUAL INSPECTIONS : CUSTOMER REQUIREMENT STATUS")
+            q_w, s_w, v_w = page_w * 0.76, page_w * 0.12, page_w * 0.12
+            pdf.set_font("Helvetica", "B", 7)
+            pdf.set_fill_color(243, 243, 243)
+            pdf.cell(q_w, 6, "Requirement", border=1, align="C", fill=True)
+            pdf.cell(s_w, 6, "STATUS", border=1, align="C", fill=True)
+            pdf.cell(v_w, 6, "VERIFY", border=1, align="C", fill=True, new_x="LMARGIN", new_y="NEXT")
+            insp_h = 5.3
+            for row in inspection:
+                y1 = pdf.get_y()
+                answer = str(row.get("Answer") or "").strip()
+                status = "Ok" if answer.upper() == "OK" else (answer or "-")
+                verify = "Yes" if row.get("Verified") else ""
+                pdf.set_font("Helvetica", "", 7)
+                pdf.rect(left, y1, q_w, insp_h)
+                pdf.set_xy(left, y1)
+                pdf.cell(q_w, insp_h, _fit(str(row.get("Question_text") or ""), q_w, 7))
+                pdf.set_font("Helvetica", "B", 7)
+                pdf.rect(left + q_w, y1, s_w, insp_h)
+                pdf.set_xy(left + q_w, y1)
+                pdf.cell(s_w, insp_h, _pdf_safe_text(status), align="C")
+                pdf.rect(left + q_w + s_w, y1, v_w, insp_h)
+                pdf.set_xy(left + q_w + s_w, y1)
+                pdf.cell(v_w, insp_h, _pdf_safe_text(verify), align="C")
+                pdf.set_y(y1 + insp_h)
+
+        pdf.ln(3)
+        pdf.set_font("Helvetica", "B", 10)
+        pdf.cell(
+            page_w * 0.7,
+            6,
+            _pdf_safe_text(f"Approved by : {payload.get('approved_by') or ''}"),
+        )
+        if page_count > 1:
+            pdf.set_font("Helvetica", "", 8)
+            pdf.cell(page_w * 0.3, 6, f"Page {page_no} of {page_count}", align="R")
+
+    pages = _heat_pages(heats)
+    for page_no, (offset, chunk) in enumerate(pages, start=1):
+        _draw_page(chunk, offset, page_no, len(pages))
     return bytes(pdf.output())
 
 
@@ -411,44 +433,57 @@ def _render_certificate_print(
         "</tr>"
     )
     heats = payload.get("heats") or []
-    heat_count = max(len(heats), 1)
-    heat_head = ""
-    heat_qty = ""
-    heat_actual = ""
-    for heat in heats:
-        heat_head += (
-            f"<th class='tc-heat' colspan='1'>"
-            f"Heat No : {esc(str(heat.get('Heat_no') or '—'))}</th>"
+
+    def _chem_table(chunk: list[dict], offset: int) -> str:
+        """The CHEMICAL ANALYSIS REPORT table for one page's heats."""
+        heat_count = max(len(chunk), 1)
+        heat_head = ""
+        heat_qty = ""
+        heat_actual = ""
+        for heat in chunk:
+            heat_head += (
+                f"<th class='tc-heat' colspan='1'>"
+                f"Heat No : {esc(str(heat.get('Heat_no') or '—'))}</th>"
+            )
+            heat_qty += (
+                "<th class='tc-heat-sub'>"
+                f"Kgs : {esc(db._format_cert_number(heat.get('Kgs')))}<br>"
+                f"Pcs : {esc(str(int(float(heat.get('Pieces') or 0))))}"
+                "</th>"
+            )
+            heat_actual += "<th class='tc-heat-sub'>ACTUAL %</th>"
+        if not chunk:
+            heat_head = "<th class='tc-heat'>Heat No : —</th>"
+            heat_qty = "<th class='tc-heat-sub'>Kgs : — &nbsp; Pcs : —</th>"
+            heat_actual = "<th class='tc-heat-sub'>ACTUAL %</th>"
+        chem_body = ""
+        for row in payload.get("elements") or []:
+            actuals = list(row.get("actuals") or [])
+            cells = "".join(
+                "<td class='tc-actual'>"
+                + esc(str(actuals[offset + i] if offset + i < len(actuals) else "—"))
+                + "</td>"
+                for i in range(heat_count)
+            )
+            chem_body += (
+                "<tr>"
+                f"<td class='tc-elem'>{esc(str(row.get('Display_label') or row.get('Element_Name') or ''))}</td>"
+                f"<td class='tc-spec'>{esc(str(row.get('Spec_text') or ''))}</td>"
+                f"{cells}"
+                "</tr>"
+            )
+        if not chem_body:
+            chem_body = (
+                f"<tr><td colspan='{2 + heat_count}' class='tc-empty'>"
+                "No customer specification found for this alloy.</td></tr>"
+            )
+        return (
+            '<table class="tc-table tc-chem"><thead><tr>'
+            '<th rowspan="3">ELEMENTS</th><th rowspan="3">SPECIFICATION %</th>'
+            f"{heat_head}</tr><tr>{heat_qty}</tr><tr>{heat_actual}</tr></thead>"
+            f"<tbody>{chem_body}</tbody></table>"
         )
-        heat_qty += (
-            "<th class='tc-heat-sub'>"
-            f"Kgs : {esc(db._format_cert_number(heat.get('Kgs')))}<br>"
-            f"Pcs : {esc(str(int(float(heat.get('Pieces') or 0))))}"
-            "</th>"
-        )
-        heat_actual += "<th class='tc-heat-sub'>ACTUAL %</th>"
-    if not heats:
-        heat_head = "<th class='tc-heat'>Heat No : —</th>"
-        heat_qty = "<th class='tc-heat-sub'>Kgs : — &nbsp; Pcs : —</th>"
-        heat_actual = "<th class='tc-heat-sub'>ACTUAL %</th>"
-    chem_body = ""
-    for row in payload.get("elements") or []:
-        cells = "".join(
-            f"<td class='tc-actual'>{esc(str(value))}</td>"
-            for value in (row.get("actuals") or ["—"] * heat_count)
-        )
-        chem_body += (
-            "<tr>"
-            f"<td class='tc-elem'>{esc(str(row.get('Display_label') or row.get('Element_Name') or ''))}</td>"
-            f"<td class='tc-spec'>{esc(str(row.get('Spec_text') or ''))}</td>"
-            f"{cells}"
-            "</tr>"
-        )
-    if not chem_body:
-        chem_body = (
-            f"<tr><td colspan='{2 + heat_count}' class='tc-empty'>"
-            "No customer specification found for this alloy.</td></tr>"
-        )
+
     insp_body = ""
     for row in payload.get("inspection") or []:
         answer = str(row.get("Answer") or "").strip()
@@ -470,6 +505,45 @@ def _render_certificate_print(
         if insp_body
         else ""
     )
+    pages = _heat_pages(heats)
+    docs = ""
+    for page_no, (offset, chunk) in enumerate(pages, start=1):
+        chem_table = _chem_table(chunk, offset)
+        page_label = (
+            f'<span class="tc-page-no">Page {page_no} of {len(pages)}</span>'
+            if len(pages) > 1
+            else ""
+        )
+        docs += f"""
+        <div class="tc-doc">
+            <div class="tc-head">
+                <div class="tc-head-left">{logo_html}</div>
+                <div class="tc-head-center">
+                    <div class="tc-company-name">{esc(letterhead["name"])}</div>
+                    <div class="tc-company-line">{esc(letterhead["address"])}</div>
+                    <div class="tc-company-line">{esc(letterhead["contact"])}</div>
+                    <div class="tc-company-line">{esc(letterhead["gst"])}</div>
+                </div>
+                <div class="tc-head-right">{iso_html}</div>
+            </div>
+            <div class="tc-title">TEST CERTIFICATE</div>
+            <table class="tc-table tc-meta">
+                <tbody>{meta_rows_html}</tbody>
+            </table>
+            <div class="tc-section">CHEMICAL ANALYSIS REPORT</div>
+            {chem_table}
+            <div class="tc-section">INSTRUMENT DETAILS</div>
+            <table class="tc-table tc-inst">
+                <tbody>
+                    <tr><td>Analysis Method</td><td>{esc(str(payload.get("analysis_method") or ""))}</td></tr>
+                    <tr><td>Instrument</td><td>{esc(str(payload.get("instrument") or ""))}</td></tr>
+                    <tr><td>Instrument Make</td><td>{esc(str(payload.get("instrument_make") or ""))}</td></tr>
+                </tbody>
+            </table>
+            {insp_section}
+            <p class="tc-approve">Approved by : {esc(str(payload.get("approved_by") or ""))}{page_label}</p>
+        </div>
+        """
     st.markdown(
         f"""
         <style>
@@ -559,47 +633,12 @@ def _render_certificate_print(
             }}
             .block-container {{ max-width: 100% !important; padding: 0.2rem !important; }}
             .tc-doc {{ border: none; padding: 0; }}
+            .tc-doc + .tc-doc {{ break-before: page; page-break-before: always; }}
         }}
+        .tc-doc + .tc-doc {{ margin-top: 1.2rem; }}
+        .tc-page-no {{ float: right; font-weight: 400; font-size: 0.8rem; color: #555; }}
         </style>
-        <div class="tc-doc">
-            <div class="tc-head">
-                <div class="tc-head-left">{logo_html}</div>
-                <div class="tc-head-center">
-                    <div class="tc-company-name">{esc(letterhead["name"])}</div>
-                    <div class="tc-company-line">{esc(letterhead["address"])}</div>
-                    <div class="tc-company-line">{esc(letterhead["contact"])}</div>
-                    <div class="tc-company-line">{esc(letterhead["gst"])}</div>
-                </div>
-                <div class="tc-head-right">{iso_html}</div>
-            </div>
-            <div class="tc-title">TEST CERTIFICATE</div>
-            <table class="tc-table tc-meta">
-                <tbody>{meta_rows_html}</tbody>
-            </table>
-            <div class="tc-section">CHEMICAL ANALYSIS REPORT</div>
-            <table class="tc-table tc-chem">
-                <thead>
-                    <tr>
-                        <th rowspan="3">ELEMENTS</th>
-                        <th rowspan="3">SPECIFICATION %</th>
-                        {heat_head}
-                    </tr>
-                    <tr>{heat_qty}</tr>
-                    <tr>{heat_actual}</tr>
-                </thead>
-                <tbody>{chem_body}</tbody>
-            </table>
-            <div class="tc-section">INSTRUMENT DETAILS</div>
-            <table class="tc-table tc-inst">
-                <tbody>
-                    <tr><td>Analysis Method</td><td>{esc(str(payload.get("analysis_method") or ""))}</td></tr>
-                    <tr><td>Instrument</td><td>{esc(str(payload.get("instrument") or ""))}</td></tr>
-                    <tr><td>Instrument Make</td><td>{esc(str(payload.get("instrument_make") or ""))}</td></tr>
-                </tbody>
-            </table>
-            {insp_section}
-            <p class="tc-approve">Approved by : {esc(str(payload.get("approved_by") or ""))}</p>
-        </div>
+        {docs}
         """,
         unsafe_allow_html=True,
     )
