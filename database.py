@@ -1212,6 +1212,7 @@ CREATE TABLE IF NOT EXISTS batch_input (
     Charge_time TEXT DEFAULT {now},
     Notes TEXT,
     Weighment_scale_photo {blob}, Input_photo {blob},
+    Last_updated_by TEXT,
     PRIMARY KEY (Batch_ID, Raw_Material_Name, Lot_id, Charge_time)
 );
 CREATE TABLE IF NOT EXISTS batch_input_return (
@@ -1242,7 +1243,8 @@ CREATE TABLE IF NOT EXISTS batch_output (
     cost_of_production_per_kg {pct4},
     cost_of_production_overall_per_kg {pct4},
     conversion_rate_applied {pct4},
-    conversion_expense_month DATE
+    conversion_expense_month DATE,
+    Last_updated_by TEXT
 );
 CREATE TABLE IF NOT EXISTS Batch_Chemical_Composition (
     Batch_ID TEXT NOT NULL REFERENCES Production_batch(Batch_ID),
@@ -6142,8 +6144,9 @@ def _insert_charge_lines(conn: Connection, batch_id: str, inputs: list[dict[str,
                 INSERT INTO batch_input
                     (Batch_ID, Raw_Material_Name, Lot_id, Weight,
                      Weighment_scale_weight, Trolley_weight, Trolley_name,
-                     Charge_time, Notes, Weighment_scale_photo, Input_photo)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     Charge_time, Notes, Weighment_scale_photo, Input_photo,
+                     Last_updated_by)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     batch_id,
@@ -6157,6 +6160,7 @@ def _insert_charge_lines(conn: Connection, batch_id: str, inputs: list[dict[str,
                     item.get("Notes", ""),
                     item.get("Weighment_scale_photo"),
                     item.get("Input_photo"),
+                    get_acting_user(),
                 ),
             )
         except IntegrityError as exc:
@@ -8349,6 +8353,9 @@ def _ensure_packing_list_schema() -> None:
             ],
         )
         _ensure_batch_input_return(conn)
+        # Who saved each charge line / output line.
+        _ensure_columns(conn, "batch_input", [("Last_updated_by", "TEXT")])
+        _ensure_columns(conn, "batch_output", [("Last_updated_by", "TEXT")])
         _ensure_ocr_extraction_job(conn)
         _ensure_furnace_oil_purchase_tank(conn)
         _ensure_furnace_oil_consumption_tank(conn)
@@ -10640,7 +10647,8 @@ def get_batch_inputs(batch_id: str) -> list[dict[str, Any]]:
                Weighment_scale_weight AS "Weighment_scale_weight",
                Trolley_weight AS "Trolley_weight",
                Trolley_name AS "Trolley_name",
-               Charge_time AS "Charge_time", Notes AS "Notes"
+               Charge_time AS "Charge_time", Notes AS "Notes",
+               Last_updated_by AS "Saved_by"
         FROM batch_input WHERE Batch_ID = ?
         ORDER BY Charge_time
         """,
@@ -12012,6 +12020,7 @@ def list_all_batch_outputs(
                o.Stand_weight AS "Stand_weight",
                o.Pieces AS "Pieces",
                o.Notes AS "Notes", o.Output_time AS "Output_time",
+               o.Last_updated_by AS "Saved_by",
                o.cost_of_production_per_kg AS "cost_of_production_per_kg",
                o.cost_of_production_overall_per_kg AS "cost_of_production_overall_per_kg",
                o.conversion_rate_applied AS "conversion_rate_applied",
@@ -12094,7 +12103,7 @@ def save_batch_outputs(
             }
         )
 
-    stamp = now_ist().isoformat(timespec="seconds")
+    saved_by, stamp = audit_stamp()
     with get_connection() as conn:
         _exec(conn, "DELETE FROM batch_output WHERE Batch_ID = ?", (batch_id,))
         for row in cleaned:
@@ -12103,8 +12112,9 @@ def save_batch_outputs(
                 """
                 INSERT INTO batch_output
                     (Batch_ID, Alloy_id, Weight, Weighment_scale_weight, Stand_weight,
-                     Pieces, Notes, Output_time, Weighment_scale_photo, Output_photo)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     Pieces, Notes, Output_time, Weighment_scale_photo, Output_photo,
+                     Last_updated_by)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     batch_id,
@@ -12117,6 +12127,7 @@ def save_batch_outputs(
                     stamp,
                     row["Weighment_scale_photo"],
                     row["Output_photo"],
+                    saved_by,
                 ),
             )
         if cleaned:
