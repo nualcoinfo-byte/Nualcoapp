@@ -309,6 +309,8 @@ _NAV_SECTION_KEY = {
     "Tools": "tools",
     ADMIN_NAV_SECTION: "admin",
 }
+# Masters pages granted on their own by the "masters_parties" permission.
+_PARTY_MASTER_PAGES = ("Company", "Customers", "Vendors")
 _BASE_NAV_PAGES = [page for _section, pages in NAV_SECTIONS for page in pages]
 _ALL_NAV_PAGES = _BASE_NAV_PAGES + ADMIN_NAV_PAGES
 _ALL_SECTION_NAMES = [section for section, _pages in NAV_SECTIONS] + [ADMIN_NAV_SECTION]
@@ -329,6 +331,8 @@ def _nav_sections_for_role(role_id: object, role_name: object) -> list[tuple[str
     for section, pages in NAV_SECTIONS:
         if _NAV_SECTION_KEY.get(section) in allowed:
             sections.append((section, list(pages)))
+        elif section == "Masters" and "masters_parties" in allowed:
+            sections.append((section, [p for p in pages if p in _PARTY_MASTER_PAGES]))
     if "admin" in allowed:
         sections.append((ADMIN_NAV_SECTION, list(ADMIN_NAV_PAGES)))
     return sections

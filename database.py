@@ -766,6 +766,9 @@ NAV_SECTION_DEFS: list[tuple[str, str]] = [
     ("production", "Production"),
     ("utilities", "Utilities & conversion"),
     ("masters", "Masters"),
+    # Only the Company, Customers and Vendors pages of Masters (e.g. Accounts);
+    # "masters" already includes them.
+    ("masters_parties", "Masters: Company, Customers & Vendors"),
     ("tools", "Tools"),
     ("admin", "Admin"),
 ]
@@ -786,12 +789,13 @@ _NO_MASTERS_SECTIONS = (
     "utilities",
 )
 _LIMITED_SECTIONS = ("overview", "purchasing", "utilities")
+_ACCOUNTS_SECTIONS = _LIMITED_SECTIONS + ("masters_parties",)
 DEFAULT_ROLE_SECTIONS_BY_NAME: dict[str, tuple[str, ...]] = {
     "admin": ALL_NAV_SECTION_KEYS,
     "management": _STANDARD_SECTIONS,
     "purchase": _STANDARD_SECTIONS,
     "production": _NO_MASTERS_SECTIONS,
-    "accounts": _LIMITED_SECTIONS,
+    "accounts": _ACCOUNTS_SECTIONS,
     "inventory": _LIMITED_SECTIONS,
 }
 DEFAULT_ROLE_SECTIONS_BY_ID: dict[int, tuple[str, ...]] = {
@@ -799,7 +803,7 @@ DEFAULT_ROLE_SECTIONS_BY_ID: dict[int, tuple[str, ...]] = {
     2: ALL_NAV_SECTION_KEYS,  # Admin
     5: _STANDARD_SECTIONS,  # Purchase
     6: _NO_MASTERS_SECTIONS,  # Production
-    11: _LIMITED_SECTIONS,  # accounts
+    11: _ACCOUNTS_SECTIONS,  # accounts
     13: _LIMITED_SECTIONS,  # Inventory
 }
 _PASSWORD_SCHEME = "pbkdf2_sha256"
@@ -6980,6 +6984,7 @@ def default_sections_for_role(role_id: object, role_name: object) -> tuple[str, 
 def _seed_role_permissions(conn: Connection) -> None:
     count_row = _exec(conn, "SELECT COUNT(*) FROM role_permissions").first()
     if count_row and int(count_row[0] or 0) > 0:
+        _grant_accounts_party_masters(conn)
         return
     roles = list(
         _exec(
@@ -6998,6 +7003,27 @@ def _seed_role_permissions(conn: Connection) -> None:
                 """,
                 (role["role_id"], key),
             )
+
+
+def _grant_accounts_party_masters(conn: Connection) -> None:
+    """Give existing Accounts roles the Company/Customers/Vendors pages once.
+
+    Runs only while no role holds masters_parties yet, so an Admin can still
+    take it away on Roles & permissions afterwards.
+    """
+    if _exec(
+        conn, "SELECT 1 FROM role_permissions WHERE section_key = 'masters_parties'"
+    ).first():
+        return
+    _exec(
+        conn,
+        """
+        INSERT INTO role_permissions (role_id, section_key)
+        SELECT role_id, 'masters_parties' FROM roles
+        WHERE LOWER(TRIM(role_name)) = 'accounts'
+        ON CONFLICT (role_id, section_key) DO NOTHING
+        """,
+    )
 
 
 def employee_display_name(row: dict[str, Any] | None) -> str:
