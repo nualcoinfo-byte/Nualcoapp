@@ -845,6 +845,11 @@ else:
                 [c for c in saved_df.columns if c != "Lot_id"] + ["Lot_id"]
             ]
         show_dataframe(saved_df)
+        saved_net_kg = sum(float(c.get("Weight") or 0) for c in saved_charges)
+        st.markdown(
+            f"**Net input weight: {saved_net_kg:,.2f} kg** across "
+            f"{len(saved_charges)} saved charge line(s)"
+        )
 
     trolleys = _pb_ref["trolleys"]
     trolley_by_name = {t["Trolley_name"]: float(t["Weight"] or 0) for t in trolleys}
