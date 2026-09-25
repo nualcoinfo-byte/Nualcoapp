@@ -24,7 +24,8 @@ st.caption(
     "whose input is **Completed** and whose output is not completed yet. Each **Save** "
     "adds one weighing to the batch's output. Net weight is **weighment scale − stand**; "
     "enter the stand weight every time (**0** if there was no stand). "
-    "Mark the output **Completed** on **Batch Output**, which posts it to Finished Goods."
+    "When every weighing is in, **Mark Output as Completed** locks the output and "
+    "posts it to Finished Goods."
 )
 
 flash = st.session_state.pop("_qbo_flash", None)
@@ -241,3 +242,58 @@ else:
             "Stand (kg)": st.column_config.NumberColumn(format="%.1f"),
         },
     )
+
+
+@st.dialog("Mark output as Completed?")
+def _confirm_complete_output(batch_id: str, total_kg: float, n_lines: int, remelt_only: bool) -> None:
+    st.markdown(
+        f"Batch **{batch_id}**: **{n_lines}** output line(s), **{total_kg:,.1f} kg**"
+        + (f", yield **{db.calc_yield(input_w, total_kg)['recovery_pct']:.1f}%**" if input_w > 0 else "")
+        + "."
+    )
+    st.caption(
+        "This locks the heat's output and posts it to **Finished Goods Inventory**. "
+        "Only an Admin can unlock it afterwards."
+    )
+    confirmed = True
+    if remelt_only:
+        st.warning(
+            "**Every saved output line is a remelt type**, so nothing will reach "
+            "Finished Goods. If the heat produced the product alloy, cancel and "
+            "fix the output on **Batch Output**."
+        )
+        confirmed = st.checkbox(
+            "Yes, this heat's entire output really is remelt material.",
+            key=f"qbo_complete_remelt_ok_{batch_id}",
+        )
+    ok_col, cancel_col = st.columns(2)
+    if ok_col.button("Confirm", type="primary", use_container_width=True, disabled=not confirmed):
+        try:
+            db.complete_batch_output(batch_id)
+        except Exception as exc:
+            st.error(str(exc))
+            return
+        st.session_state["_qbo_flash"] = (
+            f"Output for **{batch_id}** is **Completed** and locked. It is now "
+            "posted to **Finished Goods Inventory**."
+        )
+        # The batch drops out of the waiting list; clear the pick so the list starts fresh.
+        st.session_state.pop("qbo_batch", None)
+        st.rerun()
+    if cancel_col.button("Cancel", use_container_width=True):
+        st.rerun()
+
+
+if saved_lines:
+    saved_total = sum(float(r.get("Weight") or 0) for r in saved_lines)
+    saved_remelt_only = not product_saved
+    if st.button(
+        "Mark Output as Completed",
+        type="primary",
+        use_container_width=True,
+        key=f"qbo_complete_{batch_id}",
+        help="Locks this heat's output and posts it to Finished Goods Inventory.",
+    ):
+        _confirm_complete_output(batch_id, saved_total, len(saved_lines), saved_remelt_only)
+else:
+    st.caption("**Mark Output as Completed** appears once an output line is saved.")
