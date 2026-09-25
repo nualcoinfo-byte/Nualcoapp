@@ -33,6 +33,25 @@ def photo_bytes(uploaded) -> bytes | None:
     return uploaded.getvalue()
 
 
+def photo_picker(label: str, key: str) -> bytes | None:
+    """Toggle that opens the camera / gallery; keeps the photo once taken."""
+    bytes_key = f"{key}_bytes"
+    if st.toggle(label, key=f"{key}_open"):
+        cam = st.camera_input("Camera", key=f"{key}_cam")
+        upload = st.file_uploader(
+            "Or choose from gallery",
+            type=["png", "jpg", "jpeg", "webp"],
+            key=f"{key}_file",
+        )
+        taken = photo_bytes(cam) or photo_bytes(upload)
+        if taken:
+            st.session_state[bytes_key] = taken
+    saved = st.session_state.get(bytes_key)
+    if saved:
+        st.caption(f"{label.split(' ', 1)[-1]} attached.")
+    return saved
+
+
 def _as_photo_bytes(value: object) -> bytes | None:
     if value is None or value == "":
         return None

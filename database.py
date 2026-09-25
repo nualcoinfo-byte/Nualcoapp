@@ -12100,6 +12100,75 @@ def list_all_batch_outputs(
     )
 
 
+def _clean_batch_output_line(
+    batch_id: str, line: dict[str, Any], allowed: set[int]
+) -> Optional[dict[str, Any]]:
+    """Validate one output line; None when it carries no weight."""
+    try:
+        alloy_id = int(line["Alloy_id"])
+    except (TypeError, ValueError, KeyError):
+        return None
+    scale = float(line.get("Weighment_scale_weight") or 0)
+    stand_raw = line.get("Stand_weight")
+    stand = float(stand_raw or 0)
+    if scale > 0:
+        weight = max(scale - stand, 0.0)
+    else:
+        weight = float(line.get("Weight") or 0)
+    if weight <= 0:
+        return None
+    # Blank is not the same as zero: a forgotten stand silently inflates the
+    # net weight, so make the operator state it either way.
+    if stand_raw in (None, ""):
+        raise ValueError(
+            f"Enter the stand weight for the {alloy_id} output line on batch "
+            f"{batch_id}. Use 0 if the metal was weighed without a stand."
+        )
+    if alloy_id not in allowed:
+        raise ValueError(
+            f"Alloy {alloy_id} is not an allowed output for batch {batch_id}. "
+            "Use the batch alloy or Broken Ingot / Furnace Empty / Not Ok Ingot."
+        )
+    return {
+        "Alloy_id": alloy_id,
+        "Weight": weight,
+        "Weighment_scale_weight": scale if scale > 0 else None,
+        "Stand_weight": stand,
+        "Pieces": _as_whole_pieces(line.get("Pieces")),
+        "Notes": (str(line.get("Notes") or "")).strip() or None,
+        "Weighment_scale_photo": _as_sql_photo(line.get("Weighment_scale_photo")),
+        "Output_photo": _as_sql_photo(line.get("Output_photo")),
+    }
+
+
+def _insert_batch_output_row(
+    conn: Connection, batch_id: str, row: dict[str, Any], saved_by: str, stamp: str
+) -> None:
+    _exec(
+        conn,
+        """
+        INSERT INTO batch_output
+            (Batch_ID, Alloy_id, Weight, Weighment_scale_weight, Stand_weight,
+             Pieces, Notes, Output_time, Weighment_scale_photo, Output_photo,
+             Last_updated_by)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            batch_id,
+            row["Alloy_id"],
+            row["Weight"],
+            row["Weighment_scale_weight"],
+            row["Stand_weight"],
+            row["Pieces"],
+            row["Notes"],
+            stamp,
+            row["Weighment_scale_photo"],
+            row["Output_photo"],
+            saved_by,
+        ),
+    )
+
+
 def save_batch_outputs(
     batch_id: str,
     lines: list[dict[str, Any]],
@@ -12121,77 +12190,17 @@ def save_batch_outputs(
         if not is_admin_user():
             raise ValueError("Only Admin can correct Completed output.")
     allowed = allowed_batch_output_alloy_ids(batch.get("Alloy_id"))
-    cleaned: list[dict[str, Any]] = []
-    for line in lines:
-        try:
-            alloy_id = int(line["Alloy_id"])
-        except (TypeError, ValueError, KeyError):
-            continue
-        scale = float(line.get("Weighment_scale_weight") or 0)
-        stand_raw = line.get("Stand_weight")
-        stand = float(stand_raw or 0)
-        if scale > 0:
-            weight = max(scale - stand, 0.0)
-        else:
-            weight = float(line.get("Weight") or 0)
-        if weight <= 0:
-            continue
-        # Blank is not the same as zero: a forgotten stand silently inflates the
-        # net weight, so make the operator state it either way.
-        if stand_raw in (None, ""):
-            raise ValueError(
-                f"Enter the stand weight for the {alloy_id} output line on batch "
-                f"{batch_id}. Use 0 if the metal was weighed without a stand."
-            )
-        if alloy_id not in allowed:
-            raise ValueError(
-                f"Alloy {alloy_id} is not an allowed output for batch {batch_id}. "
-                "Use the batch alloy or Broken Ingot / Furnace Empty / Not Ok Ingot."
-            )
-        pieces_raw = line.get("Pieces")
-        pieces = _as_whole_pieces(pieces_raw)
-        cleaned.append(
-            {
-                "Alloy_id": alloy_id,
-                "Weight": weight,
-                "Weighment_scale_weight": scale if scale > 0 else None,
-                "Stand_weight": stand,
-                "Pieces": pieces,
-                "Notes": (str(line.get("Notes") or "")).strip() or None,
-                "Weighment_scale_photo": _as_sql_photo(
-                    line.get("Weighment_scale_photo")
-                ),
-                "Output_photo": _as_sql_photo(line.get("Output_photo")),
-            }
-        )
+    cleaned = [
+        row
+        for row in (_clean_batch_output_line(batch_id, line, allowed) for line in lines)
+        if row is not None
+    ]
 
     saved_by, stamp = audit_stamp()
     with get_connection() as conn:
         _exec(conn, "DELETE FROM batch_output WHERE Batch_ID = ?", (batch_id,))
         for row in cleaned:
-            _exec(
-                conn,
-                """
-                INSERT INTO batch_output
-                    (Batch_ID, Alloy_id, Weight, Weighment_scale_weight, Stand_weight,
-                     Pieces, Notes, Output_time, Weighment_scale_photo, Output_photo,
-                     Last_updated_by)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    batch_id,
-                    row["Alloy_id"],
-                    row["Weight"],
-                    row["Weighment_scale_weight"],
-                    row["Stand_weight"],
-                    row["Pieces"],
-                    row["Notes"],
-                    stamp,
-                    row["Weighment_scale_photo"],
-                    row["Output_photo"],
-                    saved_by,
-                ),
-            )
+            _insert_batch_output_row(conn, batch_id, row, saved_by, stamp)
         if cleaned:
             _apply_batch_output_costs(conn, batch_id)
         _sync_sidestream_inventory(conn, batch_id)
@@ -12201,6 +12210,31 @@ def save_batch_outputs(
             # This resave only happens as an admin history correction, so
             # re-sync to keep Finished Goods matching the corrected output.
             _sync_finished_goods_from_output(conn, batch_id)
+
+
+def add_batch_output_line(batch_id: str, line: dict[str, Any]) -> None:
+    """Append one output line to a heat whose output is still In-Progress,
+    keeping the lines already saved (Quick Batch Output)."""
+    require_completed_batch_for_output(batch_id)
+    batch = get_batch(batch_id)
+    if not batch:
+        raise ValueError(f"Batch {batch_id} not found.")
+    if batch.get("Output_status") == BATCH_STATUS_COMPLETED:
+        raise ValueError(
+            f"Output for {batch_id} is Completed and locked. An Admin can "
+            "unlock it on Batch Output to correct history."
+        )
+    allowed = allowed_batch_output_alloy_ids(batch.get("Alloy_id"))
+    row = _clean_batch_output_line(batch_id, line, allowed)
+    if row is None:
+        raise ValueError("Net weight must be greater than zero.")
+    saved_by, stamp = audit_stamp()
+    with get_connection() as conn:
+        _insert_batch_output_row(conn, batch_id, row, saved_by, stamp)
+        # Costs are per batch (charge cost ÷ total output), so every line is
+        # re-costed with the new total, and remelt lots re-synced.
+        _apply_batch_output_costs(conn, batch_id)
+        _sync_sidestream_inventory(conn, batch_id)
 
 
 def _sqlite_internal_remelt_purchase_id(conn: Connection) -> int:

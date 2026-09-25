@@ -1,6 +1,6 @@
 import streamlit as st
 import database as db
-from pages_common import df_from_rows, empty_percent_input, format_ui_date, photo_bytes, show_dataframe, ui_date_input
+from pages_common import df_from_rows, empty_percent_input, format_ui_date, photo_picker, show_dataframe, ui_date_input
 
 
 @st.cache_data(ttl=60, show_spinner=False)
@@ -43,25 +43,6 @@ def _fmt_pct(value: object) -> str:
         return f"{float(value):.1f}%"
     except (TypeError, ValueError):
         return "—"
-
-
-def _photo_picker(label: str, key: str) -> bytes | None:
-    """Toggle that opens the camera / gallery; keeps the photo once taken."""
-    bytes_key = f"{key}_bytes"
-    if st.toggle(label, key=f"{key}_open"):
-        cam = st.camera_input("Camera", key=f"{key}_cam")
-        upload = st.file_uploader(
-            "Or choose from gallery",
-            type=["png", "jpg", "jpeg", "webp"],
-            key=f"{key}_file",
-        )
-        taken = photo_bytes(cam) or photo_bytes(upload)
-        if taken:
-            st.session_state[bytes_key] = taken
-    saved = st.session_state.get(bytes_key)
-    if saved:
-        st.caption(f"{label.split(' ', 1)[-1]} attached.")
-    return saved
 
 
 st.title("Quick Batch Input")
@@ -253,8 +234,8 @@ else:
     for problem in problems:
         st.error(problem)
 
-    scale_photo = _photo_picker("📷 Weighment photo", _k("wsp"))
-    input_photo = _photo_picker("📷 Raw material photo", _k("inp"))
+    scale_photo = photo_picker("📷 Weighment photo", _k("wsp"))
+    input_photo = photo_picker("📷 Raw material photo", _k("inp"))
 
     save_label = "Save charge line" if batch else "Save and create batch"
     if st.button(save_label, type="primary", use_container_width=True, key=_k("save")):
