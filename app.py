@@ -259,6 +259,7 @@ NAV_SECTIONS: list[tuple[str, list[str]]] = [
         "Production",
         [
             "Production Batch & Chemistry",
+            "Quick Batch Input",
             "Batch Output",
             "Production Batches",
             "Daily Batch Summary",
@@ -785,6 +786,11 @@ MIGRATED_PAGES: dict[str, st.Page] = {
         "app_pages/production_batch.py",
         title="Production Batch & Chemistry",
         url_path="production-batch-chemistry",
+    ),
+    "Quick Batch Input": st.Page(
+        "app_pages/quick_batch_input.py",
+        title="Quick Batch Input",
+        url_path="quick-batch-input",
     ),
 }
 _LEGACY_PAGE = st.Page(_legacy_stub, title="Legacy", url_path="legacy", default=True)

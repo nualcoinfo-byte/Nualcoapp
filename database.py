@@ -6420,6 +6420,23 @@ def update_production_batch_input(
         _replace_batch_chemistry(conn, batch_id, composition, composition_less_than)
 
 
+def add_batch_charge_lines(batch_id: str, inputs: list[dict[str, Any]]) -> None:
+    """Append charge lines to an In-Progress batch, leaving its header,
+    samples and chemistry untouched (Quick Batch Input)."""
+    batch = get_batch(batch_id)
+    if not batch:
+        raise ValueError(f"Batch {batch_id} not found.")
+    if batch.get("Production_status") == BATCH_STATUS_COMPLETED:
+        raise ValueError(
+            f"Batch {batch_id} is Completed, so no more charge lines can be added. "
+            "An Admin can unlock it on Production Batch & Chemistry to correct history."
+        )
+    if not inputs:
+        raise ValueError("Enter a charge line with net weight above zero.")
+    with get_connection() as conn:
+        _insert_charge_lines(conn, batch_id, inputs)
+
+
 def complete_production_batch(batch_id: str) -> None:
     """Set production_status to Completed after required fields are present."""
     batch = get_batch(batch_id)
