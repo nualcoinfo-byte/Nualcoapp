@@ -82,7 +82,7 @@ if not ref["furnaces"]:
     st.error("Define at least one furnace under **Furnaces**.")
     st.stop()
 
-prod_date = ui_date_input("Production date *", key="qbi_date")
+prod_date = ui_date_input("Production date *", value=None, key="qbi_date")
 furnace = st.selectbox(
     "Furnace *",
     ref["furnaces"],
