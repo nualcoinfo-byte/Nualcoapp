@@ -7770,7 +7770,51 @@ DASHBOARD_MATERIALIZED_VIEWS = (
     "mv_production_analysis_inputs",
     "mv_production_analysis_outputs_total",
     "mv_production_analysis_output_lines",
+    "mv_raw_material_stock_summary",
 )
+
+# One row per raw material. Lots and charge lines are summed on their own and
+# joined lot to lot: joining inventory to batch_input on the material name
+# alone pairs every lot with every charge line of that material and multiplies
+# both totals. batch_input.Weight is already net of returns to inventory.
+# Lots on cancelled invoices are not stock and are left out.
+_RAW_MATERIAL_STOCK_SUMMARY_SELECT = """
+    SELECT i.Raw_Material_Name AS "Raw_Material_Name",
+           SUM(CASE WHEN COALESCE(i.Remaining_Weight, 0) > 0 THEN 1 ELSE 0 END)
+               AS "Open_lots",
+           SUM(COALESCE(i.Received_weight, 0)) AS "Received_kg",
+           SUM(COALESCE(c.Charged_kg, 0)) AS "Charged_kg",
+           SUM(COALESCE(i.Remaining_Weight, 0)) AS "Remaining_kg",
+           SUM(CASE WHEN i.Raw_Material_Status = 'Ready For Melt'
+                    THEN COALESCE(i.Remaining_Weight, 0) ELSE 0 END)
+               AS "Ready_for_melt_kg",
+           SUM(CASE WHEN i.Raw_Material_Status = 'Awaiting Assay'
+                    THEN COALESCE(i.Remaining_Weight, 0) ELSE 0 END)
+               AS "Awaiting_assay_kg",
+           SUM(CASE WHEN i.Raw_Material_Status = 'Not Ready for Melt'
+                    THEN COALESCE(i.Remaining_Weight, 0) ELSE 0 END)
+               AS "Not_ready_kg",
+           SUM(CASE WHEN i.Raw_Material_Status IS NULL
+                      OR i.Raw_Material_Status NOT IN
+                         ('Ready For Melt', 'Awaiting Assay', 'Not Ready for Melt')
+                    THEN COALESCE(i.Remaining_Weight, 0) ELSE 0 END)
+               AS "Other_status_kg",
+           SUM(CASE WHEN i.Cost_per_kg IS NOT NULL
+                    THEN COALESCE(i.Remaining_Weight, 0) * i.Cost_per_kg ELSE 0 END)
+               AS "Stock_value",
+           SUM(CASE WHEN i.Cost_per_kg IS NULL
+                    THEN COALESCE(i.Remaining_Weight, 0) ELSE 0 END)
+               AS "Uncosted_kg"
+    FROM Raw_Material_Inventory i
+    LEFT JOIN Raw_Material_Purchase p ON p.Purchase_id = i.Purchase_id
+    LEFT JOIN (
+        SELECT Lot_id, SUM(Weight) AS Charged_kg
+        FROM batch_input
+        GROUP BY Lot_id
+    ) c ON c.Lot_id = i.Lot_id
+    WHERE p.Invoice_status IS NULL OR p.Invoice_status <> 'Cancelled'
+    GROUP BY i.Raw_Material_Name
+"""
 
 
 def _ensure_dashboard_materialized_views(conn: Connection) -> None:
@@ -7970,6 +8014,21 @@ def _ensure_dashboard_materialized_views(conn: Connection) -> None:
         'ON mv_production_analysis_output_lines '
         '("Production_Date", "Furnace", "Shift", "Alloy_id", "Output_Alloy_id")',
     )
+
+    _exec(
+        conn,
+        "CREATE MATERIALIZED VIEW IF NOT EXISTS mv_raw_material_stock_summary AS "
+        + _RAW_MATERIAL_STOCK_SUMMARY_SELECT,
+    )
+    _exec(
+        conn,
+        'CREATE UNIQUE INDEX IF NOT EXISTS idx_mv_raw_material_stock_summary_pk '
+        'ON mv_raw_material_stock_summary ("Raw_Material_Name")',
+    )
+    # Supabase grants anon every new object in public; tables are revoked by
+    # the RLS setup, but a materialized view is not a table there.
+    if _exec(conn, "SELECT 1 FROM pg_roles WHERE rolname = 'anon'").scalar():
+        _exec(conn, "REVOKE ALL ON mv_raw_material_stock_summary FROM anon")
 
     _exec(
         conn,
@@ -12487,6 +12546,24 @@ def list_purchase_orders() -> list[dict[str, Any]]:
         LEFT JOIN Alloy_Master a ON a.Alloy_id = p.Alloy_Id
         ORDER BY p.Order_Date DESC, p.Customer_PO_No, p.Alloy_Id
         """
+    )
+
+
+def list_raw_material_stock_summary() -> list[dict[str, Any]]:
+    """Raw material stock by material: received, charged, remaining by status.
+
+    Reads mv_raw_material_stock_summary on Postgres (see
+    refresh_dashboard_materialized_views); queries live on SQLite, which has
+    no materialized views.
+    """
+    if IS_POSTGRES:
+        return fetch_all(
+            'SELECT * FROM mv_raw_material_stock_summary '
+            'ORDER BY "Remaining_kg" DESC, "Raw_Material_Name"'
+        )
+    return fetch_all(
+        _RAW_MATERIAL_STOCK_SUMMARY_SELECT
+        + ' ORDER BY "Remaining_kg" DESC, "Raw_Material_Name"'
     )
 
 

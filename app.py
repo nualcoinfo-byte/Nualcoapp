@@ -616,6 +616,7 @@ def _dashboard_overview_data(year: int, month: int) -> dict:
         "batches": db.list_batches(),
         "materials": db.list_raw_materials(),
         "lots": db.list_inventory_lots(),
+        "stock_summary": db.list_raw_material_stock_summary(),
         "alloys": db.list_alloys(),
         "oil_stock": db.get_furnace_oil_stock(),
         "elec_month": db.electricity_month_totals(year, month),
@@ -831,10 +832,12 @@ if PAGE == "Dashboard":
         lots = overview["lots"]
         alloys = overview["alloys"]
         oil_stock = overview["oil_stock"]
+        stock_summary = overview["stock_summary"]
         elec_month = overview["elec_month"]
     except Exception as exc:
         _show_db_connection_error(exc)
         supply_rows, batches, materials, lots, alloys = [], [], [], [], []
+        stock_summary = []
         oil_stock = 0.0
         elec_month = {"consumed": 0.0, "by_line": {}}
 
@@ -991,7 +994,91 @@ if PAGE == "Dashboard":
     else:
         show_dataframe(bdf)
 
-    st.subheader("Inventory on hand")
+    st.subheader("Raw material stock by material")
+    st.caption(
+        "One row per raw material across all lots (lots on cancelled invoices "
+        "excluded). **Charged** is what production batches have used, net of "
+        "returns to inventory. **Remaining** is split by lot status. Avg ₹/kg is "
+        "stock value ÷ the remaining kg that has a cost. Updated with the "
+        "Dashboard refresh above, so it can lag the lot table below until the "
+        "next refresh."
+    )
+    if not stock_summary:
+        st.info("No raw material inventory yet.")
+    else:
+        sf1, sf2 = st.columns([3, 1], vertical_alignment="bottom")
+        with sf1:
+            stock_pick = st.multiselect(
+                "Look up raw material",
+                sorted(str(r["Raw_Material_Name"]) for r in stock_summary),
+                placeholder="All raw materials",
+                key="dash_stock_materials",
+            )
+        with sf2:
+            stock_show_empty = st.checkbox(
+                "Include materials with no stock", key="dash_stock_empty"
+            )
+        stock_rows = [
+            r
+            for r in stock_summary
+            if (not stock_pick or r["Raw_Material_Name"] in stock_pick)
+            and (stock_show_empty or stock_pick or _kg(r.get("Remaining_kg")) > 0.05)
+        ]
+        show_other = any(_kg(r.get("Other_status_kg")) > 0.05 for r in stock_rows)
+
+        def _avg_cost(row: dict) -> float | None:
+            costed = _kg(row.get("Remaining_kg")) - _kg(row.get("Uncosted_kg"))
+            return _kg(row.get("Stock_value")) / costed if costed > 0.05 else None
+
+        stock_df = pd.DataFrame(
+            [
+                {
+                    "Raw material": r["Raw_Material_Name"],
+                    "Open lots": int(r.get("Open_lots") or 0),
+                    "Received (kg)": _kg(r.get("Received_kg")),
+                    "Charged (kg)": _kg(r.get("Charged_kg")),
+                    "Remaining (kg)": _kg(r.get("Remaining_kg")),
+                    "Ready for melt (kg)": _kg(r.get("Ready_for_melt_kg")),
+                    "Awaiting assay (kg)": _kg(r.get("Awaiting_assay_kg")),
+                    "Not ready (kg)": _kg(r.get("Not_ready_kg")),
+                    **(
+                        {"Other status (kg)": _kg(r.get("Other_status_kg"))}
+                        if show_other
+                        else {}
+                    ),
+                    "Stock value (₹)": _kg(r.get("Stock_value")),
+                    "Avg ₹/kg": _avg_cost(r),
+                }
+                for r in stock_rows
+            ]
+        )
+        if stock_df.empty:
+            st.info("No raw material matches.")
+        else:
+            t1, t2, t3, t4 = st.columns(4)
+            t1.metric("Remaining (kg)", f"{stock_df['Remaining (kg)'].sum():,.1f}")
+            t2.metric("Ready for melt (kg)", f"{stock_df['Ready for melt (kg)'].sum():,.1f}")
+            t3.metric("Awaiting assay (kg)", f"{stock_df['Awaiting assay (kg)'].sum():,.1f}")
+            t4.metric("Stock value (₹)", f"{stock_df['Stock value (₹)'].sum():,.0f}")
+            show_dataframe(
+                stock_df,
+                column_config={
+                    **{
+                        col: st.column_config.NumberColumn(format="%.1f")
+                        for col in stock_df.columns
+                        if col.endswith("(kg)")
+                    },
+                    "Stock value (₹)": st.column_config.NumberColumn(format="%.0f"),
+                    "Avg ₹/kg": st.column_config.NumberColumn(format="%.2f"),
+                },
+            )
+            if show_other:
+                st.caption(
+                    "**Other status** is stock on lots whose status is not Ready For "
+                    "Melt, Awaiting Assay or Not Ready for Melt."
+                )
+
+    st.subheader("Inventory on hand by Lot_id")
     idf = df_from_rows(lots)
     if idf.empty:
         st.info("No inventory lots with remaining weight.")
