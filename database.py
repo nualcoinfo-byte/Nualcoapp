@@ -9746,15 +9746,14 @@ def get_test_certificate_print_payload(
                             chem.get("Percentage"), chem.get("Less_than")
                         )
                 break
-        source_kg = sum(float(src.get("Source_weight") or 0) for src in sources)
-        source_pcs = sum(int(float(src.get("Source_pieces") or 0)) for src in sources)
+        # The certificate prints the printed line (Packing_list_certificate_line),
+        # which may be rounded up from the packed source weights; the sources
+        # only trace which batches the line came from.
         heats.append(
             {
                 "Heat_no": certificate_display_heat_no(line.get("Display_heat_no")),
-                "Kgs": source_kg if source_kg else float(line.get("Weight") or 0),
-                "Pieces": source_pcs
-                if source_pcs
-                else int(float(line.get("Pieces") or 0)),
+                "Kgs": float(line.get("Weight") or 0),
+                "Pieces": int(float(line.get("Pieces") or 0)),
                 "Batch_ID": batch_id,
                 "actuals": chem_by_symbol,
             }
@@ -9793,7 +9792,9 @@ def get_test_certificate_print_payload(
         "cust_code": header.get("Cust_code") or "—",
         "invoice_no": header.get("Invoice_number") or "—",
         "invoice_date": header.get("Invoice_date"),
-        "total_weight": float(cert.get("Source_weight") or 0),
+        "total_weight": round(
+            sum(float(line.get("Weight") or 0) for line in printed), 4
+        ),
         "grade": grade,
         "colour_code": colour or "—",
         "heats": heats,
