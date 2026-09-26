@@ -989,6 +989,21 @@ can_verify = db.role_allowed(
     _employee.get("role_name"), _employee.get("role_id"), db.CERT_VERIFIER_ROLES
 )
 
+def _go_to_packing_list() -> None:
+    st.session_state.nav_page = "Packing List"
+
+
+reopened_id = st.session_state.pop("tc_reopened_id", None)
+if reopened_id:
+    st.success(
+        f"Packing list **#{reopened_id}** is back to **In-Progress** and its draft "
+        "certificate was discarded. On **Packing List**, load it, remove the batches "
+        "to return to finished goods, save, then **Approve** it again."
+    )
+    st.button(
+        "Go to Packing List", key="tc_goto_packing_list", on_click=_go_to_packing_list
+    )
+
 try:
     cert_lists = db.list_packing_lists_for_certificate()
 except Exception as exc:
@@ -1553,6 +1568,39 @@ if is_draft:
             st.rerun()
         except Exception as exc:
             st.error(str(exc))
+
+    with st.expander("Return packing list to In-Progress"):
+        st.caption(
+            "Use this to change the packed batches, e.g. to move some back to finished "
+            "goods. This draft certificate and its printed lines are discarded and the "
+            "packing list goes back to **In-Progress**, where it can be edited on "
+            "**Packing List**. The packed quantity stays held until you remove batches "
+            "there. Approving the list again opens a new draft from the batches then packed."
+        )
+        confirm_reopen = st.checkbox(
+            f"Discard this draft and return packing list #{packing_list_id} to In-Progress",
+            key=f"tc_reopen_confirm_{packing_list_id}",
+            disabled=not can_pack,
+        )
+        if st.button(
+            "Return to In-Progress",
+            key="tc_reopen",
+            disabled=not can_pack or not confirm_reopen,
+        ):
+            try:
+                db.return_packing_list_to_in_progress(packing_list_id)
+                # The list no longer has a certificate, so it leaves the picker above.
+                for key in (
+                    "tc_list_pick",
+                    "tc_packing_list_id",
+                    "tc_lines",
+                    "tc_loaded_id",
+                ):
+                    st.session_state.pop(key, None)
+                st.session_state["tc_reopened_id"] = packing_list_id
+                st.rerun()
+            except Exception as exc:
+                st.error(str(exc))
 elif is_pending:
     if spec_blocked:
         st.info(

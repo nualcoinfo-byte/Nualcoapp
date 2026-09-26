@@ -10642,6 +10642,40 @@ def _packed_lines_from_header(header: dict[str, Any]) -> list[dict[str, Any]]:
     return lines
 
 
+def return_packing_list_to_in_progress(packing_list_id: int) -> dict[str, Any]:
+    """Approved -> In-Progress while the test certificate is still a Draft.
+
+    The Draft certificate (and its printed lines) is discarded, so the list is
+    back to where it was before approval and can be edited on Packing List;
+    approving it again writes a fresh Draft from the batches then packed. The
+    packed qty stays held (In-Progress lists hold stock too); batches removed
+    when the list is edited go back to finished goods. Visual inspection and
+    any deviation letter belong to the packing list and are kept.
+    """
+    _ensure_packing_list_ready()
+    _require_role(PACKING_ROLES, "return packing lists to In-Progress")
+    header, _cert = _certificate_in_status(
+        packing_list_id, (CERT_STATUS_DRAFT,), "return the packing list to In-Progress"
+    )
+    status = header.get("Packing_list_status") or ""
+    if status != PACKING_STATUS_APPROVED:
+        raise ValueError(
+            f"Only an Approved packing list can be returned to In-Progress (this one is {status})."
+        )
+    with get_connection() as conn:
+        for table in (
+            "Packing_list_certificate_source",
+            "Packing_list_certificate_line",
+            "Packing_list_certificate",
+        ):
+            _exec(conn, f"DELETE FROM {table} WHERE Packing_list_id = ?", (packing_list_id,))
+        _set_packing_list_status_on_conn(conn, packing_list_id, PACKING_STATUS_IN_PROGRESS)
+    updated = get_packing_list(packing_list_id)
+    if not updated:
+        raise ValueError("Could not return the packing list to In-Progress.")
+    return updated
+
+
 def cancel_packing_list(packing_list_id: int) -> dict[str, Any]:
     """In-Progress -> Cancelled: the packed qty goes back to finished goods."""
     _ensure_packing_list_ready()

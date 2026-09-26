@@ -320,6 +320,12 @@ with top1:
                 f"Packing list **#{editing_id}** is **Approved** and can no longer be "
                 f"edited. Its test certificate is **{cert_status}**; continue on the "
                 "**Test Certificate** page."
+                + (
+                    " To change its batches, use **Return packing list to "
+                    "In-Progress** there, then load it here again."
+                    if cert_status == db.CERT_STATUS_DRAFT
+                    else ""
+                )
             )
         elif saved_status == db.PACKING_STATUS_CANCELLED:
             st.warning(
