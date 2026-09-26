@@ -2628,6 +2628,8 @@ def _backfill_packing_list_line_quantities(conn: Connection) -> None:
             (FG_STATUS_DISPATCHED,),
         ).mappings()
     )
+    # This runs before _migrate_dispatch_statuses renames the old 'Verified'
+    # packing-list status to Approved, so 'Verified' must still count here.
     for row in dispatched:
         weight = float(row.get("Output_Weight") or 0)
         pieces = int(float(row.get("Output_pieces") or 0))
@@ -6680,7 +6682,7 @@ def _sync_finished_goods_from_output(conn: Connection, batch_id: str) -> Optiona
             FROM Packing_list_batch lb
             JOIN Packing_list p ON p.Packing_list_id = lb.Packing_list_id
             WHERE lb.Batch_ID = ?
-              AND p.Packing_list_status IN ('In-Progress', 'Approved', 'Verified')
+              AND p.Packing_list_status IN ('In-Progress', 'Approved')
             """,
             (batch_id,),
         )
