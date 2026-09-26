@@ -33,43 +33,54 @@ if not vendors:
 if not existing_materials:
     st.info("No grades in Raw Material Master yet — you can type a new name on each row.")
 
+flash = st.session_state.pop("rm_log_flash", None)
+if flash:
+    st.success(flash)
+
+# Every widget key on this form carries this token. Saving bumps it, so the
+# vendor invoice and its raw material rows all come back blank for the next
+# invoice (Streamlit keeps a widget's value while its key stays the same).
+if "rm_log_token" not in st.session_state:
+    st.session_state.rm_log_token = 0
+form_token = st.session_state.rm_log_token
+
 st.markdown("#### Vendor invoice")
 vendor_label = st.selectbox(
     "Vendor name *",
     options=[""] + list(vendor_opts.keys()),
-    key="rm_log_vendor",
+    key=f"rm_log_vendor_{form_token}",
 )
 inv1, inv2, inv3 = st.columns(3)
 with inv1:
     invoice_date = ui_date_input(
-        "Supplier invoice date *", value=db.today_ist(), key="rm_log_invoice_date"
+        "Supplier invoice date *", value=db.today_ist(), key=f"rm_log_invoice_date_{form_token}"
     )
 with inv2:
     invoice = st.text_input(
         "Vendor invoice *",
         placeholder="e.g. INV-2026-001",
-        key="rm_log_invoice",
+        key=f"rm_log_invoice_{form_token}",
     )
 with inv3:
     received = ui_date_input(
-        "Received date", value=db.today_ist(), key="rm_log_received"
+        "Received date", value=db.today_ist(), key=f"rm_log_received_{form_token}"
     )
 
 rec1, rec2, rec3 = st.columns(3)
 with rec1:
     storage = st.text_input(
-        "Storage bay", placeholder="e.g. Bay-A1", key="rm_log_storage"
+        "Storage bay", placeholder="e.g. Bay-A1", key=f"rm_log_storage_{form_token}"
     )
 with rec2:
     inv_status = st.selectbox(
-        "Inventory status", db.INVENTORY_STATUS, index=1, key="rm_log_inv_status"
+        "Inventory status", db.INVENTORY_STATUS, index=1, key=f"rm_log_inv_status_{form_token}"
     )
 with rec3:
     invoice_doc = st.file_uploader(
         "Invoice document",
         type=["png", "jpg", "jpeg", "pdf", "doc", "docx", "xls", "xlsx"],
         help="Optional. Stored once on the vendor invoice, not on each lot.",
-        key="rm_log_invoice_doc",
+        key=f"rm_log_invoice_doc_{form_token}",
     )
 
 vp_open_key = "rm_log_vphoto_open"
@@ -89,13 +100,13 @@ with photo_col:
         st.caption("Capture the vehicle with camera or pick a photo from the gallery.")
         vp_cam = st.camera_input(
             "Vehicle camera",
-            key="rm_log_vphoto_cam",
+            key=f"rm_log_vphoto_cam_{form_token}",
             help="Uses the phone camera when available.",
         )
         vp_file = st.file_uploader(
             "Vehicle gallery / files",
             type=["png", "jpg", "jpeg", "webp"],
-            key="rm_log_vphoto_file",
+            key=f"rm_log_vphoto_file_{form_token}",
             help="Choose an existing vehicle photo from the device gallery.",
         )
         vehicle_photo_bytes = photo_bytes(vp_cam) or photo_bytes(vp_file)
@@ -122,13 +133,13 @@ with slip_col:
         )
         ws_cam = st.camera_input(
             "Weighment slip camera",
-            key="rm_log_wslip_cam",
+            key=f"rm_log_wslip_cam_{form_token}",
             help="Uses the phone camera when available.",
         )
         ws_file = st.file_uploader(
             "Weighment slip gallery / files",
             type=["png", "jpg", "jpeg", "webp"],
-            key="rm_log_wslip_file",
+            key=f"rm_log_wslip_file_{form_token}",
             help="Choose an existing weighment slip photo from the device gallery.",
         )
         weighment_slip_photo_bytes = photo_bytes(ws_cam) or photo_bytes(ws_file)
@@ -148,9 +159,7 @@ st.caption(
 
 if "rm_invoice_lines" not in st.session_state:
     st.session_state.rm_invoice_lines = [{"name": "", "cost": 0.0, "weight": 0.0}]
-if "rm_log_token" not in st.session_state:
-    st.session_state.rm_log_token = 0
-line_token = st.session_state.rm_log_token
+line_token = form_token
 
 WEIGHT_TOLERANCE_PCT = 0.12  # max allowed variance between invoice and weighbridge weight
 
@@ -379,7 +388,7 @@ if submitted or submit_to_accounts:
                 invoice_status=target_status,
             )
             names = ", ".join(ln["name"] for ln in complete)
-            st.success(
+            st.session_state["rm_log_flash"] = (
                 f"Saved invoice **{invoice_no}** (purchase #{purchase_id}) "
                 f"with {len(lot_ids)} lot(s) ({names}). "
                 f"Lot IDs: {', '.join(str(i) for i in lot_ids)}. "
