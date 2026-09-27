@@ -7794,6 +7794,7 @@ _BATCH_PRODUCTION_SUMMARY_SELECT = """
            b.Furnace AS "Furnace",
            b.Alloy_id AS "Alloy_id",
            a.Alloy_name AS "Alloy_name",
+           c.Customer_name AS "Customer_name",
            b.Production_status AS "Production_status",
            b.Output_status AS "Output_status",
            COALESCE(i.Input_kg, 0) AS "Total_Input",
@@ -7802,6 +7803,7 @@ _BATCH_PRODUCTION_SUMMARY_SELECT = """
            o.Cost_per_kg AS "Cost_per_kg"
     FROM Production_batch b
     LEFT JOIN Alloy_Master a ON a.Alloy_id = b.Alloy_id
+    LEFT JOIN Customer_Master c ON c.Cust_code = a.Cust_code
     LEFT JOIN (
         SELECT bi.Batch_ID,
                SUM(bi.Weight) AS Input_kg,
@@ -8096,6 +8098,20 @@ def _ensure_dashboard_materialized_views(conn: Connection) -> None:
         'CREATE UNIQUE INDEX IF NOT EXISTS idx_mv_raw_material_stock_summary_pk '
         'ON mv_raw_material_stock_summary ("Raw_Material_Name")',
     )
+    # CREATE ... IF NOT EXISTS keeps an older definition; rebuild the summary
+    # view once if it predates the Customer_name column.
+    if _exec(
+        conn, "SELECT 1 FROM pg_matviews WHERE matviewname = 'mv_batch_production_summary'"
+    ).first() and not _exec(
+        conn,
+        """
+        SELECT 1 FROM pg_attribute
+        WHERE attrelid = 'mv_batch_production_summary'::regclass
+          AND attname = 'Customer_name' AND NOT attisdropped
+        """,
+    ).first():
+        _exec(conn, "DROP MATERIALIZED VIEW mv_batch_production_summary")
+
     for view, select_sql, key_cols in (
         ("mv_batch_production_summary", _BATCH_PRODUCTION_SUMMARY_SELECT, '"Batch_ID"'),
         (
