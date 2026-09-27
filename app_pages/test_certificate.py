@@ -1181,14 +1181,28 @@ if "tc_cert_no" not in st.session_state or st.session_state.get("tc_cert_no_for"
     st.session_state["tc_issued_date"] = (
         _parse_master_date(issued_raw) if issued_raw else db.today_ist()
     )
+    st.session_state["tc_invoice"] = header.get("Invoice_number") or ""
 
-h1, h2, h3 = st.columns(3)
+h1, h_inv, h2, h3 = st.columns(4)
 with h1:
     certificate_no = st.text_input(
         "Certificate no",
         key="tc_cert_no",
         disabled=not draft_editable,
     )
+with h_inv:
+    invoice_number = st.text_input(
+        "Invoice number *",
+        key="tc_invoice",
+        disabled=not draft_editable,
+        placeholder="Needed to submit",
+        help=(
+            "Accounts invoice the weight once the packing list is ready for its test "
+            "certificate, so enter the invoice number here. Saved with the draft; "
+            "required before Submit for verification."
+        ),
+    )
+invoice_entered = bool((invoice_number or "").strip())
 with h2:
     issued_date = ui_date_input(
         "Issued date",
@@ -1378,10 +1392,13 @@ submit_clicked = is_draft and submit_col.button(
     "Submit for verification",
     key="tc_submit",
     type="primary",
-    disabled=not draft_editable,
+    disabled=not draft_editable or not invoice_entered,
     help="Saves the draft and the visual inspection checks it includes, and sends "
-    "it to quality for verification.",
+    "it to quality for verification."
+    + ("" if invoice_entered else " Enter the invoice number first."),
 )
+if is_draft and draft_editable and not invoice_entered:
+    submit_col.caption("Enter the **Invoice number** above to submit.")
 
 if selected_nos:
     st.markdown("#### Chemistry for selected line")
@@ -1554,6 +1571,7 @@ if is_draft:
                 lines,
                 certificate_no=certificate_no,
                 issued_date=to_storage_date(issued_date),
+                invoice_number=invoice_number,
             )
             st.session_state["tc_lines"] = saved.get("lines") or []
             st.success(f"Saved draft **{saved.get('Certificate_no')}**.")
@@ -1568,6 +1586,7 @@ if is_draft:
                 lines,
                 certificate_no=certificate_no,
                 issued_date=to_storage_date(issued_date),
+                invoice_number=invoice_number,
             )
             st.success(
                 f"**{submitted.get('Certificate_no')}** submitted for verification."

@@ -9093,9 +9093,9 @@ def save_packing_list(
     _ensure_packing_list_ready()
     _require_role(PACKING_ROLES, "create or edit packing lists")
     status = PACKING_STATUS_IN_PROGRESS
+    # Often not known yet: accounts invoice the weight once the list is ready for its
+    # test certificate, so it is entered there and required before Submit for verification.
     invoice = (invoice_number or "").strip()
-    if not invoice:
-        raise ValueError("Invoice number is required.")
     po_no = (customer_po_no or "").strip()
     if not po_no:
         raise ValueError("P.O. Number is required.")
@@ -10624,7 +10624,15 @@ def _save_certificate_lines(
     certificate_no: Optional[str],
     issued_date: Optional[str],
     status: str,
+    invoice_number: Optional[str] = None,
 ) -> dict[str, Any]:
+    invoice = (
+        (invoice_number or "").strip()
+        if invoice_number is not None
+        else str(header.get("Invoice_number") or "").strip()
+    )
+    if status == CERT_STATUS_PENDING and not invoice:
+        raise ValueError("Enter the invoice number before submitting for verification.")
     packed = list(header.get("batches") or [])
     errors = validate_certificate_lines(packed, lines)
     if errors:
@@ -10646,6 +10654,16 @@ def _save_certificate_lines(
             """,
             (number, issued_date, status, packed_w, packed_p, by_val, dt_val, packing_list_id),
         )
+        if invoice_number is not None:
+            _exec(
+                conn,
+                """
+                UPDATE Packing_list SET Invoice_number = ?,
+                    Last_updated_by = ?, Last_updated_datetime = ?
+                WHERE Packing_list_id = ?
+                """,
+                (invoice, by_val, dt_val, packing_list_id),
+            )
         _replace_certificate_lines_on_conn(conn, packing_list_id, lines)
     saved = get_packing_list_certificate(packing_list_id)
     if not saved:
@@ -10659,6 +10677,7 @@ def save_packing_list_certificate_draft(
     *,
     certificate_no: Optional[str] = None,
     issued_date: Optional[str] = None,
+    invoice_number: Optional[str] = None,
 ) -> dict[str, Any]:
     _ensure_packing_list_ready()
     _require_role(PACKING_ROLES, "edit test certificate drafts")
@@ -10673,6 +10692,7 @@ def save_packing_list_certificate_draft(
         certificate_no=certificate_no,
         issued_date=issued_date,
         status=CERT_STATUS_DRAFT,
+        invoice_number=invoice_number,
     )
 
 
@@ -10682,8 +10702,12 @@ def submit_certificate_for_verification(
     *,
     certificate_no: Optional[str] = None,
     issued_date: Optional[str] = None,
+    invoice_number: Optional[str] = None,
 ) -> dict[str, Any]:
-    """Draft -> Pending verification (saves the printed lines first)."""
+    """Draft -> Pending verification (saves the printed lines first).
+
+    Needs the invoice number: passed here, or already on the packing list.
+    """
     _ensure_packing_list_ready()
     _require_role(PACKING_ROLES, "submit test certificates for verification")
     header, existing = _certificate_in_status(
@@ -10697,6 +10721,7 @@ def submit_certificate_for_verification(
         certificate_no=certificate_no,
         issued_date=issued_date,
         status=CERT_STATUS_PENDING,
+        invoice_number=invoice_number,
     )
 
 

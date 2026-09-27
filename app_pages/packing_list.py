@@ -262,7 +262,9 @@ if st.session_state.get("pl_show_summary"):
 
 st.title("Packing List")
 st.caption(
-    "Enter invoice details, then select **batch_id**s from Available finished goods. "
+    "Enter the invoice date and P.O., then select **batch_id**s from Available finished "
+    "goods. The invoice number can be left blank until the list reaches its **Test "
+    "Certificate**, where it must be entered before Submit for verification. "
     "A heat can be packed in part: enter only the kg and pieces on this list. "
     "**Save** keeps the list **In-Progress** and takes that quantity out of "
     "finished goods straight away; the remainder stays Available. **Cancel "
@@ -357,7 +359,15 @@ with r1c1:
         key="pl_invoice_date",
     )
 with r1c2:
-    invoice_number = st.text_input("Invoice number *", key="pl_invoice")
+    invoice_number = st.text_input(
+        "Invoice number",
+        key="pl_invoice",
+        help=(
+            "Optional here: the invoice is usually raised once the list is ready for "
+            "its test certificate. Enter it on the Test Certificate page before "
+            "Submit for verification."
+        ),
+    )
 with r1c3:
     po_no = st.selectbox(
         "P.O. Number *",
@@ -810,9 +820,6 @@ if cancel_list_clicked and editing_id:
 
 def _save_form() -> int | None:
     """Validate and save the form; returns the packing list id, or None after showing an error."""
-    if not invoice_number.strip():
-        st.error("Invoice number is required.")
-        return None
     if not po_no:
         st.error("P.O. Number is required.")
         return None
