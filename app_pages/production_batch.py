@@ -571,6 +571,38 @@ else:
         if not filters_on or bid in matching_ids:
             work_opts.append(label)
     wb_key = _pk("working_batch")
+
+    # A search that narrows to exactly one saved batch opens it. Only when the
+    # search itself changes, so picking "New production batch" afterwards
+    # sticks; and never over unsaved charge lines, which a batch switch clears.
+    find_sig = (str(find_date or ""), str(find_melt), str(find_shift))
+    find_sig_key = _pk("find_sig")
+    search_changed = st.session_state.get(find_sig_key) != find_sig
+    st.session_state[find_sig_key] = find_sig
+    if filters_on and search_changed and len(matching_rows) == 1:
+        only_id = str(matching_rows[0].get("Batch_ID") or "").strip()
+        only_label = next(
+            (lbl for lbl, bid in label_to_batch_id.items() if bid == only_id), None
+        )
+        if only_label and st.session_state.get(wb_key) != only_label:
+            n_lines = len(
+                (st.session_state.get("charge_lines_by_furnace") or {}).get(furnace)
+                or [None]
+            )
+            unsaved_charges = any(
+                st.session_state.get(_pk(f"mat_{i}"))
+                or float(st.session_state.get(_pk(f"scale_w_{i}")) or 0) > 0
+                for i in range(n_lines)
+            )
+            if unsaved_charges:
+                st.info(
+                    f"Only **{only_id}** matches, but there are unsaved charge lines "
+                    "below, so it was not opened. Save or discard them, or pick it "
+                    "from **Production batch**."
+                )
+            else:
+                st.session_state[wb_key] = only_label
+
     pending_batch = st.session_state.pop("_pb_select_batch", None)
     if pending_batch:
         pending_id = str(pending_batch)
