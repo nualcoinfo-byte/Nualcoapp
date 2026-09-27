@@ -1356,9 +1356,9 @@ if draft_editable:
                 st.error(str(exc))
 
 # The packing team works above the visual inspection and quality below it, so
-# Submit sits here with View summary. It is handled further down, once the
-# visual inspection selection (saved with it) has been read.
-sum_col, submit_col, _sp = st.columns([1, 1, 2])
+# Save draft and Submit sit here with View summary. Both are handled further
+# down, once the visual inspection selection (saved with them) has been read.
+sum_col, save_top_col, submit_col, _sp = st.columns([1, 1, 1, 1])
 if sum_col.button(
     "View summary",
     key="tc_view_summary",
@@ -1367,6 +1367,13 @@ if sum_col.button(
 ):
     st.session_state["tc_show_summary"] = True
     st.rerun()
+save_top_clicked = is_draft and save_top_col.button(
+    "Save draft",
+    key="tc_save_top",
+    disabled=not draft_editable,
+    help="Saves the printed lines and the visual inspection checks without "
+    "submitting; the same as Save draft at the bottom of the page.",
+)
 submit_clicked = is_draft and submit_col.button(
     "Submit for verification",
     key="tc_submit",
@@ -1539,7 +1546,7 @@ if is_draft:
     save_clicked = st.button(
         "Save draft", key="tc_save", disabled=not draft_editable, type="primary"
     )
-    if save_clicked:
+    if save_clicked or save_top_clicked:
         try:
             db.save_visual_inspection(packing_list_id, inspection_rows)
             saved = db.save_packing_list_certificate_draft(
