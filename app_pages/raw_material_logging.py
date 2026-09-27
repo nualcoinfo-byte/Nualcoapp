@@ -1,7 +1,7 @@
 import streamlit as st
 import database as db
 from datetime import date
-from pages_common import empty_percent_input, photo_bytes, ui_date_input
+from pages_common import empty_percent_input, file_bytes, photo_bytes, ui_date_input
 
 
 @st.cache_data(ttl=60, show_spinner=False)
@@ -346,7 +346,7 @@ if submitted or submit_to_accounts:
         )
     else:
         try:
-            doc_bytes = photo_bytes(invoice_doc)
+            doc_bytes = file_bytes(invoice_doc)
             doc_name = invoice_doc.name if invoice_doc else None
             doc_type = getattr(invoice_doc, "type", None) if invoice_doc else None
             lines: list[dict] = []

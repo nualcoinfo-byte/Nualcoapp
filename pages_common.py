@@ -6,6 +6,7 @@ migration -- function bodies are unchanged, only their home moved.
 
 from __future__ import annotations
 
+import io
 from datetime import date, datetime, timedelta, timezone
 
 import pandas as pd
@@ -27,7 +28,65 @@ def _show_db_connection_error(exc: BaseException) -> None:
     st.error(f"Could not load data from the database: {exc}")
 
 
+# Phone photos arrive at 3-7 MB; stored in the database as-is they made the
+# photo tables slow to read. A weighment display stays legible at this size.
+PHOTO_MAX_SIDE_PX = 1600
+PHOTO_JPEG_QUALITY = 80
+_PHOTO_CACHE_KEY = "_compressed_photo_cache"
+_PHOTO_CACHE_SIZE = 8
+
+
+def compress_photo(data: bytes) -> bytes:
+    """Shrink a photo for storage: upright, longest side <= PHOTO_MAX_SIDE_PX, JPEG.
+
+    Returns the original bytes if they are not an image Pillow can read, or if
+    the compressed copy would not be smaller.
+    """
+    try:
+        from PIL import Image, ImageOps
+
+        with Image.open(io.BytesIO(data)) as source:
+            img = ImageOps.exif_transpose(source)  # phones store rotation in EXIF
+            if img.mode in ("RGBA", "LA") or (
+                img.mode == "P" and "transparency" in img.info
+            ):
+                rgba = img.convert("RGBA")
+                img = Image.new("RGB", rgba.size, (255, 255, 255))
+                img.paste(rgba, mask=rgba.getchannel("A"))
+            elif img.mode not in ("RGB", "L"):
+                img = img.convert("RGB")
+            img.thumbnail((PHOTO_MAX_SIDE_PX, PHOTO_MAX_SIDE_PX))
+            out = io.BytesIO()
+            img.save(out, format="JPEG", quality=PHOTO_JPEG_QUALITY, optimize=True)
+    except Exception:
+        return data
+    small = out.getvalue()
+    return small if len(small) < len(data) else data
+
+
 def photo_bytes(uploaded) -> bytes | None:
+    """Bytes of a camera / gallery photo, compressed for storage (see compress_photo).
+
+    Pages re-read the widget on every rerun, so each upload is compressed once
+    and remembered for the session. For documents whose stored file type must
+    stay true (invoices, PDFs), use file_bytes instead.
+    """
+    if uploaded is None:
+        return None
+    data = uploaded.getvalue()
+    if not str(getattr(uploaded, "type", "") or "").startswith("image/"):
+        return data
+    key = getattr(uploaded, "file_id", None) or (uploaded.name, len(data))
+    cache = st.session_state.setdefault(_PHOTO_CACHE_KEY, {})
+    if key not in cache:
+        while len(cache) >= _PHOTO_CACHE_SIZE:
+            cache.pop(next(iter(cache)))
+        cache[key] = compress_photo(data)
+    return cache[key]
+
+
+def file_bytes(uploaded) -> bytes | None:
+    """Bytes of an uploaded document, unchanged."""
     if uploaded is None:
         return None
     return uploaded.getvalue()

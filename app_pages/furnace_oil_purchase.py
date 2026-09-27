@@ -4,7 +4,7 @@ from datetime import date
 from pages_common import (
     df_from_rows,
     empty_percent_input,
-    photo_bytes,
+    file_bytes,
     show_dataframe,
     tank_reading_rows,
     ui_date_input,
@@ -189,10 +189,10 @@ if st.button("Save furnace oil purchase", type="primary", key="fo_pur_save"):
                 rate_per_litre=rate_val if rate_val > 0 else None,
                 storage_tank=tank.strip() or None,
                 notes=notes.strip() or None,
-                invoice_document=photo_bytes(invoice_doc),
+                invoice_document=file_bytes(invoice_doc),
                 invoice_document_name=invoice_doc.name if invoice_doc else None,
                 invoice_document_type=getattr(invoice_doc, "type", None) if invoice_doc else None,
-                weighment_slip=photo_bytes(weighment_slip),
+                weighment_slip=file_bytes(weighment_slip),
                 weighment_slip_name=weighment_slip.name if weighment_slip else None,
                 weighment_slip_type=(
                     getattr(weighment_slip, "type", None) if weighment_slip else None
