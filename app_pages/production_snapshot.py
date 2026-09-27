@@ -1,4 +1,5 @@
 import html
+from typing import Optional
 from datetime import timedelta
 
 import pandas as pd
@@ -55,23 +56,51 @@ def _num(value: object, fmt: str = "{:,.1f}") -> str:
 
 
 CUSTOMER_PREFIX_LEN = 4
+CUSTOMER_WORD_LEN = 5
 
 
 def _customer_short_names(names: list[str]) -> dict[str, str]:
-    """Shortest prefix (at least CUSTOMER_PREFIX_LEN chars) that tells the customers apart.
+    """Every customer as its first CUSTOMER_PREFIX_LEN characters plus "…".
 
-    Most customers differ in their first four characters; any that share them
-    get just enough extra characters to be distinguishable on screen.
+    Customers on screen that share those characters also get the word where
+    their names first differ, cut to CUSTOMER_WORD_LEN characters, e.g. "UNIQ…"
+    and "UNIQ… P-6", or "ABEE… CAST" and "ABEE… INDUS". The whole word is used
+    only where the cut would make two short names identical.
     """
     unique = sorted({n.strip() for n in names if n and n.strip()})
-    short: dict[str, str] = {}
-    for name in unique:
-        n = CUSTOMER_PREFIX_LEN
-        while n < len(name) and any(
-            other != name and other[:n].upper() == name[:n].upper() for other in unique
-        ):
+    head = CUSTOMER_PREFIX_LEN
+
+    def _common_len(a: str, b: str) -> int:
+        n = 0
+        for x, y in zip(a.upper(), b.upper()):
+            if x != y:
+                break
             n += 1
-        short[name] = name if n >= len(name) else name[:n].rstrip() + "…"
+        return n
+
+    def _label(name: str, word_len: Optional[int]) -> str:
+        if len(name) <= head:
+            return name
+        label = name[:head].rstrip() + "…"
+        rivals = [o for o in unique if o != name and o[:head].upper() == name[:head].upper()]
+        if rivals:
+            differ_at = max(_common_len(name, o) for o in rivals)
+            if differ_at < len(name):
+                word_start = name.rfind(" ", 0, differ_at + 1) + 1
+                if word_start >= head:
+                    word = name[word_start:].split(" ", 1)[0]
+                    label += " " + (word[:word_len] if word_len else word)
+                else:
+                    label = name[: max(differ_at + 1, head)].rstrip() + "…"
+        if label.replace("…", "").replace(" ", "") == name.replace(" ", ""):
+            label = name  # nothing was actually shortened
+        return label
+
+    short = {name: _label(name, CUSTOMER_WORD_LEN) for name in unique}
+    clashes = {lbl for lbl in short.values() if list(short.values()).count(lbl) > 1}
+    for name, lbl in short.items():
+        if lbl in clashes:
+            short[name] = _label(name, None)
     return short
 
 
