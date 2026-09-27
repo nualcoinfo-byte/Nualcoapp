@@ -1,0 +1,73 @@
+# Refresh the staging/development database (Supabase Mumbai) with a copy of production (Supabase Singapore).
+# Runs scripts/refresh_staging_db.py --yes: production is only read; staging's data is completely replaced.
+#
+# Schedule (GitHub cron is UTC; IST = UTC+05:30, and GitHub may start a scheduled run a few minutes late):
+#   Sunday    17:00 IST = Sunday  11:30 UTC
+#   Wednesday 05:00 IST = Tuesday 23:30 UTC
+# Also runnable by hand: GitHub -> Actions -> "Refresh staging database" -> Run workflow.
+#
+# Repository secrets (Settings -> Secrets and variables -> Actions), copied from the local env files:
+#   PRODUCTION_DATABASE_URL  - PRODUCTION_DATABASE_URL from .env.production.local (session pooler, port 5432)
+#   STAGING_DATABASE_URL     - DATABASE_URL from .env.local                       (session pooler, port 5432)
+# The script refuses to run if both point at the same Supabase project, and never prints credentials.
+
+name: Refresh staging database
+
+on:
+  schedule:
+    - cron: "30 11 * * 0"   # Sunday 17:00 IST
+    - cron: "30 23 * * 2"   # Wednesday 05:00 IST
+  workflow_dispatch:
+
+concurrency:
+  group: refresh-staging-db
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version-file: .python-version
+          cache: pip
+
+      - name: Install Python requirements
+        run: pip install -r requirements.txt
+
+      # pg_dump must be at least the server's major version (Supabase runs Postgres 17).
+      - name: Install PostgreSQL 17 client tools
+        run: |
+          sudo install -d /usr/share/postgresql-common/pgdg
+          sudo curl -fsSL -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc https://www.postgresql.org/media/keys/ACCC4CF8.asc
+          echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" \
+            | sudo tee /etc/apt/sources.list.d/pgdg.list > /dev/null
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq postgresql-client-17
+          echo "/usr/lib/postgresql/17/bin" >> "$GITHUB_PATH"
+
+      - name: Write the env files the script reads
+        env:
+          PRODUCTION_DATABASE_URL: ${{ secrets.PRODUCTION_DATABASE_URL }}
+          STAGING_DATABASE_URL: ${{ secrets.STAGING_DATABASE_URL }}
+        run: |
+          if [ -z "$PRODUCTION_DATABASE_URL" ] || [ -z "$STAGING_DATABASE_URL" ]; then
+            echo "::error::Set the PRODUCTION_DATABASE_URL and STAGING_DATABASE_URL repository secrets."
+            exit 1
+          fi
+          umask 077
+          printf 'PRODUCTION_DATABASE_URL=%s\n' "$PRODUCTION_DATABASE_URL" > .env.production.local
+          printf 'DATABASE_URL=%s\nAPP_ENV=staging\n' "$STAGING_DATABASE_URL" > .env.local
+
+      - name: Refresh staging from production
+        run: python scripts/refresh_staging_db.py --yes
+
+      - name: Remove the env files
+        if: always()
+        run: rm -f .env.local .env.production.local

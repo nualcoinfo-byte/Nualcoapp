@@ -23,7 +23,10 @@ changing anything in the Supabase dashboard.
 1. Work on a branch and run it locally against the Mumbai database.
 2. Before testing anything that changes the schema, refresh Mumbai with a copy of production:
    `python scripts/refresh_staging_db.py --yes` (about a minute). It only reads production, and refuses to run unless the
-   target is a different Supabase project with `APP_ENV=development|staging`.
+   target is a different Supabase project with `APP_ENV=development|staging`. It also runs on its own every **Sunday
+   5 pm IST** and **Wednesday 5 am IST** (GitHub Actions, `.github/workflows/refresh-staging-db.yml`, using the
+   `PRODUCTION_DATABASE_URL` and `STAGING_DATABASE_URL` repository secrets), so Mumbai's data is overwritten then.
+   Run it by hand any time from GitHub -> Actions -> *Refresh staging database* -> *Run workflow*.
 3. Merge to `main`. Only **staging** rebuilds. Test the UI and the migration there (the app applies its own schema
    changes at startup, so staging is the rehearsal against real data).
 4. Release to users when nobody is active: `git push origin main:production`. Production redeploys and everyone is logged out.
