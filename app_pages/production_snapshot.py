@@ -68,7 +68,7 @@ def _yield_cell(pct: object) -> str:
     return f'<td class="num"><span class="{css}">{float(pct):.2f}%</span></td>'
 
 
-N_COLS = 16
+N_COLS = 17
 
 
 def _toggle(kind: str, bid: str, total: float) -> str:
@@ -220,7 +220,8 @@ st.caption(
 )
 
 header = (
-    "<tr><th>Production date</th><th>Batch ID</th><th>Heat no</th><th class='num'>Melt no</th>"
+    "<tr><th>Production date</th><th>Batch ID</th><th>Heat no</th><th>Alloy</th>"
+    "<th class='num'>Melt no</th>"
     "<th>Shift</th><th>Furnace</th><th class='num'>Total input (kg)</th><th>Input status</th>"
     "<th class='num'>Total output (kg)</th><th>Output status</th><th class='num'>Cost/kg (₹)</th>"
     "<th class='num'>Estimated output (kg)</th><th class='num'>Actual output (kg)</th>"
@@ -238,6 +239,7 @@ for b in batches:
         f"<td>{_esc(format_ui_date(b.get('Production_Date')))}</td>"
         f"<td>{_esc(bid)}</td>"
         f"<td>{_esc(b.get('Heat_no'))}</td>"
+        f"<td>{_esc(b.get('Alloy_name'))}</td>"
         f"<td class='num'>{_esc(b.get('Melt_No'))}</td>"
         f"<td>{_esc(b.get('Shift'))}</td>"
         f"<td>{_esc(b.get('Furnace'))}</td>"
@@ -255,7 +257,7 @@ for b in batches:
     )
 body.append(
     "<tr class='ps-total'>"
-    f"<td colspan='6'>Total ({len(batches)} batches)</td>"
+    f"<td colspan='7'>Total ({len(batches)} batches)</td>"
     f"<td class='num'>{_num(total_in)}</td><td></td>"
     f"<td class='num'>{_num(total_out)}</td><td></td><td></td>"
     f"<td class='num'>{_num(sum(b['Estimated_Output'] for b in batches))}</td>"
@@ -274,6 +276,7 @@ export = pd.DataFrame(
             "Production date": format_ui_date(b.get("Production_Date")),
             "Batch ID": b["Batch_ID"],
             "Heat no": b.get("Heat_no"),
+            "Alloy": b.get("Alloy_name"),
             "Melt no": b.get("Melt_No"),
             "Shift": b.get("Shift"),
             "Furnace": b.get("Furnace"),
