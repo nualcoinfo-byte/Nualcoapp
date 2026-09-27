@@ -7776,7 +7776,73 @@ DASHBOARD_MATERIALIZED_VIEWS = (
     "mv_production_analysis_outputs_total",
     "mv_production_analysis_output_lines",
     "mv_raw_material_stock_summary",
+    "mv_batch_production_summary",
+    "mv_batch_production_inputs",
+    "mv_batch_production_outputs",
 )
+
+# Production Snapshot: one row per batch, plus its charge lines and its output
+# by alloy for the drill-downs. Input and output are summed on their own before
+# joining the batch, so neither multiplies the other. Cost_per_kg is the overall
+# ₹/kg already stored on the batch's output lines (material + conversion).
+_BATCH_PRODUCTION_SUMMARY_SELECT = """
+    SELECT b.Batch_ID AS "Batch_ID",
+           b.Production_Date AS "Production_Date",
+           b.Heat_no AS "Heat_no",
+           b.Melt_No AS "Melt_No",
+           b.Shift AS "Shift",
+           b.Furnace AS "Furnace",
+           b.Alloy_id AS "Alloy_id",
+           a.Alloy_name AS "Alloy_name",
+           b.Production_status AS "Production_status",
+           b.Output_status AS "Output_status",
+           COALESCE(i.Input_kg, 0) AS "Total_Input",
+           COALESCE(i.Input_cost, 0) AS "Input_Cost",
+           COALESCE(o.Output_kg, 0) AS "Total_Output",
+           o.Cost_per_kg AS "Cost_per_kg"
+    FROM Production_batch b
+    LEFT JOIN Alloy_Master a ON a.Alloy_id = b.Alloy_id
+    LEFT JOIN (
+        SELECT bi.Batch_ID,
+               SUM(bi.Weight) AS Input_kg,
+               SUM(bi.Weight * COALESCE(inv.Cost_per_kg, 0)) AS Input_cost
+        FROM batch_input bi
+        LEFT JOIN Raw_Material_Inventory inv ON inv.Lot_id = bi.Lot_id
+        GROUP BY bi.Batch_ID
+    ) i ON i.Batch_ID = b.Batch_ID
+    LEFT JOIN (
+        SELECT Batch_ID,
+               SUM(Weight) AS Output_kg,
+               MAX(cost_of_production_overall_per_kg) AS Cost_per_kg
+        FROM batch_output
+        GROUP BY Batch_ID
+    ) o ON o.Batch_ID = b.Batch_ID
+"""
+_BATCH_PRODUCTION_INPUTS_SELECT = """
+    SELECT bi.Batch_ID AS "Batch_ID",
+           bi.Raw_Material_Name AS "Raw_Material_Name",
+           bi.Lot_id AS "Lot_id",
+           bi.Charge_time AS "Charge_time",
+           bi.Weight AS "Weight",
+           bi.Weighment_scale_weight AS "Weighment_scale_weight",
+           bi.Trolley_name AS "Trolley_name",
+           bi.Trolley_weight AS "Trolley_weight",
+           inv.Cost_per_kg AS "Cost_per_kg",
+           bi.Last_updated_by AS "Saved_by"
+    FROM batch_input bi
+    LEFT JOIN Raw_Material_Inventory inv ON inv.Lot_id = bi.Lot_id
+"""
+_BATCH_PRODUCTION_OUTPUTS_SELECT = """
+    SELECT o.Batch_ID AS "Batch_ID",
+           o.Alloy_id AS "Alloy_id",
+           a.Alloy_name AS "Alloy_name",
+           COUNT(*) AS "Lines",
+           SUM(o.Weight) AS "Weight",
+           SUM(COALESCE(o.Pieces, 0)) AS "Pieces"
+    FROM batch_output o
+    LEFT JOIN Alloy_Master a ON a.Alloy_id = o.Alloy_id
+    GROUP BY o.Batch_ID, o.Alloy_id, a.Alloy_name
+"""
 
 # One row per raw material. Lots and charge lines are summed on their own and
 # joined lot to lot: joining inventory to batch_input on the material name
@@ -8030,10 +8096,36 @@ def _ensure_dashboard_materialized_views(conn: Connection) -> None:
         'CREATE UNIQUE INDEX IF NOT EXISTS idx_mv_raw_material_stock_summary_pk '
         'ON mv_raw_material_stock_summary ("Raw_Material_Name")',
     )
+    for view, select_sql, key_cols in (
+        ("mv_batch_production_summary", _BATCH_PRODUCTION_SUMMARY_SELECT, '"Batch_ID"'),
+        (
+            "mv_batch_production_inputs",
+            _BATCH_PRODUCTION_INPUTS_SELECT,
+            '"Batch_ID", "Raw_Material_Name", "Lot_id", "Charge_time"',
+        ),
+        ("mv_batch_production_outputs", _BATCH_PRODUCTION_OUTPUTS_SELECT, '"Batch_ID", "Alloy_id"'),
+    ):
+        _exec(conn, f"CREATE MATERIALIZED VIEW IF NOT EXISTS {view} AS {select_sql}")
+        _exec(
+            conn,
+            f"CREATE UNIQUE INDEX IF NOT EXISTS idx_{view}_pk ON {view} ({key_cols})",
+        )
+    _exec(
+        conn,
+        'CREATE INDEX IF NOT EXISTS idx_mv_batch_production_summary_date '
+        'ON mv_batch_production_summary ("Production_Date")',
+    )
+
     # Supabase grants anon every new object in public; tables are revoked by
     # the RLS setup, but a materialized view is not a table there.
     if _exec(conn, "SELECT 1 FROM pg_roles WHERE rolname = 'anon'").scalar():
-        _exec(conn, "REVOKE ALL ON mv_raw_material_stock_summary FROM anon")
+        for view in (
+            "mv_raw_material_stock_summary",
+            "mv_batch_production_summary",
+            "mv_batch_production_inputs",
+            "mv_batch_production_outputs",
+        ):
+            _exec(conn, f"REVOKE ALL ON {view} FROM anon")
 
     _exec(
         conn,
@@ -12608,6 +12700,107 @@ def list_raw_material_stock_summary() -> list[dict[str, Any]]:
         _RAW_MATERIAL_STOCK_SUMMARY_SELECT
         + ' ORDER BY "Remaining_kg" DESC, "Raw_Material_Name"'
     )
+
+
+def production_snapshot(
+    start_date: object,
+    end_date: object,
+    *,
+    furnace: Optional[str] = None,
+    shift: Optional[str] = None,
+) -> dict[str, Any]:
+    """Per-batch production snapshot for a date range (Production Snapshot page).
+
+    Reads the mv_batch_production_* views on Postgres (refreshed with the
+    Dashboard, see refresh_dashboard_materialized_views); runs the same SQL
+    live on SQLite. Estimated output uses the rule Production Data Analysis
+    uses: each charge line's weight × its material's newest Recovery %.
+
+    Returns {"batches": [...], "inputs": {Batch_ID: [...]}, "outputs": {Batch_ID: [...]}},
+    batches sorted by production date, shift, melt no, then furnace.
+    """
+    def _src(view: str, select_sql: str) -> str:
+        return view if IS_POSTGRES else f"({select_sql}) {view}"
+
+    summary = _src("mv_batch_production_summary", _BATCH_PRODUCTION_SUMMARY_SELECT)
+    where = ['s."Production_Date" BETWEEN ? AND ?']
+    params: list[Any] = [
+        _coerce_production_date(start_date).isoformat(),
+        _coerce_production_date(end_date).isoformat(),
+    ]
+    if furnace:
+        where.append('s."Furnace" = ?')
+        params.append(str(furnace))
+    if shift:
+        where.append('s."Shift" = ?')
+        params.append(str(shift))
+    where_sql = " AND ".join(where)
+
+    batches = fetch_all(f"SELECT s.* FROM {summary} s WHERE {where_sql}", params)
+    inputs = fetch_all(
+        f"""
+        SELECT i.* FROM {_src("mv_batch_production_inputs", _BATCH_PRODUCTION_INPUTS_SELECT)} i
+        JOIN {summary} s ON s."Batch_ID" = i."Batch_ID"
+        WHERE {where_sql}
+        ORDER BY i."Batch_ID", i."Charge_time"
+        """,
+        params,
+    )
+    outputs = fetch_all(
+        f"""
+        SELECT o.* FROM {_src("mv_batch_production_outputs", _BATCH_PRODUCTION_OUTPUTS_SELECT)} o
+        JOIN {summary} s ON s."Batch_ID" = o."Batch_ID"
+        WHERE {where_sql}
+        ORDER BY o."Batch_ID", o."Weight" DESC
+        """,
+        params,
+    )
+
+    recovery_map = _production_analysis_recovery_map()
+    inputs_by_batch: dict[str, list[dict[str, Any]]] = {}
+    estimated: dict[str, float] = {}
+    for row in inputs:
+        bid = str(row["Batch_ID"])
+        info = recovery_map.get(str(row.get("Raw_Material_Name") or "").strip().lower()) or {}
+        recovery = float(info["Recovery"]) if info.get("Recovery") is not None else None
+        weight = float(row.get("Weight") or 0)
+        row["Recovery_pct"] = recovery
+        row["Estimated_Output"] = weight * recovery / 100.0 if recovery is not None else 0.0
+        estimated[bid] = estimated.get(bid, 0.0) + row["Estimated_Output"]
+        inputs_by_batch.setdefault(bid, []).append(row)
+    outputs_by_batch: dict[str, list[dict[str, Any]]] = {}
+    for row in outputs:
+        outputs_by_batch.setdefault(str(row["Batch_ID"]), []).append(row)
+
+    for b in batches:
+        total_in = float(b.get("Total_Input") or 0)
+        total_out = float(b.get("Total_Output") or 0)
+        est = estimated.get(str(b["Batch_ID"]), 0.0)
+        b["Total_Input"] = total_in
+        b["Total_Output"] = total_out
+        b["Estimated_Output"] = est
+        b["Output_vs_Estimate"] = total_out - est if total_out > 0 else None
+        b["Output_vs_Estimate_pct"] = (
+            (total_out - est) / est * 100.0 if total_out > 0 and est > 0 else None
+        )
+        b["Yield_pct"] = total_out / total_in * 100.0 if total_out > 0 and total_in > 0 else None
+        b["Cost_per_kg"] = float(b["Cost_per_kg"]) if b.get("Cost_per_kg") is not None else None
+
+    def _melt(value: object) -> int:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return 0
+
+    batches.sort(
+        key=lambda b: (
+            str(b.get("Production_Date") or ""),
+            str(b.get("Shift") or ""),
+            _melt(b.get("Melt_No")),
+            str(b.get("Furnace") or ""),
+        )
+    )
+    return {"batches": batches, "inputs": inputs_by_batch, "outputs": outputs_by_batch}
 
 
 def list_po_supply_status() -> list[dict[str, Any]]:

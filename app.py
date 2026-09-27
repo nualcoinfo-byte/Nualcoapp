@@ -239,7 +239,7 @@ else:
 st.sidebar.caption("Secondary Aluminum Alloy Manufacturing")
 
 NAV_SECTIONS: list[tuple[str, list[str]]] = [
-    ("Overview", ["Dashboard", "Production Data Analysis"]),
+    ("Overview", ["Dashboard", "Production Data Analysis", "Production Snapshot"]),
     (
         "Purchasing & inventory",
         [
@@ -732,6 +732,11 @@ MIGRATED_PAGES: dict[str, st.Page] = {
         "app_pages/production_data_analysis.py",
         title="Production Data Analysis",
         url_path="production-data-analysis",
+    ),
+    "Production Snapshot": st.Page(
+        "app_pages/production_snapshot.py",
+        title="Production Snapshot",
+        url_path="production-snapshot",
     ),
     "Raw Material Master": st.Page(
         "app_pages/raw_material_master.py",
