@@ -4007,11 +4007,6 @@ def save_table_edits(
                     row[id_col] = _next_employee_id_on_conn(conn)
                     key = _row_key(row, pk_cols)
 
-            if resolved.lower() == "batch_output":
-                lower_row = {str(k).lower(): v for k, v in row.items()}
-                bid = lower_row.get("batch_id")
-                require_completed_batch_for_output(str(bid) if bid not in (None, "") else "")
-
             write_cols = [
                 c for c in cols
                 if c in row and not (is_new and c in identity_cols and row.get(c) in (None, ""))
@@ -5662,15 +5657,19 @@ def production_batch_completion_gaps_for_id(batch_id: str) -> list[str]:
     )
 
 
-def require_completed_batch_for_output(batch_id: str) -> None:
-    batch = get_batch(batch_id)
-    if not batch:
-        raise ValueError(f"Batch {batch_id} not found.")
-    if batch.get("Production_status") != BATCH_STATUS_COMPLETED:
-        raise ValueError(
-            f"Batch output can be entered only after {batch_id} is marked "
-            "Completed on Production Batch & Chemistry."
-        )
+def _recost_batch_outputs_on_conn(conn: Connection, batch_id: str) -> None:
+    """Re-cost a heat's saved output lines after its charge input changed.
+
+    Output can be saved before the input is Completed, so charge lines added or
+    returned later would otherwise leave each line's ₹/kg (and the cost on its
+    remelt lots) at the value worked out when the output was saved.
+    """
+    if not _exec(
+        conn, "SELECT 1 FROM batch_output WHERE Batch_ID = ? LIMIT 1", (batch_id,)
+    ).first():
+        return
+    _apply_batch_output_costs(conn, batch_id)
+    _sync_sidestream_inventory(conn, batch_id)
 
 
 # ---------- Production batches ----------
@@ -6419,6 +6418,7 @@ def update_production_batch_input(
         )
         if extra_inputs:
             _insert_charge_lines(conn, batch_id, extra_inputs)
+            _recost_batch_outputs_on_conn(conn, batch_id)
         _replace_batch_chemistry(conn, batch_id, composition, composition_less_than)
 
 
@@ -6437,6 +6437,7 @@ def add_batch_charge_lines(batch_id: str, inputs: list[dict[str, Any]]) -> None:
         raise ValueError("Enter a charge line with net weight above zero.")
     with get_connection() as conn:
         _insert_charge_lines(conn, batch_id, inputs)
+        _recost_batch_outputs_on_conn(conn, batch_id)
 
 
 def complete_production_batch(batch_id: str) -> None:
@@ -6489,6 +6490,8 @@ def complete_batch_output(batch_id: str) -> None:
             + "; ".join(gaps)
         )
     with get_connection() as conn:
+        # The input is final now; cost the output against it.
+        _recost_batch_outputs_on_conn(conn, batch_id)
         _exec(
             conn,
             "UPDATE Production_batch SET Output_status = ? WHERE Batch_ID = ?",
@@ -11022,6 +11025,7 @@ def save_batch_input_return(
                 """,
                 (qty, lot),
             )
+            _recost_batch_outputs_on_conn(conn, batch_id)
         result = _exec(
             conn,
             """
@@ -12271,8 +12275,11 @@ def save_batch_outputs(
     *,
     allow_completed: bool = False,
 ) -> None:
-    """Replace all output rows for a batch. Weight > 0 lines are kept."""
-    require_completed_batch_for_output(batch_id)
+    """Replace all output rows for a batch. Weight > 0 lines are kept.
+
+    Allowed while the heat's input is still In-Progress; only marking the
+    output Completed (complete_batch_output) needs the input Completed.
+    """
     batch = get_batch(batch_id)
     if not batch:
         raise ValueError(f"Batch {batch_id} not found.")
@@ -12311,7 +12318,6 @@ def save_batch_outputs(
 def add_batch_output_line(batch_id: str, line: dict[str, Any]) -> None:
     """Append one output line to a heat whose output is still In-Progress,
     keeping the lines already saved (Quick Batch Output)."""
-    require_completed_batch_for_output(batch_id)
     batch = get_batch(batch_id)
     if not batch:
         raise ValueError(f"Batch {batch_id} not found.")

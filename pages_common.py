@@ -325,34 +325,25 @@ def _alloy_output_label(alloy: dict) -> str:
 def render_batch_output_editor(batch: dict, *, key_prefix: str) -> None:
     """Enter output lines for one batch: product alloy plus 78/79/80."""
     bid = batch["Batch_ID"]
-    if (batch.get("Production_status") or "") != db.BATCH_STATUS_COMPLETED:
+    # Output can be entered while the input is still In-Progress; only Mark
+    # Output as Completed waits for the input to be Completed.
+    input_completed = (
+        batch.get("Production_status") or ""
+    ) == db.BATCH_STATUS_COMPLETED
+    if not input_completed:
         status = batch.get("Production_status") or "In-Progress"
         gaps = []
         try:
             gaps = db.production_batch_completion_gaps_for_id(bid)
         except Exception:
             gaps = []
-        if gaps:
-            st.warning(
-                f"**{bid}** is still **{status}** — saving the chemistry form does not "
-                "complete the heat. Open **Production Batch & Chemistry**, fix: "
-                + "; ".join(gaps)
-                + ", then click **Mark as Completed**."
-            )
-        else:
-            st.warning(
-                f"**{bid}** is still **{status}**. Required fields are filled — open "
-                "**Production Batch & Chemistry** and click **Mark as Completed**. "
-                "Save changes alone does not complete the heat."
-            )
-        saved = db.get_batch_outputs(bid)
-        if saved:
-            st.caption("Saved outputs (read-only until Completed).")
-            show_dataframe(
-                df_from_rows(_output_rows_for_table(saved)),
-                highlight_avg_piece=True,
-            )
-        return
+        st.info(
+            f"The input for **{bid}** is still **{status}**. You can save output lines "
+            "now; **Mark Output as Completed** unlocks once the input is marked "
+            "Completed on **Production Batch & Chemistry**"
+            + (f" (still needed there: {'; '.join(gaps)})." if gaps else ".")
+            + " Costs on saved lines are updated if charge lines change."
+        )
 
     output_completed = (
         batch.get("Output_status") or db.BATCH_STATUS_IN_PROGRESS
@@ -698,7 +689,10 @@ def render_batch_output_editor(batch: dict, *, key_prefix: str) -> None:
         "Mark Output as Completed",
         type="primary",
         key=f"{key_prefix}_{bid}_complete_output",
-        disabled=locked or output_completed or bool(output_gaps),
+        disabled=locked
+        or output_completed
+        or bool(output_gaps)
+        or not input_completed,
         help=(
             "Locks output entry for this heat and posts it to Finished Goods "
             "Inventory. Requires at least one output line."
@@ -720,10 +714,13 @@ def render_batch_output_editor(batch: dict, *, key_prefix: str) -> None:
                 st.rerun()
             except Exception as exc:
                 st.error(str(exc))
-    if not output_completed and output_gaps:
+    completion_waits = list(output_gaps)
+    if not input_completed:
+        completion_waits.append("the input is marked Completed")
+    if not output_completed and completion_waits:
         st.caption(
             "**Mark Output as Completed** stays disabled until: "
-            + "; ".join(output_gaps)
+            + "; ".join(completion_waits)
         )
 
     saved = db.get_batch_outputs(bid)

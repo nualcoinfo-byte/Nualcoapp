@@ -7,7 +7,8 @@ def _batch_label(b: dict) -> str:
     return (
         f"{b['Batch_ID']}  |  Heat {b.get('Heat_no') or '—'}  |  "
         f"{format_ui_date(b.get('Production_Date'))}, shift {b.get('Shift') or '—'}, "
-        f"melt {b.get('Melt_No') or '—'}  |  {b.get('Alloy_name') or '—'}"
+        f"melt {b.get('Melt_No') or '—'}  |  {b.get('Alloy_name') or '—'}  |  "
+        f"input {b.get('Production_status') or db.BATCH_STATUS_IN_PROGRESS}"
     )
 
 
@@ -21,11 +22,11 @@ def _output_alloy_label(alloy: dict) -> str:
 st.title("Quick Batch Output")
 st.caption(
     "Fast output entry for a heat, made for phones. Choose the furnace, then a batch "
-    "whose input is **Completed** and whose output is not completed yet. Each **Save** "
+    "whose output is not completed yet (its input can still be In-Progress). Each **Save** "
     "adds one weighing to the batch's output. Net weight is **weighment scale − stand**; "
     "enter the stand weight every time (**0** if there was no stand). "
-    "When every weighing is in, **Mark Output as Completed** locks the output and "
-    "posts it to Finished Goods."
+    "When every weighing is in and the input is marked **Completed**, **Mark Output as "
+    "Completed** locks the output and posts it to Finished Goods."
 )
 
 flash = st.session_state.pop("_qbo_flash", None)
@@ -48,14 +49,12 @@ waiting = [
     b
     for b in db.list_batches()
     if str(b.get("Furnace")) == str(furnace)
-    and b.get("Production_status") == db.BATCH_STATUS_COMPLETED
     and b.get("Output_status") != db.BATCH_STATUS_COMPLETED
 ]
 if not waiting:
     st.info(
-        f"No batch on furnace {furnace} is waiting for output. A batch shows here once "
-        "its input is marked **Completed** on **Production Batch & Chemistry**, until "
-        "its output is marked Completed."
+        f"No batch on furnace {furnace} is waiting for output. A batch shows here from "
+        "the moment it is created until its output is marked Completed."
     )
     st.stop()
 
@@ -90,6 +89,7 @@ with st.container(border=True):
         f"**Batch ID:** `{batch_id}`  \n"
         f"**Heat no:** `{batch.get('Heat_no') or '—'}`  \n"
         f"**Alloy:** {product_name or '—'}  \n"
+        f"**Input status:** `{batch.get('Production_status') or db.BATCH_STATUS_IN_PROGRESS}`  \n"
         f"**Output status:** `{batch.get('Output_status') or db.BATCH_STATUS_IN_PROGRESS}`  \n"
         f"Input **{input_w:,.1f} kg** · output so far **{output_w:,.1f} kg**"
     )
@@ -284,7 +284,13 @@ def _confirm_complete_output(batch_id: str, total_kg: float, n_lines: int, remel
         st.rerun()
 
 
-if saved_lines:
+input_completed = batch.get("Production_status") == db.BATCH_STATUS_COMPLETED
+if saved_lines and not input_completed:
+    st.caption(
+        "**Mark Output as Completed** appears once the input for this batch is marked "
+        "**Completed** on **Production Batch & Chemistry**."
+    )
+elif saved_lines:
     saved_total = sum(float(r.get("Weight") or 0) for r in saved_lines)
     saved_remelt_only = not product_saved
     if st.button(

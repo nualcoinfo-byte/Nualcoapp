@@ -449,7 +449,8 @@ st.caption(
     "counter** (e.g. 27-Aug-2026 on furnace 1 → `26-1H001`; September → `26-1K001`). "
     "The counter is unique per furnace and resets to `001` each month. "
     "Mark the heat **Completed** after degassing, samples, K Mold, chemistry, "
-    "and at least one charge line. **Batch Output** can be entered only after that. "
+    "and at least one charge line. **Batch Output** can be entered at any time, but "
+    "the output can be marked Completed only after the heat is Completed. "
     "A Completed heat is locked; only Admin can unlock it to correct history. "
     "Browse existing batches under **Production Batches**."
 )
