@@ -74,8 +74,16 @@ defaults to or displays is IST (UTC+05:30, no daylight saving).
   was still in development then, and their provenance is mixed. IST applies from the release that introduced it onward.
 
 ## Heat numbers and their starting number
-A `Heat_no` is `YY-<furnace><month code><NNN>`, e.g. `26-1K005` (furnace 1, September 2026). The next number for a furnace-month is
-the highest suffix already used plus one, so it restarts at `001` every month. To make a furnace-month continue from a
-higher number (as at go-live, when the count started at 200), add a row to **Data Browser -> Heat number start**
-(`Heat_no_counter_start`: `Heat_prefix` such as `26-1K`, and `Start_no`). It only ever raises the next number, never lowers it,
-and never changes heat numbers already issued. It applies to that prefix only, so the next month is unaffected.
+A `Heat_no` is `YY-<furnace><month code><NNN>`, e.g. `26-1K005` (furnace 1, September 2026). The counter restarts at `001`
+every month.
+- **Up to September 2026:** one counter per furnace. The next number is the highest suffix that furnace has used that month
+  plus one.
+- **From October 2026** (`HEAT_NO_SHARED_COUNTER_FROM` in `database.py`): one counter shared by all furnaces. 1-Oct furnace 1
+  gets `26-1M001`, the next batch on furnace 2 gets `26-2M002`, and so on; the furnace digit stays in the prefix. Batch
+  creation takes a Postgres advisory lock, so two furnaces saving at the same moment cannot take the same number.
+
+To make a month continue from a higher number (as at go-live, when the count started at 200), add a row to
+**Data Browser -> Heat number start** (`Heat_no_counter_start`: `Heat_prefix` and `Start_no`). Per-furnace months use the
+furnace's prefix, e.g. `26-1K`. Shared-counter months take the highest `Start_no` among rows for that month, e.g. `26-M` (or
+any furnace's prefix such as `26-1M`). It only ever raises the next number, never lowers it, never changes heat numbers
+already issued, and does not carry into the next month.

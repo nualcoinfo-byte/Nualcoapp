@@ -5728,31 +5728,82 @@ def _heat_no_prefix_on_conn(
     return f"{yy}-{furnace_part}{_month_code_on_conn(conn, day)}"
 
 
+# From this month on the heat-no counter is shared by all furnaces: each production month
+# counts 001, 002, ... across every furnace (26-1M001, 26-2M002, ...), the furnace still in
+# the prefix. Months before it keep one counter per furnace.
+HEAT_NO_SHARED_COUNTER_FROM = date(2026, 10, 1)
+
+
+def heat_no_counter_is_shared(production_date: object) -> bool:
+    day = _coerce_production_date(production_date)
+    return day.replace(day=1) >= HEAT_NO_SHARED_COUNTER_FROM
+
+
 def _next_heat_no_on_conn(
     conn: Connection, furnace: str, production_date: object
 ) -> str:
-    """Next YY-furnace+month-code+counter for this furnace and production month."""
-    prefix = _heat_no_prefix_on_conn(conn, furnace, production_date)
-    rows = _exec(
-        conn,
-        'SELECT Heat_no AS "Heat_no" FROM Production_batch WHERE Furnace = ?',
-        (str(furnace).strip(),),
-    ).mappings()
+    """Next YY-furnace+month-code+counter for this production month.
+
+    The counter is per furnace before HEAT_NO_SHARED_COUNTER_FROM and shared by all
+    furnaces from then on (see heat_no_counter_is_shared).
+    """
+    day = _coerce_production_date(production_date)
+    prefix = _heat_no_prefix_on_conn(conn, furnace, day)
+    shared = heat_no_counter_is_shared(day)
+    if shared:
+        # Same year and month code on any furnace: YY-<furnace><code><NNN>.
+        month_part = re.compile(
+            rf"^{day.year % 100:02d}-.+{re.escape(_month_code_on_conn(conn, day))}(\d{{3}})$"
+        )
+        rows = _exec(
+            conn,
+            'SELECT Heat_no AS "Heat_no" FROM Production_batch WHERE Heat_no LIKE ?',
+            (f"{day.year % 100:02d}-%",),
+        ).mappings()
+    else:
+        rows = _exec(
+            conn,
+            'SELECT Heat_no AS "Heat_no" FROM Production_batch WHERE Furnace = ?',
+            (str(furnace).strip(),),
+        ).mappings()
     max_n = 0
     for row in rows:
         heat = str(row["Heat_no"] or "")
+        if shared:
+            match = month_part.match(heat)
+            if match:
+                max_n = max(max_n, int(match.group(1)))
+            continue
         if not heat.startswith(prefix):
             continue
         suffix = heat[len(prefix) :]
         if suffix.isdigit() and len(suffix) == 3:
             max_n = max(max_n, int(suffix))
-    # Heat_no_counter_start can move a furnace-month's next number up (e.g. to continue a
-    # count kept elsewhere); it never moves it down, so numbers already issued stay safe.
-    start_no = _exec(
-        conn,
-        'SELECT Start_no AS "Start_no" FROM Heat_no_counter_start WHERE Heat_prefix = ?',
-        (prefix,),
-    ).scalar()
+    # Heat_no_counter_start can move the next number up (e.g. to continue a count kept
+    # elsewhere); it never moves it down, so numbers already issued stay safe. With the
+    # shared counter, a row for any furnace of the month (26-1M) or none (26-M) applies.
+    if shared:
+        month_prefix = re.compile(
+            rf"^{day.year % 100:02d}-.*{re.escape(_month_code_on_conn(conn, day))}$"
+        )
+        start_rows = _exec(
+            conn,
+            'SELECT Heat_prefix AS "Heat_prefix", Start_no AS "Start_no" FROM Heat_no_counter_start',
+        ).mappings()
+        start_no = max(
+            (
+                int(r["Start_no"] or 1)
+                for r in start_rows
+                if month_prefix.match(str(r["Heat_prefix"] or "").strip())
+            ),
+            default=1,
+        )
+    else:
+        start_no = _exec(
+            conn,
+            'SELECT Start_no AS "Start_no" FROM Heat_no_counter_start WHERE Heat_prefix = ?',
+            (prefix,),
+        ).scalar()
     next_n = max(max_n + 1, int(start_no or 1))
     if next_n > 999:
         raise ValueError(f"All heat numbers for {prefix} are used (001–999).")
@@ -6269,6 +6320,11 @@ def create_batch(
     crucible_no = require_available_crucible(furnace)
 
     with get_connection() as conn:
+        if IS_POSTGRES:
+            # One heat number at a time: with the shared counter, two furnaces creating a
+            # batch at the same moment would otherwise both take the same number. Held
+            # until this transaction commits.
+            _exec(conn, "SELECT pg_advisory_xact_lock(hashtext('nualco_heat_no'))")
         batch_id = _require_unique_production_batch_identity(
             conn, furnace, production_date, shift, melt_no
         )
