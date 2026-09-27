@@ -220,15 +220,27 @@ def main() -> None:
         print("3/5 restore into the target")
         listing = subprocess.run([pg_tool("pg_restore"), "-l", str(dump)], capture_output=True, text=True, check=True).stdout
         # The target already has a `public` schema: leave its CREATE/COMMENT entries out.
-        toc.write_text("\n".join(l for l in listing.splitlines()
-                                 if " SCHEMA - public " not in l and " COMMENT - SCHEMA public " not in l) + "\n")
-        # --clean --if-exists: a running app (e.g. the staging service) re-runs its setup against the
-        # emptied schema within seconds, recreating empty tables and functions. Dropping each object inside the
-        # restore's own transaction means those can't make the restore fail with "already exists".
-        run([pg_tool("pg_restore"), "--no-owner", "--no-privileges", f"--use-list={toc}",
-             "--clean", "--if-exists", "--single-transaction",
-             "--exit-on-error", f"--dbname={libpq_env(target_url)['PGDATABASE']}", str(dump)],
-            libpq_env(target_url), "pg_restore")
+        entries = [l for l in listing.splitlines()
+                   if " SCHEMA - public " not in l and " COMMENT - SCHEMA public " not in l]
+        # Policies, triggers and rules are dropped "ON <table>": pg_restore's DROP ... IF EXISTS ... ON t
+        # still fails when table t does not exist yet, which it doesn't in an emptied schema. Restore them
+        # in a second pass, once their tables are back.
+        on_table = (" POLICY ", " TRIGGER ", " RULE ")
+        passes = [
+            ("pg_restore", [l for l in entries if not any(k in l for k in on_table)]),
+            ("pg_restore policies/triggers", [l for l in entries if any(k in l for k in on_table)]),
+        ]
+        for label, lines in passes:
+            if not lines:
+                continue
+            toc.write_text("\n".join(lines) + "\n")
+            # --clean --if-exists: a running app (e.g. the staging service) re-runs its setup against the
+            # emptied schema within seconds, recreating empty tables and functions. Dropping each object inside
+            # the restore's own transaction means those can't make the restore fail with "already exists".
+            run([pg_tool("pg_restore"), "--no-owner", "--no-privileges", f"--use-list={toc}",
+                 "--clean", "--if-exists", "--single-transaction",
+                 "--exit-on-error", f"--dbname={libpq_env(target_url)['PGDATABASE']}", str(dump)],
+                libpq_env(target_url), label)
         print("4/5 restore permissions: harden anon, then run the app's setup (row-level security and grants)")
         eng = engine(target_url)
         with eng.begin() as c:
