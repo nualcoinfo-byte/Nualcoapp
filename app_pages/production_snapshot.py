@@ -36,6 +36,10 @@ _CSS = """
 .ps-table tr.ps-detail table { font-size: 0.76rem; width: auto; }
 .ps-table tr.ps-detail th, .ps-table tr.ps-detail td { padding: 0.2rem 0.5rem; }
 .ps-good { color: #1b7a3d; font-weight: 600; }
+.ps-table label.ps-cust { cursor: pointer; border-bottom: 1px dotted rgba(128,128,128,0.8); }
+.ps-table .ps-cust-full { display: none; }
+.ps-table input.ps-toggle:checked + label.ps-cust .ps-cust-short { display: none; }
+.ps-table input.ps-toggle:checked + label.ps-cust .ps-cust-full { display: inline; }
 .ps-bad { color: #c62828; font-weight: 600; }
 </style>
 """
@@ -48,6 +52,44 @@ def _num(value: object, fmt: str = "{:,.1f}") -> str:
         return fmt.format(float(value))
     except (TypeError, ValueError):
         return "—"
+
+
+CUSTOMER_PREFIX_LEN = 4
+
+
+def _customer_short_names(names: list[str]) -> dict[str, str]:
+    """Shortest prefix (at least CUSTOMER_PREFIX_LEN chars) that tells the customers apart.
+
+    Most customers differ in their first four characters; any that share them
+    get just enough extra characters to be distinguishable on screen.
+    """
+    unique = sorted({n.strip() for n in names if n and n.strip()})
+    short: dict[str, str] = {}
+    for name in unique:
+        n = CUSTOMER_PREFIX_LEN
+        while n < len(name) and any(
+            other != name and other[:n].upper() == name[:n].upper() for other in unique
+        ):
+            n += 1
+        short[name] = name if n >= len(name) else name[:n].rstrip() + "…"
+    return short
+
+
+def _customer_cell(bid: str, name: object, short_names: dict[str, str]) -> str:
+    """Short customer name; hover shows the full name, a tap/click toggles it."""
+    full = str(name or "").strip()
+    if not full:
+        return "<td>—</td>"
+    short = short_names.get(full, full)
+    if short == full:
+        return f"<td>{html.escape(full)}</td>"
+    tid = f"ps-cust-{html.escape(bid)}"
+    return (
+        f"<td><input type='checkbox' class='ps-toggle' id='{tid}'>"
+        f"<label class='ps-cust' for='{tid}' title='{html.escape(full, quote=True)}'>"
+        f"<span class='ps-cust-short'>{html.escape(short)}</span>"
+        f"<span class='ps-cust-full'>{html.escape(full)}</span></label></td>"
+    )
 
 
 def _esc(value: object) -> str:
@@ -228,6 +270,7 @@ header = (
     "<th class='num'>Actual − estimated (kg)</th><th class='num'>Actual vs estimated %</th>"
     "<th class='num'>Actual yield %</th></tr>"
 )
+customer_short = _customer_short_names([str(b.get("Customer_name") or "") for b in batches])
 body = []
 for b in batches:
     bid = str(b["Batch_ID"])
@@ -240,7 +283,7 @@ for b in batches:
         f"<td>{_esc(bid)}</td>"
         f"<td>{_esc(b.get('Heat_no'))}</td>"
         f"<td>{_esc(b.get('Alloy_name'))}</td>"
-        f"<td>{_esc(b.get('Customer_name'))}</td>"
+        f"{_customer_cell(bid, b.get('Customer_name'), customer_short)}"
         f"<td class='num'>{_esc(b.get('Melt_No'))}</td>"
         f"<td>{_esc(b.get('Shift'))}</td>"
         f"<td>{_esc(b.get('Furnace'))}</td>"
@@ -270,6 +313,14 @@ body.append(
 st.html(
     _CSS + "<div class='ps-wrap'><table class='ps-table'>" + header + "".join(body) + "</table></div>"
 )
+
+abbreviated = {full: short for full, short in customer_short.items() if short != full}
+if abbreviated:
+    st.caption(
+        "Customers: "
+        + "  ·  ".join(f"**{short}** {full}" for full, short in sorted(abbreviated.items()))
+        + ". Hover over or tap a customer in the table to see the full name."
+    )
 
 export = pd.DataFrame(
     [
