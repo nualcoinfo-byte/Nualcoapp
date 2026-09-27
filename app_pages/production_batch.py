@@ -356,8 +356,8 @@ def _hydrate_production_batch_form(
         except (TypeError, ValueError):
             continue
         full[str(sym)] = val
+        st.session_state[pk(f"bchem_{sym}")] = val if val > 0 else None
         if str(sym) != "SF":
-            st.session_state[pk(f"bchem_{sym}")] = val if val > 0 else None
             st.session_state[pk(f"bchem_lt_{sym}")] = bool(row.get("Less_than"))
     st.session_state[pk("full_chem")] = full
 
@@ -1829,7 +1829,10 @@ else:
         "Use **Open all elements…** for the full list. "
         "Each field shows this alloy’s min/max from Alloy_Master_spec. "
         "An entered % is highlighted in red if it is at or below min, or at or above max. "
-        "**SF %** is calculated as Fe + 2×Mn + 3×Cr, rounded to two decimal places."
+        "Enter **SF %** from the spectrometer. The value shown under it "
+        "(Fe + 2×Mn + 3×Cr, rounded to two decimal places) is only a guide: the "
+        "spectrometer calculates SF from more decimal places of Fe, Mn and Cr, so "
+        "the two can differ slightly."
     )
     if not alloy_id:
         st.info("Select an alloy above to display spec ranges and validate ladle chemistry.")
@@ -1900,23 +1903,27 @@ else:
             spec = alloy_specs.get(sym)
             with chem_grid.container():
                 if sym == "SF":
-                    sludge = (
-                        1.0 * _entered_chem("Fe")
-                        + 2.0 * _entered_chem("Mn")
-                        + 3.0 * _entered_chem("Cr")
-                    )
-                    sf_val = round(sludge, 2)
-                    st.session_state[_pk("bchem_SF")] = sf_val if sf_val > 0 else None
-                    batch_chem[sym] = st.number_input(
+                    # Entered from the spectrometer; the formula is shown as a guide only.
+                    batch_chem[sym] = empty_percent_input(
                         "SF %",
-                        min_value=0.0,
-                        max_value=600.0,
-                        value=None,
-                        step=0.01,
-                        format="%.2f",
                         key=_pk("bchem_SF"),
-                        disabled=True,
-                        placeholder="Fe + 2×Mn + 3×Cr",
+                        default=full_batch.get(sym),
+                        max_value=600.0,
+                        step=CHEM_PERCENT_STEP,
+                        format=CHEM_PERCENT_FORMAT,
+                        placeholder=el["Element_Name"],
+                        disabled=later_locked,
+                    )
+                    sf_calc = round(
+                        _entered_chem("Fe")
+                        + 2.0 * _entered_chem("Mn")
+                        + 3.0 * _entered_chem("Cr"),
+                        2,
+                    )
+                    st.caption(
+                        f"System calculated: **{sf_calc:.2f}**"
+                        if sf_calc > 0
+                        else "System calculated: enter Fe, Mn, Cr"
                     )
                 else:
                     batch_chem[sym] = empty_percent_input(
