@@ -1826,7 +1826,7 @@ else:
     st.markdown("#### Batch chemistry (ladle / spectrometer)")
     st.caption(
         f"First {db.ENTRY_CHEM_ELEMENT_LIMIT} elements by Serial_no from Element_Master, "
-        "plus **OE**, **OT**, and **SF**. "
+        "plus **SF**, **OE**, and **OT**. "
         "Use **Open all elements…** for the full list. "
         "Each field shows this alloy’s min/max from Alloy_Master_spec. "
         "An entered % is highlighted in red if it is at or below min, or at or above max. "
@@ -1838,7 +1838,20 @@ else:
     if not alloy_id:
         st.info("Select an alloy above to display spec ranges and validate ladle chemistry.")
     alloy_specs = db.get_alloy_specs(alloy_id) if alloy_id else {}
-    entry_elements = _pb_ref["chem_elements"]
+    # SF sits just before OE / OT here (Element_Master's order puts it after them).
+    entry_elements = list(_pb_ref["chem_elements"])
+    sf_el = next((el for el in entry_elements if el["Element_Symbol"] == "SF"), None)
+    if sf_el is not None:
+        entry_elements.remove(sf_el)
+        first_extra = next(
+            (
+                i
+                for i, el in enumerate(entry_elements)
+                if el["Element_Symbol"] in ("OE", "OT")
+            ),
+            len(entry_elements),
+        )
+        entry_elements.insert(first_extra, sf_el)
     full_chem_key = _pk("full_chem")
     sync_batch_keys = {
         el["Element_Symbol"]: _pk(f"bchem_{el['Element_Symbol']}")
@@ -1921,10 +1934,12 @@ else:
                         + 3.0 * _entered_chem("Cr"),
                         2,
                     )
-                    st.caption(
-                        f"System calculated: **{sf_calc:.2f}**"
-                        if sf_calc > 0
-                        else "System calculated: enter Fe, Mn, Cr"
+                    st.markdown(
+                        '<p style="color:#000;font-weight:700;font-size:0.85rem;'
+                        'margin:0 0 0.35rem 0">System calculated: '
+                        + (f"{sf_calc:.2f}" if sf_calc > 0 else "enter Fe, Mn, Cr")
+                        + "</p>",
+                        unsafe_allow_html=True,
                     )
                 else:
                     batch_chem[sym] = empty_percent_input(
