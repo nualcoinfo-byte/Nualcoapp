@@ -12,3 +12,6 @@ venv/
 
 # Local SQLite database
 nualco.db
+
+# Originals saved by scripts/compress_existing_photos.py
+backups/
