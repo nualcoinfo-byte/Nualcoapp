@@ -487,6 +487,31 @@ with r2c3:
         help="Filled from alloy_master for the selected alloy.",
     )
 
+dispatch_type = None
+if db.packing_needs_dispatch_type(customer_name, alloy_id):
+    # LM25 for Brakes India is either sold to them or returned against the
+    # borings they sent for conversion (tracked on Brakes India Conversion).
+    if st.session_state.get("pl_dispatch_type") not in db.DISPATCH_TYPES:
+        st.session_state.pop("pl_dispatch_type", None)
+    dispatch_type = st.radio(
+        "Sale or conversion return? *",
+        db.DISPATCH_TYPES,
+        index=None,
+        horizontal=True,
+        key="pl_dispatch_type",
+        disabled=not editable,
+        format_func=lambda t: (
+            "Sale (Brakes India buys this LM25)"
+            if t == db.DISPATCH_TYPE_SALE
+            else f"Conversion return (LM25 returned at {db.TOLL_CONVERSION_YIELD_PCT:g}% "
+            "for borings they sent)"
+        ),
+        help=(
+            "Conversion returns count against what is owed on the Brakes India "
+            "Conversion page once the test certificate is Issued."
+        ),
+    )
+
 r3c1, r3c2, r3c3 = st.columns(3)
 with r3c1:
     vehicle_no = st.text_input("Vehicle No", key="pl_vehicle")
@@ -906,6 +931,7 @@ def _save_form() -> int | None:
             colour_code=colour_code or None,
             vehicle_no=vehicle_no,
             batch_lines=selected_lines,
+            dispatch_type=dispatch_type,
         )
     except Exception as exc:
         st.error(str(exc))
@@ -1000,6 +1026,10 @@ else:
             )
             st.session_state["pl_alloy_seen"] = aid
             st.session_state["pl_vehicle"] = header.get("Vehicle_no") or ""
+            if header.get("Dispatch_type") in db.DISPATCH_TYPES:
+                st.session_state["pl_dispatch_type"] = header["Dispatch_type"]
+            else:
+                st.session_state.pop("pl_dispatch_type", None)
             loaded_batches = header.get("batches") or []
             st.session_state["pl_batches"] = [
                 str(r["Batch_ID"]) for r in loaded_batches if r.get("Batch_ID")

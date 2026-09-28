@@ -573,6 +573,34 @@ FG_STATUSES = [
 # Assigned is leftover from the old assign step; packing list can still dispatch it.
 FG_DISPATCHABLE_STATUSES = {FG_STATUS_AVAILABLE, FG_STATUS_ASSIGNED}
 INVENTORY_STATUS = ["Awaiting Assay", "Ready For Melt", "Not Ready for Melt"]
+
+# Toll conversion (job work) for Brakes India: their borings come in either as a
+# normal purchase or for conversion into LM25, returned at an agreed yield.
+# Both kinds share the yard and are valued at the purchase rate, so a
+# conversion receipt is an ordinary stock lot that is only tagged as such.
+RECEIPT_TYPE_PURCHASE = "Purchase"
+RECEIPT_TYPE_CONVERSION = "Conversion"
+RECEIPT_TYPES = [RECEIPT_TYPE_PURCHASE, RECEIPT_TYPE_CONVERSION]
+TOLL_CONVERSION_PARTY = "BRAKES INDIA"  # matched in vendor / customer names
+TOLL_CONVERSION_ALLOY_ID = 34  # LM25, the alloy returned
+TOLL_CONVERSION_YIELD_PCT = 70.0  # agreed: return 70% of the weight collected
+DISPATCH_TYPE_SALE = "Sale"
+DISPATCH_TYPE_CONVERSION_RETURN = "Conversion return"
+DISPATCH_TYPES = [DISPATCH_TYPE_SALE, DISPATCH_TYPE_CONVERSION_RETURN]
+
+
+def is_toll_conversion_party(name: object) -> bool:
+    """True for Brakes India (vendor or customer), whatever the exact spelling."""
+    return TOLL_CONVERSION_PARTY in " ".join(str(name or "").upper().split())
+
+
+def packing_needs_dispatch_type(customer_name: object, alloy_id: object) -> bool:
+    """LM25 packed for Brakes India is either a sale or a conversion return."""
+    try:
+        aid = int(alloy_id)
+    except (TypeError, ValueError):
+        return False
+    return aid == TOLL_CONVERSION_ALLOY_ID and is_toll_conversion_party(customer_name)
 ACTIVE_STATUS = ["Active", "Inactive"]
 CRUCIBLE_STATUS = ["Available", "Damaged"]
 PURCHASE_ORDER_STATUS = ["Open", "Closed", "Cancelled"]
@@ -1644,6 +1672,7 @@ def init_db() -> None:
         _ensure_packing_list(conn)
         _ensure_columns(conn, "batch_output", [("Last_updated_by", "TEXT")])
         _ensure_batch_output_correction(conn)
+        _ensure_toll_conversion(conn)
         _ensure_company_profile(conn)
         _ensure_employees(conn)
         _ensure_row_level_security(conn)
@@ -4614,6 +4643,8 @@ def list_inventory_lots(
         SELECT i.Lot_id AS "Lot_id", i.Raw_Material_Name AS "Raw_Material_Name",
                i.Purchase_id AS "Purchase_id",
                p.Vendor_code AS "Vendor_code", v.Vendor_name AS "Vendor_name",
+               CASE WHEN p.Purchase_id IS NULL THEN NULL
+                    ELSE COALESCE(p.Receipt_type, 'Purchase') END AS "Receipt_type",
                i.Remaining_Weight AS "Remaining_Weight",
                i.Received_weight AS "Received_weight",
                i.Cost_per_kg AS "Cost_per_kg",
@@ -4960,13 +4991,31 @@ def save_raw_material_invoice(
     vehicle_photo: Optional[bytes] = None,
     weighment_slip_photo: Optional[bytes] = None,
     invoice_status: str = "Pending with purchase",
+    receipt_type: str = RECEIPT_TYPE_PURCHASE,
 ) -> tuple[int, list[int]]:
-    """Save one vendor invoice and its lots in a single transaction."""
+    """Save one vendor invoice and its lots in a single transaction.
+
+    `receipt_type` Conversion marks Brakes India borings received for toll
+    conversion into LM25: nothing is paid for them, so they skip Accounts
+    and are saved Approved, with the agreed return yield stored on the receipt.
+    """
     if not lines:
         raise ValueError("Add at least one raw material line.")
     if invoice_document and invoice_document_name:
         _validate_invoice_document_name(invoice_document_name)
-    if invoice_status not in ("Pending with purchase", "Pending with accounts"):
+    if receipt_type not in RECEIPT_TYPES:
+        raise ValueError(f"Unknown receipt type: {receipt_type}.")
+    yield_pct: Optional[float] = None
+    if receipt_type == RECEIPT_TYPE_CONVERSION:
+        vendor = fetch_one(
+            'SELECT Vendor_name AS "Vendor_name" FROM Vendor_Master WHERE Vendor_code = ?',
+            (vendor_code,),
+        )
+        if not is_toll_conversion_party((vendor or {}).get("Vendor_name")):
+            raise ValueError("Only Brakes India material can be received for conversion.")
+        invoice_status = "Approved"
+        yield_pct = TOLL_CONVERSION_YIELD_PCT
+    elif invoice_status not in ("Pending with purchase", "Pending with accounts"):
         raise ValueError(
             "New invoices can only be logged as Pending with purchase or "
             "Pending with accounts."
@@ -4980,8 +5029,9 @@ def save_raw_material_invoice(
                 (Vendor_code, Supplier_Invoice, Supplier_invoice_date, Received_date,
                  Invoice_Document, Invoice_Document_name, Invoice_Document_type,
                  Vehicle_photo, Weighment_slip_photo, Invoice_status,
-                 Last_updated_by, Last_updated_datetime)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 Last_updated_by, Last_updated_datetime, Receipt_type,
+                 Conversion_yield_pct)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             RETURNING Purchase_id
             """,
             (
@@ -4997,6 +5047,8 @@ def save_raw_material_invoice(
                 invoice_status,
                 by_val,
                 dt_val,
+                receipt_type,
+                yield_pct,
             ),
         )
         purchase_id = int(result.scalar_one())
@@ -5041,6 +5093,7 @@ def get_raw_material_purchase(purchase_id: int) -> Optional[dict[str, Any]]:
                p.Supplier_invoice_date AS "Supplier_invoice_date",
                p.Received_date AS "Received_date",
                p.Invoice_status AS "Invoice_status",
+               COALESCE(p.Receipt_type, 'Purchase') AS "Receipt_type",
                p.Last_updated_by AS "Last_updated_by",
                p.Last_updated_datetime AS "Last_updated_datetime"
         FROM Raw_Material_Purchase p
@@ -5156,6 +5209,51 @@ def set_raw_material_purchase_invoice_status(purchase_id: int, new_status: str) 
         WHERE Purchase_id = ?
         """,
         (new_status, by_val, dt_val, purchase_id),
+    )
+
+
+def cancel_conversion_receipt(purchase_id: int) -> None:
+    """Cancel a Brakes India conversion receipt logged by mistake.
+
+    Conversion receipts are saved Approved (they skip Accounts), so the normal
+    Pending with purchase -> Cancelled step does not apply. Allowed only while
+    none of its lots has been charged into a heat.
+    """
+    row = fetch_one(
+        """
+        SELECT COALESCE(Receipt_type, 'Purchase') AS "Receipt_type",
+               Invoice_status AS "Invoice_status"
+        FROM Raw_Material_Purchase WHERE Purchase_id = ?
+        """,
+        (purchase_id,),
+    )
+    if not row:
+        raise ValueError(f"Purchase {purchase_id} not found.")
+    if row["Receipt_type"] != RECEIPT_TYPE_CONVERSION:
+        raise ValueError("Only a conversion receipt can be cancelled this way.")
+    if row.get("Invoice_status") == "Cancelled":
+        return
+    used = fetch_one(
+        """
+        SELECT COUNT(*) AS "n" FROM Raw_Material_Inventory
+        WHERE Purchase_id = ?
+          AND ABS(COALESCE(Received_weight, 0) - COALESCE(Remaining_Weight, 0)) > 0.0005
+        """,
+        (purchase_id,),
+    )
+    if int((used or {}).get("n") or 0):
+        raise ValueError(
+            "Some of this receipt has already been charged into a heat, so it can "
+            "no longer be cancelled."
+        )
+    by_val, dt_val = audit_stamp()
+    execute(
+        """
+        UPDATE Raw_Material_Purchase
+        SET Invoice_status = 'Cancelled', Last_updated_by = ?, Last_updated_datetime = ?
+        WHERE Purchase_id = ?
+        """,
+        (by_val, dt_val, purchase_id),
     )
 
 
@@ -7789,6 +7887,19 @@ def _ensure_batch_input_return(conn: Connection) -> None:
     )
 
 
+def _ensure_toll_conversion(conn: Connection) -> None:
+    """Columns that tag Brakes India conversion receipts and returns."""
+    _ensure_columns(
+        conn,
+        "Raw_Material_Purchase",
+        [
+            ("Receipt_type", "TEXT DEFAULT 'Purchase'"),
+            ("Conversion_yield_pct", "DOUBLE PRECISION" if IS_POSTGRES else "REAL"),
+        ],
+    )
+    _ensure_columns(conn, "Packing_list", [("Dispatch_type", "TEXT")])
+
+
 def _ensure_batch_output_correction(conn: Connection) -> None:
     """Audit trail for Batch Output Correction (created on first startup).
 
@@ -8750,6 +8861,7 @@ def _ensure_packing_list_schema() -> None:
             [("Less_than", "INTEGER NOT NULL DEFAULT 0")],
         )
         _ensure_packing_list(conn)
+        _ensure_toll_conversion(conn)
         _ensure_company_profile(conn)
         _ensure_employees(conn)
         _ensure_row_level_security(conn)
@@ -9031,6 +9143,7 @@ def list_packing_lists() -> list[dict[str, Any]]:
                p.Colour_code AS "Colour_code",
                p.Vehicle_no AS "Vehicle_no",
                p.Packing_list_status AS "Packing_list_status",
+               p.Dispatch_type AS "Dispatch_type",
                c.Certificate_no AS "Certificate_no",
                c.Status AS "Certificate_status",
                (
@@ -9061,7 +9174,8 @@ def get_packing_list(packing_list_id: int) -> Optional[dict[str, Any]]:
                a.Alloy_group AS "Alloy_group",
                p.Colour_code AS "Colour_code",
                p.Vehicle_no AS "Vehicle_no",
-               p.Packing_list_status AS "Packing_list_status"
+               p.Packing_list_status AS "Packing_list_status",
+               p.Dispatch_type AS "Dispatch_type"
         FROM Packing_list p
         LEFT JOIN Alloy_Master a ON a.Alloy_id = p.Alloy_id
         WHERE p.Packing_list_id = ?
@@ -9196,8 +9310,13 @@ def save_packing_list(
     vehicle_no: Optional[str],
     batch_lines: Optional[list[dict[str, Any]]] = None,
     batch_ids: Optional[list[str]] = None,
+    dispatch_type: Optional[str] = None,
 ) -> int:
     """Create or update an In-Progress packing list.
+
+    LM25 to Brakes India needs `dispatch_type`: Sale, or Conversion return
+    (metal returned against borings received for toll conversion). Any other
+    list stores no dispatch type.
 
     Saving takes the packed qty out of finished goods straight away (an edit
     first puts the list's previous qty back). Only In-Progress lists can be
@@ -9213,6 +9332,14 @@ def save_packing_list(
     if not po_no:
         raise ValueError("P.O. Number is required.")
     aid = int(alloy_id)
+    if packing_needs_dispatch_type(customer_name, aid):
+        if dispatch_type not in DISPATCH_TYPES:
+            raise ValueError(
+                "Choose whether this LM25 for Brakes India is a Sale or a "
+                "Conversion return."
+            )
+    else:
+        dispatch_type = None
     alloys = list_packing_po_alloys(po_no, cust_code)
     if not any(int(r["Alloy_id"]) == aid for r in alloys if r.get("Alloy_id") not in (None, "")):
         raise ValueError(
@@ -9272,7 +9399,7 @@ def save_packing_list(
                     Invoice_date = ?, Invoice_number = ?, Customer_PO_No = ?,
                     Cust_code = ?, Customer_name = ?, Alloy_id = ?,
                     Colour_code = ?, Vehicle_no = ?, Packing_list_status = ?,
-                    Last_updated_by = ?, Last_updated_datetime = ?
+                    Last_updated_by = ?, Last_updated_datetime = ?, Dispatch_type = ?
                 WHERE Packing_list_id = ?
                 """,
                 (
@@ -9287,6 +9414,7 @@ def save_packing_list(
                     status,
                     by_val,
                     dt_val,
+                    dispatch_type,
                     packing_list_id,
                 ),
             )
@@ -9303,9 +9431,10 @@ def save_packing_list(
                 INSERT INTO Packing_list (
                     Invoice_date, Invoice_number, Customer_PO_No, Cust_code,
                     Customer_name, Alloy_id, Colour_code, Vehicle_no,
-                    Packing_list_status, Last_updated_by, Last_updated_datetime
+                    Packing_list_status, Last_updated_by, Last_updated_datetime,
+                    Dispatch_type
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 RETURNING Packing_list_id
                 """,
                 (
@@ -9320,6 +9449,7 @@ def save_packing_list(
                     status,
                     by_val,
                     dt_val,
+                    dispatch_type,
                 ),
             )
             row = result.first()
@@ -9769,6 +9899,7 @@ def list_packing_lists_for_certificate() -> list[dict[str, Any]]:
                p.Colour_code AS "Colour_code",
                p.Vehicle_no AS "Vehicle_no",
                p.Packing_list_status AS "Packing_list_status",
+               p.Dispatch_type AS "Dispatch_type",
                c.Certificate_no AS "Certificate_no",
                c.Status AS "Certificate_status",
                c.Issued_date AS "Issued_date"
@@ -11016,6 +11147,7 @@ def list_issued_certificates() -> list[dict[str, Any]]:
                a.Alloy_name AS "Alloy_name",
                p.Vehicle_no AS "Vehicle_no",
                p.Packing_list_status AS "Packing_list_status",
+               p.Dispatch_type AS "Dispatch_type",
                c.Certificate_no AS "Certificate_no",
                c.Issued_date AS "Issued_date",
                c.Source_weight AS "Source_weight",
@@ -13568,6 +13700,159 @@ def production_snapshot(
         )
     )
     return {"batches": batches, "inputs": inputs_by_batch, "outputs": outputs_by_batch}
+
+
+def toll_conversion_tracker() -> dict[str, Any]:
+    """Brakes India toll conversion: what came in, what is owed, what is in hand.
+
+    collections: one row per conversion lot (oldest first) with its target
+        return (received kg × the receipt's yield %), the kg returned against
+        it (Issued conversion-return packing lists, allocated oldest
+        collection first) and its status: Returned / Part returned / Open.
+    returns: conversion-return packing lists that are not Cancelled; they
+        count as Returned once their test certificate is Issued, else as
+        In packing.
+    yard: Brakes India lots still in stock, by material and receipt type
+        (purchase and conversion stock share the yard and can be swapped).
+    lm25_fg: LM25 finished goods by status (the metal the return comes from).
+    """
+    collections = fetch_all(
+        """
+        SELECT p.Purchase_id AS "Purchase_id",
+               p.Received_date AS "Received_date",
+               p.Supplier_invoice_date AS "Supplier_invoice_date",
+               p.Supplier_Invoice AS "Supplier_Invoice",
+               COALESCE(p.Conversion_yield_pct, ?) AS "Yield_pct",
+               i.Lot_id AS "Lot_id",
+               i.Raw_Material_Name AS "Raw_Material_Name",
+               i.Invoice_weight AS "Invoice_weight",
+               i.Received_weight AS "Received_weight",
+               i.Remaining_Weight AS "Remaining_Weight",
+               i.Cost_per_kg AS "Cost_per_kg",
+               p.Last_updated_by AS "Logged_by"
+        FROM Raw_Material_Purchase p
+        JOIN Raw_Material_Inventory i ON i.Purchase_id = p.Purchase_id
+        WHERE p.Receipt_type = ?
+          AND COALESCE(p.Invoice_status, '') <> 'Cancelled'
+        ORDER BY p.Received_date, p.Purchase_id, i.Lot_id
+        """,
+        (TOLL_CONVERSION_YIELD_PCT, RECEIPT_TYPE_CONVERSION),
+    )
+    returns = fetch_all(
+        """
+        SELECT pl.Packing_list_id AS "Packing_list_id",
+               pl.Invoice_date AS "Invoice_date",
+               pl.Invoice_number AS "Invoice_number",
+               pl.Customer_PO_No AS "Customer_PO_No",
+               pl.Vehicle_no AS "Vehicle_no",
+               pl.Packing_list_status AS "Packing_list_status",
+               c.Certificate_no AS "Certificate_no",
+               c.Status AS "Certificate_status",
+               c.Issued_date AS "Issued_date",
+               COALESCE(SUM(lb.Weight), 0) AS "Weight",
+               COALESCE(SUM(lb.Pieces), 0) AS "Pieces"
+        FROM Packing_list pl
+        LEFT JOIN Packing_list_batch lb ON lb.Packing_list_id = pl.Packing_list_id
+        LEFT JOIN Packing_list_certificate c ON c.Packing_list_id = pl.Packing_list_id
+        WHERE pl.Dispatch_type = ?
+          AND pl.Packing_list_status <> 'Cancelled'
+        GROUP BY pl.Packing_list_id, pl.Invoice_date, pl.Invoice_number,
+                 pl.Customer_PO_No, pl.Vehicle_no, pl.Packing_list_status,
+                 c.Certificate_no, c.Status, c.Issued_date
+        ORDER BY pl.Packing_list_id
+        """,
+        (DISPATCH_TYPE_CONVERSION_RETURN,),
+    )
+    yard = fetch_all(
+        """
+        SELECT i.Raw_Material_Name AS "Raw_Material_Name",
+               COALESCE(p.Receipt_type, 'Purchase') AS "Receipt_type",
+               COUNT(*) AS "Lots",
+               SUM(i.Remaining_Weight) AS "Remaining_kg"
+        FROM Raw_Material_Inventory i
+        JOIN Raw_Material_Purchase p ON p.Purchase_id = i.Purchase_id
+        JOIN Vendor_Master v ON v.Vendor_code = p.Vendor_code
+        WHERE i.Remaining_Weight > 0
+          AND COALESCE(p.Invoice_status, '') <> 'Cancelled'
+          AND UPPER(v.Vendor_name) LIKE ?
+        GROUP BY i.Raw_Material_Name, COALESCE(p.Receipt_type, 'Purchase')
+        ORDER BY i.Raw_Material_Name, COALESCE(p.Receipt_type, 'Purchase')
+        """,
+        (f"%{TOLL_CONVERSION_PARTY}%",),
+    )
+    lm25_fg = fetch_all(
+        """
+        SELECT fg.Finished_Goods_Status AS "Status",
+               COUNT(*) AS "Bundles",
+               SUM(COALESCE(fg.Output_Weight, 0)) AS "Weight",
+               SUM(COALESCE(fg.Output_pieces, 0)) AS "Pieces"
+        FROM Finished_Goods_Inventory fg
+        JOIN Production_batch b ON b.Batch_ID = fg.Batch_ID
+        WHERE b.Alloy_id = ?
+          AND fg.Finished_Goods_Status IN ('Available', 'Under_Testing', 'Assigned')
+        GROUP BY fg.Finished_Goods_Status
+        """,
+        (TOLL_CONVERSION_ALLOY_ID,),
+    )
+
+    for r in returns:
+        r["Weight"] = float(r.get("Weight") or 0)
+        r["Pieces"] = int(float(r.get("Pieces") or 0))
+        r["Returned"] = (r.get("Certificate_status") or "") == CERT_STATUS_ISSUED
+    returned_kg = sum(r["Weight"] for r in returns if r["Returned"])
+    in_packing_kg = sum(r["Weight"] for r in returns if not r["Returned"])
+
+    pool = returned_kg
+    for c in collections:
+        received = float(c.get("Received_weight") or 0)
+        pct = float(c.get("Yield_pct") or TOLL_CONVERSION_YIELD_PCT)
+        target = received * pct / 100.0
+        take = min(target, max(pool, 0.0))
+        pool -= take
+        c["Received_weight"] = received
+        c["Remaining_Weight"] = float(c.get("Remaining_Weight") or 0)
+        c["Yield_pct"] = pct
+        c["Target_return"] = target
+        c["Returned_kg"] = take
+        c["Balance_kg"] = target - take
+        if target > 0 and take >= target - 0.5:
+            c["Status"] = "Returned"
+        elif take > 0.5:
+            c["Status"] = "Part returned"
+        else:
+            c["Status"] = "Open"
+
+    collected = sum(c["Received_weight"] for c in collections)
+    target_total = sum(c["Target_return"] for c in collections)
+    fg_available = sum(
+        float(r.get("Weight") or 0)
+        for r in lm25_fg
+        if r.get("Status") in (FG_STATUS_AVAILABLE, FG_STATUS_ASSIGNED)
+    )
+    balance = target_total - returned_kg
+    return {
+        "collections": collections,
+        "returns": returns,
+        "yard": [
+            {**r, "Remaining_kg": float(r.get("Remaining_kg") or 0), "Lots": int(r["Lots"])}
+            for r in yard
+        ],
+        "lm25_fg": [
+            {**r, "Weight": float(r.get("Weight") or 0), "Pieces": int(float(r.get("Pieces") or 0))}
+            for r in lm25_fg
+        ],
+        "totals": {
+            "collected_kg": collected,
+            "target_kg": target_total,
+            "returned_kg": returned_kg,
+            "in_packing_kg": in_packing_kg,
+            "balance_kg": balance,
+            "still_to_pack_kg": balance - in_packing_kg,
+            "over_returned_kg": max(-balance, 0.0),
+            "conversion_in_yard_kg": sum(c["Remaining_Weight"] for c in collections),
+            "lm25_fg_available_kg": fg_available,
+        },
+    }
 
 
 def _melter_output_source() -> str:

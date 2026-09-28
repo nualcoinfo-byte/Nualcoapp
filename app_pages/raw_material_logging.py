@@ -50,6 +50,38 @@ vendor_label = st.selectbox(
     options=[""] + list(vendor_opts.keys()),
     key=f"rm_log_vendor_{form_token}",
 )
+vendor_names = {v["Vendor_code"]: v["Vendor_name"] for v in vendors}
+toll_vendor = bool(vendor_label) and db.is_toll_conversion_party(
+    vendor_names.get(vendor_opts.get(vendor_label))
+)
+receipt_type = db.RECEIPT_TYPE_PURCHASE
+if toll_vendor:
+    # Brakes India borings come in either bought or for toll conversion to LM25;
+    # the user must say which (no default, so it is never guessed).
+    picked_type = st.radio(
+        "Purchase or conversion? *",
+        db.RECEIPT_TYPES,
+        index=None,
+        horizontal=True,
+        key=f"rm_log_receipt_type_{form_token}",
+        format_func=lambda t: (
+            "Purchase (we buy this material)"
+            if t == db.RECEIPT_TYPE_PURCHASE
+            else f"Conversion (convert to LM25, return {db.TOLL_CONVERSION_YIELD_PCT:g}%)"
+        ),
+    )
+    receipt_type = picked_type or ""
+    if picked_type == db.RECEIPT_TYPE_CONVERSION:
+        st.info(
+            f"**Conversion receipt.** Brakes India's borings for conversion into "
+            f"**LM25**: {db.TOLL_CONVERSION_YIELD_PCT:g}% of the received weight is to "
+            "be returned as LM25. Enter the **cost per kg at the rate we buy this "
+            "material** (conversion stock is valued like purchased stock, since the "
+            "two share the yard and can be swapped). Nothing is paid for it, so it "
+            "is saved **Approved** without going to Accounts. Track it on "
+            "**Brakes India Conversion**."
+        )
+is_conversion = receipt_type == db.RECEIPT_TYPE_CONVERSION
 inv1, inv2, inv3 = st.columns(3)
 with inv1:
     invoice_date = ui_date_input(
@@ -192,7 +224,7 @@ for idx, _line in enumerate(st.session_state.rm_invoice_lines):
         )
     with n3:
         cost = empty_percent_input(
-            "Cost per kg",
+            "Cost per kg *" if is_conversion else "Cost per kg",
             key=f"rm_line_cost_{line_token}_{idx}",
             max_value=None,
             step=0.01,
@@ -277,9 +309,16 @@ grand_total = total_value + gst_value
 t1, t2, t3, t4, t5 = st.columns(5)
 t1.metric("Materials", sum(1 for ln in collected_lines if ln["name"]))
 t2.metric("Total weight (kg)", f"{total_weight:,.1f}")
-t3.metric("Invoice value", f"{total_value:,.2f}")
-t4.metric("GST value (18%)", f"{gst_value:,.2f}")
-t5.metric("Total value", f"{grand_total:,.2f}")
+if is_conversion:
+    t3.metric("Stock value (at purchase rate)", f"{total_value:,.2f}")
+    t4.metric(
+        f"LM25 to return @{db.TOLL_CONVERSION_YIELD_PCT:g}% (kg)",
+        f"{total_weight * db.TOLL_CONVERSION_YIELD_PCT / 100:,.1f}",
+    )
+else:
+    t3.metric("Invoice value", f"{total_value:,.2f}")
+    t4.metric("GST value (18%)", f"{gst_value:,.2f}")
+    t5.metric("Total value", f"{grand_total:,.2f}")
 
 add_col, rem_col, _ = st.columns([1, 1, 4])
 if add_col.button("Add raw material", key="rm_log_add_line"):
@@ -295,9 +334,18 @@ if rem_col.button("Remove last row", key="rm_log_rem_line") and len(
 
 save_col, accounts_col = st.columns([1, 1])
 with save_col:
-    submitted = st.button("Save invoice lots", type="primary", key="rm_log_save")
+    submitted = st.button(
+        "Save conversion receipt" if is_conversion else "Save invoice lots",
+        type="primary",
+        key="rm_log_save",
+    )
 with accounts_col:
-    submit_to_accounts = st.button("Submit to Accounts", key="rm_log_submit_accounts")
+    # Conversion receipts are not paid for, so they never go to Accounts.
+    submit_to_accounts = (
+        False
+        if is_conversion
+        else st.button("Submit to Accounts", key="rm_log_submit_accounts")
+    )
 
 if submitted or submit_to_accounts:
     target_status = (
@@ -325,10 +373,16 @@ if submitted or submit_to_accounts:
             and ln["weight"] < ln["weighment_slip_weight"] - 1e-9
         ):
             out_of_range.append(ln)
+    missing_cost = [ln for ln in complete if is_conversion and ln["cost"] <= 0]
     if not vendors:
         st.error("Create a vendor first.")
     elif not vendor_code:
         st.error("Select a vendor name.")
+    elif toll_vendor and not receipt_type:
+        st.error(
+            "Brakes India material: choose whether this is a **Purchase** or for "
+            "**Conversion**."
+        )
     elif not invoice_no:
         st.error("Vendor invoice is required.")
     elif incomplete:
@@ -343,6 +397,12 @@ if submitted or submit_to_accounts:
             "Received weight must be at or below the invoice weight, and at or above the "
             "weighment slip weight when it is lower than the invoice weight. "
             f"Check: {', '.join(ln['name'] for ln in out_of_range)}."
+        )
+    elif missing_cost:
+        st.error(
+            "Enter the cost per kg (the rate we buy this material at) for: "
+            + ", ".join(ln["name"] for ln in missing_cost)
+            + "."
         )
     else:
         try:
@@ -386,14 +446,24 @@ if submitted or submit_to_accounts:
                 vehicle_photo=vehicle_photo_bytes,
                 weighment_slip_photo=weighment_slip_photo_bytes,
                 invoice_status=target_status,
+                receipt_type=receipt_type,
             )
             names = ", ".join(ln["name"] for ln in complete)
-            st.session_state["rm_log_flash"] = (
-                f"Saved invoice **{invoice_no}** (purchase #{purchase_id}) "
-                f"with {len(lot_ids)} lot(s) ({names}). "
-                f"Lot IDs: {', '.join(str(i) for i in lot_ids)}. "
-                f"Invoice status: **{target_status}**."
-            )
+            if is_conversion:
+                due = sum(ln["weight"] for ln in complete) * db.TOLL_CONVERSION_YIELD_PCT / 100
+                st.session_state["rm_log_flash"] = (
+                    f"Saved conversion receipt **{invoice_no}** (#{purchase_id}) with "
+                    f"{len(lot_ids)} lot(s) ({names}). Lot IDs: "
+                    f"{', '.join(str(i) for i in lot_ids)}. **{due:,.1f} kg of LM25** "
+                    "is now due back to Brakes India."
+                )
+            else:
+                st.session_state["rm_log_flash"] = (
+                    f"Saved invoice **{invoice_no}** (purchase #{purchase_id}) "
+                    f"with {len(lot_ids)} lot(s) ({names}). "
+                    f"Lot IDs: {', '.join(str(i) for i in lot_ids)}. "
+                    f"Invoice status: **{target_status}**."
+                )
             st.session_state.rm_invoice_lines = [
                 {"name": "", "cost": 0.0, "weight": 0.0}
             ]
@@ -415,12 +485,24 @@ if last_purchase_id:
         st.session_state.pop("rm_log_last_purchase_id", None)
     else:
         st.markdown("---")
+        conversion_receipt = last_purchase.get("Receipt_type") == db.RECEIPT_TYPE_CONVERSION
         st.markdown(
-            f"**Last saved invoice:** #{last_purchase['Purchase_id']} "
+            f"**Last saved {'conversion receipt' if conversion_receipt else 'invoice'}:** "
+            f"#{last_purchase['Purchase_id']} "
             f"({last_purchase['Supplier_Invoice']}) — "
             f"status: **{last_purchase['Invoice_status']}**"
         )
-        if last_purchase["Invoice_status"] == "Pending with purchase":
+        if conversion_receipt and last_purchase["Invoice_status"] == "Approved":
+            if st.button("Cancel conversion receipt", key="rm_log_cancel_conversion"):
+                try:
+                    db.cancel_conversion_receipt(int(last_purchase["Purchase_id"]))
+                    st.success(
+                        f"Conversion receipt #{last_purchase['Purchase_id']} cancelled."
+                    )
+                    st.rerun()
+                except Exception as exc:
+                    st.error(f"Could not cancel: {exc}")
+        elif last_purchase["Invoice_status"] == "Pending with purchase":
             if st.button("Cancel Invoice", key="rm_log_cancel_invoice"):
                 try:
                     db.set_raw_material_purchase_invoice_status(

@@ -250,6 +250,7 @@ NAV_SECTIONS: list[tuple[str, list[str]]] = [
             "Purchase Invoice Review",
             "Accounts Invoice Review",
             "Raw Material Inventory",
+            "Brakes India Conversion",
             "Purchase Orders",
             "All Purchase Orders",
             "Finished Goods Inventory",
@@ -676,6 +677,11 @@ MIGRATED_PAGES: dict[str, st.Page] = {
         "app_pages/raw_material_inventory.py",
         title="Raw Material Inventory",
         url_path="raw-material-inventory",
+    ),
+    "Brakes India Conversion": st.Page(
+        "app_pages/brakes_india_conversion.py",
+        title="Brakes India Conversion",
+        url_path="brakes-india-conversion",
     ),
     "Furnace Oil Purchase": st.Page(
         "app_pages/furnace_oil_purchase.py",
