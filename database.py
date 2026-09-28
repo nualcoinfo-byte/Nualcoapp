@@ -6623,10 +6623,12 @@ def list_finished_goods(
                fg.Output_Weight AS "Output_Weight", fg.Output_pieces AS "Output_pieces",
                fg.Finished_Goods_Status AS "Finished_Goods_Status",
                a.Alloy_id AS "Alloy_id", a.Alloy_name AS "Alloy_name",
+               c.Customer_name AS "Customer_name",
                a.Alloy_group AS "Alloy_group"
         FROM Finished_Goods_Inventory fg
         LEFT JOIN Production_batch b ON b.Batch_ID = fg.Batch_ID
         LEFT JOIN Alloy_Master a ON a.Alloy_id = b.Alloy_id
+        LEFT JOIN Customer_Master c ON c.Cust_code = a.Cust_code
         WHERE 1=1
     """
     params: list[Any] = []
@@ -12721,11 +12723,13 @@ def list_batches(production_date: object = None) -> list[dict[str, Any]]:
                b.Production_status AS "Production_status",
                b.Output_status AS "Output_status",
                b.Workflow_stage AS "Workflow_stage", a.Alloy_name AS "Alloy_name",
+               c.Customer_name AS "Customer_name",
                b.Production_supervisor AS "Production_supervisor",
                b.Top_Sample AS "Top_Sample", b.Middle_Sample AS "Middle_Sample",
                b.Bottom_Sample AS "Bottom_Sample", b.Vacum_Sample AS "Vacum_Sample"
         FROM Production_batch b
         LEFT JOIN Alloy_Master a ON a.Alloy_id = b.Alloy_id
+        LEFT JOIN Customer_Master c ON c.Cust_code = a.Cust_code
         {where}
         ORDER BY b.Production_Date DESC, b.Batch_ID DESC
         """,
