@@ -378,7 +378,8 @@ def _alloy_output_label(alloy: dict) -> str:
     name = alloy.get("Alloy_name") or f"Alloy {aid}"
     if db.is_sidestream_alloy(aid):
         return f"{aid} — {name} (non-spec)"
-    return f"{aid} — {name}"
+    customer = alloy.get("Customer_name")
+    return f"{aid} — {name} — {customer}" if customer else f"{aid} — {name}"
 
 
 def render_batch_output_editor(batch: dict, *, key_prefix: str) -> None:

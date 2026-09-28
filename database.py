@@ -11364,9 +11364,11 @@ def list_batch_output_alloys(batch_alloy_id: Optional[int]) -> list[dict[str, An
     placeholders = ", ".join("?" for _ in ids)
     rows = fetch_all(
         f"""
-        SELECT Alloy_id AS "Alloy_id", Alloy_name AS "Alloy_name"
-        FROM Alloy_Master
-        WHERE Alloy_id IN ({placeholders})
+        SELECT a.Alloy_id AS "Alloy_id", a.Alloy_name AS "Alloy_name",
+               c.Customer_name AS "Customer_name"
+        FROM Alloy_Master a
+        LEFT JOIN Customer_Master c ON c.Cust_code = a.Cust_code
+        WHERE a.Alloy_id IN ({placeholders})
         """,
         tuple(ids),
     )

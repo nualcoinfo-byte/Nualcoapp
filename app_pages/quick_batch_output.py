@@ -16,7 +16,8 @@ def _output_alloy_label(alloy: dict) -> str:
     name = alloy.get("Alloy_name") or f"Alloy {alloy['Alloy_id']}"
     if db.is_sidestream_alloy(alloy["Alloy_id"]):
         return f"{name} (non-spec)"
-    return name
+    customer = alloy.get("Customer_name")
+    return f"{name} — {customer}" if customer else name
 
 
 st.title("Quick Batch Output")
