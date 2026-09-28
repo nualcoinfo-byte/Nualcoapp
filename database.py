@@ -7905,7 +7905,32 @@ DASHBOARD_MATERIALIZED_VIEWS = (
     "mv_batch_production_summary",
     "mv_batch_production_inputs",
     "mv_batch_production_outputs",
+    "mv_melter_output",
 )
+
+# Melter Output report (melters are paid on output): one row per melting team,
+# production date, shift, furnace, output alloy and heat output status.
+# Grouped on the output line's alloy (so Broken Ingot / Furnace Empty / Not Ok
+# Ingot are rows of their own) and on Alloy_id, so two alloys sharing a name
+# never merge. A blank melting team shows as "Not set" rather than vanishing.
+_MELTER_OUTPUT_SELECT = """
+    SELECT COALESCE(NULLIF(TRIM(b.Melting_team), ''), 'Not set') AS "Melting_team",
+           b.Production_Date AS "Production_Date",
+           b.Shift AS "Shift",
+           b.Furnace AS "Furnace",
+           o.Alloy_id AS "Alloy_id",
+           a.Alloy_name AS "Alloy_name",
+           b.Output_status AS "Output_status",
+           COUNT(DISTINCT b.Batch_ID) AS "Heats",
+           SUM(o.Weight) AS "Output_kg",
+           SUM(COALESCE(o.Pieces, 0)) AS "Pieces"
+    FROM batch_output o
+    JOIN Production_batch b ON b.Batch_ID = o.Batch_ID
+    LEFT JOIN Alloy_Master a ON a.Alloy_id = o.Alloy_id
+    GROUP BY COALESCE(NULLIF(TRIM(b.Melting_team), ''), 'Not set'),
+             b.Production_Date, b.Shift, b.Furnace, o.Alloy_id, a.Alloy_name,
+             b.Output_status
+"""
 
 # Production Snapshot: one row per batch, plus its charge lines and its output
 # by alloy for the drill-downs. Input and output are summed on their own before
@@ -8258,6 +8283,22 @@ def _ensure_dashboard_materialized_views(conn: Connection) -> None:
         'ON mv_batch_production_summary ("Production_Date")',
     )
 
+    _exec(
+        conn,
+        "CREATE MATERIALIZED VIEW IF NOT EXISTS mv_melter_output AS "
+        + _MELTER_OUTPUT_SELECT,
+    )
+    _exec(
+        conn,
+        'CREATE UNIQUE INDEX IF NOT EXISTS idx_mv_melter_output_pk ON mv_melter_output '
+        '("Melting_team", "Production_Date", "Shift", "Furnace", "Alloy_id", "Output_status")',
+    )
+    _exec(
+        conn,
+        'CREATE INDEX IF NOT EXISTS idx_mv_melter_output_date '
+        'ON mv_melter_output ("Production_Date", "Melting_team")',
+    )
+
     # Supabase grants anon every new object in public; tables are revoked by
     # the RLS setup, but a materialized view is not a table there.
     if _exec(conn, "SELECT 1 FROM pg_roles WHERE rolname = 'anon'").scalar():
@@ -8266,6 +8307,7 @@ def _ensure_dashboard_materialized_views(conn: Connection) -> None:
             "mv_batch_production_summary",
             "mv_batch_production_inputs",
             "mv_batch_production_outputs",
+            "mv_melter_output",
         ):
             _exec(conn, f"REVOKE ALL ON {view} FROM anon")
 
@@ -13526,6 +13568,77 @@ def production_snapshot(
         )
     )
     return {"batches": batches, "inputs": inputs_by_batch, "outputs": outputs_by_batch}
+
+
+def _melter_output_source() -> str:
+    """mv_melter_output on Postgres (refreshed with the Dashboard); live SQL on SQLite."""
+    return "mv_melter_output" if IS_POSTGRES else f"({_MELTER_OUTPUT_SELECT})"
+
+
+def melter_output_teams(start_date: object, end_date: object) -> list[str]:
+    """Melting teams that have output in the date range, A-Z."""
+    rows = fetch_all(
+        f"""
+        SELECT DISTINCT m."Melting_team" AS "Melting_team"
+        FROM {_melter_output_source()} m
+        WHERE m."Production_Date" BETWEEN ? AND ?
+        ORDER BY m."Melting_team"
+        """,
+        (
+            _coerce_production_date(start_date).isoformat(),
+            _coerce_production_date(end_date).isoformat(),
+        ),
+    )
+    return [str(r["Melting_team"]) for r in rows]
+
+
+def melter_output_report(
+    start_date: object,
+    end_date: object,
+    *,
+    melting_team: Optional[str] = None,
+    completed_only: bool = False,
+) -> list[dict[str, Any]]:
+    """Output per melting team, production date, shift, furnace and output alloy.
+
+    For paying melters on output (Melter Output page). `completed_only` keeps
+    only heats whose output is marked Completed on Batch Output.
+    """
+    where = ['m."Production_Date" BETWEEN ? AND ?']
+    params: list[Any] = [
+        _coerce_production_date(start_date).isoformat(),
+        _coerce_production_date(end_date).isoformat(),
+    ]
+    if melting_team:
+        where.append('m."Melting_team" = ?')
+        params.append(melting_team)
+    if completed_only:
+        where.append('m."Output_status" = ?')
+        params.append(BATCH_STATUS_COMPLETED)
+    rows = fetch_all(
+        f"""
+        SELECT m."Melting_team" AS "Melting_team",
+               m."Production_Date" AS "Production_Date",
+               m."Shift" AS "Shift",
+               m."Furnace" AS "Furnace",
+               m."Alloy_id" AS "Alloy_id",
+               m."Alloy_name" AS "Alloy_name",
+               m."Output_status" AS "Output_status",
+               m."Heats" AS "Heats",
+               m."Output_kg" AS "Output_kg",
+               m."Pieces" AS "Pieces"
+        FROM {_melter_output_source()} m
+        WHERE {" AND ".join(where)}
+        ORDER BY m."Melting_team", m."Production_Date", m."Shift", m."Furnace",
+                 m."Alloy_name"
+        """,
+        params,
+    )
+    for r in rows:
+        r["Output_kg"] = float(r.get("Output_kg") or 0)
+        r["Heats"] = int(r.get("Heats") or 0)
+        r["Pieces"] = int(float(r.get("Pieces") or 0))
+    return rows
 
 
 def list_po_supply_status() -> list[dict[str, Any]]:

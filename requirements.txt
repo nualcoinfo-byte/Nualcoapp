@@ -8,3 +8,5 @@ psycopg2-binary==2.9.12
 fpdf2==2.8.8
 # Photo compression (pages_common.compress_photo). Also a Streamlit / fpdf2 dependency.
 Pillow==12.3.0
+# Excel downloads (Melter Output page, pandas.ExcelWriter).
+openpyxl==3.1.5
