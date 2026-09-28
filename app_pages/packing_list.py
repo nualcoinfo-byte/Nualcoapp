@@ -1,4 +1,5 @@
 import html
+import re
 import streamlit as st
 import database as db
 from datetime import date
@@ -530,6 +531,28 @@ match_group = f2.checkbox(
     key="pl_match_group",
     help="Include heats whose alloy_group matches the packing-list alloy.",
 )
+heat_search = st.text_input(
+    "Search by Heat no",
+    key="pl_heat_search",
+    placeholder="e.g. 26-1K005, or several separated by commas",
+    help=(
+        "Shows only heats whose Heat no (or Batch ID) contains what you type. "
+        "Separate several with commas. Heats you have already ticked always stay "
+        "in the list."
+    ),
+)
+search_terms = [
+    t.strip().lower() for t in re.split(r"[,;\n]+", heat_search or "") if t.strip()
+]
+
+
+def _matches_search(row: dict) -> bool:
+    if not search_terms:
+        return True
+    heat = str(row.get("Heat_no") or "").lower()
+    bid = str(row.get("Batch_ID") or "").lower()
+    return any(t in heat or t in bid for t in search_terms)
+
 
 include_ids = [
     str(b) for b in (st.session_state.get("pl_batches") or []) if b
@@ -562,7 +585,30 @@ elif not cust_code:
 elif alloy_id in (None, ""):
     st.info("Select the alloy on this purchase order, then pick batch IDs.")
 else:
-    if dispatchable:
+    # A search hides rows, but never a heat that is already ticked: the table
+    # is what builds the list, so a hidden ticked heat would drop off it.
+    shown = [
+        r
+        for r in dispatchable
+        if _matches_search(r) or str(r["Batch_ID"]) in set(include_ids)
+    ]
+    if dispatchable and search_terms:
+        n_match = sum(1 for r in dispatchable if _matches_search(r))
+        st.caption(
+            f"Search **{heat_search.strip()}**: {n_match} of {len(dispatchable)} "
+            "heats match."
+            + (
+                " Heats already ticked are also listed."
+                if len(shown) > n_match
+                else ""
+            )
+        )
+        if not n_match:
+            st.info(
+                "No heat ready to dispatch matches that Heat no. Check the list of "
+                "heats not ready to dispatch below, or clear the search."
+            )
+    if shown:
         st.caption(
             "Tick each heat and enter the **kg** and **pieces** to pack. "
             "On-hand is what is still in finished goods. Saving subtracts the "
@@ -572,7 +618,7 @@ else:
         )
         saved_qty = st.session_state.get("pl_batch_qty") or {}
         pick_rows = []
-        for r in dispatchable:
+        for r in shown:
             bid = str(r["Batch_ID"])
             on_hand_w = float(r.get("On_hand_weight") or 0)
             on_hand_p = int(float(r.get("On_hand_pieces") or 0))
@@ -607,7 +653,10 @@ else:
         editor_key = (
             f"pl_batch_editor_{alloy_id}_"
             f"{int(bool(match_name))}_{int(bool(match_group))}_"
-            f"{int(editing_id or 0)}_qty2"
+            f"{int(editing_id or 0)}_qty2_"
+            # A new search is a new set of rows; ticks and quantities carry
+            # over through pl_batches / pl_batch_qty.
+            f"{'|'.join(search_terms)}"
         )
         prev_edit = st.session_state.get(editor_key)
         if isinstance(prev_edit, pd.DataFrame) and not prev_edit.empty:
@@ -709,7 +758,7 @@ else:
                 "Packed quantity exceeds remaining finished goods: "
                 + "; ".join(over_max)
             )
-    else:
+    elif not dispatchable:
         st.warning(
             "No Available finished-goods batches match this alloy name or group. "
             "Mark the heat **Completed**, save product-alloy output on "
@@ -747,9 +796,10 @@ else:
     else:
         st.caption("Tick one or more rows above and enter packed kg and pieces.")
 
-    if blocked:
+    blocked_shown = [r for r in blocked if _matches_search(r)]
+    if blocked_shown:
         with st.expander(
-            f"Matching heats not ready to dispatch ({len(blocked)})",
+            f"Matching heats not ready to dispatch ({len(blocked_shown)})",
             expanded=True,
         ):
             show_dataframe(
@@ -763,7 +813,7 @@ else:
                             "Status": r.get("Production_status") or "—",
                             "Reason": r.get("Reason") or "",
                         }
-                        for r in blocked
+                        for r in blocked_shown
                     ]
                 )
             )
