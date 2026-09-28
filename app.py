@@ -263,6 +263,7 @@ NAV_SECTIONS: list[tuple[str, list[str]]] = [
             "Batch Output",
             "Quick Batch Output",
             "Production Batches",
+            "Batch Output Correction",
             "Daily Batch Summary",
             "Material Recovery & Yield",
         ],
@@ -682,6 +683,11 @@ MIGRATED_PAGES: dict[str, st.Page] = {
         "app_pages/production_batches.py",
         title="Production Batches",
         url_path="production-batches",
+    ),
+    "Batch Output Correction": st.Page(
+        "app_pages/batch_output_correction.py",
+        title="Batch Output Correction",
+        url_path="batch-output-correction",
     ),
     "Furnace Oil Consumption": st.Page(
         "app_pages/furnace_oil_consumption.py",

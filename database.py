@@ -1642,6 +1642,8 @@ def init_db() -> None:
             [("Less_than", "INTEGER NOT NULL DEFAULT 0")],
         )
         _ensure_packing_list(conn)
+        _ensure_columns(conn, "batch_output", [("Last_updated_by", "TEXT")])
+        _ensure_batch_output_correction(conn)
         _ensure_company_profile(conn)
         _ensure_employees(conn)
         _ensure_row_level_security(conn)
@@ -7678,7 +7680,9 @@ def _ensure_row_level_security(conn: Connection) -> None:
                   AND p_table = ANY (ARRAY[
                     'production_batch','heat_no_counter_start','production_supervisor','batch_input',
                     'batch_input_return',
-                    'batch_output','batch_chemical_composition','furnace_master',
+                    'batch_output','batch_output_correction',
+                    'batch_output_correction_line',
+                    'batch_chemical_composition','furnace_master',
                     'crucible_master','melter_master','trolley_master',
                     'furnace_oil_consumption','furnace_oil_consumption_tank',
                     'furnace_oil_inventory',
@@ -7783,6 +7787,70 @@ def _ensure_batch_input_return(conn: Connection) -> None:
         )
         """,
     )
+
+
+def _ensure_batch_output_correction(conn: Connection) -> None:
+    """Audit trail for Batch Output Correction (created on first startup).
+
+    batch_output_correction: one row per saved correction, with who made it,
+    when (IST), where the error was found, the optional comment and the
+    heat's output totals before and after.
+    batch_output_correction_line: one row per field that changed (old and new
+    value), or per output line added or removed.
+    Rows are only ever inserted; nothing in the app updates or deletes them.
+    """
+    types = _DIALECT_TYPES[IS_POSTGRES]
+    _exec(
+        conn,
+        f"""
+        CREATE TABLE IF NOT EXISTS batch_output_correction (
+            Correction_id {types["autopk"]},
+            Batch_ID TEXT NOT NULL REFERENCES Production_batch(Batch_ID),
+            Heat_no TEXT,
+            Corrected_by TEXT NOT NULL,
+            Corrected_by_employee_id TEXT,
+            Corrected_datetime TEXT NOT NULL,
+            Found_during TEXT,
+            Comments TEXT,
+            Product_weight_before {types["float"]},
+            Product_weight_after {types["float"]},
+            Product_pieces_before INTEGER,
+            Product_pieces_after INTEGER,
+            Total_weight_before {types["float"]},
+            Total_weight_after {types["float"]}
+        )
+        """,
+    )
+    _exec(
+        conn,
+        f"""
+        CREATE TABLE IF NOT EXISTS batch_output_correction_line (
+            Change_id {types["autopk"]},
+            Correction_id INTEGER NOT NULL
+                REFERENCES batch_output_correction(Correction_id),
+            Output_id INTEGER,
+            Change_type TEXT NOT NULL
+                CHECK (Change_type IN ('Changed', 'Added', 'Removed')),
+            Alloy_id INTEGER,
+            Alloy_name TEXT,
+            Field_name TEXT NOT NULL,
+            Old_value TEXT,
+            New_value TEXT
+        )
+        """,
+    )
+    _exec(
+        conn,
+        "CREATE INDEX IF NOT EXISTS idx_batch_output_correction_batch "
+        "ON batch_output_correction (Batch_ID)",
+    )
+    _exec(
+        conn,
+        "CREATE INDEX IF NOT EXISTS idx_batch_output_correction_line_corr "
+        "ON batch_output_correction_line (Correction_id)",
+    )
+    # When a line was last changed, alongside Last_updated_by (who).
+    _ensure_columns(conn, "batch_output", [("Last_updated_datetime", "TEXT")])
 
 
 def _ensure_ocr_extraction_job(conn: Connection) -> None:
@@ -8629,6 +8697,7 @@ def _ensure_packing_list_schema() -> None:
         # Who saved each charge line / output line.
         _ensure_columns(conn, "batch_input", [("Last_updated_by", "TEXT")])
         _ensure_columns(conn, "batch_output", [("Last_updated_by", "TEXT")])
+        _ensure_batch_output_correction(conn)
         _ensure_ocr_extraction_job(conn)
         _ensure_furnace_oil_purchase_tank(conn)
         _ensure_furnace_oil_consumption_tank(conn)
@@ -12528,6 +12597,559 @@ def add_batch_output_line(batch_id: str, line: dict[str, Any]) -> None:
         # re-costed with the new total, and remelt lots re-synced.
         _apply_batch_output_costs(conn, batch_id)
         _sync_sidestream_inventory(conn, batch_id)
+
+
+# ---------- Batch Output Correction (audited edits to Completed output) ----------
+
+# Where the wrong output was noticed; optional on the correction.
+BATCH_OUTPUT_CORRECTION_FOUND_DURING = ["Physical audit", "Packing list", "Other"]
+
+# Line fields a correction can change, in the order they are logged.
+_CORRECTION_FIELDS = (
+    ("Alloy_id", "Output alloy"),
+    ("Weighment_scale_weight", "Weighment scale weight (kg)"),
+    ("Stand_weight", "Stand weight (kg)"),
+    ("Weight", "Net weight (kg)"),
+    ("Pieces", "Pieces"),
+    ("Notes", "Notes"),
+)
+_CORRECTION_KG_FIELDS = {"Weighment_scale_weight", "Stand_weight", "Weight"}
+
+
+def list_correctable_batches() -> list[dict[str, Any]]:
+    """Heats whose output is Completed (locked on Batch Output), newest first."""
+    return [
+        b
+        for b in list_batches()
+        if (b.get("Output_status") or "") == BATCH_STATUS_COMPLETED
+    ]
+
+
+def _correction_value_text(field: str, value: Any, alloy_names: dict[int, str]) -> str:
+    """How a field value is written into the audit log (and shown on screen)."""
+    if value is None or value == "":
+        return ""
+    if field == "Alloy_id":
+        aid = int(value)
+        name = alloy_names.get(aid)
+        return f"{aid} — {name}" if name else str(aid)
+    if field in _CORRECTION_KG_FIELDS:
+        return f"{float(value):.2f}"
+    if field == "Pieces":
+        return str(int(value))
+    return str(value).strip()
+
+
+def _correction_values_equal(field: str, old: Any, new: Any) -> bool:
+    if field in _CORRECTION_KG_FIELDS:
+        if old in (None, "") or new in (None, ""):
+            return old in (None, "") and new in (None, "")
+        return abs(float(old) - float(new)) < 0.005
+    if field == "Notes":
+        return (str(old or "")).strip() == (str(new or "")).strip()
+    if old in (None, "") or new in (None, ""):
+        return old in (None, "") and new in (None, "")
+    return int(old) == int(new)
+
+
+def _output_totals(lines: list[dict[str, Any]], product_alloy_id: Any) -> dict[str, Any]:
+    try:
+        product = int(product_alloy_id) if product_alloy_id not in (None, "") else None
+    except (TypeError, ValueError):
+        product = None
+    product_lines = [ln for ln in lines if product is not None and int(ln["Alloy_id"]) == product]
+    pieces = sum(int(ln.get("Pieces") or 0) for ln in product_lines)
+    return {
+        "product_weight": sum(float(ln.get("Weight") or 0) for ln in product_lines),
+        "product_pieces": pieces,
+        "total_weight": sum(float(ln.get("Weight") or 0) for ln in lines),
+    }
+
+
+def batch_output_packed_qty(batch_id: str) -> dict[str, float]:
+    """Weight / pieces of this heat on packing lists that are not Cancelled.
+
+    That quantity has left finished goods, so a correction may not take the
+    product-alloy output below it.
+    """
+    row = fetch_one(
+        """
+        SELECT COALESCE(SUM(lb.Weight), 0) AS "Weight",
+               COALESCE(SUM(lb.Pieces), 0) AS "Pieces"
+        FROM Packing_list_batch lb
+        JOIN Packing_list p ON p.Packing_list_id = lb.Packing_list_id
+        WHERE lb.Batch_ID = ?
+          AND p.Packing_list_status IN ('In-Progress', 'Approved')
+        """,
+        (batch_id,),
+    ) or {}
+    return {
+        "weight": float(row.get("Weight") or 0),
+        "pieces": int(float(row.get("Pieces") or 0)),
+    }
+
+
+def list_batch_packing_lists(batch_id: str) -> list[dict[str, Any]]:
+    """Packing lists (not Cancelled) that carry this heat."""
+    return fetch_all(
+        """
+        SELECT p.Packing_list_id AS "Packing_list_id",
+               p.Invoice_number AS "Invoice_number",
+               p.Customer_name AS "Customer_name",
+               p.Packing_list_status AS "Packing_list_status",
+               lb.Weight AS "Weight", lb.Pieces AS "Pieces"
+        FROM Packing_list_batch lb
+        JOIN Packing_list p ON p.Packing_list_id = lb.Packing_list_id
+        WHERE lb.Batch_ID = ?
+          AND p.Packing_list_status IN ('In-Progress', 'Approved')
+        ORDER BY p.Packing_list_id
+        """,
+        (batch_id,),
+    )
+
+
+def _clean_correction_lines(
+    batch: dict[str, Any], lines: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Validate the corrected lines (the ones not marked Remove)."""
+    batch_id = batch["Batch_ID"]
+    allowed = allowed_batch_output_alloy_ids(batch.get("Alloy_id"))
+    cleaned: list[dict[str, Any]] = []
+    for pos, line in enumerate(lines, start=1):
+        if line.get("Remove"):
+            continue
+        row = _clean_batch_output_line(batch_id, line, allowed)
+        if row is None:
+            raise ValueError(
+                f"Output line {pos} has no net weight. Enter the weighment scale "
+                "weight, or tick Remove to delete the line."
+            )
+        output_id = line.get("Output_id")
+        row["Output_id"] = int(output_id) if output_id not in (None, "") else None
+        cleaned.append(row)
+    if not cleaned:
+        raise ValueError(
+            "A Completed heat must keep at least one output line. Correct the "
+            "wrong line instead of removing every line."
+        )
+    return cleaned
+
+
+def batch_output_correction_changes(
+    batch: dict[str, Any],
+    existing: list[dict[str, Any]],
+    lines: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Compare the saved output with the corrected lines.
+
+    Returns (cleaned lines to save, field-level changes). Each change is
+    {Output_id, Change_type, Alloy_id, Alloy_name, Field_name, Old_value,
+    New_value}. Raises ValueError when a corrected line is not valid.
+    """
+    cleaned = _clean_correction_lines(batch, lines)
+    alloy_names = {
+        int(a["Alloy_id"]): str(a.get("Alloy_name") or "")
+        for a in list_batch_output_alloys(batch.get("Alloy_id"))
+    }
+    for row in existing:
+        if row.get("Alloy_name"):
+            alloy_names.setdefault(int(row["Alloy_id"]), str(row["Alloy_name"]))
+    by_id = {int(r["Output_id"]): r for r in existing}
+    kept_ids = {r["Output_id"] for r in cleaned if r["Output_id"] is not None}
+    unknown = kept_ids - set(by_id)
+    if unknown:
+        raise ValueError(
+            "The output on this heat changed while you were editing it. "
+            "Reload the page and make the correction again."
+        )
+
+    changes: list[dict[str, Any]] = []
+
+    def _add(change_type: str, output_id: Any, alloy_id: Any, field: str, old: Any, new: Any) -> None:
+        aid = int(alloy_id) if alloy_id not in (None, "") else None
+        changes.append(
+            {
+                "Output_id": output_id,
+                "Change_type": change_type,
+                "Alloy_id": aid,
+                "Alloy_name": alloy_names.get(aid) if aid is not None else None,
+                "Field_name": field,
+                "Old_value": old,
+                "New_value": new,
+            }
+        )
+
+    for row in cleaned:
+        oid = row["Output_id"]
+        if oid is None:
+            for field, label in _CORRECTION_FIELDS:
+                new_text = _correction_value_text(field, row.get(field), alloy_names)
+                if new_text:
+                    _add("Added", None, row["Alloy_id"], label, "", new_text)
+            continue
+        old_row = by_id[oid]
+        for field, label in _CORRECTION_FIELDS:
+            if _correction_values_equal(field, old_row.get(field), row.get(field)):
+                continue
+            _add(
+                "Changed",
+                oid,
+                row["Alloy_id"],
+                label,
+                _correction_value_text(field, old_row.get(field), alloy_names),
+                _correction_value_text(field, row.get(field), alloy_names),
+            )
+    for oid, old_row in by_id.items():
+        if oid in kept_ids:
+            continue
+        for field, label in _CORRECTION_FIELDS:
+            old_text = _correction_value_text(field, old_row.get(field), alloy_names)
+            if old_text:
+                _add("Removed", oid, old_row["Alloy_id"], label, old_text, "")
+    return cleaned, changes
+
+
+def _output_snapshot(rows: list[dict[str, Any]]) -> list[tuple]:
+    """What must not have changed between loading the page and saving."""
+    return sorted(
+        (
+            int(r["Output_id"]),
+            int(r["Alloy_id"]),
+            round(float(r.get("Weight") or 0), 3),
+            round(float(r.get("Weighment_scale_weight") or 0), 3),
+            round(float(r.get("Stand_weight") or 0), 3),
+            int(r.get("Pieces") or 0),
+            (str(r.get("Notes") or "")).strip(),
+        )
+        for r in rows
+    )
+
+
+def _resync_finished_goods_after_correction(conn: Connection, batch_id: str) -> None:
+    """Set the heat's finished-goods bundle to corrected product output − packed.
+
+    Unlike _sync_finished_goods_from_output, a bundle already marked
+    Dispatched is updated too: a correction that raises the output of a fully
+    packed heat puts the extra back on the shelf as Available.
+    """
+    batch = (
+        _exec(
+            conn,
+            """
+            SELECT Alloy_id AS "Alloy_id", Production_status AS "Production_status"
+            FROM Production_batch WHERE Batch_ID = ?
+            """,
+            (batch_id,),
+        )
+        .mappings()
+        .first()
+    )
+    if not batch:
+        return
+    weight, pieces = _product_output_totals_on_conn(conn, batch_id, batch.get("Alloy_id"))
+    held = (
+        _exec(
+            conn,
+            """
+            SELECT COALESCE(SUM(lb.Weight), 0) AS "Weight",
+                   COALESCE(SUM(lb.Pieces), 0) AS "Pieces"
+            FROM Packing_list_batch lb
+            JOIN Packing_list p ON p.Packing_list_id = lb.Packing_list_id
+            WHERE lb.Batch_ID = ?
+              AND p.Packing_list_status IN ('In-Progress', 'Approved')
+            """,
+            (batch_id,),
+        )
+        .mappings()
+        .first()
+    ) or {}
+    held_w = float(held.get("Weight") or 0)
+    held_p = int(float(held.get("Pieces") or 0))
+    if weight + 0.0005 < held_w or (held_p and (pieces or 0) < held_p):
+        raise ValueError(
+            f"{batch_id} already has {held_w:,.2f} kg and {held_p} pieces on packing "
+            f"lists, more than the corrected product output ({weight:,.2f} kg, "
+            f"{pieces or 0} pieces). Reduce this heat on the packing list first."
+        )
+    remaining_w = max(weight - held_w, 0.0)
+    remaining_p = max((pieces or 0) - held_p, 0) if pieces is not None else None
+    bundle = _fg_bundle_on_conn(conn, batch_id)
+    if bundle is None:
+        if remaining_w > 0.0005:
+            status = (
+                FG_STATUS_AVAILABLE
+                if batch.get("Production_status") == BATCH_STATUS_COMPLETED
+                else FG_STATUS_UNDER_TESTING
+            )
+            _exec(
+                conn,
+                """
+                INSERT INTO Finished_Goods_Inventory
+                    (Batch_ID, Output_Weight, Output_pieces, Finished_Goods_Status)
+                VALUES (?, ?, ?, ?)
+                """,
+                (batch_id, remaining_w, remaining_p, status),
+            )
+        return
+    if weight <= 0.0005 and held_w <= 0.0005:
+        # No product alloy left on the heat (all remelt) and none of it packed.
+        _exec(
+            conn,
+            "DELETE FROM Finished_Goods_Inventory WHERE Batch_ID = ?",
+            (batch_id,),
+        )
+        return
+    current = bundle.get("Finished_Goods_Status") or ""
+    if current == FG_STATUS_REJECTED:
+        status = FG_STATUS_REJECTED
+    elif remaining_w <= 0.0005:
+        status = FG_STATUS_DISPATCHED
+    elif current == FG_STATUS_ASSIGNED:
+        status = FG_STATUS_ASSIGNED
+    elif batch.get("Production_status") == BATCH_STATUS_COMPLETED:
+        status = FG_STATUS_AVAILABLE
+    else:
+        status = FG_STATUS_UNDER_TESTING
+    _exec(
+        conn,
+        """
+        UPDATE Finished_Goods_Inventory
+        SET Output_Weight = ?, Output_pieces = ?, Finished_Goods_Status = ?
+        WHERE Bundle_id = ?
+        """,
+        (remaining_w, remaining_p, status, bundle["Bundle_id"]),
+    )
+
+
+def correct_batch_output(
+    batch_id: str,
+    lines: list[dict[str, Any]],
+    *,
+    expected: list[dict[str, Any]],
+    found_during: Optional[str] = None,
+    comments: Optional[str] = None,
+) -> int:
+    """Save a correction to a heat's Completed output, with a full audit trail.
+
+    `lines` are the corrected output lines: each has Output_id (None for a new
+    line), Alloy_id, Weighment_scale_weight, Stand_weight, Pieces, Notes and
+    Remove (True to delete a saved line). `expected` is the output as it was
+    when the page loaded (get_batch_outputs); the save is refused if someone
+    else changed it since. Photos on existing lines are kept as they are.
+
+    Output is re-costed, remelt lots and finished goods re-synced, and one
+    batch_output_correction row plus its batch_output_correction_line rows are
+    written, all in one transaction. Returns the new Correction_id.
+    """
+    batch = get_batch(batch_id)
+    if not batch:
+        raise ValueError(f"Batch {batch_id} not found.")
+    if (batch.get("Output_status") or "") != BATCH_STATUS_COMPLETED:
+        raise ValueError(
+            f"Output for {batch_id} is not Completed yet. Edit it on Batch Output."
+        )
+    found = (found_during or "").strip() or None
+    if found and found not in BATCH_OUTPUT_CORRECTION_FOUND_DURING:
+        raise ValueError(f"Unknown 'Found during' value: {found}.")
+    note = (comments or "").strip() or None
+
+    with get_connection() as conn:
+        existing = [
+            dict(r)
+            for r in _exec(
+                conn,
+                """
+                SELECT o.Output_id AS "Output_id", o.Alloy_id AS "Alloy_id",
+                       a.Alloy_name AS "Alloy_name", o.Weight AS "Weight",
+                       o.Weighment_scale_weight AS "Weighment_scale_weight",
+                       o.Stand_weight AS "Stand_weight", o.Pieces AS "Pieces",
+                       o.Notes AS "Notes"
+                FROM batch_output o
+                LEFT JOIN Alloy_Master a ON a.Alloy_id = o.Alloy_id
+                WHERE o.Batch_ID = ?
+                ORDER BY o.Output_id
+                """,
+                (batch_id,),
+            ).mappings()
+        ]
+        if _output_snapshot(existing) != _output_snapshot(expected):
+            raise ValueError(
+                "Someone else changed the output on this heat while you were "
+                "editing it. Reload the page and make the correction again."
+            )
+        cleaned, changes = batch_output_correction_changes(batch, existing, lines)
+        if not changes:
+            raise ValueError("Nothing was changed, so there is no correction to save.")
+
+        saved_by, stamp = audit_stamp()
+        kept_ids = {r["Output_id"] for r in cleaned if r["Output_id"] is not None}
+        for row in existing:
+            if int(row["Output_id"]) not in kept_ids:
+                _exec(
+                    conn,
+                    "DELETE FROM batch_output WHERE Output_id = ?",
+                    (row["Output_id"],),
+                )
+        by_id = {int(r["Output_id"]): r for r in existing}
+        for row in cleaned:
+            if row["Output_id"] is None:
+                _exec(
+                    conn,
+                    """
+                    INSERT INTO batch_output
+                        (Batch_ID, Alloy_id, Weight, Weighment_scale_weight,
+                         Stand_weight, Pieces, Notes, Output_time,
+                         Last_updated_by, Last_updated_datetime)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        batch_id,
+                        row["Alloy_id"],
+                        row["Weight"],
+                        row["Weighment_scale_weight"],
+                        row["Stand_weight"],
+                        row["Pieces"],
+                        row["Notes"],
+                        stamp,
+                        saved_by,
+                        stamp,
+                    ),
+                )
+                continue
+            old = by_id[row["Output_id"]]
+            if all(
+                _correction_values_equal(f, old.get(f), row.get(f))
+                for f, _label in _CORRECTION_FIELDS
+            ):
+                continue
+            _exec(
+                conn,
+                """
+                UPDATE batch_output
+                SET Alloy_id = ?, Weight = ?, Weighment_scale_weight = ?,
+                    Stand_weight = ?, Pieces = ?, Notes = ?,
+                    Last_updated_by = ?, Last_updated_datetime = ?
+                WHERE Output_id = ?
+                """,
+                (
+                    row["Alloy_id"],
+                    row["Weight"],
+                    row["Weighment_scale_weight"],
+                    row["Stand_weight"],
+                    row["Pieces"],
+                    row["Notes"],
+                    saved_by,
+                    stamp,
+                    row["Output_id"],
+                ),
+            )
+
+        _apply_batch_output_costs(conn, batch_id)
+        _sync_sidestream_inventory(conn, batch_id)
+        _resync_finished_goods_after_correction(conn, batch_id)
+
+        before = _output_totals(existing, batch.get("Alloy_id"))
+        after = _output_totals(cleaned, batch.get("Alloy_id"))
+        correction_id = int(
+            _exec(
+                conn,
+                """
+                INSERT INTO batch_output_correction
+                    (Batch_ID, Heat_no, Corrected_by, Corrected_by_employee_id,
+                     Corrected_datetime, Found_during, Comments,
+                     Product_weight_before, Product_weight_after,
+                     Product_pieces_before, Product_pieces_after,
+                     Total_weight_before, Total_weight_after)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                RETURNING Correction_id
+                """,
+                (
+                    batch_id,
+                    batch.get("Heat_no"),
+                    saved_by,
+                    get_acting_employee_id() or None,
+                    stamp,
+                    found,
+                    note,
+                    before["product_weight"],
+                    after["product_weight"],
+                    before["product_pieces"],
+                    after["product_pieces"],
+                    before["total_weight"],
+                    after["total_weight"],
+                ),
+            ).scalar_one()
+        )
+        for change in changes:
+            _exec(
+                conn,
+                """
+                INSERT INTO batch_output_correction_line
+                    (Correction_id, Output_id, Change_type, Alloy_id, Alloy_name,
+                     Field_name, Old_value, New_value)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    correction_id,
+                    change["Output_id"],
+                    change["Change_type"],
+                    change["Alloy_id"],
+                    change["Alloy_name"],
+                    change["Field_name"],
+                    change["Old_value"],
+                    change["New_value"],
+                ),
+            )
+    return correction_id
+
+
+def list_batch_output_corrections(
+    batch_id: Optional[str] = None, limit: int = 200
+) -> list[dict[str, Any]]:
+    """Saved corrections, newest first; for one heat when batch_id is given."""
+    where = "WHERE c.Batch_ID = ?" if batch_id else ""
+    params: tuple = (batch_id,) if batch_id else ()
+    return fetch_all(
+        f"""
+        SELECT c.Correction_id AS "Correction_id", c.Batch_ID AS "Batch_ID",
+               c.Heat_no AS "Heat_no", c.Corrected_datetime AS "Corrected_datetime",
+               c.Corrected_by AS "Corrected_by",
+               c.Corrected_by_employee_id AS "Corrected_by_employee_id",
+               c.Found_during AS "Found_during", c.Comments AS "Comments",
+               c.Product_weight_before AS "Product_weight_before",
+               c.Product_weight_after AS "Product_weight_after",
+               c.Product_pieces_before AS "Product_pieces_before",
+               c.Product_pieces_after AS "Product_pieces_after",
+               c.Total_weight_before AS "Total_weight_before",
+               c.Total_weight_after AS "Total_weight_after",
+               (SELECT COUNT(*) FROM batch_output_correction_line l
+                WHERE l.Correction_id = c.Correction_id) AS "Changes"
+        FROM batch_output_correction c
+        {where}
+        ORDER BY c.Correction_id DESC
+        LIMIT ?
+        """,
+        params + (limit,),
+    )
+
+
+def list_batch_output_correction_lines(correction_ids: list[int]) -> list[dict[str, Any]]:
+    """Field-level changes for the given corrections."""
+    if not correction_ids:
+        return []
+    marks = ", ".join("?" for _ in correction_ids)
+    return fetch_all(
+        f"""
+        SELECT l.Correction_id AS "Correction_id", l.Output_id AS "Output_id",
+               l.Change_type AS "Change_type", l.Alloy_id AS "Alloy_id",
+               l.Alloy_name AS "Alloy_name", l.Field_name AS "Field_name",
+               l.Old_value AS "Old_value", l.New_value AS "New_value"
+        FROM batch_output_correction_line l
+        WHERE l.Correction_id IN ({marks})
+        ORDER BY l.Correction_id DESC, l.Change_id
+        """,
+        [int(c) for c in correction_ids],
+    )
 
 
 def _sqlite_internal_remelt_purchase_id(conn: Connection) -> int:

@@ -407,11 +407,9 @@ def render_batch_output_editor(batch: dict, *, key_prefix: str) -> None:
     output_completed = (
         batch.get("Output_status") or db.BATCH_STATUS_IN_PROGRESS
     ) == db.BATCH_STATUS_COMPLETED
-    is_admin = db.is_admin_user()
-    unlock_key = f"{key_prefix}_{bid}_unlock_output"
-    locked = output_completed and not (
-        is_admin and st.session_state.get(unlock_key)
-    )
+    # Completed output is corrected only on Batch Output Correction, which
+    # logs who changed what and when (the old unaudited Admin unlock is gone).
+    locked = output_completed
     output_gaps: list[str] = []
     try:
         output_gaps = db.batch_output_completion_gaps_for_id(bid)
@@ -425,20 +423,11 @@ def render_batch_output_editor(batch: dict, *, key_prefix: str) -> None:
             f"{batch.get('Output_status') or db.BATCH_STATUS_IN_PROGRESS}`"
         )
     with unlock_col:
-        if output_completed and is_admin:
-            st.checkbox(
-                "Correct history (unlock completed output)",
-                key=unlock_key,
-                help=(
-                    "Admin only. Check this to edit output after it is Completed. "
-                    "Finished Goods Inventory is re-synced on save; status stays "
-                    "Completed."
-                ),
-            )
-        elif output_completed:
+        if output_completed:
             st.info(
-                "Output for this heat is **Completed** and locked. Ask an Admin "
-                "to unlock it if history needs correction."
+                "Output for this heat is **Completed** and locked. To fix a wrong "
+                "entry, use **Batch Output Correction** (under Production); every "
+                "change there is logged with who made it and when."
             )
 
     product_id = batch.get("Alloy_id")
