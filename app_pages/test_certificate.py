@@ -693,9 +693,15 @@ def _render_certificate_summary(
     header: dict,
     cert: dict,
     lines: list[dict],
+    *,
+    checking: bool = False,
 ) -> None:
     """Plain, printable summary of the certificate as it stands (unsaved draft
-    edits included) for looking things up during the physical inspection."""
+    edits included) for looking things up during the physical inspection.
+
+    `checking` (View checking summary): the printed lines show only Line,
+    Printed heat no, Printed kg and Pieces, without source batches or round-up.
+    """
     st.markdown(
         f"""
         <style>
@@ -791,6 +797,39 @@ def _render_certificate_summary(
     if not line_rows:
         line_rows = "<tr><td colspan='6' style='text-align:center;color:#666'>No printed lines</td></tr>"
 
+    if checking:
+        check_rows = "".join(
+            "<tr>"
+            f"<td>{int(line.get('Line_no') or 0)}</td>"
+            f"<td><b>{esc(db.certificate_display_heat_no(line.get('Display_heat_no')) or '—')}</b></td>"
+            f"<td class='num'>{float(line.get('Weight') or 0):,.2f}</td>"
+            f"<td class='num'>{int(float(line.get('Pieces') or 0)):,}</td>"
+            "</tr>"
+            for line in lines
+        ) or "<tr><td colspan='4' style='text-align:center;color:#666'>No printed lines</td></tr>"
+        st.markdown(
+            f"""
+            <div class="tc-summary-wrap">
+                <h2 class="tc-summary-title">Test Certificate Checking Summary — {esc(str(cert.get('Certificate_no') or ''))}</h2>
+                <table class="tc-summary-table tc-summary-meta"><tbody>{meta_html}</tbody></table>
+                <p class="tc-summary-h"><b>Printed lines</b></p>
+                <table class="tc-summary-table tc-summary-lines">
+                    <thead><tr>
+                        <th>Line</th><th>Printed heat no</th>
+                        <th class="num">Printed kg</th><th class="num">Pieces</th>
+                    </tr></thead>
+                    <tbody>{check_rows}</tbody>
+                    <tfoot><tr>
+                        <td colspan="2">Total ({len(lines)} printed line{'s' if len(lines) != 1 else ''})</td>
+                        <td class="num">{printed_w:,.2f}</td>
+                        <td class="num">{printed_p:,}</td>
+                    </tr></tfoot>
+                </table>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
     pieces_note = (
         "" if printed_p == packed_p
         else f" <span class='tc-summary-bad'>Pieces differ from packed ({packed_p:,}).</span>"
@@ -804,36 +843,37 @@ def _render_certificate_summary(
     else:
         weight_note = esc(weight_note)
 
-    st.markdown(
-        f"""
-        <div class="tc-summary-wrap">
-            <h2 class="tc-summary-title">Test Certificate Summary — {esc(str(cert.get('Certificate_no') or ''))}</h2>
-            <table class="tc-summary-table tc-summary-meta"><tbody>{meta_html}</tbody></table>
-            <p class="tc-summary-h"><b>Printed lines</b> (batches under each line are what it is made of)</p>
-            <table class="tc-summary-table tc-summary-lines">
-                <thead><tr>
-                    <th>Line</th><th>Printed heat no / source batches</th>
-                    <th class="num">Source kg</th><th class="num">Printed kg</th>
-                    <th class="num">Round-up kg</th><th class="num">Pieces</th>
-                </tr></thead>
-                <tbody>{line_rows}</tbody>
-                <tfoot><tr>
-                    <td colspan="2">Total ({len(lines)} printed line{'s' if len(lines) != 1 else ''})</td>
-                    <td class="num">{packed_w:,.2f}</td>
-                    <td class="num">{printed_w:,.2f}</td>
-                    <td class="num">{printed_w - packed_w:+,.2f}</td>
-                    <td class="num">{printed_p:,}</td>
-                </tr></tfoot>
-            </table>
-            <p class="tc-summary-note">{weight_note}{pieces_note}</p>
-            <p class="tc-summary-note">
-                Source kg is the packed weight from the packing list; printed kg is what the
-                certificate shows. Check the physical bundles against the source batches.
-            </p>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
+    if not checking:
+        st.markdown(
+            f"""
+            <div class="tc-summary-wrap">
+                <h2 class="tc-summary-title">Test Certificate Summary — {esc(str(cert.get('Certificate_no') or ''))}</h2>
+                <table class="tc-summary-table tc-summary-meta"><tbody>{meta_html}</tbody></table>
+                <p class="tc-summary-h"><b>Printed lines</b> (batches under each line are what it is made of)</p>
+                <table class="tc-summary-table tc-summary-lines">
+                    <thead><tr>
+                        <th>Line</th><th>Printed heat no / source batches</th>
+                        <th class="num">Source kg</th><th class="num">Printed kg</th>
+                        <th class="num">Round-up kg</th><th class="num">Pieces</th>
+                    </tr></thead>
+                    <tbody>{line_rows}</tbody>
+                    <tfoot><tr>
+                        <td colspan="2">Total ({len(lines)} printed line{'s' if len(lines) != 1 else ''})</td>
+                        <td class="num">{packed_w:,.2f}</td>
+                        <td class="num">{printed_w:,.2f}</td>
+                        <td class="num">{printed_w - packed_w:+,.2f}</td>
+                        <td class="num">{printed_p:,}</td>
+                    </tr></tfoot>
+                </table>
+                <p class="tc-summary-note">{weight_note}{pieces_note}</p>
+                <p class="tc-summary-note">
+                    Source kg is the packed weight from the packing list; printed kg is what the
+                    certificate shows. Check the physical bundles against the source batches.
+                </p>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
 
     c1, c2, _c3 = st.columns([1, 1, 2])
     with c1:
@@ -1180,6 +1220,7 @@ if st.session_state.get("tc_show_summary"):
         header,
         summary_cert,
         list(st.session_state.get("tc_lines") or []),
+        checking=st.session_state.get("tc_show_summary") == "checking",
     )
     st.stop()
 
@@ -1381,7 +1422,7 @@ if draft_editable:
 # The packing team works above the visual inspection and quality below it, so
 # Save draft and Submit sit here with View summary. Both are handled further
 # down, once the visual inspection selection (saved with them) has been read.
-sum_col, save_top_col, submit_col, _sp = st.columns([1, 1, 1, 1])
+sum_col, check_col, save_top_col, submit_col = st.columns([1, 1.2, 1, 1.2])
 if sum_col.button(
     "View summary",
     key="tc_view_summary",
@@ -1389,6 +1430,14 @@ if sum_col.button(
     "made of, for the physical check.",
 ):
     st.session_state["tc_show_summary"] = True
+    st.rerun()
+if check_col.button(
+    "View checking summary",
+    key="tc_view_checking_summary",
+    help="Printable list of the printed lines only: line, printed heat no, "
+    "printed kg and pieces.",
+):
+    st.session_state["tc_show_summary"] = "checking"
     st.rerun()
 save_top_clicked = is_draft and save_top_col.button(
     "Save draft",
