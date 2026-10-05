@@ -1674,6 +1674,7 @@ def init_db() -> None:
         _ensure_batch_output_correction(conn)
         _ensure_toll_conversion(conn)
         _ensure_raw_material_correction(conn)
+        _ensure_packing_list_po(conn)
         _ensure_company_profile(conn)
         _ensure_employees(conn)
         _ensure_row_level_security(conn)
@@ -8455,7 +8456,7 @@ def _ensure_row_level_security(conn: Connection) -> None:
                     'raw_material_correction','raw_material_correction_line',
                     'scrap_inventory','raw_material_returns',
                     'isri_code_table','finished_goods_inventory','packing_list',
-                    'packing_list_batch','packing_list_certificate',
+                    'packing_list_batch','packing_list_po','packing_list_certificate',
                     'packing_list_certificate_line','packing_list_certificate_source',
                     'packing_list_visual_inspection','customer_master','alloy_master',
                     'alloy_master_spec','element_master','company_profile',
@@ -8465,7 +8466,7 @@ def _ensure_row_level_security(conn: Connection) -> None:
                 OR (
                   public.nualco_role_name() = 'accounts'
                   AND p_table = ANY (ARRAY[
-                    'packing_list','packing_list_batch','packing_list_certificate',
+                    'packing_list','packing_list_batch','packing_list_po','packing_list_certificate',
                     'packing_list_certificate_line','packing_list_certificate_source',
                     'packing_list_visual_inspection','purchase_order',
                     'raw_material_returns','scrap_inventory',
@@ -8694,6 +8695,50 @@ def _backfill_production_scrap(conn: Connection) -> None:
         WHERE r.Return_type = 'Scrap'
           AND NOT EXISTS (
               SELECT 1 FROM scrap_inventory s WHERE s.Batch_input_return_id = r.Return_id
+          )
+        """,
+    )
+
+
+def _ensure_packing_list_po(conn: Connection) -> None:
+    """Purchase orders on each packing list, and the kg allocated to each.
+
+    A customer may send several POs for the same alloy and rate and get one
+    dispatch (one invoice). Packing_list.Customer_PO_No stays the first PO;
+    Packing_list_po holds every PO on the list with the packed kg allocated
+    to it, so dispatched / in-packing / balance stay right per PO. Lists saved
+    before this table existed get one row with all their kg.
+    """
+    _exec(
+        conn,
+        f"""
+        CREATE TABLE IF NOT EXISTS Packing_list_po (
+            Packing_list_id INTEGER NOT NULL REFERENCES Packing_list(Packing_list_id),
+            Customer_PO_No TEXT NOT NULL,
+            Alloy_id INTEGER NOT NULL,
+            Seq INTEGER NOT NULL DEFAULT 1,
+            Allocated_weight {_DIALECT_TYPES[IS_POSTGRES]["float"]} NOT NULL DEFAULT 0,
+            PRIMARY KEY (Packing_list_id, Customer_PO_No)
+        )
+        """,
+    )
+    _exec(
+        conn,
+        "CREATE INDEX IF NOT EXISTS idx_packing_list_po_po "
+        "ON Packing_list_po (Customer_PO_No, Alloy_id)",
+    )
+    _exec(
+        conn,
+        """
+        INSERT INTO Packing_list_po
+            (Packing_list_id, Customer_PO_No, Alloy_id, Seq, Allocated_weight)
+        SELECT pl.Packing_list_id, pl.Customer_PO_No, pl.Alloy_id, 1,
+               COALESCE((SELECT SUM(lb.Weight) FROM Packing_list_batch lb
+                         WHERE lb.Packing_list_id = pl.Packing_list_id), 0)
+        FROM Packing_list pl
+        WHERE pl.Customer_PO_No IS NOT NULL AND pl.Alloy_id IS NOT NULL
+          AND NOT EXISTS (
+              SELECT 1 FROM Packing_list_po x WHERE x.Packing_list_id = pl.Packing_list_id
           )
         """,
     )
@@ -9031,6 +9076,15 @@ def _ensure_dashboard_materialized_views(conn: Connection) -> None:
         "WHERE Purchase_Order_Status = 'Open'",
     )
 
+    # CREATE ... IF NOT EXISTS keeps an older definition: rebuild the PO supply
+    # view once if it still counts dispatch by Packing_list.Customer_PO_No
+    # rather than the per-PO allocations in Packing_list_po.
+    old_def = _exec(
+        conn,
+        "SELECT definition FROM pg_matviews WHERE matviewname = 'mv_po_supply_status'",
+    ).scalar()
+    if old_def is not None and "packing_list_po" not in str(old_def).lower():
+        _exec(conn, "DROP MATERIALIZED VIEW mv_po_supply_status")
     _exec(
         conn,
         """
@@ -9054,21 +9108,21 @@ def _ensure_dashboard_materialized_views(conn: Connection) -> None:
         FROM Purchase_Order p
         LEFT JOIN Alloy_Master a ON a.Alloy_id = p.Alloy_Id
         LEFT JOIN (
-            SELECT pl.Customer_PO_No AS po_no,
-                   pl.Alloy_id AS alloy_id,
+            SELECT plp.Customer_PO_No AS po_no,
+                   plp.Alloy_id AS alloy_id,
                    SUM(CASE WHEN pc.Status = 'Issued'
-                            THEN COALESCE(lb.Weight, 0) ELSE 0 END)
+                            THEN COALESCE(plp.Allocated_weight, 0) ELSE 0 END)
                        AS Dispatched_Qty,
                    SUM(CASE WHEN pl.Packing_list_status IN ('In-Progress', 'Approved')
                              AND COALESCE(pc.Status, '') <> 'Issued'
-                            THEN COALESCE(lb.Weight, 0) ELSE 0 END)
+                            THEN COALESCE(plp.Allocated_weight, 0) ELSE 0 END)
                        AS In_packing_Qty
-            FROM Packing_list pl
-            JOIN Packing_list_batch lb
-                ON lb.Packing_list_id = pl.Packing_list_id
+            FROM Packing_list_po plp
+            JOIN Packing_list pl
+                ON pl.Packing_list_id = plp.Packing_list_id
             LEFT JOIN Packing_list_certificate pc
                 ON pc.Packing_list_id = pl.Packing_list_id
-            GROUP BY pl.Customer_PO_No, pl.Alloy_id
+            GROUP BY plp.Customer_PO_No, plp.Alloy_id
         ) d ON d.po_no = p.Customer_PO_No AND d.alloy_id = p.Alloy_Id
         LEFT JOIN (
             SELECT b.Alloy_id AS alloy_id,
@@ -9675,6 +9729,7 @@ def _ensure_packing_list_schema() -> None:
         _ensure_packing_list(conn)
         _ensure_toll_conversion(conn)
         _ensure_raw_material_correction(conn)
+        _ensure_packing_list_po(conn)
         _ensure_company_profile(conn)
         _ensure_employees(conn)
         _ensure_row_level_security(conn)
@@ -9757,6 +9812,182 @@ def list_packing_po_alloys(
         params.append(cust_code)
     sql += " ORDER BY a.Alloy_name"
     return fetch_all(sql, params)
+
+
+def _same_rate(a: object, b: object) -> bool:
+    if a in (None, "") or b in (None, ""):
+        return a in (None, "") and b in (None, "")
+    return abs(float(a) - float(b)) < 0.005
+
+
+def _po_lines_on_conn(
+    conn: Connection, po_numbers: list[str], alloy_id: int
+) -> dict[str, dict[str, Any]]:
+    """PO line (not Cancelled) per PO number for one alloy."""
+    if not po_numbers:
+        return {}
+    marks = ", ".join("?" for _ in po_numbers)
+    rows = _exec(
+        conn,
+        f"""
+        SELECT p.Customer_PO_No AS "Customer_PO_No", p.Cust_code AS "Cust_code",
+               p.Rate AS "Rate", COALESCE(p.Order_Qty, 0) AS "Order_Qty",
+               p.Delivery_Date AS "Delivery_Date", p.Order_Date AS "Order_Date",
+               COALESCE(p.Purchase_Order_Status, 'Open') AS "Status"
+        FROM Purchase_Order p
+        WHERE p.Alloy_Id = ? AND p.Customer_PO_No IN ({marks})
+          AND COALESCE(p.Purchase_Order_Status, 'Open') <> 'Cancelled'
+        """,
+        (int(alloy_id), *po_numbers),
+    ).mappings()
+    return {str(r["Customer_PO_No"]): dict(r) for r in rows}
+
+
+def _po_allocated_elsewhere_on_conn(
+    conn: Connection,
+    po_numbers: list[str],
+    alloy_id: int,
+    packing_list_id: Optional[int],
+) -> dict[str, float]:
+    """kg already on other (not Cancelled) packing lists, per PO."""
+    if not po_numbers:
+        return {}
+    marks = ", ".join("?" for _ in po_numbers)
+    rows = _exec(
+        conn,
+        f"""
+        SELECT plp.Customer_PO_No AS "Customer_PO_No",
+               COALESCE(SUM(plp.Allocated_weight), 0) AS "Weight"
+        FROM Packing_list_po plp
+        JOIN Packing_list pl ON pl.Packing_list_id = plp.Packing_list_id
+        WHERE plp.Alloy_id = ? AND plp.Customer_PO_No IN ({marks})
+          AND pl.Packing_list_status <> 'Cancelled'
+          AND pl.Packing_list_id <> ?
+        GROUP BY plp.Customer_PO_No
+        """,
+        (int(alloy_id), *po_numbers, int(packing_list_id or 0)),
+    ).mappings()
+    return {str(r["Customer_PO_No"]): float(r["Weight"] or 0) for r in rows}
+
+
+def _plan_po_allocation_on_conn(
+    conn: Connection,
+    po_numbers: list[str],
+    alloy_id: int,
+    total_kg: float,
+    packing_list_id: Optional[int],
+) -> list[dict[str, Any]]:
+    """Spread the packed kg over the POs: earliest delivery first, each up to
+    its open balance (order qty minus kg on other packing lists); anything
+    beyond every balance goes on the last PO."""
+    lines = _po_lines_on_conn(conn, po_numbers, alloy_id)
+    elsewhere = _po_allocated_elsewhere_on_conn(conn, po_numbers, alloy_id, packing_list_id)
+    ordered = sorted(
+        (po for po in po_numbers if po in lines),
+        key=lambda po: (
+            str(lines[po].get("Delivery_Date") or "9999"),
+            str(lines[po].get("Order_Date") or "9999"),
+            po,
+        ),
+    )
+    remaining = max(float(total_kg or 0), 0.0)
+    plan: list[dict[str, Any]] = []
+    for po in ordered:
+        line = lines[po]
+        balance = max(float(line["Order_Qty"] or 0) - elsewhere.get(po, 0.0), 0.0)
+        take = min(balance, remaining)
+        remaining -= take
+        plan.append(
+            {
+                "Customer_PO_No": po,
+                "Delivery_Date": line.get("Delivery_Date"),
+                "Order_Qty": float(line["Order_Qty"] or 0),
+                "Rate": line.get("Rate"),
+                "Open_balance": balance,
+                "Allocated_weight": take,
+            }
+        )
+    if plan and remaining > 0.0005:
+        plan[-1]["Allocated_weight"] += remaining
+    return plan
+
+
+def plan_packing_po_allocation(
+    po_numbers: list[str],
+    alloy_id: object,
+    total_kg: float,
+    packing_list_id: Optional[int] = None,
+) -> list[dict[str, Any]]:
+    """Preview how a packing list's kg would be split over its POs."""
+    try:
+        aid = int(alloy_id)
+    except (TypeError, ValueError):
+        return []
+    pos = [str(p).strip() for p in dict.fromkeys(po_numbers or []) if str(p or "").strip()]
+    with get_connection() as conn:
+        return _plan_po_allocation_on_conn(conn, pos, aid, total_kg, packing_list_id)
+
+
+def list_packing_po_companions(
+    po_no: str, cust_code: Optional[str], alloy_id: object
+) -> list[dict[str, Any]]:
+    """Other POs that may share a packing list with `po_no`: same customer,
+    same alloy and same rate, not Cancelled."""
+    try:
+        aid = int(alloy_id)
+    except (TypeError, ValueError):
+        return []
+    po = (po_no or "").strip()
+    if not po or not cust_code:
+        return []
+    with get_connection() as conn:
+        base = _po_lines_on_conn(conn, [po], aid).get(po)
+        if not base:
+            return []
+        rows = [
+            dict(r)
+            for r in _exec(
+                conn,
+                """
+                SELECT p.Customer_PO_No AS "Customer_PO_No", p.Rate AS "Rate",
+                       COALESCE(p.Order_Qty, 0) AS "Order_Qty",
+                       p.Order_Date AS "Order_Date", p.Delivery_Date AS "Delivery_Date",
+                       COALESCE(p.Purchase_Order_Status, 'Open') AS "Status"
+                FROM Purchase_Order p
+                WHERE p.Alloy_Id = ? AND LOWER(p.Cust_code) = LOWER(?)
+                  AND p.Customer_PO_No <> ?
+                  AND COALESCE(p.Purchase_Order_Status, 'Open') <> 'Cancelled'
+                ORDER BY p.Delivery_Date, p.Customer_PO_No
+                """,
+                (aid, cust_code, po),
+            ).mappings()
+        ]
+        rows = [r for r in rows if _same_rate(r.get("Rate"), base.get("Rate"))]
+        elsewhere = _po_allocated_elsewhere_on_conn(
+            conn, [r["Customer_PO_No"] for r in rows], aid, None
+        )
+    for r in rows:
+        r["Open_balance"] = float(r["Order_Qty"] or 0) - elsewhere.get(r["Customer_PO_No"], 0.0)
+    return rows
+
+
+def packing_list_po_numbers(packing_list_ids: list[int]) -> dict[int, list[str]]:
+    """{packing list id: its PO numbers, first PO first}."""
+    ids = [int(i) for i in packing_list_ids if i not in (None, "")]
+    if not ids:
+        return {}
+    marks = ", ".join("?" for _ in ids)
+    out: dict[int, list[str]] = {}
+    for r in fetch_all(
+        f"""
+        SELECT Packing_list_id AS "Packing_list_id", Customer_PO_No AS "Customer_PO_No"
+        FROM Packing_list_po WHERE Packing_list_id IN ({marks})
+        ORDER BY Packing_list_id, Seq, Customer_PO_No
+        """,
+        ids,
+    ):
+        out.setdefault(int(r["Packing_list_id"]), []).append(str(r["Customer_PO_No"]))
+    return out
 
 
 def _alloy_matches_target(
@@ -9997,6 +10228,18 @@ def get_packing_list(packing_list_id: int) -> Optional[dict[str, Any]]:
     )
     if not header:
         return None
+    header["po_allocations"] = fetch_all(
+        """
+        SELECT Customer_PO_No AS "Customer_PO_No", Allocated_weight AS "Allocated_weight"
+        FROM Packing_list_po WHERE Packing_list_id = ?
+        ORDER BY Seq, Customer_PO_No
+        """,
+        (packing_list_id,),
+    )
+    header["PO_numbers"] = [r["Customer_PO_No"] for r in header["po_allocations"]] or [
+        header.get("Customer_PO_No")
+    ]
+    header["PO_numbers_text"] = ", ".join(str(p) for p in header["PO_numbers"] if p)
     header["batches"] = fetch_all(
         """
         SELECT lb.Batch_ID AS "Batch_ID",
@@ -10124,8 +10367,14 @@ def save_packing_list(
     batch_lines: Optional[list[dict[str, Any]]] = None,
     batch_ids: Optional[list[str]] = None,
     dispatch_type: Optional[str] = None,
+    additional_po_numbers: Optional[list[str]] = None,
 ) -> int:
     """Create or update an In-Progress packing list.
+
+    `additional_po_numbers`: more POs dispatched on this one list (one
+    invoice). They must be for the same customer, the same alloy and the same
+    rate as `customer_po_no`. The packed kg is allocated over all of them,
+    earliest delivery first (see _plan_po_allocation_on_conn).
 
     LM25 to Brakes India needs `dispatch_type`: Sale, or Conversion return
     (metal returned against borings received for toll conversion). Any other
@@ -10158,6 +10407,11 @@ def save_packing_list(
         raise ValueError(
             f"Alloy {aid} is not on purchase order {po_no}."
         )
+    all_pos = [po_no] + [
+        p
+        for p in dict.fromkeys(str(x or "").strip() for x in (additional_po_numbers or []))
+        if p and p != po_no
+    ]
     unique_lines = _normalize_packing_lines(batch_lines, batch_ids)
     if not unique_lines:
         raise ValueError("Select at least one batch_id to pack.")
@@ -10180,6 +10434,26 @@ def save_packing_list(
     by_val, dt_val = audit_stamp()
 
     with get_connection() as conn:
+        if len(all_pos) > 1:
+            po_lines = _po_lines_on_conn(conn, all_pos, aid)
+            base = po_lines.get(po_no) or {}
+            for extra in all_pos[1:]:
+                line = po_lines.get(extra)
+                if not line:
+                    raise ValueError(
+                        f"Purchase order {extra} has no open line for this alloy."
+                    )
+                if str(line.get("Cust_code") or "").lower() != str(cust_code or "").lower():
+                    raise ValueError(
+                        f"Purchase order {extra} is for a different customer; one packing "
+                        "list can only carry POs of the same customer."
+                    )
+                if not _same_rate(line.get("Rate"), base.get("Rate")):
+                    raise ValueError(
+                        f"Purchase order {extra} has a different rate ({line.get('Rate')}) "
+                        f"from {po_no} ({base.get('Rate')}); POs on one packing list must "
+                        "have the same rate."
+                    )
         if previous:
             _apply_packing_lines_to_fg(conn, previous_lines, restore=True)
         for line in unique_lines:
@@ -10278,6 +10552,23 @@ def save_packing_list(
                 (pid, line["Batch_ID"], line["Weight"], line["Pieces"]),
             )
         _apply_packing_lines_to_fg(conn, unique_lines, restore=False)
+        total_kg = sum(float(line["Weight"] or 0) for line in unique_lines)
+        plan = _plan_po_allocation_on_conn(conn, all_pos, aid, total_kg, pid)
+        if not plan:  # PO line not found (e.g. legacy data): keep all on the first PO
+            plan = [{"Customer_PO_No": po_no, "Allocated_weight": total_kg}]
+        order = {po: i for i, po in enumerate(all_pos, start=1)}
+        _exec(conn, "DELETE FROM Packing_list_po WHERE Packing_list_id = ?", (pid,))
+        for row in plan:
+            _exec(
+                conn,
+                """
+                INSERT INTO Packing_list_po
+                    (Packing_list_id, Customer_PO_No, Alloy_id, Seq, Allocated_weight)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (pid, row["Customer_PO_No"], aid, order.get(row["Customer_PO_No"], 99),
+                 float(row["Allocated_weight"] or 0)),
+            )
     return pid
 
 
@@ -11008,10 +11299,14 @@ def get_test_certificate_print_payload(
         "document_id": CERT_DOCUMENT_ID,
         "certificate_no": cert.get("Certificate_no") or "—",
         "issued_date": cert.get("Issued_date"),
-        "po_no": header.get("Customer_PO_No") or "—",
+        "po_no": header.get("PO_numbers_text") or header.get("Customer_PO_No") or "—",
         "po_date": get_purchase_order_date(
             header.get("Customer_PO_No"), header.get("Alloy_id")
         ),
+        "po_dates": [
+            get_purchase_order_date(po, header.get("Alloy_id"))
+            for po in (header.get("PO_numbers") or [header.get("Customer_PO_No")])
+        ],
         "customer_name": customer.get("Customer_name")
         or header.get("Customer_name")
         or "—",
@@ -14636,7 +14931,10 @@ def toll_conversion_tracker() -> dict[str, Any]:
         (TOLL_CONVERSION_ALLOY_ID,),
     )
 
+    po_map = packing_list_po_numbers([r["Packing_list_id"] for r in returns])
     for r in returns:
+        if po_map.get(int(r["Packing_list_id"])):
+            r["Customer_PO_No"] = ", ".join(po_map[int(r["Packing_list_id"])])
         r["Weight"] = float(r.get("Weight") or 0)
         r["Pieces"] = int(float(r.get("Pieces") or 0))
         r["Returned"] = (r.get("Certificate_status") or "") == CERT_STATUS_ISSUED
@@ -14809,21 +15107,21 @@ def list_po_supply_status() -> list[dict[str, Any]]:
         FROM Purchase_Order p
         LEFT JOIN Alloy_Master a ON a.Alloy_id = p.Alloy_Id
         LEFT JOIN (
-            SELECT pl.Customer_PO_No AS po_no,
-                   pl.Alloy_id AS alloy_id,
+            SELECT plp.Customer_PO_No AS po_no,
+                   plp.Alloy_id AS alloy_id,
                    SUM(CASE WHEN pc.Status = 'Issued'
-                            THEN COALESCE(lb.Weight, 0) ELSE 0 END)
+                            THEN COALESCE(plp.Allocated_weight, 0) ELSE 0 END)
                        AS Dispatched_Qty,
                    SUM(CASE WHEN pl.Packing_list_status IN ('In-Progress', 'Approved')
                              AND COALESCE(pc.Status, '') <> 'Issued'
-                            THEN COALESCE(lb.Weight, 0) ELSE 0 END)
+                            THEN COALESCE(plp.Allocated_weight, 0) ELSE 0 END)
                        AS In_packing_Qty
-            FROM Packing_list pl
-            JOIN Packing_list_batch lb
-                ON lb.Packing_list_id = pl.Packing_list_id
+            FROM Packing_list_po plp
+            JOIN Packing_list pl
+                ON pl.Packing_list_id = plp.Packing_list_id
             LEFT JOIN Packing_list_certificate pc
                 ON pc.Packing_list_id = pl.Packing_list_id
-            GROUP BY pl.Customer_PO_No, pl.Alloy_id
+            GROUP BY plp.Customer_PO_No, plp.Alloy_id
         ) d ON d.po_no = p.Customer_PO_No AND d.alloy_id = p.Alloy_Id
         LEFT JOIN (
             SELECT b.Alloy_id AS alloy_id,

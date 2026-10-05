@@ -39,6 +39,15 @@ def format_cert_print_date(value: object, empty: str = "—") -> str:
     return day.strftime("%d-%m-%Y")
 
 
+def _po_dates_text(payload: dict) -> str:
+    """P.O date(s) for print: one per P.O when a list carries several."""
+    dates = [format_cert_print_date(d) for d in (payload.get("po_dates") or [])]
+    dates = [d for d in dict.fromkeys(dates) if d and d != "—"]
+    if len(dates) > 1:
+        return ", ".join(dates)
+    return format_cert_print_date(payload.get("po_date"))
+
+
 def _image_data_uri(path: Path) -> str:
     if not path.exists():
         return ""
@@ -226,7 +235,7 @@ def _certificate_pdf_bytes(payload: dict) -> bytes:
             ("Invoice No", payload.get("invoice_no") or "—"),
             ("Invoice Date", format_cert_print_date(payload.get("invoice_date"))),
             ("P.O No", payload.get("po_no") or "—"),
-            ("P.O Date", format_cert_print_date(payload.get("po_date"))),
+            ("P.O Date", _po_dates_text(payload)),
         ]
         for i in range(0, len(meta_pairs), 2):
             left_label, left_value = meta_pairs[i]
@@ -436,7 +445,7 @@ def _render_certificate_print(
         ("Invoice No", payload.get("invoice_no") or "—"),
         ("Invoice Date", format_cert_print_date(payload.get("invoice_date"))),
         ("P.O No", payload.get("po_no") or "—"),
-        ("P.O Date", format_cert_print_date(payload.get("po_date"))),
+        ("P.O Date", _po_dates_text(payload)),
     ]
     meta_rows_html = ""
     for i in range(0, len(meta_pairs), 2):
@@ -739,7 +748,7 @@ def _render_certificate_summary(
         ("Packing list", f"#{header.get('Packing_list_id')} ({header.get('Packing_list_status') or '—'})"),
         ("Invoice", f"{header.get('Invoice_number') or '—'}  ·  "
                     f"{format_ui_date(header.get('Invoice_date'), empty='—')}"),
-        ("P.O. Number", header.get("Customer_PO_No") or "—"),
+        ("P.O. Number", header.get("PO_numbers_text") or header.get("Customer_PO_No") or "—"),
         ("Customer name", header.get("Customer_name") or "—"),
         ("Alloy name", header.get("Alloy_name") or "—"),
         ("Colour code", header.get("Colour_code") or "—"),
@@ -1113,7 +1122,7 @@ m3.metric("Invoice", header.get("Invoice_number") or "—")
 m4.metric("Alloy", header.get("Alloy_name") or "—")
 st.caption(
     f"Customer: {header.get('Customer_name') or '—'}  ·  "
-    f"PO: {header.get('Customer_PO_No') or '—'}  ·  "
+    f"PO: {header.get('PO_numbers_text') or header.get('Customer_PO_No') or '—'}  ·  "
     f"Vehicle: {header.get('Vehicle_no') or '—'}  ·  "
     f"Packing list: {header.get('Packing_list_status') or '—'}"
 )

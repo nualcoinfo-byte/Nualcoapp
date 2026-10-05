@@ -18,7 +18,7 @@ def _packing_summary_from_saved(packing_list_id: int) -> dict | None:
         "packing_list_id": header.get("Packing_list_id"),
         "invoice_date": header.get("Invoice_date"),
         "invoice_number": header.get("Invoice_number") or "",
-        "po_no": header.get("Customer_PO_No") or "",
+        "po_no": header.get("PO_numbers_text") or header.get("Customer_PO_No") or "",
         "customer_name": header.get("Customer_name") or "",
         "alloy_name": header.get("Alloy_name") or "",
         "colour_code": header.get("Colour_code") or "",
@@ -57,7 +57,10 @@ def _packing_summary_from_form() -> dict:
         "packing_list_id": st.session_state.get("pl_edit_id"),
         "invoice_date": to_storage_date(inv_date) if inv_date else None,
         "invoice_number": str(st.session_state.get("pl_invoice") or "").strip(),
-        "po_no": str(st.session_state.get("pl_po") or "").strip(),
+        "po_no": ", ".join(
+            [str(st.session_state.get("pl_po") or "").strip()]
+            + [str(p) for p in (st.session_state.get("pl_extra_pos") or [])]
+        ).strip(", "),
         "customer_name": customer_name,
         "alloy_name": alloy_name,
         "colour_code": colour_code,
@@ -512,6 +515,38 @@ if db.packing_needs_dispatch_type(customer_name, alloy_id):
         ),
     )
 
+# More POs on the same list (one invoice): same customer, alloy and rate only.
+extra_pos: list[str] = []
+if po_no and cust_code and alloy_id not in (None, ""):
+    companions = db.list_packing_po_companions(po_no, cust_code, alloy_id)
+    companion_by_po = {str(c["Customer_PO_No"]): c for c in companions}
+    if st.session_state.get("pl_extra_pos"):
+        st.session_state["pl_extra_pos"] = [
+            p for p in st.session_state["pl_extra_pos"] if p in companion_by_po
+        ]
+    if companions:
+
+        def _companion_label(po: str) -> str:
+            c = companion_by_po[po]
+            return (
+                f"{po}  |  delivery {format_ui_date(c.get('Delivery_Date')) or '—'}  |  "
+                f"open {float(c.get('Open_balance') or 0):,.0f} of "
+                f"{float(c.get('Order_Qty') or 0):,.0f} kg"
+            )
+
+        extra_pos = st.multiselect(
+            "Additional P.O. numbers (same customer, alloy and rate)",
+            list(companion_by_po),
+            format_func=_companion_label,
+            key="pl_extra_pos",
+            disabled=not editable,
+            help=(
+                "When the customer has sent several POs for this alloy at the same "
+                "rate and they go out on one invoice. The packed kg is allocated to "
+                "the POs by earliest delivery date, each up to its open balance."
+            ),
+        )
+
 r3c1, r3c2, r3c3 = st.columns(3)
 with r3c1:
     vehicle_no = st.text_input("Vehicle No", key="pl_vehicle")
@@ -818,6 +853,39 @@ else:
             "Total pieces",
             f"{int(selected_df['Pieces'].sum())}",
         )
+        if extra_pos:
+            plan = db.plan_packing_po_allocation(
+                [po_no] + list(extra_pos),
+                alloy_id,
+                float(selected_df["Weight (kg)"].sum()),
+                packing_list_id=int(editing_id) if editing_id else None,
+            )
+            st.markdown("##### Allocation to purchase orders")
+            show_dataframe(
+                pd.DataFrame(
+                    [
+                        {
+                            "P.O. Number": r["Customer_PO_No"],
+                            "Delivery date": format_ui_date(r.get("Delivery_Date")),
+                            "Order qty (kg)": round(r["Order_Qty"], 2),
+                            "Open before this list (kg)": round(r["Open_balance"], 2),
+                            "Allocated here (kg)": round(r["Allocated_weight"], 2),
+                        }
+                        for r in plan
+                    ]
+                )
+            )
+            over = sum(r["Allocated_weight"] for r in plan) - sum(r["Open_balance"] for r in plan)
+            st.caption(
+                "Packed kg is allocated to the earliest delivery first, each P.O. up to "
+                "its open balance."
+                + (
+                    f" **{over:,.2f} kg** is more than all their open balances and is "
+                    "put on the last P.O."
+                    if over > 0.005
+                    else ""
+                )
+            )
     else:
         st.caption("Tick one or more rows above and enter packed kg and pieces.")
 
@@ -932,6 +1000,7 @@ def _save_form() -> int | None:
             vehicle_no=vehicle_no,
             batch_lines=selected_lines,
             dispatch_type=dispatch_type,
+            additional_po_numbers=extra_pos,
         )
     except Exception as exc:
         st.error(str(exc))
@@ -1026,6 +1095,9 @@ else:
             )
             st.session_state["pl_alloy_seen"] = aid
             st.session_state["pl_vehicle"] = header.get("Vehicle_no") or ""
+            st.session_state["pl_extra_pos"] = [
+                p for p in (header.get("PO_numbers") or [])[1:] if p
+            ]
             if header.get("Dispatch_type") in db.DISPATCH_TYPES:
                 st.session_state["pl_dispatch_type"] = header["Dispatch_type"]
             else:
