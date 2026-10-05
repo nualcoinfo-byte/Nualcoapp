@@ -1673,6 +1673,7 @@ def init_db() -> None:
         _ensure_columns(conn, "batch_output", [("Last_updated_by", "TEXT")])
         _ensure_batch_output_correction(conn)
         _ensure_toll_conversion(conn)
+        _ensure_raw_material_correction(conn)
         _ensure_company_profile(conn)
         _ensure_employees(conn)
         _ensure_row_level_security(conn)
@@ -5212,6 +5213,658 @@ def set_raw_material_purchase_invoice_status(purchase_id: int, new_status: str) 
     )
 
 
+# ---------- Raw Material Purchase Correction (split / scrap / return) ----------
+
+RM_FINANCE_ROLES = ("Accounts", "Management")  # raise sales invoice / debit note
+SCRAP_CATEGORIES = ["Iron", "Plastic", "Rubber", "Dirt", "Non-metallic", "Other"]
+RM_RETURN_PENDING = "Pending Finance Action"
+RM_RETURN_INVOICE_RAISED = "Invoice Raised"
+RM_RETURN_DEBIT_NOTE_RAISED = "Debit Note Raised"
+RM_RETURN_COMPLETED = "Completed"
+RM_FINANCE_SALES_INVOICE = "Sales invoice"
+RM_FINANCE_DEBIT_NOTE = "Debit note"
+_RM_EPS = 0.005  # kg
+
+
+def list_correctable_lots(
+    vendor_code: Optional[int] = None,
+    material: Optional[str] = None,
+    lot_id: Optional[int] = None,
+) -> list[dict[str, Any]]:
+    """Purchased lots with stock left (remelt lots and cancelled invoices excluded)."""
+    sql = """
+        SELECT i.Lot_id AS "Lot_id", i.Raw_Material_Name AS "Raw_Material_Name",
+               i.Purchase_id AS "Purchase_id", p.Vendor_code AS "Vendor_code",
+               v.Vendor_name AS "Vendor_name", p.Supplier_Invoice AS "Supplier_Invoice",
+               p.Received_date AS "Received_date", p.Invoice_status AS "Invoice_status",
+               COALESCE(p.Receipt_type, 'Purchase') AS "Receipt_type",
+               i.Received_weight AS "Received_weight",
+               i.Remaining_Weight AS "Remaining_Weight",
+               i.Cost_per_kg AS "Cost_per_kg", i.Storage_bay AS "Storage_bay",
+               i.Raw_Material_Status AS "Raw_Material_Status",
+               i.Parent_lot_id AS "Parent_lot_id"
+        FROM Raw_Material_Inventory i
+        JOIN Raw_Material_Purchase p ON p.Purchase_id = i.Purchase_id
+        LEFT JOIN Vendor_Master v ON v.Vendor_code = p.Vendor_code
+        WHERE COALESCE(p.Invoice_status, '') <> 'Cancelled'
+          AND COALESCE(i.Remaining_Weight, 0) > 0.0005
+    """
+    params: list[Any] = []
+    if vendor_code:
+        sql += " AND p.Vendor_code = ?"
+        params.append(int(vendor_code))
+    if material:
+        sql += " AND LOWER(i.Raw_Material_Name) = LOWER(?)"
+        params.append(material)
+    if lot_id:
+        sql += " AND i.Lot_id = ?"
+        params.append(int(lot_id))
+    sql += " ORDER BY i.Lot_id DESC"
+    return fetch_all(sql, params)
+
+
+def _lot_for_correction(conn: Connection, lot_id: int) -> dict[str, Any]:
+    row = (
+        _exec(
+            conn,
+            """
+            SELECT i.Lot_id AS "Lot_id", i.Raw_Material_Name AS "Raw_Material_Name",
+                   i.Purchase_id AS "Purchase_id", p.Vendor_code AS "Vendor_code",
+                   p.Invoice_status AS "Invoice_status",
+                   i.Received_weight AS "Received_weight",
+                   i.Remaining_Weight AS "Remaining_Weight",
+                   i.Cost_per_kg AS "Cost_per_kg", i.Storage_bay AS "Storage_bay",
+                   i.Raw_Material_Status AS "Raw_Material_Status"
+            FROM Raw_Material_Inventory i
+            LEFT JOIN Raw_Material_Purchase p ON p.Purchase_id = i.Purchase_id
+            WHERE i.Lot_id = ?
+            """,
+            (int(lot_id),),
+        )
+        .mappings()
+        .first()
+    )
+    if not row:
+        raise ValueError(f"Lot {lot_id} not found.")
+    lot = dict(row)
+    if lot.get("Purchase_id") is None:
+        raise ValueError(
+            f"Lot {lot_id} is a remelt lot from production, not a purchase; it "
+            "cannot be corrected here."
+        )
+    if lot.get("Invoice_status") == "Cancelled":
+        raise ValueError(f"Lot {lot_id} is on a cancelled invoice.")
+    lot["Received_weight"] = float(lot.get("Received_weight") or 0)
+    lot["Remaining_Weight"] = float(lot.get("Remaining_Weight") or 0)
+    return lot
+
+
+def _check_expected_remaining(lot: dict[str, Any], expected: Optional[float]) -> None:
+    if expected is not None and abs(lot["Remaining_Weight"] - float(expected)) > _RM_EPS:
+        raise ValueError(
+            f"Lot {lot['Lot_id']} changed while you were working on it (it now has "
+            f"{lot['Remaining_Weight']:,.2f} kg left). Reload and try again."
+        )
+
+
+def _write_rm_correction(
+    conn: Connection,
+    kind: str,
+    lot: dict[str, Any],
+    weight: float,
+    remaining_after: float,
+    reason: Optional[str],
+    lines: list[dict[str, Any]],
+) -> int:
+    by_val, dt_val = audit_stamp()
+    correction_id = int(
+        _exec(
+            conn,
+            """
+            INSERT INTO raw_material_correction
+                (Correction_type, Lot_id, Purchase_id, Vendor_code, Raw_Material_Name,
+                 Weight, Remaining_before, Remaining_after, Cost_per_kg, Reason,
+                 Corrected_by, Corrected_by_employee_id, Corrected_datetime)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            RETURNING Correction_id
+            """,
+            (
+                kind,
+                lot["Lot_id"],
+                lot["Purchase_id"],
+                lot.get("Vendor_code"),
+                lot["Raw_Material_Name"],
+                weight,
+                lot["Remaining_Weight"],
+                remaining_after,
+                lot.get("Cost_per_kg"),
+                (reason or "").strip() or None,
+                by_val,
+                get_acting_employee_id() or None,
+                dt_val,
+            ),
+        ).scalar_one()
+    )
+    for ln in lines:
+        _exec(
+            conn,
+            """
+            INSERT INTO raw_material_correction_line
+                (Correction_id, Raw_Material_Name, Weight, New_lot_id, Scrap_id, Return_id)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                correction_id,
+                ln.get("Raw_Material_Name"),
+                ln["Weight"],
+                ln.get("New_lot_id"),
+                ln.get("Scrap_id"),
+                ln.get("Return_id"),
+            ),
+        )
+    return correction_id
+
+
+def split_raw_material_lot(
+    lot_id: int,
+    lines: list[dict[str, Any]],
+    *,
+    reason: Optional[str] = None,
+    expected_remaining: Optional[float] = None,
+) -> int:
+    """Reclassify a lot's remaining stock into several raw materials.
+
+    `lines` are {material, weight} and must add up to the lot's remaining
+    weight. Lines for the lot's own material stay on the lot; every other line
+    becomes a new lot on the same purchase, at the same cost per kg, storage
+    bay and status, pointing back to this lot (Parent_lot_id). The received kg
+    moves with it, so the purchase's received weight × cost (its invoice
+    value) and the kg already charged from the lot do not change.
+    """
+    cleaned: list[dict[str, Any]] = []
+    for ln in lines:
+        name = (ln.get("material") or "").strip()
+        try:
+            weight = float(ln.get("weight") or 0)
+        except (TypeError, ValueError):
+            raise ValueError("Split weights must be numbers.")
+        if not name and weight == 0:
+            continue
+        if not name:
+            raise ValueError("Choose a raw material on every split line.")
+        if weight <= 0:
+            raise ValueError(f"The weight for {name} must be greater than zero.")
+        stored = find_raw_material_name(name)
+        if not stored:
+            raise ValueError(
+                f"{name} is not in Raw Material Master. Add it there first."
+            )
+        cleaned.append({"material": stored, "weight": weight})
+    if not cleaned:
+        raise ValueError("Add the raw materials this lot is split into.")
+
+    with get_connection() as conn:
+        lot = _lot_for_correction(conn, lot_id)
+        _check_expected_remaining(lot, expected_remaining)
+        total = sum(ln["weight"] for ln in cleaned)
+        if abs(total - lot["Remaining_Weight"]) > _RM_EPS:
+            raise ValueError(
+                f"The split adds up to {total:,.2f} kg but lot {lot_id} has "
+                f"{lot['Remaining_Weight']:,.2f} kg left. They must be equal."
+            )
+        source = lot["Raw_Material_Name"].lower()
+        kept = sum(ln["weight"] for ln in cleaned if ln["material"].lower() == source)
+        moved = [ln for ln in cleaned if ln["material"].lower() != source]
+        if not moved:
+            raise ValueError(
+                "Every line is the lot's own material, so nothing would change. "
+                "Add the other raw materials it is split into."
+            )
+        moved_kg = sum(ln["weight"] for ln in moved)
+        correction_id = _write_rm_correction(
+            conn, "Split", lot, moved_kg, kept, reason, []
+        )
+        audit_lines: list[dict[str, Any]] = []
+        for ln in moved:
+            new_lot = int(
+                _exec(
+                    conn,
+                    """
+                    INSERT INTO Raw_Material_Inventory
+                        (Purchase_id, Raw_Material_Name, Received_weight, Remaining_Weight,
+                         Storage_bay, Raw_Material_Status, Cost_per_kg, Comments,
+                         Parent_lot_id, Correction_id)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    RETURNING Lot_id
+                    """,
+                    (
+                        lot["Purchase_id"],
+                        ln["material"],
+                        ln["weight"],
+                        ln["weight"],
+                        lot.get("Storage_bay"),
+                        lot.get("Raw_Material_Status"),
+                        lot.get("Cost_per_kg"),
+                        f"Split from lot {lot['Lot_id']} ({lot['Raw_Material_Name']}) "
+                        f"by correction #{correction_id}",
+                        lot["Lot_id"],
+                        correction_id,
+                    ),
+                ).scalar_one()
+            )
+            audit_lines.append(
+                {"Raw_Material_Name": ln["material"], "Weight": ln["weight"], "New_lot_id": new_lot}
+            )
+        if kept > _RM_EPS:
+            audit_lines.append({"Raw_Material_Name": lot["Raw_Material_Name"], "Weight": kept})
+        for ln in audit_lines:
+            _exec(
+                conn,
+                """
+                INSERT INTO raw_material_correction_line
+                    (Correction_id, Raw_Material_Name, Weight, New_lot_id)
+                VALUES (?, ?, ?, ?)
+                """,
+                (correction_id, ln["Raw_Material_Name"], ln["Weight"], ln.get("New_lot_id")),
+            )
+        _exec(
+            conn,
+            """
+            UPDATE Raw_Material_Inventory
+            SET Received_weight = ?, Remaining_Weight = ?
+            WHERE Lot_id = ?
+            """,
+            (max(lot["Received_weight"] - moved_kg, 0.0), kept, lot["Lot_id"]),
+        )
+    return correction_id
+
+
+def _take_from_lot(
+    conn: Connection, lot: dict[str, Any], weight: object, what: str
+) -> float:
+    try:
+        qty = float(weight)
+    except (TypeError, ValueError):
+        raise ValueError(f"{what} quantity must be a number.")
+    if qty <= 0:
+        raise ValueError(f"{what} quantity must be greater than zero.")
+    if qty > lot["Remaining_Weight"] + _RM_EPS:
+        raise ValueError(
+            f"{what} quantity {qty:,.2f} kg is more than the {lot['Remaining_Weight']:,.2f} "
+            f"kg left on lot {lot['Lot_id']}."
+        )
+    qty = min(qty, lot["Remaining_Weight"])
+    _exec(
+        conn,
+        "UPDATE Raw_Material_Inventory SET Remaining_Weight = ? WHERE Lot_id = ?",
+        (lot["Remaining_Weight"] - qty, lot["Lot_id"]),
+    )
+    return qty
+
+
+def scrap_raw_material(
+    lot_id: int,
+    weight: float,
+    *,
+    category: str,
+    reason: Optional[str] = None,
+    expected_remaining: Optional[float] = None,
+) -> int:
+    """Move contaminant found at segregation (iron, plastic, ...) to scrap_inventory.
+
+    The lot's remaining kg goes down; its received kg (what was bought and
+    paid for) does not, so the loss stays traceable to the purchase and vendor.
+    Returns the new Scrap_id.
+    """
+    if category not in SCRAP_CATEGORIES:
+        raise ValueError("Choose what the scrap is (Iron, Plastic, Rubber, ...).")
+    with get_connection() as conn:
+        lot = _lot_for_correction(conn, lot_id)
+        _check_expected_remaining(lot, expected_remaining)
+        qty = _take_from_lot(conn, lot, weight, "Scrap")
+        correction_id = _write_rm_correction(
+            conn, "Scrap", lot, qty, lot["Remaining_Weight"] - qty, reason, []
+        )
+        by_val, dt_val = audit_stamp()
+        scrap_id = int(
+            _exec(
+                conn,
+                """
+                INSERT INTO scrap_inventory
+                    (Source_type, Lot_id, Raw_Material_Name, Purchase_id, Vendor_code,
+                     Correction_id, Weight, Cost_per_kg, Scrap_category, Notes,
+                     Created_by, Created_datetime)
+                VALUES ('Purchase segregation', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                RETURNING Scrap_id
+                """,
+                (
+                    lot["Lot_id"],
+                    lot["Raw_Material_Name"],
+                    lot["Purchase_id"],
+                    lot.get("Vendor_code"),
+                    correction_id,
+                    qty,
+                    lot.get("Cost_per_kg"),
+                    category,
+                    (reason or "").strip() or None,
+                    by_val,
+                    dt_val,
+                ),
+            ).scalar_one()
+        )
+        _exec(
+            conn,
+            """
+            INSERT INTO raw_material_correction_line
+                (Correction_id, Raw_Material_Name, Weight, Scrap_id)
+            VALUES (?, ?, ?, ?)
+            """,
+            (correction_id, f"Scrap — {category}", qty, scrap_id),
+        )
+    return scrap_id
+
+
+def return_raw_material(
+    lot_id: int,
+    weight: float,
+    *,
+    reason: str,
+    expected_remaining: Optional[float] = None,
+) -> int:
+    """Hand unordered material to Accounts to return or sell back to the supplier.
+
+    The lot's remaining kg goes down and a raw_material_returns row is opened
+    as Pending Finance Action. Returns the new Return_id.
+    """
+    if not (reason or "").strip():
+        raise ValueError("Say why the material is going back (wrong grade, excess, ...).")
+    with get_connection() as conn:
+        lot = _lot_for_correction(conn, lot_id)
+        _check_expected_remaining(lot, expected_remaining)
+        qty = _take_from_lot(conn, lot, weight, "Return")
+        correction_id = _write_rm_correction(
+            conn, "Return", lot, qty, lot["Remaining_Weight"] - qty, reason, []
+        )
+        by_val, dt_val = audit_stamp()
+        return_id = int(
+            _exec(
+                conn,
+                """
+                INSERT INTO raw_material_returns
+                    (Lot_id, Purchase_id, Vendor_code, Raw_Material_Name, Returned_qty,
+                     Cost_per_kg, Return_reason, Status, Correction_id, Created_by, Created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                RETURNING Return_id
+                """,
+                (
+                    lot["Lot_id"],
+                    lot["Purchase_id"],
+                    lot.get("Vendor_code"),
+                    lot["Raw_Material_Name"],
+                    qty,
+                    lot.get("Cost_per_kg"),
+                    reason.strip(),
+                    RM_RETURN_PENDING,
+                    correction_id,
+                    by_val,
+                    dt_val,
+                ),
+            ).scalar_one()
+        )
+        _exec(
+            conn,
+            """
+            INSERT INTO raw_material_correction_line
+                (Correction_id, Raw_Material_Name, Weight, Return_id)
+            VALUES (?, ?, ?, ?)
+            """,
+            (correction_id, lot["Raw_Material_Name"], qty, return_id),
+        )
+    return return_id
+
+
+def record_raw_material_return_finance(
+    return_id: int, action: str, document_number: str, notes: Optional[str] = None
+) -> None:
+    """Accounts raised a sales invoice or a debit note to the supplier."""
+    _require_role(RM_FINANCE_ROLES, "raise a sales invoice or debit note for a return")
+    if action not in (RM_FINANCE_SALES_INVOICE, RM_FINANCE_DEBIT_NOTE):
+        raise ValueError("Choose Sales invoice or Debit note.")
+    number = (document_number or "").strip()
+    if not number:
+        raise ValueError(f"Enter the {action.lower()} number.")
+    row = fetch_one(
+        'SELECT Status AS "Status" FROM raw_material_returns WHERE Return_id = ?',
+        (int(return_id),),
+    )
+    if not row:
+        raise ValueError(f"Return {return_id} not found.")
+    if row["Status"] != RM_RETURN_PENDING:
+        raise ValueError(f"Return {return_id} is already {row['Status']}.")
+    by_val, dt_val = audit_stamp()
+    invoice = number if action == RM_FINANCE_SALES_INVOICE else None
+    debit = number if action == RM_FINANCE_DEBIT_NOTE else None
+    status = (
+        RM_RETURN_INVOICE_RAISED
+        if action == RM_FINANCE_SALES_INVOICE
+        else RM_RETURN_DEBIT_NOTE_RAISED
+    )
+    execute(
+        """
+        UPDATE raw_material_returns
+        SET Status = ?, Finance_action = ?, Invoice_number = ?, Debit_note_number = ?,
+            Finance_notes = ?, Finance_by = ?, Finance_at = ?
+        WHERE Return_id = ? AND Status = ?
+        """,
+        (
+            status,
+            action,
+            invoice,
+            debit,
+            (notes or "").strip() or None,
+            by_val,
+            dt_val,
+            int(return_id),
+            RM_RETURN_PENDING,
+        ),
+    )
+
+
+def complete_raw_material_return(return_id: int) -> None:
+    """Close a return once its sales invoice / debit note is settled."""
+    _require_role(RM_FINANCE_ROLES, "complete a supplier return")
+    row = fetch_one(
+        'SELECT Status AS "Status" FROM raw_material_returns WHERE Return_id = ?',
+        (int(return_id),),
+    )
+    if not row:
+        raise ValueError(f"Return {return_id} not found.")
+    if row["Status"] not in (RM_RETURN_INVOICE_RAISED, RM_RETURN_DEBIT_NOTE_RAISED):
+        raise ValueError(
+            "Raise the sales invoice or debit note first; the return can then be completed."
+        )
+    by_val, dt_val = audit_stamp()
+    execute(
+        """
+        UPDATE raw_material_returns
+        SET Status = ?, Completed_by = ?, Completed_at = ?
+        WHERE Return_id = ?
+        """,
+        (RM_RETURN_COMPLETED, by_val, dt_val, int(return_id)),
+    )
+
+
+def list_raw_material_returns(open_only: bool = False) -> list[dict[str, Any]]:
+    sql = """
+        SELECT r.Return_id AS "Return_id", r.Lot_id AS "Lot_id",
+               r.Purchase_id AS "Purchase_id", v.Vendor_name AS "Vendor_name",
+               p.Supplier_Invoice AS "Supplier_Invoice",
+               r.Raw_Material_Name AS "Raw_Material_Name",
+               r.Returned_qty AS "Returned_qty", r.Cost_per_kg AS "Cost_per_kg",
+               r.Return_reason AS "Return_reason", r.Status AS "Status",
+               r.Finance_action AS "Finance_action", r.Invoice_number AS "Invoice_number",
+               r.Debit_note_number AS "Debit_note_number",
+               r.Finance_notes AS "Finance_notes",
+               r.Created_by AS "Created_by", r.Created_at AS "Created_at",
+               r.Finance_by AS "Finance_by", r.Finance_at AS "Finance_at",
+               r.Completed_by AS "Completed_by", r.Completed_at AS "Completed_at"
+        FROM raw_material_returns r
+        LEFT JOIN Vendor_Master v ON v.Vendor_code = r.Vendor_code
+        LEFT JOIN Raw_Material_Purchase p ON p.Purchase_id = r.Purchase_id
+    """
+    params: tuple = ()
+    if open_only:
+        sql += " WHERE r.Status <> ?"
+        params = (RM_RETURN_COMPLETED,)
+    sql += " ORDER BY r.Return_id DESC"
+    return fetch_all(sql, params)
+
+
+def list_scrap_inventory(
+    start_date: Optional[object] = None, end_date: Optional[object] = None
+) -> list[dict[str, Any]]:
+    """Scrap from purchase segregation and production, newest first."""
+    sql = """
+        SELECT s.Scrap_id AS "Scrap_id", s.Source_type AS "Source_type",
+               s.Created_datetime AS "Created_datetime",
+               v.Vendor_name AS "Vendor_name", s.Vendor_code AS "Vendor_code",
+               s.Raw_Material_Name AS "Raw_Material_Name", s.Lot_id AS "Lot_id",
+               s.Purchase_id AS "Purchase_id", p.Supplier_Invoice AS "Supplier_Invoice",
+               s.Batch_ID AS "Batch_ID", s.Scrap_category AS "Scrap_category",
+               s.Weight AS "Weight", s.Cost_per_kg AS "Cost_per_kg",
+               s.Weight * COALESCE(s.Cost_per_kg, 0) AS "Value",
+               s.Notes AS "Notes", s.Created_by AS "Created_by"
+        FROM scrap_inventory s
+        LEFT JOIN Vendor_Master v ON v.Vendor_code = s.Vendor_code
+        LEFT JOIN Raw_Material_Purchase p ON p.Purchase_id = s.Purchase_id
+        WHERE 1 = 1
+    """
+    params: list[Any] = []
+    if start_date is not None:
+        sql += " AND SUBSTR(s.Created_datetime, 1, 10) >= ?"
+        params.append(_coerce_production_date(start_date).isoformat())
+    if end_date is not None:
+        sql += " AND SUBSTR(s.Created_datetime, 1, 10) <= ?"
+        params.append(_coerce_production_date(end_date).isoformat())
+    sql += " ORDER BY s.Scrap_id DESC"
+    return fetch_all(sql, params)
+
+
+def vendor_scrap_summary() -> list[dict[str, Any]]:
+    """Per vendor: kg received, kg found as scrap at segregation, kg returned, %."""
+    rows = fetch_all(
+        """
+        SELECT v.Vendor_code AS "Vendor_code", v.Vendor_name AS "Vendor_name",
+               COALESCE(rec.Received_kg, 0) AS "Received_kg",
+               COALESCE(sc.Scrap_kg, 0) AS "Segregation_scrap_kg",
+               COALESCE(sc.Scrap_value, 0) AS "Segregation_scrap_value",
+               COALESCE(pr.Production_scrap_kg, 0) AS "Production_scrap_kg",
+               COALESCE(rt.Returned_kg, 0) AS "Returned_kg"
+        FROM Vendor_Master v
+        LEFT JOIN (
+            SELECT p.Vendor_code, SUM(COALESCE(i.Received_weight, 0)) AS Received_kg
+            FROM Raw_Material_Inventory i
+            JOIN Raw_Material_Purchase p ON p.Purchase_id = i.Purchase_id
+            WHERE COALESCE(p.Invoice_status, '') <> 'Cancelled'
+            GROUP BY p.Vendor_code
+        ) rec ON rec.Vendor_code = v.Vendor_code
+        LEFT JOIN (
+            SELECT Vendor_code, SUM(Weight) AS Scrap_kg,
+                   SUM(Weight * COALESCE(Cost_per_kg, 0)) AS Scrap_value
+            FROM scrap_inventory WHERE Source_type = 'Purchase segregation'
+            GROUP BY Vendor_code
+        ) sc ON sc.Vendor_code = v.Vendor_code
+        LEFT JOIN (
+            SELECT Vendor_code, SUM(Weight) AS Production_scrap_kg
+            FROM scrap_inventory WHERE Source_type = 'Production charge return'
+            GROUP BY Vendor_code
+        ) pr ON pr.Vendor_code = v.Vendor_code
+        LEFT JOIN (
+            SELECT Vendor_code, SUM(Returned_qty) AS Returned_kg
+            FROM raw_material_returns GROUP BY Vendor_code
+        ) rt ON rt.Vendor_code = v.Vendor_code
+        ORDER BY v.Vendor_name
+        """
+    )
+    out = []
+    for r in rows:
+        rec = float(r.get("Received_kg") or 0)
+        seg = float(r.get("Segregation_scrap_kg") or 0)
+        prod = float(r.get("Production_scrap_kg") or 0)
+        ret = float(r.get("Returned_kg") or 0)
+        if not (seg or prod or ret):
+            continue
+        out.append(
+            {
+                **r,
+                "Received_kg": rec,
+                "Segregation_scrap_kg": seg,
+                "Segregation_scrap_value": float(r.get("Segregation_scrap_value") or 0),
+                "Production_scrap_kg": prod,
+                "Returned_kg": ret,
+                "Segregation_scrap_pct": seg / rec * 100 if rec else None,
+                "Returned_pct": ret / rec * 100 if rec else None,
+            }
+        )
+    return out
+
+
+def list_raw_material_corrections(
+    lot_id: Optional[int] = None, limit: int = 100
+) -> list[dict[str, Any]]:
+    """Corrections newest first: for one lot (as source, or that it was split into)."""
+    where = ""
+    params: list[Any] = []
+    if lot_id:
+        where = """
+            WHERE c.Lot_id = ?
+               OR c.Correction_id IN (
+                   SELECT l.Correction_id FROM raw_material_correction_line l
+                   WHERE l.New_lot_id = ?
+               )
+        """
+        params = [int(lot_id), int(lot_id)]
+    rows = fetch_all(
+        f"""
+        SELECT c.Correction_id AS "Correction_id", c.Correction_type AS "Correction_type",
+               c.Lot_id AS "Lot_id", c.Raw_Material_Name AS "Raw_Material_Name",
+               v.Vendor_name AS "Vendor_name", c.Weight AS "Weight",
+               c.Remaining_before AS "Remaining_before",
+               c.Remaining_after AS "Remaining_after", c.Reason AS "Reason",
+               c.Corrected_by AS "Corrected_by",
+               c.Corrected_by_employee_id AS "Corrected_by_employee_id",
+               c.Corrected_datetime AS "Corrected_datetime"
+        FROM raw_material_correction c
+        LEFT JOIN Vendor_Master v ON v.Vendor_code = c.Vendor_code
+        {where}
+        ORDER BY c.Correction_id DESC
+        LIMIT ?
+        """,
+        params + [limit],
+    )
+    if not rows:
+        return rows
+    ids = [int(r["Correction_id"]) for r in rows]
+    marks = ", ".join("?" for _ in ids)
+    lines = fetch_all(
+        f"""
+        SELECT Correction_id AS "Correction_id", Raw_Material_Name AS "Raw_Material_Name",
+               Weight AS "Weight", New_lot_id AS "New_lot_id", Scrap_id AS "Scrap_id",
+               Return_id AS "Return_id"
+        FROM raw_material_correction_line
+        WHERE Correction_id IN ({marks})
+        ORDER BY Line_id
+        """,
+        ids,
+    )
+    by_id: dict[int, list[dict[str, Any]]] = {}
+    for ln in lines:
+        by_id.setdefault(int(ln["Correction_id"]), []).append(ln)
+    for r in rows:
+        r["lines"] = by_id.get(int(r["Correction_id"]), [])
+    return rows
+
+
 def cancel_conversion_receipt(purchase_id: int) -> None:
     """Cancel a Brakes India conversion receipt logged by mistake.
 
@@ -7768,6 +8421,8 @@ def _ensure_row_level_security(conn: Connection) -> None:
                     'vendor_master','raw_material_purchase','raw_material_inventory',
                     'raw_material_master','raw_material_spec','isri_code_table',
                     'purchase_order','furnace_oil_purchase',
+                    'raw_material_correction','raw_material_correction_line',
+                    'scrap_inventory','raw_material_returns',
                 'furnace_oil_purchase_tank','customer_master',
                     'state_city_master','month_code','element_master','alloy_master',
                     'alloy_master_spec','company_profile','roles'
@@ -7777,7 +8432,7 @@ def _ensure_row_level_security(conn: Connection) -> None:
                   public.nualco_role_name() = 'production'
                   AND p_table = ANY (ARRAY[
                     'production_batch','heat_no_counter_start','production_supervisor','batch_input',
-                    'batch_input_return',
+                    'batch_input_return','scrap_inventory',
                     'batch_output','batch_output_correction',
                     'batch_output_correction_line',
                     'batch_chemical_composition','furnace_master',
@@ -7797,6 +8452,8 @@ def _ensure_row_level_security(conn: Connection) -> None:
                   public.nualco_role_name() = 'inventory'
                   AND p_table = ANY (ARRAY[
                     'raw_material_inventory','raw_material_master','raw_material_spec',
+                    'raw_material_correction','raw_material_correction_line',
+                    'scrap_inventory','raw_material_returns',
                     'isri_code_table','finished_goods_inventory','packing_list',
                     'packing_list_batch','packing_list_certificate',
                     'packing_list_certificate_line','packing_list_certificate_source',
@@ -7811,6 +8468,7 @@ def _ensure_row_level_security(conn: Connection) -> None:
                     'packing_list','packing_list_batch','packing_list_certificate',
                     'packing_list_certificate_line','packing_list_certificate_source',
                     'packing_list_visual_inspection','purchase_order',
+                    'raw_material_returns','scrap_inventory',
                     'customer_master','company_profile','finished_goods_inventory',
                     'vendor_master','alloy_master','element_master',
                     'state_city_master','month_code','roles'
@@ -7883,6 +8541,160 @@ def _ensure_batch_input_return(conn: Connection) -> None:
             Last_updated_by TEXT,
             Last_updated_datetime TEXT
         )
+        """,
+    )
+
+
+def _ensure_raw_material_correction(conn: Connection) -> None:
+    """Tables behind Raw Material Purchase Correction (created on startup).
+
+    raw_material_correction / _line: audit of every split, scrap and return
+        (who, when, why, the lot's remaining kg before and after, and the new
+        lots / scrap rows / returns it created). Rows are only ever inserted.
+    scrap_inventory: one scrap repository for purchase segregation scrap and
+        production charge material returned as scrap (batch_input_return).
+    raw_material_returns: material handed to Accounts to return or sell back
+        to the supplier, open until a sales invoice or debit note is raised
+        and the return is marked Completed.
+    Raw_Material_Inventory gains Parent_lot_id / Correction_id, so a lot made
+    by a split always points back to the purchase lot it came from.
+    """
+    t = _DIALECT_TYPES[IS_POSTGRES]
+    _ensure_columns(
+        conn,
+        "Raw_Material_Inventory",
+        [("Parent_lot_id", "INTEGER"), ("Correction_id", "INTEGER")],
+    )
+    _exec(
+        conn,
+        f"""
+        CREATE TABLE IF NOT EXISTS raw_material_correction (
+            Correction_id {t["autopk"]},
+            Correction_type TEXT NOT NULL
+                CHECK (Correction_type IN ('Split', 'Scrap', 'Return')),
+            Lot_id INTEGER NOT NULL REFERENCES Raw_Material_Inventory(Lot_id),
+            Purchase_id INTEGER,
+            Vendor_code INTEGER,
+            Raw_Material_Name TEXT,
+            Weight {t["float"]} NOT NULL,
+            Remaining_before {t["float"]},
+            Remaining_after {t["float"]},
+            Cost_per_kg {t["float"]},
+            Reason TEXT,
+            Corrected_by TEXT NOT NULL,
+            Corrected_by_employee_id TEXT,
+            Corrected_datetime TEXT NOT NULL
+        )
+        """,
+    )
+    _exec(
+        conn,
+        f"""
+        CREATE TABLE IF NOT EXISTS raw_material_correction_line (
+            Line_id {t["autopk"]},
+            Correction_id INTEGER NOT NULL
+                REFERENCES raw_material_correction(Correction_id),
+            Raw_Material_Name TEXT,
+            Weight {t["float"]} NOT NULL,
+            New_lot_id INTEGER,
+            Scrap_id INTEGER,
+            Return_id INTEGER
+        )
+        """,
+    )
+    _exec(
+        conn,
+        f"""
+        CREATE TABLE IF NOT EXISTS scrap_inventory (
+            Scrap_id {t["autopk"]},
+            Source_type TEXT NOT NULL
+                CHECK (Source_type IN ('Purchase segregation', 'Production charge return')),
+            Lot_id INTEGER REFERENCES Raw_Material_Inventory(Lot_id),
+            Raw_Material_Name TEXT,
+            Purchase_id INTEGER,
+            Vendor_code INTEGER,
+            Batch_ID TEXT,
+            Batch_input_return_id INTEGER,
+            Correction_id INTEGER,
+            Weight {t["float"]} NOT NULL,
+            Cost_per_kg {t["float"]},
+            Scrap_category TEXT,
+            Notes TEXT,
+            Created_by TEXT,
+            Created_datetime TEXT
+        )
+        """,
+    )
+    _exec(
+        conn,
+        f"""
+        CREATE TABLE IF NOT EXISTS raw_material_returns (
+            Return_id {t["autopk"]},
+            Lot_id INTEGER NOT NULL REFERENCES Raw_Material_Inventory(Lot_id),
+            Purchase_id INTEGER,
+            Vendor_code INTEGER,
+            Raw_Material_Name TEXT,
+            Returned_qty {t["float"]} NOT NULL,
+            Cost_per_kg {t["float"]},
+            Return_reason TEXT,
+            Status TEXT NOT NULL DEFAULT 'Pending Finance Action'
+                CHECK (Status IN ('Pending Finance Action', 'Invoice Raised',
+                                  'Debit Note Raised', 'Completed')),
+            Finance_action TEXT
+                CHECK (Finance_action IS NULL
+                       OR Finance_action IN ('Sales invoice', 'Debit note')),
+            Invoice_number TEXT,
+            Debit_note_number TEXT,
+            Finance_notes TEXT,
+            Correction_id INTEGER,
+            Created_by TEXT,
+            Created_at TEXT,
+            Finance_by TEXT,
+            Finance_at TEXT,
+            Completed_by TEXT,
+            Completed_at TEXT
+        )
+        """,
+    )
+    for stmt in (
+        "CREATE INDEX IF NOT EXISTS idx_rm_correction_lot ON raw_material_correction (Lot_id)",
+        "CREATE INDEX IF NOT EXISTS idx_rm_correction_line_corr "
+        "ON raw_material_correction_line (Correction_id)",
+        "CREATE INDEX IF NOT EXISTS idx_scrap_inventory_vendor ON scrap_inventory (Vendor_code)",
+        "CREATE INDEX IF NOT EXISTS idx_scrap_inventory_lot ON scrap_inventory (Lot_id)",
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_scrap_inventory_bir "
+        "ON scrap_inventory (Batch_input_return_id) WHERE Batch_input_return_id IS NOT NULL",
+        "CREATE INDEX IF NOT EXISTS idx_rm_returns_status ON raw_material_returns (Status)",
+    ):
+        _exec(conn, stmt)
+    _backfill_production_scrap(conn)
+
+
+def _backfill_production_scrap(conn: Connection) -> None:
+    """Copy charge material returned as Scrap into scrap_inventory (idempotent).
+
+    New Scrap returns are written there by save_batch_input_return; this
+    brings in the ones saved before scrap_inventory existed.
+    """
+    _ensure_batch_input_return(conn)
+    _exec(
+        conn,
+        """
+        INSERT INTO scrap_inventory
+            (Source_type, Lot_id, Raw_Material_Name, Purchase_id, Vendor_code,
+             Batch_ID, Batch_input_return_id, Weight, Cost_per_kg, Notes,
+             Created_by, Created_datetime)
+        SELECT 'Production charge return', r.Lot_id, r.Raw_Material_Name,
+               i.Purchase_id, p.Vendor_code, r.Batch_ID, r.Return_id, r.Weight,
+               i.Cost_per_kg, r.Notes, r.Last_updated_by,
+               COALESCE(r.Last_updated_datetime, r.Return_time)
+        FROM batch_input_return r
+        LEFT JOIN Raw_Material_Inventory i ON i.Lot_id = r.Lot_id
+        LEFT JOIN Raw_Material_Purchase p ON p.Purchase_id = i.Purchase_id
+        WHERE r.Return_type = 'Scrap'
+          AND NOT EXISTS (
+              SELECT 1 FROM scrap_inventory s WHERE s.Batch_input_return_id = r.Return_id
+          )
         """,
     )
 
@@ -8862,6 +9674,7 @@ def _ensure_packing_list_schema() -> None:
         )
         _ensure_packing_list(conn)
         _ensure_toll_conversion(conn)
+        _ensure_raw_material_correction(conn)
         _ensure_company_profile(conn)
         _ensure_employees(conn)
         _ensure_row_level_security(conn)
@@ -11481,7 +12294,35 @@ def save_batch_input_return(
                 dt_val,
             ),
         )
-        return int(result.scalar_one())
+        return_id = int(result.scalar_one())
+        if kind == "Scrap":
+            # One scrap repository: production scrap sits with purchase scrap,
+            # traceable to the lot, its purchase and vendor.
+            _exec(
+                conn,
+                """
+                INSERT INTO scrap_inventory
+                    (Source_type, Lot_id, Raw_Material_Name, Purchase_id, Vendor_code,
+                     Batch_ID, Batch_input_return_id, Weight, Cost_per_kg, Notes,
+                     Created_by, Created_datetime)
+                SELECT 'Production charge return', i.Lot_id, ?, i.Purchase_id,
+                       p.Vendor_code, ?, ?, ?, i.Cost_per_kg, ?, ?, ?
+                FROM Raw_Material_Inventory i
+                LEFT JOIN Raw_Material_Purchase p ON p.Purchase_id = i.Purchase_id
+                WHERE i.Lot_id = ?
+                """,
+                (
+                    match["Raw_Material_Name"],
+                    batch_id,
+                    return_id,
+                    qty,
+                    (notes or "").strip() or None,
+                    by_val,
+                    dt_val,
+                    lot,
+                ),
+            )
+        return return_id
 
 
 def alloy_piece_avg_kg(net_weight: object, pieces: object) -> float | None:
