@@ -9121,6 +9121,25 @@ def _ensure_toll_conversion(conn: Connection) -> None:
         [("Usable_pct", "DOUBLE PRECISION" if IS_POSTGRES else "REAL")],
     )
     t = _DIALECT_TYPES[IS_POSTGRES]
+    # Admin removals of a Raw Material Master row (e.g. a duplicate), with the
+    # full row and its chemistry rows as they were, so nothing is lost.
+    _exec(
+        conn,
+        f"""
+        CREATE TABLE IF NOT EXISTS raw_material_master_delete_log (
+            Delete_id {t["autopk"]},
+            Raw_Material_Name TEXT NOT NULL,
+            Effective_date TEXT,
+            Row_data TEXT,
+            Spec_rows TEXT,
+            Exact_copy TEXT,
+            Reason TEXT,
+            Deleted_by TEXT NOT NULL,
+            Deleted_by_employee_id TEXT,
+            Deleted_datetime TEXT NOT NULL
+        )
+        """,
+    )
     _exec(
         conn,
         f"""
@@ -15501,6 +15520,182 @@ def apply_bil_merge() -> dict[str, Any]:
         except Exception:
             pass
     return {"sources": sources, "changed": changed, "plants_set": plants_set, "mixed": mixed}
+
+
+# ── Remove a Raw Material Master row (Admin) ──────────────────────────────────
+# Rows are addressed by their physical row (Postgres ctid, SQLite rowid) so an
+# exact copy (same name and effective date) can be removed on its own.
+_ROW_REF_SQL = "ctid::text" if IS_POSTGRES else "CAST(rowid AS TEXT)"
+_ROW_REF_MATCH = "ctid = CAST(? AS tid)" if IS_POSTGRES else "rowid = CAST(? AS INTEGER)"
+
+
+def raw_material_master_duplicate_names() -> list[dict[str, Any]]:
+    """Raw materials with more than one Raw Material Master row."""
+    return fetch_all(
+        """
+        SELECT Raw_Material_Name AS "Raw_Material_Name", COUNT(*) AS "Rows"
+        FROM Raw_Material_Master
+        GROUP BY Raw_Material_Name
+        HAVING COUNT(*) > 1
+        ORDER BY Raw_Material_Name
+        """
+    )
+
+
+def raw_material_master_rows(name: str) -> list[dict[str, Any]]:
+    """Every master row of one raw material, newest effective date first, with
+    its chemistry row count and how many rows share its effective date."""
+    rows = fetch_all(
+        f"""
+        SELECT {_ROW_REF_SQL} AS "Row_ref",
+               m.Raw_Material_Name AS "Raw_Material_Name",
+               m.Effective_date AS "Effective_date",
+               m.Status AS "Status",
+               m.Recovery AS "Recovery",
+               m.Vendor_code AS "Vendor_code",
+               m.ISRI_CODE AS "ISRI_CODE",
+               m.Availability_class AS "Availability_class",
+               CASE WHEN m.Photo IS NULL THEN NULL ELSE 'Yes' END AS "Photo",
+               m.Last_updated_by AS "Last_updated_by",
+               m.Last_updated_datetime AS "Last_updated_datetime"
+        FROM Raw_Material_Master m
+        WHERE m.Raw_Material_Name = ?
+        ORDER BY m.Effective_date DESC, m.Last_updated_datetime DESC
+        """,
+        (name,),
+    )
+    for r in rows:
+        r["Spec_rows"] = int(
+            (fetch_one(
+                'SELECT COUNT(*) AS "n" FROM Raw_Material_Spec '
+                "WHERE Raw_Material_Name = ? AND Effective_date = ?",
+                (name, r["Effective_date"]),
+            ) or {}).get("n") or 0
+        )
+        r["Same_date_rows"] = sum(
+            1 for o in rows if str(o["Effective_date"]) == str(r["Effective_date"])
+        )
+    return rows
+
+
+def remove_raw_material_master_row(
+    name: str, row_ref: str, reason: Optional[str] = None
+) -> dict[str, Any]:
+    """Admin, one transaction: remove one Raw Material Master row and log it.
+
+    The material must keep at least one row. If another row has the same
+    effective date (an exact copy), only this physical row goes and the
+    chemistry rows stay with the copy that remains; otherwise the chemistry
+    rows of that effective date go with it. The removed row and its
+    chemistry are saved in raw_material_master_delete_log.
+    """
+    if not is_admin_user():
+        raise ValueError("Only an Admin can remove a Raw Material Master row.")
+    by_val, dt_val = audit_stamp()
+    with get_connection() as conn:
+        row = (
+            _exec(
+                conn,
+                f"SELECT * FROM Raw_Material_Master "
+                f"WHERE {_ROW_REF_MATCH} AND Raw_Material_Name = ?",
+                (str(row_ref), name),
+            )
+            .mappings()
+            .first()
+        )
+        if not row:
+            raise ValueError("That row is no longer there. Reload and try again.")
+        row = {str(k): v for k, v in dict(row).items()}
+        eff = row.get("effective_date", row.get("Effective_date"))
+        total = int(
+            _exec(
+                conn,
+                "SELECT COUNT(*) FROM Raw_Material_Master WHERE Raw_Material_Name = ?",
+                (name,),
+            ).scalar()
+            or 0
+        )
+        if total < 2:
+            raise ValueError(f"{name} has only this row in Raw Material Master; it cannot be removed.")
+        same_date = int(
+            _exec(
+                conn,
+                "SELECT COUNT(*) FROM Raw_Material_Master "
+                "WHERE Raw_Material_Name = ? AND Effective_date = ?",
+                (name, eff),
+            ).scalar()
+            or 0
+        )
+        specs = [
+            dict(r)
+            for r in _exec(
+                conn,
+                """
+                SELECT Element_symbol AS "Element_symbol", Percentage AS "Percentage",
+                       Last_updated_by AS "Last_updated_by",
+                       Last_updated_datetime AS "Last_updated_datetime"
+                FROM Raw_Material_Spec
+                WHERE Raw_Material_Name = ? AND Effective_date = ?
+                """,
+                (name, eff),
+            ).mappings()
+        ]
+        exact_copy = same_date > 1
+        if not exact_copy and specs:
+            _exec(
+                conn,
+                "DELETE FROM Raw_Material_Spec WHERE Raw_Material_Name = ? AND Effective_date = ?",
+                (name, eff),
+            )
+        _exec(
+            conn,
+            f"DELETE FROM Raw_Material_Master WHERE {_ROW_REF_MATCH} AND Raw_Material_Name = ?",
+            (str(row_ref), name),
+        )
+        snapshot = {
+            k: (f"<{len(v)} bytes>" if isinstance(v, (bytes, bytearray, memoryview)) else v)
+            for k, v in row.items()
+        }
+        _exec(
+            conn,
+            """
+            INSERT INTO raw_material_master_delete_log
+                (Raw_Material_Name, Effective_date, Row_data, Spec_rows, Exact_copy,
+                 Reason, Deleted_by, Deleted_by_employee_id, Deleted_datetime)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                name,
+                str(eff) if eff is not None else None,
+                json.dumps(snapshot, default=str),
+                json.dumps(specs, default=str),
+                "Yes" if exact_copy else "No",
+                (reason or "").strip() or None,
+                by_val,
+                get_acting_employee_id() or None,
+                dt_val,
+            ),
+        )
+    return {
+        "name": name,
+        "effective_date": eff,
+        "exact_copy": exact_copy,
+        "spec_rows_removed": 0 if exact_copy else len(specs),
+        "rows_left": total - 1,
+    }
+
+
+def list_raw_material_master_removals() -> list[dict[str, Any]]:
+    return fetch_all(
+        """
+        SELECT Delete_id AS "Delete_id", Raw_Material_Name AS "Raw_Material_Name",
+               Effective_date AS "Effective_date", Exact_copy AS "Exact_copy",
+               Spec_rows AS "Spec_rows", Reason AS "Reason", Deleted_by AS "Deleted_by",
+               Deleted_datetime AS "Deleted_datetime"
+        FROM raw_material_master_delete_log
+        ORDER BY Delete_id DESC
+        """
+    )
 
 
 def list_raw_material_merges() -> list[dict[str, Any]]:

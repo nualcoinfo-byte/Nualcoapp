@@ -305,12 +305,14 @@ ADMIN_PAGE_ROLES = "Roles & permissions"
 ADMIN_PAGE_PASSWORDS = "Employee passwords"
 ADMIN_PAGE_BATCH_ID = "Correct batch ID"
 ADMIN_PAGE_BIL_MERGE = "Merge BIL borings"
+ADMIN_PAGE_RM_MASTER_ROW = "Remove raw material master row"
 ADMIN_NAV_PAGES = [
     ADMIN_PAGE_CANCEL_ISSUED,
     ADMIN_PAGE_ROLES,
     ADMIN_PAGE_PASSWORDS,
     ADMIN_PAGE_BATCH_ID,
     ADMIN_PAGE_BIL_MERGE,
+    ADMIN_PAGE_RM_MASTER_ROW,
 ]
 _NAV_SECTION_KEY = {
     "Overview": "overview",
@@ -798,6 +800,11 @@ MIGRATED_PAGES: dict[str, st.Page] = {
         "app_pages/admin_bil_merge.py",
         title="Merge BIL borings",
         url_path="admin-bil-merge",
+    ),
+    ADMIN_PAGE_RM_MASTER_ROW: st.Page(
+        "app_pages/admin_rm_master_row.py",
+        title="Remove raw material master row",
+        url_path="admin-rm-master-row",
     ),
     ADMIN_PAGE_BATCH_ID: st.Page(
         "app_pages/admin_batch_id.py",
