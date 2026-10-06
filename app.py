@@ -303,10 +303,12 @@ ADMIN_NAV_SECTION = "Admin"
 ADMIN_PAGE_CANCEL_ISSUED = "Cancel issued certificate"
 ADMIN_PAGE_ROLES = "Roles & permissions"
 ADMIN_PAGE_PASSWORDS = "Employee passwords"
+ADMIN_PAGE_BATCH_ID = "Correct batch ID"
 ADMIN_NAV_PAGES = [
     ADMIN_PAGE_CANCEL_ISSUED,
     ADMIN_PAGE_ROLES,
     ADMIN_PAGE_PASSWORDS,
+    ADMIN_PAGE_BATCH_ID,
 ]
 _NAV_SECTION_KEY = {
     "Overview": "overview",
@@ -789,6 +791,11 @@ MIGRATED_PAGES: dict[str, st.Page] = {
         "app_pages/admin_roles.py",
         title="Roles & permissions",
         url_path="admin-roles",
+    ),
+    ADMIN_PAGE_BATCH_ID: st.Page(
+        "app_pages/admin_batch_id.py",
+        title="Correct batch ID",
+        url_path="admin-batch-id",
     ),
     ADMIN_PAGE_PASSWORDS: st.Page(
         "app_pages/admin_passwords.py",

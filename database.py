@@ -1675,6 +1675,7 @@ def init_db() -> None:
         _ensure_toll_conversion(conn)
         _ensure_raw_material_correction(conn)
         _ensure_packing_list_po(conn)
+        _ensure_batch_id_change_log(conn)
         _ensure_company_profile(conn)
         _ensure_employees(conn)
         _ensure_row_level_security(conn)
@@ -6785,6 +6786,232 @@ def list_furnace_batch_ids(furnace: str) -> list[str]:
     ]
 
 
+# ---------- Correct a batch ID (Admin) ----------
+
+def _ensure_batch_id_change_log(conn: Connection) -> None:
+    t = _DIALECT_TYPES[IS_POSTGRES]
+    _exec(
+        conn,
+        f"""
+        CREATE TABLE IF NOT EXISTS batch_id_change_log (
+            Change_id {t["autopk"]},
+            Old_batch_id TEXT NOT NULL,
+            New_batch_id TEXT NOT NULL,
+            Old_shift TEXT, New_shift TEXT,
+            Old_melt_no INTEGER, New_melt_no INTEGER,
+            Rows_moved TEXT,
+            Reason TEXT,
+            Changed_by TEXT NOT NULL,
+            Changed_by_employee_id TEXT,
+            Changed_datetime TEXT NOT NULL
+        )
+        """,
+    )
+
+
+def _batch_id_columns_on_conn(conn: Connection) -> list[tuple[str, str]]:
+    """Every (table, column) in the database that holds a production Batch ID,
+    found from the live schema so a table added later is never missed."""
+    found: list[tuple[str, str]] = []
+    wanted = {"batch_id", "source_batch_id"}
+    if IS_POSTGRES:
+        rows = _exec(
+            conn,
+            """
+            SELECT c.table_name AS "t", c.column_name AS "c"
+            FROM information_schema.columns c
+            JOIN information_schema.tables t
+              ON t.table_schema = c.table_schema AND t.table_name = c.table_name
+            WHERE c.table_schema = 'public' AND t.table_type = 'BASE TABLE'
+              AND LOWER(c.column_name) IN ('batch_id', 'source_batch_id')
+            ORDER BY c.table_name, c.column_name
+            """,
+        ).mappings()
+        found = [(str(r["t"]), str(r["c"])) for r in rows]
+    else:
+        tables = [
+            str(r[0])
+            for r in _exec(
+                conn,
+                "SELECT name FROM sqlite_master WHERE type = 'table' "
+                "AND name NOT LIKE 'sqlite_%' ORDER BY name",
+            )
+        ]
+        for table in tables:
+            for col in _exec(conn, f'PRAGMA table_info("{table}")').mappings():
+                if str(col["name"]).lower() in wanted:
+                    found.append((table, str(col["name"])))
+    return [
+        (t, c)
+        for t, c in found
+        if t.lower() not in ("production_batch", "batch_id_change_log")
+    ]
+
+
+def batch_id_change_preview(
+    old_batch_id: str, new_shift: str, new_melt_no: object
+) -> dict[str, Any]:
+    """What renaming a batch would do: the new ID (same date and furnace, new
+    shift / melt), clashes that block it, and the rows per table that move."""
+    old = (old_batch_id or "").strip()
+    batch = get_batch(old)
+    if not batch:
+        raise ValueError(f"Batch {old} was not found.")
+    new_id = build_production_batch_id(
+        batch.get("Furnace") or "", batch.get("Production_Date"), new_shift, new_melt_no
+    )
+    blockers: list[str] = []
+    with get_connection() as conn:
+        if new_id == old:
+            blockers.append("The new shift and melt give the same Batch ID.")
+        taken = _exec(
+            conn,
+            'SELECT Batch_ID AS "b" FROM Production_batch WHERE LOWER(Batch_ID) = LOWER(?)',
+            (new_id,),
+        ).mappings().first()
+        if taken and str(taken["b"]) != old:
+            blockers.append(f"Batch ID {new_id} already exists.")
+        clash = _find_batch_id_for_identity_on_conn(
+            conn,
+            batch.get("Furnace") or "",
+            batch.get("Production_Date"),
+            new_shift,
+            new_melt_no,
+            exclude_batch_id=old,
+        )
+        if clash and clash != new_id:
+            blockers.append(
+                f"Batch {clash} already has furnace {batch.get('Furnace')}, this date, "
+                f"shift {str(new_shift).upper()}, melt {new_melt_no}."
+            )
+        impact = []
+        for table, col in _batch_id_columns_on_conn(conn):
+            n = int(
+                _exec(conn, f"SELECT COUNT(*) FROM {table} WHERE {col} = ?", (old,)).scalar()
+                or 0
+            )
+            impact.append({"Table": table, "Column": col, "Rows": n})
+    return {
+        "batch": batch,
+        "old_batch_id": old,
+        "new_batch_id": new_id,
+        "new_shift": str(new_shift).strip().upper(),
+        "new_melt_no": int(new_melt_no),
+        "blockers": blockers,
+        "impact": impact,
+    }
+
+
+def rename_batch_id(
+    old_batch_id: str, new_shift: str, new_melt_no: object, *, reason: str
+) -> dict[str, Any]:
+    """Admin: give a batch the Batch ID of its correct shift / melt.
+
+    One transaction: copy the Production_batch row under the new ID (with the
+    new Shift and Melt_No), point every table holding the old ID at the new
+    one, delete the old row, and log it in batch_id_change_log. Heat no,
+    weights, costs, finished goods, packing lists and certificates are not
+    otherwise touched.
+    """
+    if not is_admin_user():
+        raise ValueError("Only an Admin can change a Batch ID.")
+    if not (reason or "").strip():
+        raise ValueError("Say why the Batch ID is being changed.")
+    preview = batch_id_change_preview(old_batch_id, new_shift, new_melt_no)
+    if preview["blockers"]:
+        raise ValueError(" ".join(preview["blockers"]))
+    old, new = preview["old_batch_id"], preview["new_batch_id"]
+    batch = preview["batch"]
+    by_val, dt_val = audit_stamp()
+    moved: dict[str, int] = {}
+    with get_connection() as conn:
+        _ensure_batch_id_change_log(conn)
+        if IS_POSTGRES:
+            cols = [
+                str(r["c"])
+                for r in _exec(
+                    conn,
+                    """
+                    SELECT column_name AS "c" FROM information_schema.columns
+                    WHERE table_schema = 'public' AND table_name = 'production_batch'
+                    ORDER BY ordinal_position
+                    """,
+                ).mappings()
+            ]
+        else:
+            cols = [
+                str(r["name"])
+                for r in _exec(conn, "PRAGMA table_info(Production_batch)").mappings()
+            ]
+        special = {"batch_id": "?", "shift": "?", "melt_no": "?"}
+        select_parts = [special.get(c.lower(), c) for c in cols]
+        params = []
+        for c in cols:
+            if c.lower() == "batch_id":
+                params.append(new)
+            elif c.lower() == "shift":
+                params.append(preview["new_shift"])
+            elif c.lower() == "melt_no":
+                params.append(preview["new_melt_no"])
+        _exec(
+            conn,
+            f"INSERT INTO Production_batch ({', '.join(cols)}) "
+            f"SELECT {', '.join(select_parts)} FROM Production_batch WHERE Batch_ID = ?",
+            (*params, old),
+        )
+        for table, col in _batch_id_columns_on_conn(conn):
+            result = _exec(conn, f"UPDATE {table} SET {col} = ? WHERE {col} = ?", (new, old))
+            if result.rowcount:
+                moved[f"{table}.{col}"] = int(result.rowcount)
+        _exec(conn, "DELETE FROM Production_batch WHERE Batch_ID = ?", (old,))
+        _exec(
+            conn,
+            """
+            INSERT INTO batch_id_change_log
+                (Old_batch_id, New_batch_id, Old_shift, New_shift, Old_melt_no,
+                 New_melt_no, Rows_moved, Reason, Changed_by, Changed_by_employee_id,
+                 Changed_datetime)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                old,
+                new,
+                batch.get("Shift"),
+                preview["new_shift"],
+                batch.get("Melt_No"),
+                preview["new_melt_no"],
+                json.dumps(moved),
+                reason.strip(),
+                by_val,
+                get_acting_employee_id() or None,
+                dt_val,
+            ),
+        )
+    if IS_POSTGRES:
+        try:
+            refresh_dashboard_materialized_views()
+        except Exception:
+            pass  # the 4-hourly refresh will catch up
+    return {"old": old, "new": new, "moved": moved}
+
+
+def list_batch_id_changes(limit: int = 50) -> list[dict[str, Any]]:
+    with get_connection() as conn:
+        _ensure_batch_id_change_log(conn)
+    return fetch_all(
+        """
+        SELECT Change_id AS "Change_id", Old_batch_id AS "Old_batch_id",
+               New_batch_id AS "New_batch_id", Old_shift AS "Old_shift",
+               New_shift AS "New_shift", Old_melt_no AS "Old_melt_no",
+               New_melt_no AS "New_melt_no", Rows_moved AS "Rows_moved",
+               Reason AS "Reason", Changed_by AS "Changed_by",
+               Changed_datetime AS "Changed_datetime"
+        FROM batch_id_change_log ORDER BY Change_id DESC LIMIT ?
+        """,
+        (limit,),
+    )
+
+
 def make_batch_id(
     furnace: str,
     production_date: object,
@@ -9730,6 +9957,7 @@ def _ensure_packing_list_schema() -> None:
         _ensure_toll_conversion(conn)
         _ensure_raw_material_correction(conn)
         _ensure_packing_list_po(conn)
+        _ensure_batch_id_change_log(conn)
         _ensure_company_profile(conn)
         _ensure_employees(conn)
         _ensure_row_level_security(conn)
