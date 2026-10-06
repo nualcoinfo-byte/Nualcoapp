@@ -333,6 +333,21 @@ else:
     t4.metric("GST value (18%)", f"{gst_value:,.2f}")
     t5.metric("Total value", f"{grand_total:,.2f}")
 
+processed = [
+    (ln["name"], db.usable_pct_for_material(ln["name"]), ln["weight"])
+    for ln in collected_lines
+    if ln["name"] and db.usable_pct_for_material(ln["name"]) is not None
+]
+if processed:
+    st.info(
+        " ".join(
+            f"**{name}** is centrifuged and magnetically separated before melting: "
+            f"{pct:g}% of the received weight goes into stock for production "
+            f"(**{db.usable_weight(name, w):,.1f} kg** of {w:,.1f} kg)."
+            for name, pct, w in processed
+        )
+    )
+
 add_col, rem_col, _ = st.columns([1, 1, 4])
 if add_col.button("Add raw material", key="rm_log_add_line"):
     st.session_state.rm_invoice_lines.append(
@@ -472,20 +487,27 @@ if submitted or submit_to_accounts:
                 bil_plant=bil_plant,
             )
             names = ", ".join(ln["name"] for ln in complete)
+            stock_note = "".join(
+                f" {ln['material']}: {db.usable_weight(ln['material'], ln['weight']):,.1f} kg "
+                f"of {ln['weight']:,.1f} kg into stock "
+                f"({db.usable_pct_for_material(ln['material']):g}% usable after processing)."
+                for ln in lines
+                if db.usable_pct_for_material(ln["material"]) is not None
+            )
             if is_conversion:
                 due = sum(ln["weight"] for ln in complete) * db.TOLL_CONVERSION_YIELD_PCT / 100
                 st.session_state["rm_log_flash"] = (
                     f"Saved conversion receipt **{invoice_no}** (#{purchase_id}) with "
                     f"{len(lot_ids)} lot(s) ({names}). Lot IDs: "
                     f"{', '.join(str(i) for i in lot_ids)}. **{due:,.1f} kg of LM25** "
-                    "is now due back to Brakes India."
+                    "is now due back to Brakes India." + stock_note
                 )
             else:
                 st.session_state["rm_log_flash"] = (
                     f"Saved invoice **{invoice_no}** (purchase #{purchase_id}) "
                     f"with {len(lot_ids)} lot(s) ({names}). "
                     f"Lot IDs: {', '.join(str(i) for i in lot_ids)}. "
-                    f"Invoice status: **{target_status}**."
+                    f"Invoice status: **{target_status}**." + stock_note
                 )
             st.session_state.rm_invoice_lines = [
                 {"name": "", "cost": 0.0, "weight": 0.0}

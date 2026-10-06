@@ -593,6 +593,27 @@ DISPATCH_TYPES = [DISPATCH_TYPE_SALE, DISPATCH_TYPE_CONVERSION_RETURN]
 BIL_PLANTS = ["MODULAR", "TRANSENERGY", "MARAIMALAR NAGAR"]
 BIL_BORING = "BIL BORING"
 
+# Raw materials processed before they can be charged. BIL BORING is centrifuged
+# (coolant out) and run through a magnetic separator (fine iron out), leaving
+# 85% of the received weight for production. A new lot of such a material is
+# stocked at received × usable % (Remaining_Weight), with the % kept on the lot
+# (Raw_Material_Inventory.Usable_pct). Lots received before this rule have no
+# Usable_pct and are left as they were.
+PROCESSING_USABLE_PCT: dict[str, float] = {BIL_BORING: 85.0}
+
+
+def usable_pct_for_material(name: object) -> Optional[float]:
+    """Usable % after processing for a raw material, or None if it is used as received."""
+    text = " ".join(str(name or "").upper().split())
+    return PROCESSING_USABLE_PCT.get(text)
+
+
+def usable_weight(name: object, received_kg: float) -> float:
+    """Kg of a new receipt that goes into stock for production."""
+    pct = usable_pct_for_material(name)
+    received = float(received_kg or 0)
+    return received if pct is None else round(received * pct / 100.0, 4)
+
 
 def bil_plant_for_material(name: object) -> Optional[str]:
     """The BIL plant a plant-specific boring name came from, e.g. MODULAR BORING."""
@@ -5014,19 +5035,20 @@ def add_inventory_lot(
             """
             INSERT INTO Raw_Material_Inventory
                 (Purchase_id, Raw_Material_Name, Received_weight, Remaining_Weight,
-                 Storage_bay, Raw_Material_Status, Photo, Cost_per_kg)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                 Storage_bay, Raw_Material_Status, Photo, Cost_per_kg, Usable_pct)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             RETURNING Lot_id
             """,
             (
                 int(purchase_id),
                 material,
                 weight,
-                weight,
+                usable_weight(material, weight),
                 storage_bay,
                 status,
                 photo,
                 cost_per_kg,
+                usable_pct_for_material(material),
             ),
         )
         return int(result.scalar_one())
@@ -5121,21 +5143,23 @@ def save_raw_material_invoice(
         lot_ids: list[int] = []
         for line in lines:
             weight = float(line["weight"])
+            # Processed materials (BIL BORING) go into stock at their usable %.
+            usable_pct = usable_pct_for_material(line["material"])
             lot = _exec(
                 conn,
                 """
                 INSERT INTO Raw_Material_Inventory
                     (Purchase_id, Raw_Material_Name, Received_weight, Remaining_Weight,
                      Storage_bay, Raw_Material_Status, Photo, Cost_per_kg,
-                     Weighment_slip_weight, Invoice_weight, Comments)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     Weighment_slip_weight, Invoice_weight, Comments, Usable_pct)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 RETURNING Lot_id
                 """,
                 (
                     purchase_id,
                     line["material"],
                     weight,
-                    weight,
+                    usable_weight(line["material"], weight),
                     storage_bay,
                     status,
                     line.get("photo"),
@@ -5143,6 +5167,7 @@ def save_raw_material_invoice(
                     line.get("weighment_slip_weight"),
                     line.get("invoice_weight"),
                     line.get("comments"),
+                    usable_pct,
                 ),
             )
             lot_ids.append(int(lot.scalar_one()))
@@ -5956,7 +5981,8 @@ def cancel_conversion_receipt(purchase_id: int) -> None:
         """
         SELECT COUNT(*) AS "n" FROM Raw_Material_Inventory
         WHERE Purchase_id = ?
-          AND ABS(COALESCE(Received_weight, 0) - COALESCE(Remaining_Weight, 0)) > 0.0005
+          AND ABS(COALESCE(Received_weight, 0) * COALESCE(Usable_pct, 100) / 100.0
+                  - COALESCE(Remaining_Weight, 0)) > 0.0005
         """,
         (purchase_id,),
     )
@@ -9059,6 +9085,12 @@ def _ensure_toll_conversion(conn: Connection) -> None:
     )
     _ensure_columns(conn, "Packing_list", [("Dispatch_type", "TEXT")])
     _ensure_columns(conn, "Raw_Material_Purchase", [("BIL_plant", "TEXT")])
+    # Usable % after processing (e.g. BIL BORING 85); NULL = stocked as received.
+    _ensure_columns(
+        conn,
+        "Raw_Material_Inventory",
+        [("Usable_pct", "DOUBLE PRECISION" if IS_POSTGRES else "REAL")],
+    )
     t = _DIALECT_TYPES[IS_POSTGRES]
     _exec(
         conn,
@@ -9296,6 +9328,9 @@ _RAW_MATERIAL_STOCK_SUMMARY_SELECT = """
                AS "Open_lots",
            SUM(COALESCE(i.Received_weight, 0)) AS "Received_kg",
            SUM(COALESCE(c.Charged_kg, 0)) AS "Charged_kg",
+           SUM(CASE WHEN i.Usable_pct IS NOT NULL
+                    THEN COALESCE(i.Received_weight, 0) * (100 - i.Usable_pct) / 100.0
+                    ELSE 0 END) AS "Processing_loss_kg",
            SUM(COALESCE(i.Remaining_Weight, 0)) AS "Remaining_kg",
            SUM(CASE WHEN i.Raw_Material_Status = 'Ready For Melt'
                     THEN COALESCE(i.Remaining_Weight, 0) ELSE 0 END)
@@ -9536,6 +9571,18 @@ def _ensure_dashboard_materialized_views(conn: Connection) -> None:
         '("Production_Date", "Furnace", "Shift", "Alloy_id", "Output_Alloy_id")',
     )
 
+    # Rebuild the stock summary once if it predates the Processing_loss_kg column.
+    if _exec(
+        conn, "SELECT 1 FROM pg_matviews WHERE matviewname = 'mv_raw_material_stock_summary'"
+    ).first() and not _exec(
+        conn,
+        """
+        SELECT 1 FROM pg_attribute
+        WHERE attrelid = 'mv_raw_material_stock_summary'::regclass
+          AND attname = 'Processing_loss_kg' AND NOT attisdropped
+        """,
+    ).first():
+        _exec(conn, "DROP MATERIALIZED VIEW mv_raw_material_stock_summary")
     _exec(
         conn,
         "CREATE MATERIALIZED VIEW IF NOT EXISTS mv_raw_material_stock_summary AS "

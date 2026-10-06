@@ -10,7 +10,12 @@ st.caption(
     "**Raw Material Purchase**; grade chemistry comes from **Raw Material Spec**. "
     "New receipts are entered on **Raw Material Logging**. "
     "Broken Ingot, Furnace Empty, and Not Ok Ingot from **Batch Output** "
-    "are stored as remelt lots linked to the source heat (`Source_Batch_ID`)."
+    "are stored as remelt lots linked to the source heat (`Source_Batch_ID`). "
+    + " ".join(
+        f"**{name}** is processed before melting, so a new lot goes into stock at "
+        f"{pct:g}% of its received weight (`Usable_pct`)."
+        for name, pct in db.PROCESSING_USABLE_PCT.items()
+    )
 )
 
 recent = df_from_rows(
@@ -25,6 +30,7 @@ recent = df_from_rows(
                p.Supplier_invoice_date AS "Supplier_invoice_date",
                COALESCE(p.Received_date, b.Production_Date) AS "Received_date",
                i.Received_weight AS "Received_weight",
+               i.Usable_pct AS "Usable_pct",
                i.Remaining_Weight AS "Remaining_Weight",
                i.Cost_per_kg AS "Cost_per_kg",
                i.Storage_bay AS "Storage_bay",

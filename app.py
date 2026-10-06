@@ -1070,6 +1070,7 @@ if PAGE == "Dashboard":
             and (stock_show_empty or stock_pick or _kg(r.get("Remaining_kg")) > 0.05)
         ]
         show_other = any(_kg(r.get("Other_status_kg")) > 0.05 for r in stock_rows)
+        show_loss = any(_kg(r.get("Processing_loss_kg")) > 0.05 for r in stock_rows)
 
         def _avg_cost(row: dict) -> float | None:
             costed = _kg(row.get("Remaining_kg")) - _kg(row.get("Uncosted_kg"))
@@ -1082,6 +1083,11 @@ if PAGE == "Dashboard":
                     "Open lots": int(r.get("Open_lots") or 0),
                     "Received (kg)": _kg(r.get("Received_kg")),
                     "Charged (kg)": _kg(r.get("Charged_kg")),
+                    **(
+                        {"Processing loss (kg)": _kg(r.get("Processing_loss_kg"))}
+                        if show_loss
+                        else {}
+                    ),
                     "Remaining (kg)": _kg(r.get("Remaining_kg")),
                     "Ready for melt (kg)": _kg(r.get("Ready_for_melt_kg")),
                     "Awaiting assay (kg)": _kg(r.get("Awaiting_assay_kg")),
