@@ -12557,6 +12557,33 @@ def submit_certificate_for_verification(
     )
 
 
+def update_pending_certificate_invoice_number(
+    packing_list_id: int, invoice_number: str
+) -> dict[str, Any]:
+    """Pending verification: quality can correct the packing list's invoice number
+    without sending the certificate back to draft."""
+    _ensure_packing_list_ready()
+    _require_role(CERT_VERIFIER_ROLES, "change the invoice number")
+    _certificate_in_status(
+        packing_list_id, (CERT_STATUS_PENDING,), "change the invoice number"
+    )
+    invoice = (invoice_number or "").strip()
+    if not invoice:
+        raise ValueError("The invoice number cannot be blank.")
+    by_val, dt_val = audit_stamp()
+    with get_connection() as conn:
+        _exec(
+            conn,
+            """
+            UPDATE Packing_list SET Invoice_number = ?,
+                Last_updated_by = ?, Last_updated_datetime = ?
+            WHERE Packing_list_id = ?
+            """,
+            (invoice, by_val, dt_val, packing_list_id),
+        )
+    return get_packing_list_certificate(packing_list_id) or {}
+
+
 def return_certificate_to_draft(packing_list_id: int) -> dict[str, Any]:
     """Pending verification -> Draft, so the packing team can correct it. Stock stays held."""
     _ensure_packing_list_ready()
