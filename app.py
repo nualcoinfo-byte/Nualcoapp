@@ -304,11 +304,13 @@ ADMIN_PAGE_CANCEL_ISSUED = "Cancel issued certificate"
 ADMIN_PAGE_ROLES = "Roles & permissions"
 ADMIN_PAGE_PASSWORDS = "Employee passwords"
 ADMIN_PAGE_BATCH_ID = "Correct batch ID"
+ADMIN_PAGE_BIL_MERGE = "Merge BIL borings"
 ADMIN_NAV_PAGES = [
     ADMIN_PAGE_CANCEL_ISSUED,
     ADMIN_PAGE_ROLES,
     ADMIN_PAGE_PASSWORDS,
     ADMIN_PAGE_BATCH_ID,
+    ADMIN_PAGE_BIL_MERGE,
 ]
 _NAV_SECTION_KEY = {
     "Overview": "overview",
@@ -791,6 +793,11 @@ MIGRATED_PAGES: dict[str, st.Page] = {
         "app_pages/admin_roles.py",
         title="Roles & permissions",
         url_path="admin-roles",
+    ),
+    ADMIN_PAGE_BIL_MERGE: st.Page(
+        "app_pages/admin_bil_merge.py",
+        title="Merge BIL borings",
+        url_path="admin-bil-merge",
     ),
     ADMIN_PAGE_BATCH_ID: st.Page(
         "app_pages/admin_batch_id.py",

@@ -14,7 +14,8 @@ def _cached_vendors() -> list[dict]:
 
 @st.cache_data(ttl=60, show_spinner=False)
 def _cached_raw_materials() -> list[str]:
-    return db.list_raw_materials(active_only=False)
+    # Inactive grades (e.g. plant borings merged into BIL BORING) are not received.
+    return db.list_raw_materials(active_only=True)
 
 
 st.title("Raw Material Logging")
@@ -55,7 +56,19 @@ toll_vendor = bool(vendor_label) and db.is_toll_conversion_party(
     vendor_names.get(vendor_opts.get(vendor_label))
 )
 receipt_type = db.RECEIPT_TYPE_PURCHASE
+bil_plant = None
 if toll_vendor:
+    bil_plant = st.selectbox(
+        "Brakes India plant *",
+        db.BIL_PLANTS,
+        index=None,
+        placeholder="Which factory was it collected from?",
+        key=f"rm_log_bil_plant_{form_token}",
+        help=(
+            f"Receive their borings as **{db.BIL_BORING}**; the plant records "
+            "where it came from."
+        ),
+    )
     # Brakes India borings come in either bought or for toll conversion to LM25;
     # the user must say which (no default, so it is never guessed).
     picked_type = st.radio(
@@ -374,10 +387,19 @@ if submitted or submit_to_accounts:
         ):
             out_of_range.append(ln)
     missing_cost = [ln for ln in complete if is_conversion and ln["cost"] <= 0]
+    inactive = [ln["name"] for ln in complete if db.raw_material_is_inactive(ln["name"])]
     if not vendors:
         st.error("Create a vendor first.")
     elif not vendor_code:
         st.error("Select a vendor name.")
+    elif inactive:
+        st.error(
+            "These raw materials are Inactive in Raw Material Master and can no longer "
+            f"be received: {', '.join(inactive)}."
+            + (f" Use **{db.BIL_BORING}** for Brakes India borings." if toll_vendor else "")
+        )
+    elif toll_vendor and not bil_plant:
+        st.error("Brakes India material: choose the **plant** it was collected from.")
     elif toll_vendor and not receipt_type:
         st.error(
             "Brakes India material: choose whether this is a **Purchase** or for "
@@ -447,6 +469,7 @@ if submitted or submit_to_accounts:
                 weighment_slip_photo=weighment_slip_photo_bytes,
                 invoice_status=target_status,
                 receipt_type=receipt_type,
+                bil_plant=bil_plant,
             )
             names = ", ".join(ln["name"] for ln in complete)
             if is_conversion:

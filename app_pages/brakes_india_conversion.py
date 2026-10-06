@@ -20,7 +20,8 @@ st.caption(
     "marked **Conversion return**, counted as returned once their test certificate "
     "is **Issued**. Returned kg is matched to the oldest collections first. "
     "Conversion and purchased borings share the yard and are valued at the same "
-    "rate, so either can be melted; what matters is the LM25 still owed."
+    "rate, so either can be melted; what matters is the LM25 still owed. Every "
+    "receipt records the **Brakes India plant** it was collected from."
 )
 
 data = db.toll_conversion_tracker()
@@ -90,6 +91,39 @@ if not collections and not returns:
     )
     st.stop()
 
+# ── By plant ──────────────────────────────────────────────────────────────────
+st.subheader("By Brakes India plant")
+plant_view = pd.DataFrame(
+    [
+        {
+            "Plant": r["BIL_plant"],
+            "Receipts": int(r["Receipts"]),
+            "Collected (kg)": round(r["Collected_kg"], 2),
+            f"LM25 due @{YIELD:g}% (kg)": round(r["Due_kg"], 2),
+            "Returned (kg)": round(r["Returned_kg"], 2),
+            "Balance (kg)": round(r["Balance_kg"], 2),
+            "Still in yard (kg)": round(r["In_yard_kg"], 2),
+        }
+        for r in data["by_plant"]
+    ]
+)
+if plant_view.empty:
+    st.caption("No conversion receipts yet.")
+else:
+    show_dataframe(
+        plant_view,
+        column_config={
+            c: st.column_config.NumberColumn(format="%.2f")
+            for c in plant_view.columns
+            if c.endswith("(kg)")
+        },
+    )
+    if "Not set" in set(plant_view["Plant"]):
+        st.warning(
+            "Some conversion receipts have no plant. An Admin can set it on "
+            "**Merge BIL borings** (Admin)."
+        )
+
 # ── Collections (the Excel log) ────────────────────────────────────────────────
 st.subheader("Collections")
 f1, f2, f3 = st.columns([1, 1, 2])
@@ -98,8 +132,10 @@ with f1:
         "Show", [ALL, OPEN_ONLY, RETURNED_ONLY], key="bic_status"
     )
 with f2:
-    materials = sorted({str(c["Raw_Material_Name"]) for c in collections})
-    material_pick = st.selectbox("Raw material", [ALL] + materials, key="bic_material")
+    plants = [p for p in db.BIL_PLANTS if any(c.get("BIL_plant") == p for c in collections)]
+    if any(not c.get("BIL_plant") for c in collections):
+        plants.append("Not set")
+    material_pick = st.selectbox("Plant", [ALL] + plants, key="bic_plant")
 with f3:
     dates = [d for d in (_as_day(c.get("Received_date")) for c in collections) if d]
     if dates:
@@ -121,7 +157,7 @@ def _keep(c: dict) -> bool:
         return False
     if status_pick == RETURNED_ONLY and c["Status"] != "Returned":
         return False
-    if material_pick != ALL and str(c["Raw_Material_Name"]) != material_pick:
+    if material_pick != ALL and (c.get("BIL_plant") or "Not set") != material_pick:
         return False
     if start and end and c.get("Received_date"):
         d = _as_day(c["Received_date"])
@@ -137,14 +173,14 @@ coll_view = pd.DataFrame(
             "Status": c["Status"],
             "Collection date": format_ui_date(c.get("Received_date")),
             "Invoice no": c.get("Supplier_Invoice") or "",
-            "Raw material": c.get("Raw_Material_Name"),
+            "Plant": c.get("BIL_plant") or "Not set",
             "Collected (kg)": round(c["Received_weight"], 2),
             f"LM25 due @{YIELD:g}% (kg)": round(c["Target_return"], 2),
             "Returned (kg)": round(c["Returned_kg"], 2),
             "Balance (kg)": round(c["Balance_kg"], 2),
             "Still in yard (kg)": round(c["Remaining_Weight"], 2),
-            "Lot": c["Lot_id"],
             "Receipt": c["Purchase_id"],
+            "Lots": int(c.get("Lots") or 0),
         }
         for c in reversed(shown)
     ]
@@ -201,7 +237,7 @@ if yard:
     yard_view = (
         pd.DataFrame(yard)
         .pivot_table(
-            index="Raw_Material_Name",
+            index="BIL_plant",
             columns="Receipt_type",
             values="Remaining_kg",
             aggfunc="sum",
@@ -211,7 +247,7 @@ if yard:
         .reset_index()
         .rename(
             columns={
-                "Raw_Material_Name": "Raw material",
+                "BIL_plant": "Plant",
                 db.RECEIPT_TYPE_PURCHASE: "Purchased (kg)",
                 db.RECEIPT_TYPE_CONVERSION: "Conversion (kg)",
             }
@@ -284,6 +320,8 @@ def _excel() -> bytes:
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as writer:
         summary.to_excel(writer, sheet_name="Summary", index=False)
+        if not plant_view.empty:
+            plant_view.to_excel(writer, sheet_name="By plant", index=False)
         coll_view.to_excel(writer, sheet_name="Collections", index=False)
         if not ret_view.empty:
             ret_view.to_excel(writer, sheet_name="Returns", index=False)

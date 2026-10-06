@@ -587,6 +587,25 @@ TOLL_CONVERSION_YIELD_PCT = 70.0  # agreed: return 70% of the weight collected
 DISPATCH_TYPE_SALE = "Sale"
 DISPATCH_TYPE_CONVERSION_RETURN = "Conversion return"
 DISPATCH_TYPES = [DISPATCH_TYPE_SALE, DISPATCH_TYPE_CONVERSION_RETURN]
+# Brakes India (BIL) factories material is collected from, recorded on every
+# Brakes India receipt (purchase or conversion). Their borings are one raw
+# material, BIL BORING, since they share a bay and behave alike.
+BIL_PLANTS = ["MODULAR", "TRANSENERGY", "MARAIMALAR NAGAR"]
+BIL_BORING = "BIL BORING"
+
+
+def bil_plant_for_material(name: object) -> Optional[str]:
+    """The BIL plant a plant-specific boring name came from, e.g. MODULAR BORING."""
+    text = " ".join(str(name or "").upper().split())
+    if "BORING" not in text or text == BIL_BORING:
+        return None
+    if "MODULAR" in text:
+        return "MODULAR"
+    if "TRANSENERGY" in text:
+        return "TRANSENERGY"
+    if "MARAIMALA" in text:
+        return "MARAIMALAR NAGAR"
+    return None
 
 
 def is_toll_conversion_party(name: object) -> bool:
@@ -4387,6 +4406,38 @@ def list_raw_materials(active_only: bool = True) -> list[str]:
     return [r["Raw_Material_Name"] for r in fetch_all(sql)]
 
 
+def raw_material_is_inactive(name: str) -> bool:
+    """True when a grade exists in Raw Material Master but none of its rows is Active."""
+    row = fetch_one(
+        """
+        SELECT COUNT(*) AS "n",
+               SUM(CASE WHEN Status = 'Active' THEN 1 ELSE 0 END) AS "active"
+        FROM Raw_Material_Master WHERE LOWER(Raw_Material_Name) = LOWER(?)
+        """,
+        ((name or "").strip(),),
+    ) or {}
+    return int(row.get("n") or 0) > 0 and int(row.get("active") or 0) == 0
+
+
+def list_bil_receipts_without_plant() -> list[dict[str, Any]]:
+    """Brakes India receipts (not Cancelled) that have no plant recorded."""
+    return fetch_all(
+        """
+        SELECT p.Purchase_id AS "Purchase_id", p.Supplier_Invoice AS "Supplier_Invoice",
+               p.Received_date AS "Received_date",
+               COALESCE(p.Receipt_type, 'Purchase') AS "Receipt_type",
+               (SELECT COALESCE(SUM(i.Received_weight), 0) FROM Raw_Material_Inventory i
+                WHERE i.Purchase_id = p.Purchase_id) AS "Received_kg"
+        FROM Raw_Material_Purchase p
+        JOIN Vendor_Master v ON v.Vendor_code = p.Vendor_code
+        WHERE UPPER(v.Vendor_name) LIKE ? AND p.BIL_plant IS NULL
+          AND COALESCE(p.Invoice_status, '') <> 'Cancelled'
+        ORDER BY p.Received_date DESC, p.Purchase_id DESC
+        """,
+        (f"%{TOLL_CONVERSION_PARTY}%",),
+    )
+
+
 def find_raw_material_name(name: str) -> Optional[str]:
     """Return the stored spelling of a raw_material_name, ignoring letter case."""
     text = "" if name is None else str(name).strip()
@@ -4648,6 +4699,7 @@ def list_inventory_lots(
                p.Vendor_code AS "Vendor_code", v.Vendor_name AS "Vendor_name",
                CASE WHEN p.Purchase_id IS NULL THEN NULL
                     ELSE COALESCE(p.Receipt_type, 'Purchase') END AS "Receipt_type",
+               p.BIL_plant AS "BIL_plant",
                i.Remaining_Weight AS "Remaining_Weight",
                i.Received_weight AS "Received_weight",
                i.Cost_per_kg AS "Cost_per_kg",
@@ -4995,6 +5047,7 @@ def save_raw_material_invoice(
     weighment_slip_photo: Optional[bytes] = None,
     invoice_status: str = "Pending with purchase",
     receipt_type: str = RECEIPT_TYPE_PURCHASE,
+    bil_plant: Optional[str] = None,
 ) -> tuple[int, list[int]]:
     """Save one vendor invoice and its lots in a single transaction.
 
@@ -5008,13 +5061,22 @@ def save_raw_material_invoice(
         _validate_invoice_document_name(invoice_document_name)
     if receipt_type not in RECEIPT_TYPES:
         raise ValueError(f"Unknown receipt type: {receipt_type}.")
+    vendor = fetch_one(
+        'SELECT Vendor_name AS "Vendor_name" FROM Vendor_Master WHERE Vendor_code = ?',
+        (vendor_code,),
+    )
+    toll_vendor = is_toll_conversion_party((vendor or {}).get("Vendor_name"))
+    if toll_vendor:
+        if bil_plant not in BIL_PLANTS:
+            raise ValueError(
+                "Choose the Brakes India plant the material came from "
+                f"({', '.join(BIL_PLANTS)})."
+            )
+    else:
+        bil_plant = None
     yield_pct: Optional[float] = None
     if receipt_type == RECEIPT_TYPE_CONVERSION:
-        vendor = fetch_one(
-            'SELECT Vendor_name AS "Vendor_name" FROM Vendor_Master WHERE Vendor_code = ?',
-            (vendor_code,),
-        )
-        if not is_toll_conversion_party((vendor or {}).get("Vendor_name")):
+        if not toll_vendor:
             raise ValueError("Only Brakes India material can be received for conversion.")
         invoice_status = "Approved"
         yield_pct = TOLL_CONVERSION_YIELD_PCT
@@ -5033,8 +5095,8 @@ def save_raw_material_invoice(
                  Invoice_Document, Invoice_Document_name, Invoice_Document_type,
                  Vehicle_photo, Weighment_slip_photo, Invoice_status,
                  Last_updated_by, Last_updated_datetime, Receipt_type,
-                 Conversion_yield_pct)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 Conversion_yield_pct, BIL_plant)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             RETURNING Purchase_id
             """,
             (
@@ -5052,6 +5114,7 @@ def save_raw_material_invoice(
                 dt_val,
                 receipt_type,
                 yield_pct,
+                bil_plant,
             ),
         )
         purchase_id = int(result.scalar_one())
@@ -5097,6 +5160,7 @@ def get_raw_material_purchase(purchase_id: int) -> Optional[dict[str, Any]]:
                p.Received_date AS "Received_date",
                p.Invoice_status AS "Invoice_status",
                COALESCE(p.Receipt_type, 'Purchase') AS "Receipt_type",
+               p.BIL_plant AS "BIL_plant",
                p.Last_updated_by AS "Last_updated_by",
                p.Last_updated_datetime AS "Last_updated_datetime"
         FROM Raw_Material_Purchase p
@@ -8994,6 +9058,23 @@ def _ensure_toll_conversion(conn: Connection) -> None:
         ],
     )
     _ensure_columns(conn, "Packing_list", [("Dispatch_type", "TEXT")])
+    _ensure_columns(conn, "Raw_Material_Purchase", [("BIL_plant", "TEXT")])
+    t = _DIALECT_TYPES[IS_POSTGRES]
+    _exec(
+        conn,
+        f"""
+        CREATE TABLE IF NOT EXISTS raw_material_merge_log (
+            Merge_id {t["autopk"]},
+            Source_names TEXT NOT NULL,
+            Target_name TEXT NOT NULL,
+            Rows_changed TEXT,
+            Plants_set TEXT,
+            Changed_by TEXT NOT NULL,
+            Changed_by_employee_id TEXT,
+            Changed_datetime TEXT NOT NULL
+        )
+        """,
+    )
 
 
 def _ensure_batch_output_correction(conn: Connection) -> None:
@@ -15090,18 +15171,293 @@ def production_snapshot(
     return {"batches": batches, "inputs": inputs_by_batch, "outputs": outputs_by_batch}
 
 
+# ---------- BIL BORING merge (one-time, Admin) ----------
+
+_BIL_NAME_TABLES = (
+    "Raw_Material_Inventory",
+    "batch_input",
+    "batch_input_return",
+    "scrap_inventory",
+    "raw_material_correction",
+    "raw_material_correction_line",
+    "raw_material_returns",
+    "Build_of_Material",
+)
+
+
+def _bil_source_names_on_conn(conn: Connection) -> list[str]:
+    """Plant-specific boring names still in use (master or stock), e.g. MODULAR BORING."""
+    names = {
+        str(r[0])
+        for r in _exec(
+            conn,
+            "SELECT Raw_Material_Name FROM Raw_Material_Master WHERE Status = 'Active' "
+            "UNION SELECT Raw_Material_Name FROM Raw_Material_Inventory",
+        )
+        if r[0]
+    }
+    return sorted(n for n in names if bil_plant_for_material(n))
+
+
+def _bil_purchase_plants_on_conn(
+    conn: Connection, sources: list[str]
+) -> tuple[dict[int, str], list[int]]:
+    """Plant for each Brakes India receipt with no plant yet, from its lot names.
+    Returns ({purchase id: plant}, [receipts whose lots point at several plants])."""
+    rows = _exec(
+        conn,
+        """
+        SELECT p.Purchase_id AS "Purchase_id", i.Raw_Material_Name AS "Name"
+        FROM Raw_Material_Purchase p
+        JOIN Vendor_Master v ON v.Vendor_code = p.Vendor_code
+        JOIN Raw_Material_Inventory i ON i.Purchase_id = p.Purchase_id
+        WHERE UPPER(v.Vendor_name) LIKE ? AND p.BIL_plant IS NULL
+        """,
+        (f"%{TOLL_CONVERSION_PARTY}%",),
+    ).mappings()
+    found: dict[int, set[str]] = {}
+    for r in rows:
+        plant = bil_plant_for_material(r["Name"])
+        if plant:
+            found.setdefault(int(r["Purchase_id"]), set()).add(plant)
+    plants = {pid: next(iter(ps)) for pid, ps in found.items() if len(ps) == 1}
+    mixed = sorted(pid for pid, ps in found.items() if len(ps) > 1)
+    return plants, mixed
+
+
+def bil_merge_preview() -> dict[str, Any]:
+    """What merging the plant-specific borings into BIL BORING would change."""
+    with get_connection() as conn:
+        sources = _bil_source_names_on_conn(conn)
+        lowered = [s.lower() for s in sources]
+        tables = []
+        if lowered:
+            marks = ", ".join("?" for _ in lowered)
+            for table in _BIL_NAME_TABLES:
+                n = int(
+                    _exec(
+                        conn,
+                        f"SELECT COUNT(*) FROM {table} WHERE LOWER(Raw_Material_Name) IN ({marks})",
+                        tuple(lowered),
+                    ).scalar()
+                    or 0
+                )
+                tables.append({"Table": table, "Rows": n})
+            stock = [
+                dict(r)
+                for r in _exec(
+                    conn,
+                    f"""
+                    SELECT Raw_Material_Name AS "Raw_Material_Name", COUNT(*) AS "Lots",
+                           COALESCE(SUM(Remaining_Weight), 0) AS "Remaining_kg"
+                    FROM Raw_Material_Inventory
+                    WHERE LOWER(Raw_Material_Name) IN ({marks})
+                    GROUP BY Raw_Material_Name
+                    """,
+                    tuple(lowered),
+                ).mappings()
+            ]
+        else:
+            stock = []
+        plants, mixed = _bil_purchase_plants_on_conn(conn, sources)
+        has_target = bool(
+            _exec(
+                conn,
+                "SELECT 1 FROM Raw_Material_Master WHERE LOWER(Raw_Material_Name) = LOWER(?)",
+                (BIL_BORING,),
+            ).first()
+        )
+    by_plant: dict[str, int] = {}
+    for plant in plants.values():
+        by_plant[plant] = by_plant.get(plant, 0) + 1
+    return {
+        "sources": sources,
+        "tables": tables,
+        "stock": stock,
+        "plants_to_set": by_plant,
+        "mixed_receipts": mixed,
+        "target_exists": has_target,
+    }
+
+
+def apply_bil_merge() -> dict[str, Any]:
+    """Admin, one transaction: set each Brakes India receipt's plant from its lot
+    names, create BIL BORING in Raw Material Master (copying the latest master
+    row and spec of a plant boring), rename the plant borings to BIL BORING in
+    every table that stores the name (stock lots, charge lines, returns,
+    scrap, corrections, BOM), mark the old names Inactive, and log it.
+    Old master and spec rows are kept for history."""
+    if not is_admin_user():
+        raise ValueError("Only an Admin can merge raw materials.")
+    by_val, dt_val = audit_stamp()
+    with get_connection() as conn:
+        sources = _bil_source_names_on_conn(conn)
+        if not sources:
+            raise ValueError("There are no plant borings left to merge.")
+        lowered = [s.lower() for s in sources]
+        marks = ", ".join("?" for _ in lowered)
+        plants, mixed = _bil_purchase_plants_on_conn(conn, sources)
+        for pid, plant in plants.items():
+            _exec(
+                conn,
+                "UPDATE Raw_Material_Purchase SET BIL_plant = ? WHERE Purchase_id = ?",
+                (plant, pid),
+            )
+        if not _exec(
+            conn,
+            "SELECT 1 FROM Raw_Material_Master WHERE LOWER(Raw_Material_Name) = LOWER(?)",
+            (BIL_BORING,),
+        ).first():
+            ordered = sorted(sources, key=lambda n: (bil_plant_for_material(n) != "MODULAR", n))
+            template = None
+            for name in ordered:
+                template = (
+                    _exec(
+                        conn,
+                        """
+                        SELECT * FROM Raw_Material_Master
+                        WHERE Raw_Material_Name = ?
+                        ORDER BY Effective_date DESC
+                        """,
+                        (name,),
+                    )
+                    .mappings()
+                    .first()
+                )
+                if template:
+                    break
+            if template:
+                row = {str(k): v for k, v in dict(template).items()}
+                src_name = row.get("raw_material_name", row.get("Raw_Material_Name"))
+                eff = row.get("effective_date", row.get("Effective_date"))
+                cols = list(row.keys())
+                values = []
+                for c in cols:
+                    if c.lower() == "raw_material_name":
+                        values.append(BIL_BORING)
+                    elif c.lower() == "status":
+                        values.append("Active")
+                    elif c.lower() == "last_updated_by":
+                        values.append(by_val)
+                    elif c.lower() == "last_updated_datetime":
+                        values.append(dt_val)
+                    else:
+                        values.append(row[c])
+                _exec(
+                    conn,
+                    f"INSERT INTO Raw_Material_Master ({', '.join(cols)}) "
+                    f"VALUES ({', '.join('?' for _ in cols)})",
+                    tuple(values),
+                )
+                _exec(
+                    conn,
+                    """
+                    INSERT INTO Raw_Material_Spec
+                        (Raw_Material_Name, Effective_date, Element_symbol, Percentage,
+                         Last_updated_by, Last_updated_datetime)
+                    SELECT ?, Effective_date, Element_symbol, Percentage, ?, ?
+                    FROM Raw_Material_Spec
+                    WHERE Raw_Material_Name = ? AND Effective_date = ?
+                    """,
+                    (BIL_BORING, by_val, dt_val, src_name, eff),
+                )
+            else:
+                _exec(
+                    conn,
+                    """
+                    INSERT INTO Raw_Material_Master
+                        (Raw_Material_Name, Effective_date, Status, Last_updated_by,
+                         Last_updated_datetime)
+                    VALUES (?, ?, 'Active', ?, ?)
+                    """,
+                    (BIL_BORING, today_ist().isoformat(), by_val, dt_val),
+                )
+        changed: dict[str, int] = {}
+        for table in _BIL_NAME_TABLES:
+            result = _exec(
+                conn,
+                f"UPDATE {table} SET Raw_Material_Name = ? "
+                f"WHERE LOWER(Raw_Material_Name) IN ({marks})",
+                (BIL_BORING, *lowered),
+            )
+            if result.rowcount:
+                changed[table] = int(result.rowcount)
+        _exec(
+            conn,
+            f"UPDATE Raw_Material_Master SET Status = 'Inactive', Last_updated_by = ?, "
+            f"Last_updated_datetime = ? WHERE LOWER(Raw_Material_Name) IN ({marks})",
+            (by_val, dt_val, *lowered),
+        )
+        plants_set: dict[str, int] = {}
+        for plant in plants.values():
+            plants_set[plant] = plants_set.get(plant, 0) + 1
+        _exec(
+            conn,
+            """
+            INSERT INTO raw_material_merge_log
+                (Source_names, Target_name, Rows_changed, Plants_set, Changed_by,
+                 Changed_by_employee_id, Changed_datetime)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                ", ".join(sources),
+                BIL_BORING,
+                json.dumps(changed),
+                json.dumps({**plants_set, "mixed_receipts": mixed}),
+                by_val,
+                get_acting_employee_id() or None,
+                dt_val,
+            ),
+        )
+    if IS_POSTGRES:
+        try:
+            refresh_dashboard_materialized_views()
+        except Exception:
+            pass
+    return {"sources": sources, "changed": changed, "plants_set": plants_set, "mixed": mixed}
+
+
+def list_raw_material_merges() -> list[dict[str, Any]]:
+    return fetch_all(
+        """
+        SELECT Merge_id AS "Merge_id", Source_names AS "Source_names",
+               Target_name AS "Target_name", Rows_changed AS "Rows_changed",
+               Plants_set AS "Plants_set", Changed_by AS "Changed_by",
+               Changed_datetime AS "Changed_datetime"
+        FROM raw_material_merge_log ORDER BY Merge_id DESC
+        """
+    )
+
+
+def set_bil_plant(purchase_id: int, plant: str) -> None:
+    """Set the Brakes India plant on a receipt that has none (or correct it)."""
+    if plant not in BIL_PLANTS:
+        raise ValueError(f"Plant must be one of {', '.join(BIL_PLANTS)}.")
+    by_val, dt_val = audit_stamp()
+    execute(
+        """
+        UPDATE Raw_Material_Purchase
+        SET BIL_plant = ?, Last_updated_by = ?, Last_updated_datetime = ?
+        WHERE Purchase_id = ?
+        """,
+        (plant, by_val, dt_val, int(purchase_id)),
+    )
+
+
 def toll_conversion_tracker() -> dict[str, Any]:
     """Brakes India toll conversion: what came in, what is owed, what is in hand.
 
-    collections: one row per conversion lot (oldest first) with its target
-        return (received kg × the receipt's yield %), the kg returned against
-        it (Issued conversion-return packing lists, allocated oldest
-        collection first) and its status: Returned / Part returned / Open.
+    collections: one row per conversion receipt (oldest first) with its BIL
+        plant, collected kg (received weight of its lots), LM25 due (collected
+        × the receipt's yield %), the kg returned against it (Issued
+        conversion-return packing lists, allocated oldest receipt first),
+        balance, and status Returned / Part returned / Open.
+    by_plant: the same totals per BIL plant.
     returns: conversion-return packing lists that are not Cancelled; they
         count as Returned once their test certificate is Issued, else as
         In packing.
-    yard: Brakes India lots still in stock, by material and receipt type
-        (purchase and conversion stock share the yard and can be swapped).
+    yard: Brakes India stock still in the yard, by plant and receipt type
+        (purchase and conversion stock share the bay and can be swapped).
     lm25_fg: LM25 finished goods by status (the metal the return comes from).
     """
     collections = fetch_all(
@@ -15110,19 +15466,22 @@ def toll_conversion_tracker() -> dict[str, Any]:
                p.Received_date AS "Received_date",
                p.Supplier_invoice_date AS "Supplier_invoice_date",
                p.Supplier_Invoice AS "Supplier_Invoice",
+               p.BIL_plant AS "BIL_plant",
                COALESCE(p.Conversion_yield_pct, ?) AS "Yield_pct",
-               i.Lot_id AS "Lot_id",
-               i.Raw_Material_Name AS "Raw_Material_Name",
-               i.Invoice_weight AS "Invoice_weight",
-               i.Received_weight AS "Received_weight",
-               i.Remaining_Weight AS "Remaining_Weight",
-               i.Cost_per_kg AS "Cost_per_kg",
+               COUNT(i.Lot_id) AS "Lots",
+               COALESCE(SUM(i.Invoice_weight), 0) AS "Invoice_weight",
+               COALESCE(SUM(i.Received_weight), 0) AS "Received_weight",
+               COALESCE(SUM(i.Remaining_Weight), 0) AS "Remaining_Weight",
+               MIN(i.Lot_id) AS "First_lot",
                p.Last_updated_by AS "Logged_by"
         FROM Raw_Material_Purchase p
         JOIN Raw_Material_Inventory i ON i.Purchase_id = p.Purchase_id
         WHERE p.Receipt_type = ?
           AND COALESCE(p.Invoice_status, '') <> 'Cancelled'
-        ORDER BY p.Received_date, p.Purchase_id, i.Lot_id
+        GROUP BY p.Purchase_id, p.Received_date, p.Supplier_invoice_date,
+                 p.Supplier_Invoice, p.BIL_plant, p.Conversion_yield_pct,
+                 p.Last_updated_by
+        ORDER BY p.Received_date, p.Purchase_id
         """,
         (TOLL_CONVERSION_YIELD_PCT, RECEIPT_TYPE_CONVERSION),
     )
@@ -15153,7 +15512,7 @@ def toll_conversion_tracker() -> dict[str, Any]:
     )
     yard = fetch_all(
         """
-        SELECT i.Raw_Material_Name AS "Raw_Material_Name",
+        SELECT COALESCE(p.BIL_plant, 'Not set') AS "BIL_plant",
                COALESCE(p.Receipt_type, 'Purchase') AS "Receipt_type",
                COUNT(*) AS "Lots",
                SUM(i.Remaining_Weight) AS "Remaining_kg"
@@ -15163,8 +15522,8 @@ def toll_conversion_tracker() -> dict[str, Any]:
         WHERE i.Remaining_Weight > 0
           AND COALESCE(p.Invoice_status, '') <> 'Cancelled'
           AND UPPER(v.Vendor_name) LIKE ?
-        GROUP BY i.Raw_Material_Name, COALESCE(p.Receipt_type, 'Purchase')
-        ORDER BY i.Raw_Material_Name, COALESCE(p.Receipt_type, 'Purchase')
+        GROUP BY COALESCE(p.BIL_plant, 'Not set'), COALESCE(p.Receipt_type, 'Purchase')
+        ORDER BY 1, 2
         """,
         (f"%{TOLL_CONVERSION_PARTY}%",),
     )
@@ -15194,6 +15553,7 @@ def toll_conversion_tracker() -> dict[str, Any]:
     in_packing_kg = sum(r["Weight"] for r in returns if not r["Returned"])
 
     pool = returned_kg
+    by_plant: dict[str, dict[str, float]] = {}
     for c in collections:
         received = float(c.get("Received_weight") or 0)
         pct = float(c.get("Yield_pct") or TOLL_CONVERSION_YIELD_PCT)
@@ -15201,6 +15561,7 @@ def toll_conversion_tracker() -> dict[str, Any]:
         take = min(target, max(pool, 0.0))
         pool -= take
         c["Received_weight"] = received
+        c["Invoice_weight"] = float(c.get("Invoice_weight") or 0)
         c["Remaining_Weight"] = float(c.get("Remaining_Weight") or 0)
         c["Yield_pct"] = pct
         c["Target_return"] = target
@@ -15212,6 +15573,18 @@ def toll_conversion_tracker() -> dict[str, Any]:
             c["Status"] = "Part returned"
         else:
             c["Status"] = "Open"
+        plant = c.get("BIL_plant") or "Not set"
+        agg = by_plant.setdefault(
+            plant,
+            {"Receipts": 0, "Collected_kg": 0.0, "Due_kg": 0.0, "Returned_kg": 0.0,
+             "Balance_kg": 0.0, "In_yard_kg": 0.0},
+        )
+        agg["Receipts"] += 1
+        agg["Collected_kg"] += received
+        agg["Due_kg"] += target
+        agg["Returned_kg"] += take
+        agg["Balance_kg"] += target - take
+        agg["In_yard_kg"] += c["Remaining_Weight"]
 
     collected = sum(c["Received_weight"] for c in collections)
     target_total = sum(c["Target_return"] for c in collections)
@@ -15223,6 +15596,13 @@ def toll_conversion_tracker() -> dict[str, Any]:
     balance = target_total - returned_kg
     return {
         "collections": collections,
+        "by_plant": [
+            {"BIL_plant": plant, **vals}
+            for plant, vals in sorted(
+                by_plant.items(),
+                key=lambda kv: (BIL_PLANTS.index(kv[0]) if kv[0] in BIL_PLANTS else 99),
+            )
+        ],
         "returns": returns,
         "yard": [
             {**r, "Remaining_kg": float(r.get("Remaining_kg") or 0), "Lots": int(r["Lots"])}
