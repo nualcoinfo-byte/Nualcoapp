@@ -9316,6 +9316,11 @@ DASHBOARD_MATERIALIZED_VIEWS = (
     "mv_batch_production_inputs",
     "mv_batch_production_outputs",
     "mv_melter_output",
+    # Purchase and Inventory dashboard
+    "mv_pi_purchase_lots",
+    "mv_pi_corrections",
+    "mv_pi_scrap",
+    "mv_pi_inventory_lots",
 )
 
 # Melter Output report (melters are paid on output): one row per melting team,
@@ -9453,6 +9458,134 @@ _RAW_MATERIAL_STOCK_SUMMARY_SELECT = """
     WHERE p.Invoice_status IS NULL OR p.Invoice_status <> 'Cancelled'
     GROUP BY i.Raw_Material_Name
 """
+
+
+# ── Purchase and Inventory dashboard views ───────────────────────────────────
+# One row per purchased lot (remelt lots from production have no Purchase_id
+# and are left out; cancelled invoices too). A split moves received kg to the
+# new lots, so summing a purchase's lots still gives what was bought, filed
+# under the material it turned out to be. Purchase_value is received kg × the
+# invoice rate, what Accounts pays.
+_PI_PURCHASE_LOTS_SELECT = """
+    SELECT i.Lot_id AS "Lot_id",
+           i.Purchase_id AS "Purchase_id",
+           i.Parent_lot_id AS "Parent_lot_id",
+           SUBSTR(p.Received_date, 1, 10) AS "Received_date",
+           p.Supplier_Invoice AS "Supplier_Invoice",
+           p.Vendor_code AS "Vendor_code",
+           COALESCE(v.Vendor_name, 'Unknown vendor') AS "Vendor_name",
+           COALESCE(p.Receipt_type, 'Purchase') AS "Receipt_type",
+           COALESCE(p.Invoice_status, 'Pending with purchase') AS "Invoice_status",
+           i.Raw_Material_Name AS "Raw_Material_Name",
+           COALESCE(i.Received_weight, 0) AS "Received_kg",
+           i.Cost_per_kg AS "Cost_per_kg",
+           CASE WHEN i.Cost_per_kg IS NULL THEN 0
+                ELSE COALESCE(i.Received_weight, 0) END AS "Costed_kg",
+           CASE WHEN i.Cost_per_kg IS NULL THEN 0
+                ELSE COALESCE(i.Received_weight, 0) * i.Cost_per_kg END AS "Purchase_value",
+           i.Usable_pct AS "Usable_pct",
+           CASE WHEN i.Usable_pct IS NOT NULL
+                THEN COALESCE(i.Received_weight, 0) * (100 - i.Usable_pct) / 100.0
+                ELSE 0 END AS "Processing_loss_kg",
+           CASE WHEN i.Usable_pct IS NOT NULL AND i.Cost_per_kg IS NOT NULL
+                THEN COALESCE(i.Received_weight, 0) * (100 - i.Usable_pct) / 100.0
+                     * i.Cost_per_kg
+                ELSE 0 END AS "Processing_loss_value",
+           COALESCE(i.Remaining_Weight, 0) AS "Remaining_kg"
+    FROM Raw_Material_Inventory i
+    JOIN Raw_Material_Purchase p ON p.Purchase_id = i.Purchase_id
+    LEFT JOIN Vendor_Master v ON v.Vendor_code = p.Vendor_code
+    WHERE p.Invoice_status IS NULL OR p.Invoice_status <> 'Cancelled'
+"""
+
+# One row per Raw Material Purchase Correction (split / scrap / return).
+_PI_CORRECTIONS_SELECT = """
+    SELECT c.Correction_id AS "Correction_id",
+           SUBSTR(c.Corrected_datetime, 1, 10) AS "Correction_date",
+           c.Correction_type AS "Correction_type",
+           c.Lot_id AS "Lot_id",
+           c.Purchase_id AS "Purchase_id",
+           c.Vendor_code AS "Vendor_code",
+           COALESCE(v.Vendor_name, 'Unknown vendor') AS "Vendor_name",
+           c.Raw_Material_Name AS "Raw_Material_Name",
+           COALESCE(c.Weight, 0) AS "Weight",
+           c.Cost_per_kg AS "Cost_per_kg",
+           COALESCE(c.Weight, 0) * COALESCE(c.Cost_per_kg, 0) AS "Value",
+           c.Reason AS "Reason",
+           c.Corrected_by AS "Corrected_by"
+    FROM raw_material_correction c
+    LEFT JOIN Vendor_Master v ON v.Vendor_code = c.Vendor_code
+"""
+
+# One row per scrap_inventory entry. Production scrap is dated by its batch's
+# production date (falling back to when it was recorded); purchase segregation
+# scrap by when it was found. Value is weight × the lot's charge cost.
+_PI_SCRAP_SELECT = """
+    SELECT s.Scrap_id AS "Scrap_id",
+           COALESCE(SUBSTR(b.Production_Date, 1, 10), SUBSTR(s.Created_datetime, 1, 10))
+               AS "Scrap_date",
+           s.Source_type AS "Source_type",
+           COALESCE(s.Scrap_category, 'Not set') AS "Scrap_category",
+           s.Raw_Material_Name AS "Raw_Material_Name",
+           s.Lot_id AS "Lot_id",
+           s.Batch_ID AS "Batch_ID",
+           s.Vendor_code AS "Vendor_code",
+           COALESCE(v.Vendor_name, 'Unknown vendor') AS "Vendor_name",
+           COALESCE(s.Weight, 0) AS "Weight",
+           s.Cost_per_kg AS "Cost_per_kg",
+           COALESCE(s.Weight, 0) * COALESCE(s.Cost_per_kg, 0) AS "Value",
+           CASE WHEN s.Cost_per_kg IS NULL THEN COALESCE(s.Weight, 0) ELSE 0 END
+               AS "Uncosted_kg"
+    FROM scrap_inventory s
+    LEFT JOIN Vendor_Master v ON v.Vendor_code = s.Vendor_code
+    LEFT JOIN Production_batch b ON b.Batch_ID = s.Batch_ID
+"""
+
+# Open inventory lots (remaining kg > 0), the Dashboard's "Inventory on hand by
+# Lot_id" table, plus stock value at the charge cost.
+_PI_INVENTORY_LOTS_SELECT = """
+    SELECT i.Lot_id AS "Lot_id", i.Raw_Material_Name AS "Raw_Material_Name",
+           i.Purchase_id AS "Purchase_id",
+           p.Vendor_code AS "Vendor_code", v.Vendor_name AS "Vendor_name",
+           CASE WHEN p.Purchase_id IS NULL THEN 'Remelt'
+                ELSE COALESCE(p.Receipt_type, 'Purchase') END AS "Receipt_type",
+           p.BIL_plant AS "BIL_plant",
+           i.Remaining_Weight AS "Remaining_Weight",
+           i.Received_weight AS "Received_weight",
+           """ + lot_charge_cost_sql("i") + """ AS "Cost_per_kg",
+           i.Remaining_Weight * """ + lot_charge_cost_sql("i") + """ AS "Stock_value",
+           i.Usable_pct AS "Usable_pct",
+           i.Raw_Material_Status AS "Raw_Material_Status",
+           i.Storage_bay AS "Storage_bay",
+           i.Source_Batch_ID AS "Source_Batch_ID",
+           oa.Alloy_name AS "Origin_Alloy_name",
+           SUBSTR(COALESCE(p.Received_date, b.Production_Date), 1, 10) AS "Received_date"
+    FROM Raw_Material_Inventory i
+    LEFT JOIN Raw_Material_Purchase p ON p.Purchase_id = i.Purchase_id
+    LEFT JOIN Vendor_Master v ON v.Vendor_code = p.Vendor_code
+    LEFT JOIN Production_batch b ON b.Batch_ID = i.Source_Batch_ID
+    LEFT JOIN Alloy_Master oa ON oa.Alloy_id = b.Alloy_id
+    WHERE i.Remaining_Weight > 0
+      AND (p.Invoice_status IS NULL OR p.Invoice_status <> 'Cancelled')
+"""
+
+# view, SELECT, unique key (REFRESH ... CONCURRENTLY needs one), date column.
+_PI_VIEWS = (
+    ("mv_pi_purchase_lots", _PI_PURCHASE_LOTS_SELECT, '"Lot_id"', '"Received_date"'),
+    ("mv_pi_corrections", _PI_CORRECTIONS_SELECT, '"Correction_id"', '"Correction_date"'),
+    ("mv_pi_scrap", _PI_SCRAP_SELECT, '"Scrap_id"', '"Scrap_date"'),
+    ("mv_pi_inventory_lots", _PI_INVENTORY_LOTS_SELECT, '"Lot_id"', '"Received_date"'),
+)
+
+
+def _mv_source(view: str, select_sql: str, alias: str = "") -> str:
+    """The materialized view on Postgres; the same SELECT inline on SQLite.
+
+    With `alias`, returns "view alias" / "(SELECT ...) alias".
+    """
+    if IS_POSTGRES:
+        return f"{view} {alias}".rstrip()
+    return f"({select_sql}) {alias or view}"
 
 
 _USABLE_COST_VIEWS = (
@@ -9743,6 +9876,18 @@ def _ensure_dashboard_materialized_views(conn: Connection) -> None:
         'ON mv_melter_output ("Production_Date", "Melting_team")',
     )
 
+    # Purchase and Inventory dashboard.
+    for view, select_sql, key_cols, date_col in _PI_VIEWS:
+        _exec(conn, f"CREATE MATERIALIZED VIEW IF NOT EXISTS {view} AS {select_sql}")
+        _exec(
+            conn,
+            f"CREATE UNIQUE INDEX IF NOT EXISTS idx_{view}_pk ON {view} ({key_cols})",
+        )
+        _exec(
+            conn,
+            f"CREATE INDEX IF NOT EXISTS idx_{view}_date ON {view} ({date_col})",
+        )
+
     # Supabase grants anon every new object in public; tables are revoked by
     # the RLS setup, but a materialized view is not a table there.
     if _exec(conn, "SELECT 1 FROM pg_roles WHERE rolname = 'anon'").scalar():
@@ -9752,6 +9897,7 @@ def _ensure_dashboard_materialized_views(conn: Connection) -> None:
             "mv_batch_production_inputs",
             "mv_batch_production_outputs",
             "mv_melter_output",
+            *(v[0] for v in _PI_VIEWS),
         ):
             _exec(conn, f"REVOKE ALL ON {view} FROM anon")
 
@@ -15242,6 +15388,117 @@ def list_raw_material_stock_summary() -> list[dict[str, Any]]:
         _RAW_MATERIAL_STOCK_SUMMARY_SELECT
         + ' ORDER BY "Remaining_kg" DESC, "Raw_Material_Name"'
     )
+
+
+# ---------- Purchase and Inventory dashboard ----------
+# All of these read materialized views on Postgres (refreshed with the
+# Dashboard, see refresh_dashboard_materialized_views) and run the same SELECT
+# live on SQLite. Dates are inclusive ISO strings.
+
+def _pi_range(start_date: object, end_date: object) -> list[str]:
+    return [
+        _coerce_production_date(start_date).isoformat(),
+        _coerce_production_date(end_date).isoformat(),
+    ]
+
+
+def pi_purchase_lots(start_date: object, end_date: object) -> list[dict[str, Any]]:
+    """Purchased lots received in the period (one row per lot)."""
+    src = _mv_source("mv_pi_purchase_lots", _PI_PURCHASE_LOTS_SELECT)
+    return fetch_all(
+        f'SELECT * FROM {src} WHERE "Received_date" BETWEEN ? AND ? '
+        'ORDER BY "Received_date", "Lot_id"',
+        _pi_range(start_date, end_date),
+    )
+
+
+def pi_corrections(start_date: object, end_date: object) -> list[dict[str, Any]]:
+    """Raw material purchase corrections (split / scrap / return) made in the period."""
+    src = _mv_source("mv_pi_corrections", _PI_CORRECTIONS_SELECT)
+    return fetch_all(
+        f'SELECT * FROM {src} WHERE "Correction_date" BETWEEN ? AND ? '
+        'ORDER BY "Correction_date", "Correction_id"',
+        _pi_range(start_date, end_date),
+    )
+
+
+def pi_scrap(start_date: object, end_date: object) -> list[dict[str, Any]]:
+    """Scrap from purchase segregation and production in the period."""
+    src = _mv_source("mv_pi_scrap", _PI_SCRAP_SELECT)
+    return fetch_all(
+        f'SELECT * FROM {src} WHERE "Scrap_date" BETWEEN ? AND ? '
+        'ORDER BY "Scrap_date", "Scrap_id"',
+        _pi_range(start_date, end_date),
+    )
+
+
+def pi_inventory_lots() -> list[dict[str, Any]]:
+    """Inventory on hand by lot (remaining kg > 0), newest lot first."""
+    src = _mv_source("mv_pi_inventory_lots", _PI_INVENTORY_LOTS_SELECT)
+    return fetch_all(f'SELECT * FROM {src} ORDER BY "Lot_id" DESC')
+
+
+def pi_production_consumption(start_date: object, end_date: object) -> list[dict[str, Any]]:
+    """Raw material charged to production batches made in the period, per day and material."""
+    summary = _mv_source("mv_batch_production_summary", _BATCH_PRODUCTION_SUMMARY_SELECT, "s")
+    inputs = _mv_source("mv_batch_production_inputs", _BATCH_PRODUCTION_INPUTS_SELECT, "i")
+    return fetch_all(
+        f"""
+        SELECT SUBSTR(s."Production_Date", 1, 10) AS "Production_Date",
+               i."Raw_Material_Name" AS "Raw_Material_Name",
+               SUM(i."Weight") AS "Charged_kg",
+               SUM(i."Weight" * COALESCE(i."Cost_per_kg", 0)) AS "Charged_value",
+               SUM(CASE WHEN i."Cost_per_kg" IS NULL THEN i."Weight" ELSE 0 END)
+                   AS "Uncosted_kg"
+        FROM {inputs}
+        JOIN {summary} ON s."Batch_ID" = i."Batch_ID"
+        WHERE SUBSTR(s."Production_Date", 1, 10) BETWEEN ? AND ?
+        GROUP BY SUBSTR(s."Production_Date", 1, 10), i."Raw_Material_Name"
+        ORDER BY 1, 2
+        """,
+        _pi_range(start_date, end_date),
+    )
+
+
+def pi_production_totals(start_date: object, end_date: object) -> dict[str, Any]:
+    """Batches, charged kg / value and output kg for production in the period.
+
+    Remelt_kg is output booked to Broken Ingot / Furnace Empty / Not Ok Ingot,
+    which goes back into raw material stock rather than finished goods.
+    """
+    summary = _mv_source("mv_batch_production_summary", _BATCH_PRODUCTION_SUMMARY_SELECT, "s")
+    outputs = _mv_source("mv_batch_production_outputs", _BATCH_PRODUCTION_OUTPUTS_SELECT, "o")
+    params = _pi_range(start_date, end_date)
+    row = fetch_one(
+        f"""
+        SELECT COUNT(*) AS "Batches",
+               SUM(s."Total_Input") AS "Input_kg",
+               SUM(s."Input_Cost") AS "Input_value",
+               SUM(s."Total_Output") AS "Output_kg"
+        FROM {summary}
+        WHERE SUBSTR(s."Production_Date", 1, 10) BETWEEN ? AND ?
+        """,
+        params,
+    )
+    marks = ", ".join("?" for _ in SIDESTREAM_ALLOY_IDS)
+    remelt = fetch_one(
+        f"""
+        SELECT SUM(o."Weight") AS "Remelt_kg"
+        FROM {outputs}
+        JOIN {summary} ON s."Batch_ID" = o."Batch_ID"
+        WHERE SUBSTR(s."Production_Date", 1, 10) BETWEEN ? AND ?
+          AND o."Alloy_id" IN ({marks})
+        """,
+        params + list(SIDESTREAM_ALLOY_IDS),
+    )
+    row = dict(row or {})
+    return {
+        "Batches": int(row.get("Batches") or 0),
+        "Input_kg": float(row.get("Input_kg") or 0),
+        "Input_value": float(row.get("Input_value") or 0),
+        "Output_kg": float(row.get("Output_kg") or 0),
+        "Remelt_kg": float((remelt or {}).get("Remelt_kg") or 0),
+    }
 
 
 def production_snapshot(
