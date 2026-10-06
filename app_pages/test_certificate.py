@@ -1244,14 +1244,31 @@ with h_inv:
     invoice_number = st.text_input(
         "Invoice number *",
         key="tc_invoice",
-        disabled=not draft_editable,
+        disabled=not (draft_editable or insp_editable),
         placeholder="Needed to submit",
         help=(
             "Accounts invoice the weight once the packing list is ready for its test "
             "certificate, so enter the invoice number here. Saved with the draft; "
-            "required before Submit for verification."
+            "required before Submit for verification. While pending verification, "
+            "Production can correct it with Save invoice number."
         ),
     )
+    if insp_editable:
+        saved_invoice = (header.get("Invoice_number") or "").strip()
+        invoice_changed = (invoice_number or "").strip() != saved_invoice
+        if st.button(
+            "Save invoice number",
+            key="tc_invoice_save",
+            disabled=not invoice_changed or not (invoice_number or "").strip(),
+        ):
+            try:
+                db.update_pending_certificate_invoice_number(
+                    packing_list_id, invoice_number
+                )
+                st.success("Invoice number saved.")
+                st.rerun()
+            except Exception as exc:
+                st.error(str(exc))
 invoice_entered = bool((invoice_number or "").strip())
 with h2:
     issued_date = ui_date_input(
@@ -1719,6 +1736,10 @@ elif is_pending:
     if verify_clicked:
         try:
             db.save_visual_inspection(packing_list_id, inspection_rows)
+            if (invoice_number or "").strip() != (header.get("Invoice_number") or "").strip():
+                db.update_pending_certificate_invoice_number(
+                    packing_list_id, invoice_number
+                )
             done = db.verify_packing_list_certificate(packing_list_id)
             st.success(f"**{done.get('Certificate_no')}** verified.")
             st.rerun()
