@@ -6943,7 +6943,17 @@ def rename_batch_id(
                 str(r["name"])
                 for r in _exec(conn, "PRAGMA table_info(Production_batch)").mappings()
             ]
-        special = {"batch_id": "?", "shift": "?", "melt_no": "?"}
+        # Heat no is unique per furnace on production (production_batch_heat_no
+        # _unique): park the old row on a temporary heat no first, so the copy
+        # can carry the real one while both rows exist inside this transaction.
+        heat = batch.get("Heat_no")
+        if heat not in (None, ""):
+            _exec(
+                conn,
+                "UPDATE Production_batch SET Heat_no = ? WHERE Batch_ID = ?",
+                (f"{heat}#renaming-{old}", old),
+            )
+        special = {"batch_id": "?", "shift": "?", "melt_no": "?", "heat_no": "?"}
         select_parts = [special.get(c.lower(), c) for c in cols]
         params = []
         for c in cols:
@@ -6953,6 +6963,8 @@ def rename_batch_id(
                 params.append(preview["new_shift"])
             elif c.lower() == "melt_no":
                 params.append(preview["new_melt_no"])
+            elif c.lower() == "heat_no":
+                params.append(heat)
         _exec(
             conn,
             f"INSERT INTO Production_batch ({', '.join(cols)}) "
