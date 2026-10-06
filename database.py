@@ -15760,6 +15760,8 @@ def list_raw_material_merges() -> list[dict[str, Any]]:
 # its Brakes India conversion tracking and the cost per usable kg all carry
 # over. BIL BORING goes down by the kg entered and BIL BRIQUTTE goes up by it.
 BIL_BRIQUETTE = "BIL BRIQUTTE"
+# Who may briquette or undo one (Admin always). Production may not.
+BRIQUETTING_ROLES = ("Purchase", "Inventory", "Management")
 
 
 def _date_iso(value: object, what: str) -> str:
@@ -15865,6 +15867,7 @@ def save_bil_briquetting(
     The kg cannot exceed the BIL BORING in stock that was received on or
     before the briquetting date (which cannot be in the future).
     """
+    _require_role(BRIQUETTING_ROLES, "convert BIL BORING to BIL BRIQUTTE")
     day = _date_iso(briquetting_date, "briquetting date")
     if day > today_ist().isoformat():
         raise ValueError("The briquetting date cannot be in the future.")
@@ -16067,6 +16070,7 @@ def undo_bil_briquetting(briquetting_id: int, reason: str) -> None:
     """Put a briquetting's kg back on its BIL BORING lots and remove the BIL
     BRIQUTTE lots it made. Only while those lots are untouched (nothing
     charged, scrapped, split or corrected from them). Logged on the record."""
+    _require_role(BRIQUETTING_ROLES, "undo a briquetting")
     if not (reason or "").strip():
         raise ValueError("Enter why the briquetting is being undone.")
     by_val, dt_val = audit_stamp()

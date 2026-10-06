@@ -18,6 +18,11 @@ st.caption(
     "briquettes are untouched."
 )
 
+_employee = st.session_state.get("auth_employee") or {}
+can_briquette = db.role_allowed(
+    _employee.get("role_name"), _employee.get("role_id"), db.BRIQUETTING_ROLES
+)
+
 flash = st.session_state.pop("briq_flash", None)
 if flash:
     st.success(flash)
@@ -68,88 +73,94 @@ with st.expander(f"{BORING} lots in stock ({len(lots)})", expanded=False):
         st.caption(f"No {BORING} in stock.")
 
 # ── Briquetting entry ─────────────────────────────────────────────────────────
-st.subheader(f"Convert {BORING} to {BRIQ}")
-token = int(st.session_state.get("briq_token", 0))
-c1, c2 = st.columns(2)
-with c1:
-    briq_date = ui_date_input(
-        "Briquetting date *", value="today", max_value=db.today_ist(), key=f"briq_date_{token}"
+if not can_briquette:
+    st.info(
+        f"Only {', '.join(db.BRIQUETTING_ROLES)} or Admin users can convert "
+        f"{BORING} to {BRIQ}."
     )
-plan_avail = db.plan_bil_briquetting(0, briq_date)["available_kg"] if briq_date else 0.0
-with c2:
-    weight = empty_percent_input(
-        f"Weight converted to {BRIQ} (kg) *",
-        key=f"briq_weight_{token}",
-        max_value=None,
-        step=1.0,
-        format="%.2f",
-        placeholder=f"Up to {plan_avail:,.2f} kg",
-    )
-c3, c4 = st.columns(2)
-with c3:
-    bay = st.text_input(
-        "Storage bay for the briquettes",
-        key=f"briq_bay_{token}",
-        placeholder="Leave blank to keep each lot's bay",
-    )
-with c4:
-    notes = st.text_input("Notes", key=f"briq_notes_{token}", placeholder="Optional")
-
-st.caption(
-    f"{BORING} in stock on {format_ui_date(briq_date) if briq_date else '—'}: "
-    f"**{plan_avail:,.2f} kg**."
-)
-over = weight is not None and weight > plan_avail + 0.005
-if over:
-    st.error(
-        f"{weight:,.2f} kg is more than the {plan_avail:,.2f} kg of {BORING} in stock "
-        "on that date."
-    )
-elif weight:
-    plan = db.plan_bil_briquetting(weight, briq_date)
-    st.markdown(
-        f"**After saving:** {BORING} {stock[BORING]['kg'] - weight:,.2f} kg · "
-        f"{BRIQ} {stock[BRIQ]['kg'] + weight:,.2f} kg"
-    )
-    show_dataframe(
-        pd.DataFrame(
-            [
-                {
-                    f"{BORING} lot": p["Lot_id"],
-                    "Received": p.get("Received_date"),
-                    "Plant": p.get("BIL_plant") or "—",
-                    "Receipt": p.get("Receipt_type"),
-                    "Takes (kg)": round(p["Take_kg"], 2),
-                    "Lot left (kg)": round(p["Remaining_Weight"] - p["Take_kg"], 2),
-                }
-                for p in plan["parts"]
-            ]
+else:
+    st.subheader(f"Convert {BORING} to {BRIQ}")
+    token = int(st.session_state.get("briq_token", 0))
+    c1, c2 = st.columns(2)
+    with c1:
+        briq_date = ui_date_input(
+            "Briquetting date *", value="today", max_value=db.today_ist(), key=f"briq_date_{token}"
         )
-    )
-
-if st.button(
-    f"Move to {BRIQ}",
-    type="primary",
-    key="briq_save",
-    disabled=not weight or over or not stock["briquette_name"] or stock["briquette_inactive"],
-):
-    try:
-        res = db.save_bil_briquetting(briq_date, weight, storage_bay=bay, notes=notes)
-    except Exception as exc:
-        st.error(f"Could not save: {exc}")
-    else:
-        after = db.bil_briquetting_stock()
-        st.session_state["briq_flash"] = (
-            f"Briquetting #{res['briquetting_id']} on {format_ui_date(res['date'])}: "
-            f"{res['weight']:,.2f} kg moved from {BORING} to {res['target']} "
-            f"(new lot{'s' if len(res['lines']) != 1 else ''} "
-            f"{', '.join(str(l['New_lot_id']) for l in res['lines'])}). "
-            f"{BORING} now {after[BORING]['kg']:,.2f} kg, "
-            f"{res['target']} {after[BRIQ]['kg']:,.2f} kg."
+    plan_avail = db.plan_bil_briquetting(0, briq_date)["available_kg"] if briq_date else 0.0
+    with c2:
+        weight = empty_percent_input(
+            f"Weight converted to {BRIQ} (kg) *",
+            key=f"briq_weight_{token}",
+            max_value=None,
+            step=1.0,
+            format="%.2f",
+            placeholder=f"Up to {plan_avail:,.2f} kg",
         )
-        st.session_state["briq_token"] = token + 1
-        st.cache_data.clear()
-        st.rerun()
+    c3, c4 = st.columns(2)
+    with c3:
+        bay = st.text_input(
+            "Storage bay for the briquettes",
+            key=f"briq_bay_{token}",
+            placeholder="Leave blank to keep each lot's bay",
+        )
+    with c4:
+        notes = st.text_input("Notes", key=f"briq_notes_{token}", placeholder="Optional")
+
+    st.caption(
+        f"{BORING} in stock on {format_ui_date(briq_date) if briq_date else '—'}: "
+        f"**{plan_avail:,.2f} kg**."
+    )
+    over = weight is not None and weight > plan_avail + 0.005
+    if over:
+        st.error(
+            f"{weight:,.2f} kg is more than the {plan_avail:,.2f} kg of {BORING} in stock "
+            "on that date."
+        )
+    elif weight:
+        plan = db.plan_bil_briquetting(weight, briq_date)
+        st.markdown(
+            f"**After saving:** {BORING} {stock[BORING]['kg'] - weight:,.2f} kg · "
+            f"{BRIQ} {stock[BRIQ]['kg'] + weight:,.2f} kg"
+        )
+        show_dataframe(
+            pd.DataFrame(
+                [
+                    {
+                        f"{BORING} lot": p["Lot_id"],
+                        "Received": p.get("Received_date"),
+                        "Plant": p.get("BIL_plant") or "—",
+                        "Receipt": p.get("Receipt_type"),
+                        "Takes (kg)": round(p["Take_kg"], 2),
+                        "Lot left (kg)": round(p["Remaining_Weight"] - p["Take_kg"], 2),
+                    }
+                    for p in plan["parts"]
+                ]
+            )
+        )
+
+    if st.button(
+        f"Move to {BRIQ}",
+        type="primary",
+        key="briq_save",
+        disabled=not weight or over or not stock["briquette_name"] or stock["briquette_inactive"],
+    ):
+        try:
+            res = db.save_bil_briquetting(briq_date, weight, storage_bay=bay, notes=notes)
+        except Exception as exc:
+            st.error(f"Could not save: {exc}")
+        else:
+            after = db.bil_briquetting_stock()
+            st.session_state["briq_flash"] = (
+                f"Briquetting #{res['briquetting_id']} on {format_ui_date(res['date'])}: "
+                f"{res['weight']:,.2f} kg moved from {BORING} to {res['target']} "
+                f"(new lot{'s' if len(res['lines']) != 1 else ''} "
+                f"{', '.join(str(l['New_lot_id']) for l in res['lines'])}). "
+                f"{BORING} now {after[BORING]['kg']:,.2f} kg, "
+                f"{res['target']} {after[BRIQ]['kg']:,.2f} kg."
+            )
+            st.session_state["briq_token"] = token + 1
+            st.cache_data.clear()
+            st.rerun()
 
 # ── History ───────────────────────────────────────────────────────────────────
 st.divider()
@@ -179,7 +190,13 @@ else:
             ]
         )
     )
-    undoable = [h for h in history[:20] if h["Status"] == "Done" and db.bil_briquetting_can_undo(h["Briquetting_id"])]
+    undoable = [
+        h
+        for h in history[:20]
+        if can_briquette
+        and h["Status"] == "Done"
+        and db.bil_briquetting_can_undo(h["Briquetting_id"])
+    ]
     if undoable:
         with st.expander("Undo a briquetting entered by mistake"):
             st.caption(
