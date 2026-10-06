@@ -8782,6 +8782,7 @@ def _ensure_row_level_security(conn: Connection) -> None:
                     'purchase_order','furnace_oil_purchase',
                     'raw_material_correction','raw_material_correction_line',
                     'scrap_inventory','raw_material_returns',
+                    'bil_briquetting','bil_briquetting_line',
                 'furnace_oil_purchase_tank','customer_master',
                     'state_city_master','month_code','element_master','alloy_master',
                     'alloy_master_spec','company_profile','roles'
@@ -8802,6 +8803,7 @@ def _ensure_row_level_security(conn: Connection) -> None:
                     'electricity_consumption__lines','alloy_master',
                     'alloy_master_spec','element_master','build_of_material',
                     'cost_of_conversion','raw_material_inventory',
+                    'bil_briquetting','bil_briquetting_line',
                     'raw_material_master','raw_material_spec','isri_code_table',
                     'finished_goods_inventory','company_profile',
                     'alloy_data_checker','roles'
@@ -8813,6 +8815,7 @@ def _ensure_row_level_security(conn: Connection) -> None:
                     'raw_material_inventory','raw_material_master','raw_material_spec',
                     'raw_material_correction','raw_material_correction_line',
                     'scrap_inventory','raw_material_returns',
+                    'bil_briquetting','bil_briquetting_line',
                     'isri_code_table','finished_goods_inventory','packing_list',
                     'packing_list_batch','packing_list_po','packing_list_certificate',
                     'packing_list_certificate_line','packing_list_certificate_source',
@@ -9121,6 +9124,45 @@ def _ensure_toll_conversion(conn: Connection) -> None:
         [("Usable_pct", "DOUBLE PRECISION" if IS_POSTGRES else "REAL")],
     )
     t = _DIALECT_TYPES[IS_POSTGRES]
+    # BIL Briquetting: BIL BORING stock pressed into BIL BRIQUTTE in house.
+    # One header per briquetting (user's date and kg), one line per BIL BORING
+    # lot it drew from and the BIL BRIQUTTE lot it made.
+    _ensure_columns(conn, "Raw_Material_Inventory", [("Briquetting_id", "INTEGER")])
+    _exec(
+        conn,
+        f"""
+        CREATE TABLE IF NOT EXISTS bil_briquetting (
+            Briquetting_id {t["autopk"]},
+            Briquetting_date TEXT NOT NULL,
+            Source_material TEXT NOT NULL,
+            Target_material TEXT NOT NULL,
+            Weight {t["float"]} NOT NULL,
+            Storage_bay TEXT,
+            Notes TEXT,
+            Status TEXT NOT NULL DEFAULT 'Done' CHECK (Status IN ('Done', 'Reversed')),
+            Created_by TEXT NOT NULL,
+            Created_by_employee_id TEXT,
+            Created_datetime TEXT NOT NULL,
+            Reversed_by TEXT,
+            Reversed_by_employee_id TEXT,
+            Reversed_datetime TEXT,
+            Reverse_reason TEXT
+        )
+        """,
+    )
+    _exec(
+        conn,
+        f"""
+        CREATE TABLE IF NOT EXISTS bil_briquetting_line (
+            Line_id {t["autopk"]},
+            Briquetting_id INTEGER NOT NULL REFERENCES bil_briquetting(Briquetting_id),
+            Source_lot_id INTEGER NOT NULL,
+            Weight {t["float"]} NOT NULL,
+            Received_moved {t["float"]},
+            New_lot_id INTEGER
+        )
+        """,
+    )
     # Admin removals of a Raw Material Master row (e.g. a duplicate), with the
     # full row and its chemistry rows as they were, so nothing is lost.
     _exec(
@@ -15708,6 +15750,387 @@ def list_raw_material_merges() -> list[dict[str, Any]]:
         FROM raw_material_merge_log ORDER BY Merge_id DESC
         """
     )
+
+
+# ── BIL Briquetting ───────────────────────────────────────────────────────────
+# BIL BORING stock is pressed in house into BIL BRIQUTTE, which recovers better
+# in the furnace. Briquetting moves kg from BIL BORING lots (oldest received
+# first) into new BIL BRIQUTTE lots, one per source lot, on the same purchase
+# with the same cost, Usable_pct, status and plant: the receipt's invoice value,
+# its Brakes India conversion tracking and the cost per usable kg all carry
+# over. BIL BORING goes down by the kg entered and BIL BRIQUTTE goes up by it.
+BIL_BRIQUETTE = "BIL BRIQUTTE"
+
+
+def _date_iso(value: object, what: str) -> str:
+    if isinstance(value, datetime):
+        return value.date().isoformat()
+    if isinstance(value, date):
+        return value.isoformat()
+    try:
+        return date.fromisoformat(str(value or "")[:10]).isoformat()
+    except ValueError:
+        raise ValueError(f"Enter the {what}.")
+
+
+def _bil_boring_lots_on_conn(
+    conn: Connection, as_of: Optional[str] = None
+) -> list[dict[str, Any]]:
+    """BIL BORING lots with stock, oldest received first (FIFO for briquetting).
+    `as_of` keeps only lots received on or before that date."""
+    sql = f"""
+        SELECT i.Lot_id AS "Lot_id", i.Purchase_id AS "Purchase_id",
+               i.Raw_Material_Name AS "Raw_Material_Name",
+               i.Received_weight AS "Received_weight",
+               i.Remaining_Weight AS "Remaining_Weight",
+               i.Cost_per_kg AS "Cost_per_kg", i.Usable_pct AS "Usable_pct",
+               i.Storage_bay AS "Storage_bay",
+               i.Raw_Material_Status AS "Raw_Material_Status",
+               p.Received_date AS "Received_date",
+               p.Supplier_Invoice AS "Supplier_Invoice",
+               p.BIL_plant AS "BIL_plant",
+               COALESCE(p.Receipt_type, 'Purchase') AS "Receipt_type"
+        FROM Raw_Material_Inventory i
+        LEFT JOIN Raw_Material_Purchase p ON p.Purchase_id = i.Purchase_id
+        WHERE LOWER(i.Raw_Material_Name) = LOWER(?)
+          AND COALESCE(i.Remaining_Weight, 0) > 0.0005
+          AND COALESCE(p.Invoice_status, '') <> 'Cancelled'
+    """
+    params: list[Any] = [BIL_BORING]
+    if as_of:
+        sql += " AND (p.Received_date IS NULL OR p.Received_date <= ?)"
+        params.append(as_of)
+    sql += " ORDER BY p.Received_date, i.Lot_id"
+    rows = [dict(r) for r in _exec(conn, sql, tuple(params)).mappings()]
+    for r in rows:
+        r["Remaining_Weight"] = float(r.get("Remaining_Weight") or 0)
+        r["Received_weight"] = float(r.get("Received_weight") or 0)
+    return rows
+
+
+def bil_boring_lots(as_of: object = None) -> list[dict[str, Any]]:
+    with get_connection() as conn:
+        return _bil_boring_lots_on_conn(
+            conn, _date_iso(as_of, "date") if as_of else None
+        )
+
+
+def bil_briquetting_stock() -> dict[str, Any]:
+    """kg and open lots of BIL BORING and BIL BRIQUTTE (cancelled invoices left out)."""
+    out: dict[str, Any] = {}
+    for name in (BIL_BORING, BIL_BRIQUETTE):
+        row = fetch_one(
+            """
+            SELECT COALESCE(SUM(i.Remaining_Weight), 0) AS "kg",
+                   SUM(CASE WHEN i.Remaining_Weight > 0.0005 THEN 1 ELSE 0 END) AS "lots"
+            FROM Raw_Material_Inventory i
+            LEFT JOIN Raw_Material_Purchase p ON p.Purchase_id = i.Purchase_id
+            WHERE LOWER(i.Raw_Material_Name) = LOWER(?)
+              AND COALESCE(p.Invoice_status, '') <> 'Cancelled'
+            """,
+            (name,),
+        ) or {}
+        out[name] = {"kg": float(row.get("kg") or 0), "lots": int(row.get("lots") or 0)}
+    out["briquette_name"] = find_raw_material_name(BIL_BRIQUETTE)
+    out["briquette_inactive"] = raw_material_is_inactive(BIL_BRIQUETTE)
+    return out
+
+
+def plan_bil_briquetting(weight: object, as_of: object) -> dict[str, Any]:
+    """Which BIL BORING lots a briquetting of `weight` kg on `as_of` draws from."""
+    day = _date_iso(as_of, "briquetting date")
+    with get_connection() as conn:
+        lots = _bil_boring_lots_on_conn(conn, day)
+    parts, short = allocate_fifo(
+        [{"Lot_id": l["Lot_id"], "Remaining_Weight": l["Remaining_Weight"]} for l in lots],
+        float(weight or 0),
+    )
+    by_id = {l["Lot_id"]: l for l in lots}
+    return {
+        "available_kg": sum(l["Remaining_Weight"] for l in lots),
+        "short_kg": short,
+        "parts": [dict(by_id[p["Lot_id"]], Take_kg=float(p["Weight"])) for p in parts],
+    }
+
+
+def save_bil_briquetting(
+    briquetting_date: object,
+    weight: object,
+    *,
+    storage_bay: Optional[str] = None,
+    notes: Optional[str] = None,
+) -> dict[str, Any]:
+    """Move `weight` kg of BIL BORING into BIL BRIQUTTE, in one transaction.
+
+    The kg cannot exceed the BIL BORING in stock that was received on or
+    before the briquetting date (which cannot be in the future).
+    """
+    day = _date_iso(briquetting_date, "briquetting date")
+    if day > today_ist().isoformat():
+        raise ValueError("The briquetting date cannot be in the future.")
+    try:
+        kg = float(weight)
+    except (TypeError, ValueError):
+        raise ValueError("Enter the weight converted to BIL BRIQUTTE.")
+    if kg <= 0:
+        raise ValueError("The weight converted must be greater than zero.")
+    target = find_raw_material_name(BIL_BRIQUETTE)
+    if not target:
+        raise ValueError(
+            f"{BIL_BRIQUETTE} is not in Raw Material Master. Add it there first "
+            "(with its recovery % and chemistry)."
+        )
+    if raw_material_is_inactive(target):
+        raise ValueError(f"{target} is Inactive in Raw Material Master.")
+    bay = (storage_bay or "").strip() or None
+    by_val, dt_val = audit_stamp()
+    with get_connection() as conn:
+        lots = _bil_boring_lots_on_conn(conn, day)
+        available = sum(l["Remaining_Weight"] for l in lots)
+        if kg > available + _RM_EPS:
+            raise ValueError(
+                f"Only {available:,.2f} kg of {BIL_BORING} is in stock (received on or "
+                f"before {day}); {kg:,.2f} kg cannot be converted."
+            )
+        parts, _short = allocate_fifo(
+            [{"Lot_id": l["Lot_id"], "Remaining_Weight": l["Remaining_Weight"]} for l in lots],
+            min(kg, available),
+        )
+        by_id = {l["Lot_id"]: l for l in lots}
+        bid = int(
+            _exec(
+                conn,
+                """
+                INSERT INTO bil_briquetting
+                    (Briquetting_date, Source_material, Target_material, Weight,
+                     Storage_bay, Notes, Status, Created_by, Created_by_employee_id,
+                     Created_datetime)
+                VALUES (?, ?, ?, ?, ?, ?, 'Done', ?, ?, ?)
+                RETURNING Briquetting_id
+                """,
+                (
+                    day,
+                    BIL_BORING,
+                    target,
+                    kg,
+                    bay,
+                    (notes or "").strip() or None,
+                    by_val,
+                    get_acting_employee_id() or None,
+                    dt_val,
+                ),
+            ).scalar_one()
+        )
+        lines = []
+        for part in parts:
+            lot = by_id[part["Lot_id"]]
+            take = float(part["Weight"])
+            # Usable kg of a processed lot carry 100 / Usable_pct received kg,
+            # so the receipt's invoice value and processing loss stay whole.
+            pct = float(lot.get("Usable_pct") or 0) or None
+            received_moved = take * 100.0 / pct if pct else take
+            new_lot = int(
+                _exec(
+                    conn,
+                    """
+                    INSERT INTO Raw_Material_Inventory
+                        (Purchase_id, Raw_Material_Name, Received_weight, Remaining_Weight,
+                         Storage_bay, Raw_Material_Status, Cost_per_kg, Comments,
+                         Parent_lot_id, Usable_pct, Briquetting_id)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    RETURNING Lot_id
+                    """,
+                    (
+                        lot["Purchase_id"],
+                        target,
+                        received_moved,
+                        take,
+                        bay or lot.get("Storage_bay"),
+                        lot.get("Raw_Material_Status"),
+                        lot.get("Cost_per_kg"),
+                        f"Briquetted on {day} from {BIL_BORING} lot {lot['Lot_id']} "
+                        f"(briquetting #{bid})",
+                        lot["Lot_id"],
+                        pct,
+                        bid,
+                    ),
+                ).scalar_one()
+            )
+            left = lot["Remaining_Weight"] - take
+            _exec(
+                conn,
+                """
+                UPDATE Raw_Material_Inventory
+                SET Received_weight = ?, Remaining_Weight = ?
+                WHERE Lot_id = ?
+                """,
+                (
+                    max(lot["Received_weight"] - received_moved, 0.0),
+                    0.0 if left < 0.000001 else left,
+                    lot["Lot_id"],
+                ),
+            )
+            _exec(
+                conn,
+                """
+                INSERT INTO bil_briquetting_line
+                    (Briquetting_id, Source_lot_id, Weight, Received_moved, New_lot_id)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (bid, lot["Lot_id"], take, received_moved, new_lot),
+            )
+            lines.append({"Source_lot_id": lot["Lot_id"], "Weight": take, "New_lot_id": new_lot})
+    return {"briquetting_id": bid, "date": day, "weight": kg, "target": target, "lines": lines}
+
+
+def list_bil_briquettings(limit: int = 200) -> list[dict[str, Any]]:
+    rows = fetch_all(
+        f"""
+        SELECT Briquetting_id AS "Briquetting_id", Briquetting_date AS "Briquetting_date",
+               Source_material AS "Source_material", Target_material AS "Target_material",
+               Weight AS "Weight", Storage_bay AS "Storage_bay", Notes AS "Notes",
+               Status AS "Status", Created_by AS "Created_by",
+               Created_datetime AS "Created_datetime", Reversed_by AS "Reversed_by",
+               Reversed_datetime AS "Reversed_datetime", Reverse_reason AS "Reverse_reason"
+        FROM bil_briquetting
+        ORDER BY Briquetting_id DESC
+        LIMIT {int(limit)}
+        """
+    )
+    if not rows:
+        return rows
+    ids = [int(r["Briquetting_id"]) for r in rows]
+    marks = ", ".join("?" for _ in ids)
+    lines = fetch_all(
+        f"""
+        SELECT Briquetting_id AS "Briquetting_id", Source_lot_id AS "Source_lot_id",
+               Weight AS "Weight", New_lot_id AS "New_lot_id"
+        FROM bil_briquetting_line WHERE Briquetting_id IN ({marks})
+        ORDER BY Line_id
+        """,
+        tuple(ids),
+    )
+    for r in rows:
+        mine = [l for l in lines if int(l["Briquetting_id"]) == int(r["Briquetting_id"])]
+        r["Lines"] = mine
+        r["Source_lots"] = ", ".join(str(l["Source_lot_id"]) for l in mine)
+        r["New_lots"] = ", ".join(str(l["New_lot_id"]) for l in mine if l.get("New_lot_id"))
+    return rows
+
+
+def _briquette_lot_untouched_on_conn(conn: Connection, line: dict[str, Any]) -> bool:
+    lot_id = line.get("New_lot_id")
+    if not lot_id:
+        return False
+    lot = _exec(
+        conn,
+        'SELECT Remaining_Weight AS "r" FROM Raw_Material_Inventory WHERE Lot_id = ?',
+        (int(lot_id),),
+    ).mappings().first()
+    if not lot or abs(float(lot["r"] or 0) - float(line["Weight"] or 0)) > _RM_EPS:
+        return False
+    for table, col in (
+        ("batch_input", "Lot_id"),
+        ("raw_material_correction", "Lot_id"),
+        ("scrap_inventory", "Lot_id"),
+        ("raw_material_returns", "Lot_id"),
+        ("Raw_Material_Inventory", "Parent_lot_id"),
+    ):
+        if _exec(conn, f"SELECT 1 FROM {table} WHERE {col} = ?", (int(lot_id),)).first():
+            return False
+    return True
+
+
+def bil_briquetting_can_undo(briquetting_id: int) -> bool:
+    with get_connection() as conn:
+        status = _exec(
+            conn,
+            "SELECT Status FROM bil_briquetting WHERE Briquetting_id = ?",
+            (int(briquetting_id),),
+        ).scalar()
+        if status != "Done":
+            return False
+        lines = [
+            dict(r)
+            for r in _exec(
+                conn,
+                'SELECT Source_lot_id AS "Source_lot_id", Weight AS "Weight", '
+                'Received_moved AS "Received_moved", New_lot_id AS "New_lot_id" '
+                "FROM bil_briquetting_line WHERE Briquetting_id = ?",
+                (int(briquetting_id),),
+            ).mappings()
+        ]
+        return bool(lines) and all(_briquette_lot_untouched_on_conn(conn, l) for l in lines)
+
+
+def undo_bil_briquetting(briquetting_id: int, reason: str) -> None:
+    """Put a briquetting's kg back on its BIL BORING lots and remove the BIL
+    BRIQUTTE lots it made. Only while those lots are untouched (nothing
+    charged, scrapped, split or corrected from them). Logged on the record."""
+    if not (reason or "").strip():
+        raise ValueError("Enter why the briquetting is being undone.")
+    by_val, dt_val = audit_stamp()
+    with get_connection() as conn:
+        status = _exec(
+            conn,
+            "SELECT Status FROM bil_briquetting WHERE Briquetting_id = ?",
+            (int(briquetting_id),),
+        ).scalar()
+        if status is None:
+            raise ValueError(f"Briquetting #{briquetting_id} not found.")
+        if status != "Done":
+            raise ValueError(f"Briquetting #{briquetting_id} is already undone.")
+        lines = [
+            dict(r)
+            for r in _exec(
+                conn,
+                'SELECT Source_lot_id AS "Source_lot_id", Weight AS "Weight", '
+                'Received_moved AS "Received_moved", New_lot_id AS "New_lot_id" '
+                "FROM bil_briquetting_line WHERE Briquetting_id = ?",
+                (int(briquetting_id),),
+            ).mappings()
+        ]
+        if not lines or not all(_briquette_lot_untouched_on_conn(conn, l) for l in lines):
+            raise ValueError(
+                "Some of these BIL BRIQUTTE lots have already been used (charged, "
+                "scrapped, split or corrected), so this briquetting can no longer be undone."
+            )
+        for l in lines:
+            _exec(
+                conn,
+                """
+                UPDATE Raw_Material_Inventory
+                SET Received_weight = COALESCE(Received_weight, 0) + ?,
+                    Remaining_Weight = COALESCE(Remaining_Weight, 0) + ?
+                WHERE Lot_id = ?
+                """,
+                (
+                    float(l.get("Received_moved") or l["Weight"]),
+                    float(l["Weight"]),
+                    int(l["Source_lot_id"]),
+                ),
+            )
+            _exec(
+                conn,
+                "DELETE FROM Raw_Material_Inventory WHERE Lot_id = ?",
+                (int(l["New_lot_id"]),),
+            )
+        _exec(
+            conn,
+            """
+            UPDATE bil_briquetting
+            SET Status = 'Reversed', Reversed_by = ?, Reversed_by_employee_id = ?,
+                Reversed_datetime = ?, Reverse_reason = ?
+            WHERE Briquetting_id = ?
+            """,
+            (
+                by_val,
+                get_acting_employee_id() or None,
+                dt_val,
+                reason.strip(),
+                int(briquetting_id),
+            ),
+        )
 
 
 def set_bil_plant(purchase_id: int, plant: str) -> None:
