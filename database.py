@@ -608,6 +608,27 @@ def usable_pct_for_material(name: object) -> Optional[float]:
     return PROCESSING_USABLE_PCT.get(text)
 
 
+def lot_charge_cost_sql(alias: str = "") -> str:
+    """SQL for a lot's cost per usable kg, the rate production is costed at.
+
+    Cost_per_kg stays the invoice rate (what Accounts checks: received kg ×
+    rate). A processed lot (Usable_pct set, e.g. BIL BORING 85) only yields
+    that % for production, so each kg charged carries rate × 100 / Usable_pct;
+    the lot's full invoice value then lands on the heats that use it. Lots
+    without Usable_pct are costed at the invoice rate, as before.
+    """
+    a = f"{alias}." if alias else ""
+    return f"({a}Cost_per_kg * 100.0 / COALESCE(NULLIF({a}Usable_pct, 0), 100))"
+
+
+def lot_charge_cost(cost_per_kg: object, usable_pct: object) -> Optional[float]:
+    """Python twin of lot_charge_cost_sql."""
+    if cost_per_kg is None:
+        return None
+    pct = float(usable_pct or 0) or 100.0
+    return float(cost_per_kg) * 100.0 / pct
+
+
 def usable_weight(name: object, received_kg: float) -> float:
     """Kg of a new receipt that goes into stock for production."""
     pct = usable_pct_for_material(name)
@@ -4723,7 +4744,8 @@ def list_inventory_lots(
                p.BIL_plant AS "BIL_plant",
                i.Remaining_Weight AS "Remaining_Weight",
                i.Received_weight AS "Received_weight",
-               i.Cost_per_kg AS "Cost_per_kg",
+               """ + lot_charge_cost_sql("i") + """ AS "Cost_per_kg",
+               i.Usable_pct AS "Usable_pct",
                i.Raw_Material_Status AS "Raw_Material_Status",
                i.Source_Batch_ID AS "Source_Batch_ID",
                i.Source_Alloy_id AS "Source_Alloy_id",
@@ -5365,7 +5387,8 @@ def _lot_for_correction(conn: Connection, lot_id: int) -> dict[str, Any]:
                    i.Received_weight AS "Received_weight",
                    i.Remaining_Weight AS "Remaining_Weight",
                    i.Cost_per_kg AS "Cost_per_kg", i.Storage_bay AS "Storage_bay",
-                   i.Raw_Material_Status AS "Raw_Material_Status"
+                   i.Raw_Material_Status AS "Raw_Material_Status",
+                   i.Usable_pct AS "Usable_pct"
             FROM Raw_Material_Inventory i
             LEFT JOIN Raw_Material_Purchase p ON p.Purchase_id = i.Purchase_id
             WHERE i.Lot_id = ?
@@ -5512,6 +5535,11 @@ def split_raw_material_lot(
                 "Add the other raw materials it is split into."
             )
         moved_kg = sum(ln["weight"] for ln in moved)
+        # A processed lot (e.g. BIL BORING at 85%) holds usable kg: each usable kg
+        # moved carries 100 / Usable_pct received kg and the same Usable_pct, so
+        # the purchase's invoice value and the processing loss stay whole.
+        usable_pct = float(lot.get("Usable_pct") or 0) or None
+        to_received = (100.0 / usable_pct) if usable_pct else 1.0
         correction_id = _write_rm_correction(
             conn, "Split", lot, moved_kg, kept, reason, []
         )
@@ -5524,14 +5552,14 @@ def split_raw_material_lot(
                     INSERT INTO Raw_Material_Inventory
                         (Purchase_id, Raw_Material_Name, Received_weight, Remaining_Weight,
                          Storage_bay, Raw_Material_Status, Cost_per_kg, Comments,
-                         Parent_lot_id, Correction_id)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                         Parent_lot_id, Correction_id, Usable_pct)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     RETURNING Lot_id
                     """,
                     (
                         lot["Purchase_id"],
                         ln["material"],
-                        ln["weight"],
+                        ln["weight"] * to_received,
                         ln["weight"],
                         lot.get("Storage_bay"),
                         lot.get("Raw_Material_Status"),
@@ -5540,6 +5568,7 @@ def split_raw_material_lot(
                         f"by correction #{correction_id}",
                         lot["Lot_id"],
                         correction_id,
+                        usable_pct,
                     ),
                 ).scalar_one()
             )
@@ -5565,7 +5594,7 @@ def split_raw_material_lot(
             SET Received_weight = ?, Remaining_Weight = ?
             WHERE Lot_id = ?
             """,
-            (max(lot["Received_weight"] - moved_kg, 0.0), kept, lot["Lot_id"]),
+            (max(lot["Received_weight"] - moved_kg * to_received, 0.0), kept, lot["Lot_id"]),
         )
     return correction_id
 
@@ -5635,7 +5664,7 @@ def scrap_raw_material(
                     lot.get("Vendor_code"),
                     correction_id,
                     qty,
-                    lot.get("Cost_per_kg"),
+                    lot_charge_cost(lot.get("Cost_per_kg"), lot.get("Usable_pct")),
                     category,
                     (reason or "").strip() or None,
                     by_val,
@@ -9278,7 +9307,7 @@ _BATCH_PRODUCTION_SUMMARY_SELECT = """
     LEFT JOIN (
         SELECT bi.Batch_ID,
                SUM(bi.Weight) AS Input_kg,
-               SUM(bi.Weight * COALESCE(inv.Cost_per_kg, 0)) AS Input_cost
+               SUM(bi.Weight * COALESCE(""" + lot_charge_cost_sql("inv") + """, 0)) AS Input_cost
         FROM batch_input bi
         LEFT JOIN Raw_Material_Inventory inv ON inv.Lot_id = bi.Lot_id
         GROUP BY bi.Batch_ID
@@ -9300,7 +9329,7 @@ _BATCH_PRODUCTION_INPUTS_SELECT = """
            bi.Weighment_scale_weight AS "Weighment_scale_weight",
            bi.Trolley_name AS "Trolley_name",
            bi.Trolley_weight AS "Trolley_weight",
-           inv.Cost_per_kg AS "Cost_per_kg",
+           """ + lot_charge_cost_sql("inv") + """ AS "Cost_per_kg",
            bi.Last_updated_by AS "Saved_by"
     FROM batch_input bi
     LEFT JOIN Raw_Material_Inventory inv ON inv.Lot_id = bi.Lot_id
@@ -9347,7 +9376,8 @@ _RAW_MATERIAL_STOCK_SUMMARY_SELECT = """
                     THEN COALESCE(i.Remaining_Weight, 0) ELSE 0 END)
                AS "Other_status_kg",
            SUM(CASE WHEN i.Cost_per_kg IS NOT NULL
-                    THEN COALESCE(i.Remaining_Weight, 0) * i.Cost_per_kg ELSE 0 END)
+                    THEN COALESCE(i.Remaining_Weight, 0) * """ + lot_charge_cost_sql("i") + """
+                    ELSE 0 END)
                AS "Stock_value",
            SUM(CASE WHEN i.Cost_per_kg IS NULL
                     THEN COALESCE(i.Remaining_Weight, 0) ELSE 0 END)
@@ -9364,6 +9394,14 @@ _RAW_MATERIAL_STOCK_SUMMARY_SELECT = """
 """
 
 
+_USABLE_COST_VIEWS = (
+    "mv_raw_material_stock_summary",
+    "mv_batch_production_summary",
+    "mv_batch_production_inputs",
+    "mv_production_analysis_inputs",
+)
+
+
 def _ensure_dashboard_materialized_views(conn: Connection) -> None:
     """Materialized views + supporting indexes behind the Dashboard pages.
 
@@ -9376,6 +9414,19 @@ def _ensure_dashboard_materialized_views(conn: Connection) -> None:
     """
     if not IS_POSTGRES:
         return
+
+    # Views that cost charge lines read a lot's cost per usable kg
+    # (lot_charge_cost_sql). CREATE ... IF NOT EXISTS keeps an older
+    # definition, so rebuild each once if it predates Usable_pct.
+    for view in _USABLE_COST_VIEWS:
+        old_def = _exec(
+            conn,
+            "SELECT definition FROM pg_matviews "
+            "WHERE schemaname = current_schema() AND matviewname = ?",
+            (view,),
+        ).scalar()
+        if old_def is not None and "usable_pct" not in str(old_def).lower():
+            _exec(conn, f"DROP MATERIALIZED VIEW {view}")
 
     # FK / range-filter columns the views and their base queries actually
     # join or filter on. B-Tree for equality/FK lookups; BRIN for the
@@ -9510,7 +9561,7 @@ def _ensure_dashboard_materialized_views(conn: Connection) -> None:
                a.Alloy_name AS "Alloy_name",
                i.Raw_Material_Name AS "Raw_Material_Name",
                SUM(i.Weight) AS "Weight",
-               SUM(i.Weight * COALESCE(inv.Cost_per_kg, 0)) AS "Cost"
+               SUM(i.Weight * COALESCE(""" + lot_charge_cost_sql("inv") + """, 0)) AS "Cost"
         FROM batch_input i
         JOIN Production_batch b ON b.Batch_ID = i.Batch_ID
         LEFT JOIN Alloy_Master a ON a.Alloy_id = b.Alloy_id
@@ -9571,18 +9622,6 @@ def _ensure_dashboard_materialized_views(conn: Connection) -> None:
         '("Production_Date", "Furnace", "Shift", "Alloy_id", "Output_Alloy_id")',
     )
 
-    # Rebuild the stock summary once if it predates the Processing_loss_kg column.
-    if _exec(
-        conn, "SELECT 1 FROM pg_matviews WHERE matviewname = 'mv_raw_material_stock_summary'"
-    ).first() and not _exec(
-        conn,
-        """
-        SELECT 1 FROM pg_attribute
-        WHERE attrelid = 'mv_raw_material_stock_summary'::regclass
-          AND attname = 'Processing_loss_kg' AND NOT attisdropped
-        """,
-    ).first():
-        _exec(conn, "DROP MATERIALIZED VIEW mv_raw_material_stock_summary")
     _exec(
         conn,
         "CREATE MATERIALIZED VIEW IF NOT EXISTS mv_raw_material_stock_summary AS "
@@ -12981,7 +13020,7 @@ def save_batch_input_return(
                      Batch_ID, Batch_input_return_id, Weight, Cost_per_kg, Notes,
                      Created_by, Created_datetime)
                 SELECT 'Production charge return', i.Lot_id, ?, i.Purchase_id,
-                       p.Vendor_code, ?, ?, ?, i.Cost_per_kg, ?, ?, ?
+                       p.Vendor_code, ?, ?, ?, """ + lot_charge_cost_sql("i") + """, ?, ?, ?
                 FROM Raw_Material_Inventory i
                 LEFT JOIN Raw_Material_Purchase p ON p.Purchase_id = i.Purchase_id
                 WHERE i.Lot_id = ?
@@ -13202,7 +13241,7 @@ def _batch_input_material_cost_on_conn(conn: Connection, batch_id: str) -> float
         _exec(
             conn,
             """
-            SELECT COALESCE(SUM(i.Weight * COALESCE(inv.Cost_per_kg, 0)), 0)
+            SELECT COALESCE(SUM(i.Weight * COALESCE(""" + lot_charge_cost_sql("inv") + """, 0)), 0)
                    AS "input_cost"
             FROM batch_input i
             LEFT JOIN Raw_Material_Inventory inv ON inv.Lot_id = i.Lot_id
@@ -13288,7 +13327,7 @@ def estimate_batch_input_cost(
             for row in _exec(
                 conn,
                 f"""
-                SELECT Lot_id AS "Lot_id", Cost_per_kg AS "Cost_per_kg"
+                SELECT Lot_id AS "Lot_id", {lot_charge_cost_sql()} AS "Cost_per_kg"
                 FROM Raw_Material_Inventory
                 WHERE Lot_id IN ({placeholders})
                 """,
@@ -13422,7 +13461,7 @@ def compute_batch_production_cost(
     as_of = as_of or conversion_cutoff_for_batch(batch_id)
     input_row = fetch_one(
         """
-        SELECT COALESCE(SUM(i.Weight * COALESCE(inv.Cost_per_kg, 0)), 0)
+        SELECT COALESCE(SUM(i.Weight * COALESCE(""" + lot_charge_cost_sql("inv") + """, 0)), 0)
                AS "input_cost"
         FROM batch_input i
         LEFT JOIN Raw_Material_Inventory inv ON inv.Lot_id = i.Lot_id
@@ -13576,7 +13615,7 @@ def _production_analysis_inputs(start_date: str, end_date: str) -> list[dict[str
                a.Alloy_name AS "Alloy_name",
                i.Raw_Material_Name AS "Raw_Material_Name",
                SUM(i.Weight) AS "Weight",
-               SUM(i.Weight * COALESCE(inv.Cost_per_kg, 0)) AS "Cost"
+               SUM(i.Weight * COALESCE(""" + lot_charge_cost_sql("inv") + """, 0)) AS "Cost"
         FROM batch_input i
         JOIN Production_batch b ON b.Batch_ID = i.Batch_ID
         LEFT JOIN Alloy_Master a ON a.Alloy_id = b.Alloy_id
