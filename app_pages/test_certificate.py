@@ -1489,6 +1489,7 @@ if selected_nos:
                         pct,
                         spec.get("Min_percent"),
                         spec.get("Max_percent"),
+                        less_than=row.get("Less_than"),
                     )
                 )
                 chem_rows.append(

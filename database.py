@@ -11523,7 +11523,7 @@ def get_test_certificate_print_payload(
             if spec.get("Is_remainder"):
                 actuals.append("Remainder")
             else:
-                # chem_by_symbol already carries the '<=' prefix (format_chem_percent).
+                # chem_by_symbol already carries the '<' prefix (format_chem_percent).
                 raw = heat["actuals"].get(symbol)
                 actuals.append(raw if raw else "—")
         element_rows.append(
@@ -11805,14 +11805,25 @@ def element_percent_out_of_spec(
     value: object,
     min_percent: object,
     max_percent: object,
+    less_than: object = False,
 ) -> bool:
-    """True when recorded % is at/below min or at/above max. Blank or 0 is not compared."""
+    """True when recorded % is at/below min or at/above max. Blank or 0 is not compared.
+
+    `less_than` (below the spectrometer's detection limit): the real value is
+    at or below the number recorded, so being under the minimum proves
+    nothing; it is out of spec only when the number is above the maximum.
+    """
     try:
         pct = float(value)
     except (TypeError, ValueError):
         return False
     if pct <= 0:
         return False
+    if less_than:
+        try:
+            return max_percent not in (None, "") and pct > float(max_percent)
+        except (TypeError, ValueError):
+            return False
     try:
         if min_percent is not None and min_percent != "" and pct <= float(min_percent):
             return True
@@ -11897,7 +11908,8 @@ def list_packing_list_chemistry_vs_spec(packing_list_id: int) -> list[dict[str, 
             if pct <= 0:
                 continue
             out_of_spec = element_percent_out_of_spec(
-                pct, spec.get("Min_percent"), spec.get("Max_percent")
+                pct, spec.get("Min_percent"), spec.get("Max_percent"),
+                less_than=rec.get("Less_than"),
             )
             out.append(
                 {
@@ -14860,12 +14872,12 @@ def get_batch_chemistry(batch_id: str) -> list[dict[str, Any]]:
 
 
 def format_chem_percent(value: object, less_than: object = False) -> str:
-    """'<=0.0050' when the reading was below the spectrometer's detection limit,
+    """'<0.0050' when the reading was below the spectrometer's detection limit,
     else the plain number ('0.5' etc, same rules as the printed certificate)."""
     text = _format_cert_number(value)
     if not text:
         return text
-    return f"<={text}" if less_than else text
+    return f"<{text}" if less_than else text
 
 
 def list_batches(production_date: object = None) -> list[dict[str, Any]]:

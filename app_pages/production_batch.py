@@ -1921,10 +1921,16 @@ else:
             except (TypeError, ValueError):
                 return "—"
 
-        def _spec_out_of_range(value: float, spec: dict | None) -> bool:
+        def _spec_out_of_range(
+            value: float, spec: dict | None, less_than: bool = False
+        ) -> bool:
             if not spec or value <= 0:
                 return False
             mn, mx = spec.get("Min_percent"), spec.get("Max_percent")
+            if less_than:
+                # Below detection limit: the real value is at or below the number
+                # entered, so only a number above the max is out of spec.
+                return mx is not None and mx != "" and value > float(mx)
             if mn is not None and mn != "" and value <= float(mn):
                 return True
             if mx is not None and mx != "" and value >= float(mx):
@@ -1992,11 +1998,13 @@ else:
                         help=(
                             "The spectrometer could not resolve a value this low. "
                             "The number above is the reported ceiling; the test "
-                            "certificate prints it as e.g. <=0.0050."
+                            "certificate prints it as e.g. <0.0050."
                         ),
                     )
                 entered = float(batch_chem[sym] or 0.0)
-                bad = _spec_out_of_range(entered, spec)
+                bad = _spec_out_of_range(
+                    entered, spec, bool(st.session_state.get(_pk(f"bchem_lt_{sym}")))
+                )
                 if spec:
                     spec_line = (
                         f"Spec min {_fmt_spec_pct(spec.get('Min_percent'))} / "
