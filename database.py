@@ -9321,6 +9321,10 @@ DASHBOARD_MATERIALIZED_VIEWS = (
     "mv_pi_corrections",
     "mv_pi_scrap",
     "mv_pi_inventory_lots",
+    # Production and Profitability dashboard
+    "mv_pd_batches",
+    "mv_pd_dispatch",
+    "mv_pd_fg_stock",
 )
 
 # Melter Output report (melters are paid on output): one row per melting team,
@@ -9577,6 +9581,162 @@ _PI_VIEWS = (
     ("mv_pi_inventory_lots", _PI_INVENTORY_LOTS_SELECT, '"Lot_id"', '"Received_date"'),
 )
 
+
+# ── Production and Profitability dashboard views ─────────────────────────────
+# Unit cost of production per batch is what Batch Output already stamps on
+# every output line of the batch: material ₹/kg (charged cost ÷ all output kg)
+# + the month's conversion ₹/kg = overall ₹/kg.
+_PD_BATCH_COST_SUBQUERY = """
+    SELECT Batch_ID,
+           MAX(cost_of_production_overall_per_kg) AS Cost_per_kg,
+           MAX(cost_of_production_per_kg) AS Material_cost_per_kg,
+           MAX(conversion_rate_applied) AS Conversion_rate
+    FROM batch_output
+    GROUP BY Batch_ID
+"""
+
+# One row per production batch. Remelt_kg is output booked to Broken Ingot /
+# Furnace Empty / Not Ok Ingot; Product_kg is the rest.
+_PD_BATCHES_SELECT = """
+    SELECT b.Batch_ID AS "Batch_ID",
+           SUBSTR(b.Production_Date, 1, 10) AS "Production_Date",
+           b.Shift AS "Shift",
+           b.Furnace AS "Furnace",
+           COALESCE(NULLIF(TRIM(b.Melting_team), ''), 'Not set') AS "Melting_team",
+           b.Heat_no AS "Heat_no",
+           b.Alloy_id AS "Alloy_id",
+           COALESCE(a.Alloy_name, 'Not set') AS "Alloy_name",
+           c.Customer_name AS "Customer_name",
+           b.Production_status AS "Production_status",
+           b.Output_status AS "Output_status",
+           b.Sampled_pcs AS "Sampled_pcs",
+           b.Defect_pcs AS "Defect_pcs",
+           COALESCE(i.Input_kg, 0) AS "Input_kg",
+           COALESCE(i.Input_cost, 0) AS "Input_cost",
+           COALESCE(i.Uncosted_kg, 0) AS "Uncosted_input_kg",
+           COALESCE(o.Output_kg, 0) AS "Output_kg",
+           COALESCE(o.Remelt_kg, 0) AS "Remelt_kg",
+           COALESCE(o.Output_kg, 0) - COALESCE(o.Remelt_kg, 0) AS "Product_kg",
+           COALESCE(o.Pieces, 0) AS "Pieces",
+           oc.Material_cost_per_kg AS "Material_cost_per_kg",
+           oc.Conversion_rate AS "Conversion_rate",
+           oc.Cost_per_kg AS "Cost_per_kg",
+           COALESCE(sc.Scrap_kg, 0) AS "Scrap_kg"
+    FROM Production_batch b
+    LEFT JOIN Alloy_Master a ON a.Alloy_id = b.Alloy_id
+    LEFT JOIN Customer_Master c ON c.Cust_code = a.Cust_code
+    LEFT JOIN (
+        SELECT bi.Batch_ID,
+               SUM(bi.Weight) AS Input_kg,
+               SUM(bi.Weight * COALESCE(""" + lot_charge_cost_sql("inv") + """, 0)) AS Input_cost,
+               SUM(CASE WHEN inv.Cost_per_kg IS NULL THEN bi.Weight ELSE 0 END) AS Uncosted_kg
+        FROM batch_input bi
+        LEFT JOIN Raw_Material_Inventory inv ON inv.Lot_id = bi.Lot_id
+        GROUP BY bi.Batch_ID
+    ) i ON i.Batch_ID = b.Batch_ID
+    LEFT JOIN (
+        SELECT Batch_ID,
+               SUM(Weight) AS Output_kg,
+               SUM(CASE WHEN Alloy_id IN (""" + ", ".join(str(a) for a in SIDESTREAM_ALLOY_IDS) + """)
+                        THEN Weight ELSE 0 END) AS Remelt_kg,
+               SUM(COALESCE(Pieces, 0)) AS Pieces
+        FROM batch_output
+        GROUP BY Batch_ID
+    ) o ON o.Batch_ID = b.Batch_ID
+    LEFT JOIN (""" + _PD_BATCH_COST_SUBQUERY + """) oc ON oc.Batch_ID = b.Batch_ID
+    LEFT JOIN (
+        SELECT Batch_ID, SUM(Weight) AS Scrap_kg
+        FROM scrap_inventory
+        WHERE Source_type = 'Production charge return' AND Batch_ID IS NOT NULL
+        GROUP BY Batch_ID
+    ) sc ON sc.Batch_ID = b.Batch_ID
+"""
+
+# One row per PO allocation on a dispatched packing list (test certificate
+# Issued, the same rule the Dashboard uses for Dispatched). Revenue is the kg
+# allocated to that PO × the PO's rate; cost of production is the same kg × the
+# weighted cost per kg of the batches packed on the list.
+_PD_DISPATCH_SELECT = """
+    SELECT plp.Packing_list_id AS "Packing_list_id",
+           plp.Customer_PO_No AS "Customer_PO_No",
+           SUBSTR(COALESCE(pc.Issued_date, pl.Invoice_date), 1, 10) AS "Dispatch_date",
+           pl.Invoice_number AS "Invoice_number",
+           pc.Certificate_no AS "Certificate_no",
+           COALESCE(pl.Customer_name, cm.Customer_name, pl.Cust_code, 'Not set')
+               AS "Customer_name",
+           pl.Alloy_id AS "Alloy_id",
+           COALESCE(a.Alloy_name, 'Not set') AS "Alloy_name",
+           COALESCE(pl.Dispatch_type, 'Sale') AS "Dispatch_type",
+           COALESCE(plp.Allocated_weight, 0) AS "Dispatched_kg",
+           po.Rate AS "PO_rate",
+           CASE WHEN po.Rate IS NULL THEN NULL
+                ELSE COALESCE(plp.Allocated_weight, 0) * po.Rate END AS "Revenue",
+           bc.Cost_per_kg AS "Cost_per_kg",
+           bc.Material_cost_per_kg AS "Material_cost_per_kg",
+           bc.Conversion_rate AS "Conversion_rate",
+           CASE WHEN bc.Cost_per_kg IS NULL THEN NULL
+                ELSE COALESCE(plp.Allocated_weight, 0) * bc.Cost_per_kg END
+               AS "Production_cost",
+           COALESCE(bc.Packed_kg, 0) AS "Packed_kg",
+           COALESCE(bc.Uncosted_kg, 0) AS "Uncosted_packed_kg"
+    FROM Packing_list_po plp
+    JOIN Packing_list pl ON pl.Packing_list_id = plp.Packing_list_id
+    JOIN Packing_list_certificate pc
+        ON pc.Packing_list_id = pl.Packing_list_id AND pc.Status = 'Issued'
+    LEFT JOIN Purchase_Order po
+        ON po.Customer_PO_No = plp.Customer_PO_No AND po.Alloy_Id = plp.Alloy_id
+    LEFT JOIN Alloy_Master a ON a.Alloy_id = pl.Alloy_id
+    LEFT JOIN Customer_Master cm ON cm.Cust_code = pl.Cust_code
+    LEFT JOIN (
+        SELECT lb.Packing_list_id,
+               SUM(lb.Weight) AS Packed_kg,
+               SUM(CASE WHEN oc.Cost_per_kg IS NULL THEN lb.Weight ELSE 0 END)
+                   AS Uncosted_kg,
+               SUM(lb.Weight * oc.Cost_per_kg)
+                   / NULLIF(SUM(CASE WHEN oc.Cost_per_kg IS NOT NULL
+                                     THEN lb.Weight END), 0) AS Cost_per_kg,
+               SUM(lb.Weight * oc.Material_cost_per_kg)
+                   / NULLIF(SUM(CASE WHEN oc.Material_cost_per_kg IS NOT NULL
+                                     THEN lb.Weight END), 0) AS Material_cost_per_kg,
+               SUM(lb.Weight * oc.Conversion_rate)
+                   / NULLIF(SUM(CASE WHEN oc.Conversion_rate IS NOT NULL
+                                     THEN lb.Weight END), 0) AS Conversion_rate
+        FROM Packing_list_batch lb
+        LEFT JOIN (""" + _PD_BATCH_COST_SUBQUERY + """) oc ON oc.Batch_ID = lb.Batch_ID
+        GROUP BY lb.Packing_list_id
+    ) bc ON bc.Packing_list_id = pl.Packing_list_id
+"""
+
+# Finished goods on hand (not dispatched or rejected) by alloy and status,
+# valued at each batch's cost of production.
+_PD_FG_STOCK_SELECT = """
+    SELECT COALESCE(b.Alloy_id, -1) AS "Alloy_id",
+           COALESCE(a.Alloy_name, 'Not set') AS "Alloy_name",
+           fg.Finished_Goods_Status AS "Status",
+           COUNT(*) AS "Bundles",
+           SUM(COALESCE(fg.Output_Weight, 0)) AS "Kg",
+           SUM(COALESCE(fg.Output_Weight, 0) * COALESCE(oc.Cost_per_kg, 0)) AS "Value",
+           SUM(CASE WHEN oc.Cost_per_kg IS NULL THEN COALESCE(fg.Output_Weight, 0)
+                    ELSE 0 END) AS "Uncosted_kg"
+    FROM Finished_Goods_Inventory fg
+    JOIN Production_batch b ON b.Batch_ID = fg.Batch_ID
+    LEFT JOIN Alloy_Master a ON a.Alloy_id = b.Alloy_id
+    LEFT JOIN (""" + _PD_BATCH_COST_SUBQUERY + """) oc ON oc.Batch_ID = fg.Batch_ID
+    WHERE fg.Finished_Goods_Status IN ('Under_Testing', 'Available', 'Assigned')
+    GROUP BY COALESCE(b.Alloy_id, -1), COALESCE(a.Alloy_name, 'Not set'),
+             fg.Finished_Goods_Status
+"""
+
+_PD_VIEWS = (
+    ("mv_pd_batches", _PD_BATCHES_SELECT, '"Batch_ID"', '"Production_Date"'),
+    (
+        "mv_pd_dispatch",
+        _PD_DISPATCH_SELECT,
+        '"Packing_list_id", "Customer_PO_No"',
+        '"Dispatch_date"',
+    ),
+    ("mv_pd_fg_stock", _PD_FG_STOCK_SELECT, '"Alloy_id", "Status"', '"Alloy_id"'),
+)
 
 def _mv_source(view: str, select_sql: str, alias: str = "") -> str:
     """The materialized view on Postgres; the same SELECT inline on SQLite.
@@ -9876,8 +10036,8 @@ def _ensure_dashboard_materialized_views(conn: Connection) -> None:
         'ON mv_melter_output ("Production_Date", "Melting_team")',
     )
 
-    # Purchase and Inventory dashboard.
-    for view, select_sql, key_cols, date_col in _PI_VIEWS:
+    # Purchase and Inventory, and Production and Profitability dashboards.
+    for view, select_sql, key_cols, date_col in _PI_VIEWS + _PD_VIEWS:
         _exec(conn, f"CREATE MATERIALIZED VIEW IF NOT EXISTS {view} AS {select_sql}")
         _exec(
             conn,
@@ -9897,7 +10057,7 @@ def _ensure_dashboard_materialized_views(conn: Connection) -> None:
             "mv_batch_production_inputs",
             "mv_batch_production_outputs",
             "mv_melter_output",
-            *(v[0] for v in _PI_VIEWS),
+            *(v[0] for v in _PI_VIEWS + _PD_VIEWS),
         ):
             _exec(conn, f"REVOKE ALL ON {view} FROM anon")
 
@@ -15499,6 +15659,41 @@ def pi_production_totals(start_date: object, end_date: object) -> dict[str, Any]
         "Output_kg": float(row.get("Output_kg") or 0),
         "Remelt_kg": float((remelt or {}).get("Remelt_kg") or 0),
     }
+
+
+# ---------- Production and Profitability dashboard ----------
+
+def pd_batches(start_date: object, end_date: object) -> list[dict[str, Any]]:
+    """Production batches made in the period, with charge, output and unit cost."""
+    src = _mv_source("mv_pd_batches", _PD_BATCHES_SELECT)
+    return fetch_all(
+        f'SELECT * FROM {src} WHERE "Production_Date" BETWEEN ? AND ? '
+        'ORDER BY "Production_Date", "Batch_ID"',
+        _pi_range(start_date, end_date),
+    )
+
+
+def pd_dispatches(
+    start_date: Optional[object] = None, end_date: Optional[object] = None
+) -> list[dict[str, Any]]:
+    """Dispatched packing lists (certificate Issued), one row per PO allocation.
+
+    Without dates, every dispatch ever (for per-PO totals).
+    """
+    src = _mv_source("mv_pd_dispatch", _PD_DISPATCH_SELECT)
+    if start_date is None or end_date is None:
+        return fetch_all(f'SELECT * FROM {src} ORDER BY "Dispatch_date", "Packing_list_id"')
+    return fetch_all(
+        f'SELECT * FROM {src} WHERE "Dispatch_date" BETWEEN ? AND ? '
+        'ORDER BY "Dispatch_date", "Packing_list_id"',
+        _pi_range(start_date, end_date),
+    )
+
+
+def pd_fg_stock() -> list[dict[str, Any]]:
+    """Finished goods on hand by alloy and status, valued at cost of production."""
+    src = _mv_source("mv_pd_fg_stock", _PD_FG_STOCK_SELECT)
+    return fetch_all(f'SELECT * FROM {src} ORDER BY "Alloy_name", "Status"')
 
 
 def production_snapshot(
