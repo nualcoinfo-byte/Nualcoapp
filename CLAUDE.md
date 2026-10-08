@@ -33,7 +33,7 @@ Versions are pinned exactly in `requirements.txt` on purpose. Don't loosen them.
 
 ```
 app.py            Entry: page config, DB bootstrap, login, role-based sidebar nav, page routing, Production Dashboard
-database.py       ~18k lines. ALL SQL, schema + startup migrations, business rules, constants, RLS, MV refresh, workers
+database.py       ~18.5k lines. ALL SQL, schema + startup migrations, business rules, constants, RLS, MV refresh, workers
 pages_common.py   Shared UI helpers (inputs, dataframe display, dates, photos, the batch-output editor)
 app_pages/*.py    One Streamlit page per file (run via st.navigation, see §6)
 scripts/          One-off/ops scripts: refresh_staging_db.py, compress_existing_photos.py, import_tank_measurements.py
@@ -192,3 +192,30 @@ inspection question. See TODO.md.
   DEVELOPMENT.md. There are no automated tests, so describe what to click on staging to verify.
 - Staging requires an employee login; Claude cannot sign in. Ask the user to verify UI changes there.
 - `database.py` is huge: search with `grep -n "def name"` and read the function rather than the whole file.
+- Read `TODO.md` → "Next session: start here" first; it lists what was released last time and what to check.
+- Removing a page or making one admin-only: see §6 Navigation / Permissions. Prefer an audited correction page over
+  unlocking a locked record in place (pattern: `correct_batch_output`, `correct_production_batch` with an `expected`
+  snapshot for stale-save protection, a `*_correction` + `*_correction_line` log, and a required reason).
+
+### Testing from the Claude cloud workspace
+- PyPI is blocked there (403), so `pip install -r requirements.txt` fails and Streamlit cannot be installed. GitHub works.
+- Database logic can still be run on SQLite: shallow-clone SQLAlchemy at tag `rel_2_0_52` from GitHub into the
+  scratchpad, put its `lib/` on `sys.path`, set `NUALCO_FORCE_SQLITE=1`, copy `database.py` into a scratch folder (it
+  creates `nualco.db` next to itself), call `db.init_db()`, seed masters (Furnace, Crucible, Melter, Production_supervisor,
+  Month_code for the month, Customer, Alloy, Vendor, a purchase + Ready For Melt lot), and act as a role with
+  `db.set_session_actor(name=..., role_name="Admin", role_id=2)`.
+- Page scripts can be smoke-run with a small stand-in `streamlit` module (widgets return `st.session_state` values,
+  `st.stop` / `st.rerun` raise) via `runpy.run_path`. It checks control flow and HTML layout, not real rendering.
+- Known SQLite-only quirk: `production_snapshot()` fails on SQLite (double alias); patch it or stub it in tests.
+- Always say in the PR and to the user that the real UI was not run; ask them to click through on staging.
+
+### Releasing
+- Merge the PR to `main`, then watch the staging deploy: `gh api "repos/nualcoinfo-byte/Nualcoapp/deployments?per_page=1"`
+  and its `/statuses` (`success`). Open https://nualco-staging-staging.up.railway.app/ and confirm the sign-in page
+  loads (it shows "Running _init_postgres()" for a few seconds after a deploy; startup schema changes run then).
+- Production only on the user's explicit request: fetch `production` (`git fetch --depth=50 origin
+  +refs/heads/production:refs/remotes/origin/production`), check it is an ancestor of `origin/main`, list
+  `git log origin/production..origin/main` for the user, then `git push origin origin/main:refs/heads/production`.
+  Watch the `nualco-app / production` deployment and load https://nualco-production.up.railway.app/.
+- GitHub GraphQL is unavailable from this workspace: create and merge PRs with `gh api` REST
+  (`repos/.../pulls`, `PUT repos/.../pulls/<n>/merge`).
