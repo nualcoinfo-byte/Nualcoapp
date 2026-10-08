@@ -680,7 +680,8 @@ def render_batch_output_editor(batch: dict, *, key_prefix: str) -> None:
                 "to it before saving."
                 if product_name
                 else "This batch has **no alloy** set: set it on **Production Batch "
-                "& Chemistry** (Correct history) first, then choose it here."
+                "& Chemistry** (or, once the heat is Completed, an Admin sets it on "
+                "**Production Batch Correction**) first, then choose it here."
             )
         )
         remelt_confirmed = st.checkbox(

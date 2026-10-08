@@ -80,6 +80,7 @@ Postgres folds them to lowercase, so every SELECT aliases columns with quoted na
 - `batch_output`: output lines (alloy incl. 78/79/80, scale − stand = net kg, pieces, photos, and stored
   `cost_of_production_per_kg`, `cost_of_production_overall_per_kg`, `conversion_rate_applied`, `conversion_expense_month`)
 - `batch_output_correction` (+ `_line`): audited edits after output is Completed
+- `production_batch_correction` (+ `_line`): audited Admin edits to a Completed heat (header, QA, chemistry), reason required
 - `batch_id_change_log`, `Heat_no_counter_start`
 
 **Sales & dispatch**
@@ -111,8 +112,13 @@ Postgres folds them to lowercase, so every SELECT aliases columns with quoted na
    (`PROCESSING_USABLE_PCT`), and costed per usable kg (`lot_charge_cost_sql`). *BIL Briquetting* presses borings into
    briquettes, FIFO from oldest lots.
 3. **Furnace heat (batch).** *Production Batch & Chemistry* (desktop) or *Quick Batch Input* (phone) creates the heat
-   and adds trolley charge lines from **Ready For Melt** lots (FIFO allocation, `allocate_fifo`). Then degassing,
-   K-mould test (defect/sampled ≤ `K_MOLD_MAX` 0.5), top/middle/bottom/vacuum samples, then **Mark input Completed**.
+   and adds trolley charge lines from **Ready For Melt** lots (FIFO allocation, `allocate_fifo`). Melter name and
+   production supervisor start **blank** on a new heat and must be selected before saving (Quick Batch Input creates
+   heats without them). Then degassing, K-mould test (defect/sampled ≤ `K_MOLD_MAX` 0.5), top/middle/bottom/vacuum
+   samples, then **Mark input Completed**. A Completed heat is locked for everyone on that page; **Admin** corrects
+   it only on *Production Batch Correction* (audited, must still pass every completion rule; alloy change moves the
+   product output lines and is blocked once the heat is on a packing list; batch ID/date/shift/melt via Admin →
+   Correct batch ID).
 4. **Spectro analysis.** Chemistry is typed in from the **Bruker Q2 ION optical emission spectrometer** per heat and
    checked against `Alloy_Master_spec` min/max (out-of-spec in red). **SF** = Fe + 2×Mn + 3×Cr is entered from the spectro;
    the formula is shown as a guide only. Below-detection values print as `<`. There is no instrument integration.
@@ -159,6 +165,8 @@ inspection question. See TODO.md.
   hard-code strings.
 - **Permissions**: nav sections per role (`role_permissions`, defaults in `DEFAULT_ROLE_SECTIONS_BY_*`); Admin sees all.
   Some actions check roles in code (`PACKING_ROLES`, `CERT_VERIFIER_ROLES`, `RM_FINANCE_ROLES`).
+  Pages in `ADMIN_ONLY_PAGES` (`app.py`) are hidden from every non-Admin role whatever sections it has; such pages
+  also check `db.is_admin_user()` at the top and the `database.py` write refuses non-Admins (three layers).
 - **Navigation**: the sidebar is custom (`NAV_SECTIONS` in `app.py`). Each page is registered in `MIGRATED_PAGES`
   (`st.Page("app_pages/x.py", url_path=...)`) and routed with a hidden `st.navigation`. Only the Dashboard is still
   inline in `app.py` (legacy `if PAGE == "Dashboard"`). To add a page: create `app_pages/x.py`, add it to `NAV_SECTIONS` and

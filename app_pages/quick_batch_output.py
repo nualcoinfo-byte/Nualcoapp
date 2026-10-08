@@ -172,7 +172,8 @@ if out_alloy_id is not None and db.is_sidestream_alloy(out_alloy_id) and not pro
             f"If this metal is **{product_name}**, change the output alloy first."
             if product_name
             else "This batch has **no alloy** set; set it on Production Batch & "
-            "Chemistry (Correct history) first."
+            "Chemistry first (an Admin uses Production Batch Correction once the "
+            "heat is Completed)."
         )
     )
     remelt_confirmed = st.checkbox(
