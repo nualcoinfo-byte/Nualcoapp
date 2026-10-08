@@ -95,9 +95,23 @@ else:
             batch = db.get_batch(bid) or batch
             input_w = float(batch.get("Input_Weight") or 0)
             output_w = float(batch.get("Output_Weight") or 0)
+            output_rows = db.get_batch_outputs(bid)
+            product_id = batch.get("Alloy_id")
+            product_w = sum(
+                float(r["Weight"] or 0)
+                for r in output_rows
+                if product_id is not None and int(r["Alloy_id"]) == int(product_id)
+            )
+            sidestream_w = sum(
+                float(r["Weight"] or 0)
+                for r in output_rows
+                if db.is_sidestream_alloy(r["Alloy_id"])
+            )
             st.markdown("#### Batch yield")
-            y1, y2, y3 = st.columns(3)
+            y1, y4, y5, y2, y3 = st.columns(5)
             y1.metric("Total input (kg)", f"{input_w:,.2f}")
+            y4.metric("Product alloy (kg)", f"{product_w:,.2f}")
+            y5.metric("Non-spec output (kg)", f"{sidestream_w:,.2f}")
             y2.metric("Total output (kg)", f"{output_w:,.2f}")
             with y3:
                 st.markdown(

@@ -278,7 +278,6 @@ NAV_SECTIONS: list[tuple[str, list[str]]] = [
             "Production Batches",
             "Batch Output Correction",
             "Daily Batch Summary",
-            "Material Recovery & Yield",
         ],
     ),
     (
@@ -761,11 +760,6 @@ MIGRATED_PAGES: dict[str, st.Page] = {
         "app_pages/bill_of_materials.py",
         title="Bill of Materials",
         url_path="bill-of-materials",
-    ),
-    "Material Recovery & Yield": st.Page(
-        "app_pages/material_recovery_yield.py",
-        title="Material Recovery & Yield",
-        url_path="material-recovery-yield",
     ),
     "Purchase and Inventory dashboard": st.Page(
         "app_pages/purchase_inventory_dashboard.py",
