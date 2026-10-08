@@ -141,7 +141,7 @@ saved_lines = db.get_batch_inputs(batch_id) if batch else []
 if batch and batch.get("Production_status") == db.BATCH_STATUS_COMPLETED:
     st.warning(
         "This heat is **Completed** and locked, so no more raw material can be "
-        "added. An Admin can unlock it on **Production Batch & Chemistry**."
+        "added."
     )
 else:
     # Bumping the generation after a save gives every charge-line widget a fresh

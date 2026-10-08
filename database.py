@@ -1737,6 +1737,7 @@ def init_db() -> None:
         _ensure_raw_material_correction(conn)
         _ensure_packing_list_po(conn)
         _ensure_batch_id_change_log(conn)
+        _ensure_production_batch_correction(conn)
         _ensure_company_profile(conn)
         _ensure_employees(conn)
         _ensure_row_level_security(conn)
@@ -7525,7 +7526,7 @@ def update_production_batch_input(
     if status == BATCH_STATUS_COMPLETED and not allow_completed:
         raise ValueError(
             f"Batch {batch_id} is Completed and cannot be edited. "
-            "An Admin can unlock it on Production Batch & Chemistry to correct history."
+            "An Admin can correct it on Production Batch Correction."
         )
     if status == BATCH_STATUS_COMPLETED and allow_completed and not is_admin_user():
         raise ValueError("Only Admin can correct a Completed batch.")
@@ -7598,8 +7599,7 @@ def add_batch_charge_lines(batch_id: str, inputs: list[dict[str, Any]]) -> None:
         raise ValueError(f"Batch {batch_id} not found.")
     if batch.get("Production_status") == BATCH_STATUS_COMPLETED:
         raise ValueError(
-            f"Batch {batch_id} is Completed, so no more charge lines can be added. "
-            "An Admin can unlock it on Production Batch & Chemistry to correct history."
+            f"Batch {batch_id} is Completed, so no more charge lines can be added."
         )
     if not inputs:
         raise ValueError("Enter a charge line with net weight above zero.")
@@ -10504,6 +10504,7 @@ def _ensure_packing_list_schema() -> None:
         _ensure_raw_material_correction(conn)
         _ensure_packing_list_po(conn)
         _ensure_batch_id_change_log(conn)
+        _ensure_production_batch_correction(conn)
         _ensure_company_profile(conn)
         _ensure_employees(conn)
         _ensure_row_level_security(conn)
@@ -15270,6 +15271,529 @@ def list_batch_output_correction_lines(correction_ids: list[int]) -> list[dict[s
                l.Alloy_name AS "Alloy_name", l.Field_name AS "Field_name",
                l.Old_value AS "Old_value", l.New_value AS "New_value"
         FROM batch_output_correction_line l
+        WHERE l.Correction_id IN ({marks})
+        ORDER BY l.Correction_id DESC, l.Change_id
+        """,
+        [int(c) for c in correction_ids],
+    )
+
+
+# ---------- Production Batch Correction (Admin) ----------
+#
+# A heat whose input is Completed is locked on Production Batch & Chemistry for
+# everyone. The old in-page Admin "Correct history" unlock edited it without any
+# record of what changed; corrections now go through the Production Batch
+# Correction page, Admin only, and every changed field is logged.
+
+# (column, label, kind). kind drives how values are compared and logged.
+PRODUCTION_BATCH_CORRECTION_FIELDS: tuple[tuple[str, str, str], ...] = (
+    ("Alloy_id", "Alloy", "alloy"),
+    ("Melting_team", "Melter name", "text"),
+    ("Production_supervisor", "Production supervisor", "text"),
+    ("Notes", "Notes", "text"),
+    ("Degassing_time", "Degassing time", "text"),
+    ("Sampled_pcs", "Sampled pcs", "number"),
+    ("Defect_pcs", "Defect pcs", "number"),
+    ("Top_Sample", "Top sample", "text"),
+    ("Middle_Sample", "Middle sample", "text"),
+    ("Bottom_Sample", "Bottom sample", "text"),
+    ("Vacum_Sample", "Vacum sample", "text"),
+    ("Top_Sample_Remarks", "Top sample remarks", "text"),
+    ("Middle_Sample_Remarks", "Middle sample remarks", "text"),
+    ("Bottom_Sample_Remarks", "Bottom sample remarks", "text"),
+    ("Top_Sample_datetime", "Top sample datetime", "datetime"),
+    ("Middle_Sample_datetime", "Middle sample datetime", "datetime"),
+    ("Bottom_Sample_datetime", "Bottom sample datetime", "datetime"),
+)
+PRODUCTION_BATCH_CORRECTION_FOUND_DURING = [
+    "Lab / spectrometer recheck",
+    "Shop-floor records",
+    "Customer complaint",
+    "Internal audit",
+    "Other",
+]
+
+
+def _ensure_production_batch_correction(conn: Connection) -> None:
+    """Audit trail for Production Batch Correction (created on first startup).
+
+    production_batch_correction: one row per saved correction (who, when in IST,
+    where the error was found, the required reason).
+    production_batch_correction_line: one row per field or chemistry element
+    that changed, with old and new value. Rows are only ever inserted.
+    """
+    types = _DIALECT_TYPES[IS_POSTGRES]
+    _exec(
+        conn,
+        f"""
+        CREATE TABLE IF NOT EXISTS production_batch_correction (
+            Correction_id {types["autopk"]},
+            Batch_ID TEXT NOT NULL REFERENCES Production_batch(Batch_ID),
+            Heat_no TEXT,
+            Corrected_by TEXT NOT NULL,
+            Corrected_by_employee_id TEXT,
+            Corrected_datetime TEXT NOT NULL,
+            Found_during TEXT,
+            Reason TEXT NOT NULL
+        )
+        """,
+    )
+    _exec(
+        conn,
+        f"""
+        CREATE TABLE IF NOT EXISTS production_batch_correction_line (
+            Change_id {types["autopk"]},
+            Correction_id INTEGER NOT NULL
+                REFERENCES production_batch_correction(Correction_id),
+            Section TEXT NOT NULL,
+            Field_name TEXT NOT NULL,
+            Old_value TEXT,
+            New_value TEXT
+        )
+        """,
+    )
+    _exec(
+        conn,
+        "CREATE INDEX IF NOT EXISTS idx_production_batch_correction_batch "
+        "ON production_batch_correction (Batch_ID)",
+    )
+    _exec(
+        conn,
+        "CREATE INDEX IF NOT EXISTS idx_production_batch_correction_line_corr "
+        "ON production_batch_correction_line (Correction_id)",
+    )
+
+
+def list_completed_production_batches() -> list[dict[str, Any]]:
+    """Heats whose input is Completed (locked on Production Batch & Chemistry), newest first."""
+    return [
+        b
+        for b in list_batches()
+        if (b.get("Production_status") or "") == BATCH_STATUS_COMPLETED
+    ]
+
+
+def _pbc_number(value: Any) -> Optional[float]:
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _pbc_datetime_text(value: Any) -> str:
+    """Datetimes compared and logged to the minute, as the entry widget offers them."""
+    if value is None or value == "":
+        return ""
+    if isinstance(value, datetime):
+        return value.strftime("%Y-%m-%d %H:%M")
+    text = str(value).strip()
+    try:
+        return datetime.fromisoformat(text.replace(" ", "T")).strftime("%Y-%m-%d %H:%M")
+    except ValueError:
+        return text
+
+
+def _pbc_field_text(kind: str, value: Any, alloy_names: dict[int, str]) -> str:
+    """How a header field value is compared and written into the audit log."""
+    if kind == "alloy":
+        if value in (None, ""):
+            return ""
+        aid = int(value)
+        name = alloy_names.get(aid)
+        return f"{aid} — {name}" if name else str(aid)
+    if kind == "number":
+        num = _pbc_number(value)
+        if num is None:
+            return ""
+        return str(int(num)) if float(num).is_integer() else f"{num:g}"
+    if kind == "datetime":
+        return _pbc_datetime_text(value)
+    return str(value or "").strip()
+
+
+def _pbc_chem_text(entry: Any) -> str:
+    """A chemistry reading as logged: '0.5', '<0.005' (below detection limit) or ''."""
+    if not entry:
+        return ""
+    pct, less_than = entry
+    rounded = round_percent_4(pct)
+    if rounded is None or rounded <= 0:
+        return ""
+    text = f"{rounded:.4f}".rstrip("0").rstrip(".")
+    return f"<{text}" if less_than else text
+
+
+def _pbc_chem_map(rows: list[dict[str, Any]]) -> dict[str, tuple[float, bool]]:
+    """{symbol: (percentage, below detection limit)} from get_batch_chemistry rows."""
+    out: dict[str, tuple[float, bool]] = {}
+    for row in rows:
+        sym = str(row.get("Element_symbol") or "").strip()
+        pct = _pbc_number(row.get("Percentage"))
+        if sym and pct is not None and pct > 0:
+            out[sym] = (pct, bool(row.get("Less_than")) and sym != "SF")
+    return out
+
+
+def production_batch_correction_changes(
+    batch: dict[str, Any],
+    old_chemistry: list[dict[str, Any]],
+    header: dict[str, Any],
+    chemistry: dict[str, tuple[float, bool]],
+) -> list[dict[str, Any]]:
+    """Field-by-field difference between the saved heat and the corrected values.
+
+    `header` holds the PRODUCTION_BATCH_CORRECTION_FIELDS columns; `chemistry` is
+    {symbol: (percentage, below detection limit)} for every element with a value.
+    Returns [{"Section", "Field_name", "Old_value", "New_value"}, ...].
+    """
+    alloy_names = {
+        int(a["Alloy_id"]): str(a.get("Alloy_name") or "")
+        for a in list_alloys(include_sidestream=True)
+    }
+    changes: list[dict[str, Any]] = []
+    for column, label, kind in PRODUCTION_BATCH_CORRECTION_FIELDS:
+        old = _pbc_field_text(kind, batch.get(column), alloy_names)
+        new = _pbc_field_text(kind, header.get(column), alloy_names)
+        if old != new:
+            changes.append(
+                {"Section": "Batch", "Field_name": label, "Old_value": old, "New_value": new}
+            )
+    old_chem = _pbc_chem_map(old_chemistry)
+    new_chem = {
+        sym: (float(pct), bool(lt) and sym != "SF")
+        for sym, (pct, lt) in chemistry.items()
+        if _pbc_number(pct) is not None and float(pct) > 0
+    }
+    order = {sym: i for i, sym in enumerate(old_chem)}
+    for sym in sorted(set(old_chem) | set(new_chem), key=lambda s: (order.get(s, 999), s)):
+        old = _pbc_chem_text(old_chem.get(sym))
+        new = _pbc_chem_text(new_chem.get(sym))
+        if old != new:
+            changes.append(
+                {
+                    "Section": "Chemistry",
+                    "Field_name": f"{sym} %",
+                    "Old_value": old,
+                    "New_value": new,
+                }
+            )
+    return changes
+
+
+def _pbc_snapshot(batch: dict[str, Any], chemistry: list[dict[str, Any]]) -> tuple:
+    """What the correction page loaded, to refuse a save over someone else's change."""
+    fields = tuple(
+        _pbc_field_text(kind, batch.get(column), {})
+        for column, _label, kind in PRODUCTION_BATCH_CORRECTION_FIELDS
+    )
+    chem = tuple(
+        sorted((sym, _pbc_chem_text(v)) for sym, v in _pbc_chem_map(chemistry).items())
+    )
+    return fields + chem + (str(batch.get("Production_status") or ""),)
+
+
+def correct_production_batch(
+    batch_id: str,
+    *,
+    header: dict[str, Any],
+    chemistry: dict[str, tuple[float, bool]],
+    expected_batch: dict[str, Any],
+    expected_chemistry: list[dict[str, Any]],
+    reason: str,
+    found_during: Optional[str] = None,
+) -> int:
+    """Admin only: correct a Completed heat's header, QA results and chemistry.
+
+    Batch ID, production date, shift, melt no and furnace are not changed here
+    (Admin -> Correct batch ID does that), nor are charge lines. The heat must
+    still meet every Mark-as-Completed rule after the correction. Changing the
+    alloy is refused once the heat is on a packing list; otherwise the heat's
+    product-alloy output lines move to the new alloy and its finished-goods
+    bundle is re-synced. Everything, including one production_batch_correction
+    row and a line per changed field, is written in one transaction.
+    Returns the new Correction_id.
+    """
+    if not is_admin_user():
+        raise ValueError("Only Admin can correct a Completed production batch.")
+    batch = get_batch(batch_id)
+    if not batch:
+        raise ValueError(f"Batch {batch_id} not found.")
+    if (batch.get("Production_status") or "") != BATCH_STATUS_COMPLETED:
+        raise ValueError(
+            f"Batch {batch_id} is not Completed. Edit it on Production Batch & Chemistry."
+        )
+    note = (reason or "").strip()
+    if not note:
+        raise ValueError("Enter the reason for this correction.")
+    found = (found_during or "").strip() or None
+    if found and found not in PRODUCTION_BATCH_CORRECTION_FOUND_DURING:
+        raise ValueError(f"Unknown 'Found during' value: {found}.")
+
+    melter = str(header.get("Melting_team") or "").strip()
+    supervisor = str(header.get("Production_supervisor") or "").strip()
+    if not melter:
+        raise ValueError("Melter name is required.")
+    if not supervisor:
+        raise ValueError("Production supervisor is required.")
+    if melter not in list_melters(active_only=False):
+        raise ValueError(f"Melter '{melter}' is not in Melter Master.")
+    _validate_batch_samples_and_supervisor(
+        header.get("Top_Sample"),
+        header.get("Middle_Sample"),
+        header.get("Bottom_Sample"),
+        header.get("Vacum_Sample"),
+        supervisor,
+    )
+    try:
+        new_alloy = int(header.get("Alloy_id"))
+    except (TypeError, ValueError):
+        raise ValueError("Alloy is required.") from None
+    if is_sidestream_alloy(new_alloy):
+        raise ValueError("A non-spec output alloy (78, 79, 80) cannot be a heat's alloy.")
+    if new_alloy not in {int(a["Alloy_id"]) for a in list_alloys(include_sidestream=False)}:
+        raise ValueError(f"Alloy {new_alloy} is not in Alloy Master.")
+
+    composition = {
+        sym: float(pct)
+        for sym, (pct, _lt) in chemistry.items()
+        if _pbc_number(pct) is not None and float(pct) > 0
+    }
+    less_than = {
+        sym: bool(lt) and sym != "SF"
+        for sym, (_pct, lt) in chemistry.items()
+        if sym in composition
+    }
+
+    def _iso(value: Any) -> Optional[str]:
+        if value in (None, ""):
+            return None
+        if isinstance(value, datetime):
+            return value.isoformat(timespec="seconds")
+        return str(value)
+
+    values: dict[str, Any] = {
+        "Alloy_id": new_alloy,
+        "Melting_team": melter,
+        "Production_supervisor": supervisor,
+        "Notes": str(header.get("Notes") or "").strip(),
+        "Degassing_time": str(header.get("Degassing_time") or "").strip() or None,
+        "Sampled_pcs": _pbc_number(header.get("Sampled_pcs")),
+        "Defect_pcs": _pbc_number(header.get("Defect_pcs")),
+        "Top_Sample": header.get("Top_Sample") or None,
+        "Middle_Sample": header.get("Middle_Sample") or None,
+        "Bottom_Sample": header.get("Bottom_Sample") or None,
+        "Vacum_Sample": header.get("Vacum_Sample") or None,
+        "Top_Sample_Remarks": str(header.get("Top_Sample_Remarks") or "").strip() or None,
+        "Middle_Sample_Remarks": str(header.get("Middle_Sample_Remarks") or "").strip() or None,
+        "Bottom_Sample_Remarks": str(header.get("Bottom_Sample_Remarks") or "").strip() or None,
+        "Top_Sample_datetime": _iso(header.get("Top_Sample_datetime")),
+        "Middle_Sample_datetime": _iso(header.get("Middle_Sample_datetime")),
+        "Bottom_Sample_datetime": _iso(header.get("Bottom_Sample_datetime")),
+    }
+    if values["Sampled_pcs"] is not None and values["Sampled_pcs"] <= 0:
+        values["Sampled_pcs"] = None
+
+    gaps = production_batch_completion_gaps(
+        degassing_time=values["Degassing_time"],
+        sampled_pcs=values["Sampled_pcs"],
+        defect_pcs=values["Defect_pcs"],
+        top_sample=values["Top_Sample"],
+        middle_sample=values["Middle_Sample"],
+        bottom_sample=values["Bottom_Sample"],
+        vacum_sample=values["Vacum_Sample"],
+        top_sample_datetime=values["Top_Sample_datetime"],
+        middle_sample_datetime=values["Middle_Sample_datetime"],
+        bottom_sample_datetime=values["Bottom_Sample_datetime"],
+        chemistry_count=len(composition),
+        charge_line_count=len(get_batch_inputs(batch_id)),
+    )
+    if gaps:
+        raise ValueError(
+            "A Completed heat must still have everything Mark as Completed needs. "
+            "Missing or invalid: " + "; ".join(gaps)
+        )
+
+    old_alloy = batch.get("Alloy_id")
+    alloy_changed = old_alloy in (None, "") or int(old_alloy) != new_alloy
+    if alloy_changed and list_batch_packing_lists(batch_id):
+        raise ValueError(
+            f"{batch_id} is on a packing list, so its alloy cannot be changed. "
+            "Cancel or remove the heat from the packing list first."
+        )
+
+    with get_connection() as conn:
+        _ensure_production_batch_correction(conn)
+        current = (
+            _exec(
+                conn,
+                f"SELECT {_BATCH_COLUMNS} FROM Production_batch WHERE Batch_ID = ?",
+                (batch_id,),
+            )
+            .mappings()
+            .first()
+        )
+        current_chem = [
+            dict(r)
+            for r in _exec(
+                conn,
+                """
+                SELECT Element_symbol AS "Element_symbol", Percentage AS "Percentage",
+                       Less_than AS "Less_than"
+                FROM Batch_Chemical_Composition WHERE Batch_ID = ?
+                """,
+                (batch_id,),
+            ).mappings()
+        ]
+        if not current or _pbc_snapshot(dict(current), current_chem) != _pbc_snapshot(
+            expected_batch, expected_chemistry
+        ):
+            raise ValueError(
+                "Someone else changed this heat while you were editing it. "
+                "Reload the page and make the correction again."
+            )
+        changes = production_batch_correction_changes(
+            dict(current), current_chem, values, {s: (composition[s], less_than[s]) for s in composition}
+        )
+        if not changes:
+            raise ValueError("Nothing was changed, so there is no correction to save.")
+
+        saved_by, stamp = audit_stamp()
+        _exec(
+            conn,
+            """
+            UPDATE Production_batch SET
+                Alloy_id = ?, Melting_team = ?, Production_supervisor = ?, Notes = ?,
+                Degassing_time = ?, Sampled_pcs = ?, Defect_pcs = ?,
+                Top_Sample = ?, Middle_Sample = ?, Bottom_Sample = ?, Vacum_Sample = ?,
+                Top_Sample_Remarks = ?, Middle_Sample_Remarks = ?, Bottom_Sample_Remarks = ?,
+                Top_Sample_datetime = ?, Middle_Sample_datetime = ?, Bottom_Sample_datetime = ?
+            WHERE Batch_ID = ?
+            """,
+            (
+                values["Alloy_id"],
+                values["Melting_team"],
+                values["Production_supervisor"],
+                values["Notes"],
+                values["Degassing_time"],
+                values["Sampled_pcs"],
+                values["Defect_pcs"],
+                values["Top_Sample"],
+                values["Middle_Sample"],
+                values["Bottom_Sample"],
+                values["Vacum_Sample"],
+                values["Top_Sample_Remarks"],
+                values["Middle_Sample_Remarks"],
+                values["Bottom_Sample_Remarks"],
+                values["Top_Sample_datetime"],
+                values["Middle_Sample_datetime"],
+                values["Bottom_Sample_datetime"],
+                batch_id,
+            ),
+        )
+        if any(c["Section"] == "Chemistry" for c in changes):
+            _replace_batch_chemistry(conn, batch_id, composition, less_than)
+        if alloy_changed and old_alloy not in (None, ""):
+            # The heat's product output was weighed as the old alloy; it is the
+            # same metal, so it moves with the heat to the corrected alloy.
+            moved = _exec(
+                conn,
+                """
+                UPDATE batch_output SET Alloy_id = ?, Last_updated_by = ?
+                WHERE Batch_ID = ? AND Alloy_id = ?
+                """,
+                (new_alloy, saved_by, batch_id, int(old_alloy)),
+            ).rowcount
+            if moved:
+                changes.append(
+                    {
+                        "Section": "Output",
+                        "Field_name": "Product output lines moved to new alloy",
+                        "Old_value": "",
+                        "New_value": str(moved),
+                    }
+                )
+            if (batch.get("Output_status") or "") == BATCH_STATUS_COMPLETED:
+                _resync_finished_goods_after_correction(conn, batch_id)
+
+        correction_id = int(
+            _exec(
+                conn,
+                """
+                INSERT INTO production_batch_correction
+                    (Batch_ID, Heat_no, Corrected_by, Corrected_by_employee_id,
+                     Corrected_datetime, Found_during, Reason)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                RETURNING Correction_id
+                """,
+                (
+                    batch_id,
+                    batch.get("Heat_no"),
+                    saved_by,
+                    get_acting_employee_id() or None,
+                    stamp,
+                    found,
+                    note,
+                ),
+            ).scalar_one()
+        )
+        for change in changes:
+            _exec(
+                conn,
+                """
+                INSERT INTO production_batch_correction_line
+                    (Correction_id, Section, Field_name, Old_value, New_value)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    correction_id,
+                    change["Section"],
+                    change["Field_name"],
+                    change["Old_value"],
+                    change["New_value"],
+                ),
+            )
+    return correction_id
+
+
+def list_production_batch_corrections(
+    batch_id: Optional[str] = None, limit: int = 200
+) -> list[dict[str, Any]]:
+    """Saved production batch corrections, newest first; for one heat when batch_id is given."""
+    where = "WHERE c.Batch_ID = ?" if batch_id else ""
+    params: tuple = (batch_id,) if batch_id else ()
+    return fetch_all(
+        f"""
+        SELECT c.Correction_id AS "Correction_id", c.Batch_ID AS "Batch_ID",
+               c.Heat_no AS "Heat_no", c.Corrected_datetime AS "Corrected_datetime",
+               c.Corrected_by AS "Corrected_by",
+               c.Corrected_by_employee_id AS "Corrected_by_employee_id",
+               c.Found_during AS "Found_during", c.Reason AS "Reason",
+               (SELECT COUNT(*) FROM production_batch_correction_line l
+                WHERE l.Correction_id = c.Correction_id) AS "Changes"
+        FROM production_batch_correction c
+        {where}
+        ORDER BY c.Correction_id DESC
+        LIMIT ?
+        """,
+        params + (limit,),
+    )
+
+
+def list_production_batch_correction_lines(
+    correction_ids: list[int],
+) -> list[dict[str, Any]]:
+    """Field-level changes for the given production batch corrections."""
+    if not correction_ids:
+        return []
+    marks = ", ".join("?" for _ in correction_ids)
+    return fetch_all(
+        f"""
+        SELECT l.Correction_id AS "Correction_id", l.Section AS "Section",
+               l.Field_name AS "Field_name", l.Old_value AS "Old_value",
+               l.New_value AS "New_value"
+        FROM production_batch_correction_line l
         WHERE l.Correction_id IN ({marks})
         ORDER BY l.Correction_id DESC, l.Change_id
         """,

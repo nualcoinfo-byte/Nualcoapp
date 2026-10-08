@@ -277,6 +277,7 @@ NAV_SECTIONS: list[tuple[str, list[str]]] = [
             "Quick Batch Output",
             "Production Batches",
             "Batch Output Correction",
+            "Production Batch Correction",
             "Daily Batch Summary",
         ],
     ),
@@ -330,6 +331,9 @@ _NAV_SECTION_KEY = {
     "Tools": "tools",
     ADMIN_NAV_SECTION: "admin",
 }
+# Pages only an Admin ever sees, whatever sections a role is given. The page
+# checks again itself, and the database refuses the save for anyone else.
+ADMIN_ONLY_PAGES = ("Production Batch Correction",)
 # Masters pages granted on their own by the "masters_parties" permission.
 _PARTY_MASTER_PAGES = ("Company", "Customers", "Vendors")
 _BASE_NAV_PAGES = [page for _section, pages in NAV_SECTIONS for page in pages]
@@ -346,12 +350,14 @@ def _nav_sections(*, include_admin: bool) -> list[tuple[str, list[str]]]:
 
 def _nav_sections_for_role(role_id: object, role_name: object) -> list[tuple[str, list[str]]]:
     allowed = set(db.nav_section_keys_for_role(role_id, role_name))
-    if db.role_is_admin(role_name, role_id):
+    is_admin_role = db.role_is_admin(role_name, role_id)
+    if is_admin_role:
         allowed = set(db.ALL_NAV_SECTION_KEYS)
     sections: list[tuple[str, list[str]]] = []
     for section, pages in NAV_SECTIONS:
         if _NAV_SECTION_KEY.get(section) in allowed:
-            sections.append((section, list(pages)))
+            visible = [p for p in pages if is_admin_role or p not in ADMIN_ONLY_PAGES]
+            sections.append((section, visible))
         elif section == "Masters" and "masters_parties" in allowed:
             sections.append((section, [p for p in pages if p in _PARTY_MASTER_PAGES]))
     if "admin" in allowed:
@@ -715,6 +721,11 @@ MIGRATED_PAGES: dict[str, st.Page] = {
         "app_pages/production_batches.py",
         title="Production Batches",
         url_path="production-batches",
+    ),
+    "Production Batch Correction": st.Page(
+        "app_pages/production_batch_correction.py",
+        title="Production Batch Correction",
+        url_path="production-batch-correction",
     ),
     "Batch Output Correction": st.Page(
         "app_pages/batch_output_correction.py",

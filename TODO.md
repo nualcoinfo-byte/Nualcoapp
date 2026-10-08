@@ -27,6 +27,9 @@ Legend: ✅ done · 🟡 partial / works with known limits · ⬜ not started
 - ✅ Daily Batch Summary, Production Batches, Production Snapshot, Production Data Analysis (estimated vs actual recovery)
 - ✅ Melter Output report (CSV / Excel) for melter pay
 - ✅ Admin: Correct batch ID (all-or-nothing rename across tables)
+- ✅ Production Batch Correction (Admin only): audited correction of Completed heats (alloy, crew, QA, chemistry);
+  replaced the unaudited "Correct history" unlock on Production Batch & Chemistry
+- ✅ New heats start with Melter name and Production supervisor blank (must be selected)
 - ✅ Removed duplicate *Material Recovery & Yield* page (PR #35); its product/non-spec split moved to Batch Output
 
 ### Costing & utilities
@@ -88,6 +91,11 @@ Legend: ✅ done · 🟡 partial / works with known limits · ⬜ not started
 12. ⬜ `APP_BUILD` in `app.py` is a hand-edited string (`2026-09-03-dashboard-produce`). Derive it from the git SHA
     (e.g. Railway's `RAILWAY_GIT_COMMIT_SHA`) so the sidebar shows what is really deployed.
 
+14. ⬜ Stale text: `database.py` `save_batch_outputs` errors still say "unlock it on Batch Output to correct history";
+    completed output is corrected on Batch Output Correction.
+15. ⬜ Production Batch Correction does not change charge lines on a Completed heat (inventory and costing impact).
+    Decide whether Admin needs an audited charge-line correction too.
+
 ### Release / ops
-13. 🟡 PR #35 (remove Material Recovery & Yield) is on **staging**; check it there, then release with
+16. 🟡 PR #35 (remove Material Recovery & Yield) is on **staging**; check it there, then release with
     `git push origin main:production` at a quiet time.

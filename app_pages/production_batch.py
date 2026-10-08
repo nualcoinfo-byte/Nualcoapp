@@ -247,6 +247,10 @@ def _clear_production_entry_fields(furnace: str, sample_blank: str) -> None:
     st.session_state[pk("notes")] = ""
     st.session_state[pk("prod_date")] = None
     st.session_state[pk("alloy")] = ""
+    # A new heat must not inherit the previous heat's crew: start blank so the
+    # user picks the melter and supervisor for this heat.
+    st.session_state[pk("melter")] = ""
+    st.session_state[pk("supervisor")] = ""
     _snapshot_furnace_widgets(furnace)
 
 
@@ -453,7 +457,10 @@ st.caption(
     "Mark the heat **Completed** after degassing, samples, K Mold, chemistry, "
     "and at least one charge line. **Batch Output** can be entered at any time, but "
     "the output can be marked Completed only after the heat is Completed. "
-    "A Completed heat is locked; only Admin can unlock it to correct history. "
+    "Melter name and Production supervisor start blank on a new heat: select them "
+    "before you save. "
+    "A Completed heat is locked; an Admin corrects it on **Production Batch "
+    "Correction**, where every change is logged. "
     "Browse existing batches under **Production Batches**."
 )
 
@@ -667,14 +674,10 @@ else:
         and existing_batch.get("Production_status") == db.BATCH_STATUS_COMPLETED
     )
     is_admin = db.is_admin_user()
-    unlock_key = (
-        f"pb_unlock_{existing_batch['Batch_ID']}"
-        if existing_batch
-        else _pk("unlock_new")
-    )
-    locked = bool(is_completed) and not (
-        is_admin and st.session_state.get(unlock_key)
-    )
+    # A Completed heat is locked for everyone here. Admin corrections go through
+    # Production Batch Correction, which logs every change (the old unaudited
+    # "Correct history" unlock on this page is gone).
+    locked = bool(is_completed)
 
     if existing_batch:
         saved_melt = existing_batch.get("Melt_No")
@@ -776,14 +779,30 @@ else:
                 disabled=locked,
                 format_func=lambda label: label or "Select alloy",
             )
+            # Blank first option: a new heat starts with no melter / supervisor
+            # so nobody saves the first name in the list by accident. A saved
+            # name that is no longer Active stays selectable on its own heat.
+            melter_opts = [""] + list(melters)
+            saved_melter = st.session_state.get(_pk("melter"))
+            if saved_melter and saved_melter not in melter_opts:
+                melter_opts.append(saved_melter)
+            supervisor_opts = [""] + list(supervisors)
+            saved_supervisor = st.session_state.get(_pk("supervisor"))
+            if saved_supervisor and saved_supervisor not in supervisor_opts:
+                supervisor_opts.append(saved_supervisor)
             melting_team = st.selectbox(
-                "Melter name *", melters, key=_pk("melter"), disabled=locked
+                "Melter name *",
+                melter_opts,
+                key=_pk("melter"),
+                disabled=locked,
+                format_func=lambda name: name or "Select melter",
             )
             production_supervisor = st.selectbox(
                 "Production supervisor *",
-                supervisors,
+                supervisor_opts,
                 key=_pk("supervisor"),
                 disabled=locked,
+                format_func=lambda name: name or "Select production supervisor",
             )
 
     alloy_id = alloy_labels.get(alloy_label) if alloy_label else None
@@ -849,18 +868,15 @@ else:
             )
     with unlock_col:
         if is_completed and is_admin:
-            st.checkbox(
-                "Correct history (unlock this completed batch)",
-                key=unlock_key,
-                help=(
-                    "Admin only. Check this to edit a Completed heat. "
-                    "Save writes a history correction; status stays Completed."
-                ),
+            st.info(
+                "This heat is Completed and locked. To correct it, use "
+                "**Production Batch Correction** (under Production); every "
+                "change there is logged with who made it and when."
             )
         elif is_completed:
             st.info(
-                "This heat is Completed and locked. Ask an Admin to unlock "
-                "it if history needs correction."
+                "This heat is Completed and locked. Ask an Admin to correct "
+                "it on **Production Batch Correction** if it is wrong."
             )
     if preview_error:
         st.error(preview_error)
@@ -1629,6 +1645,10 @@ else:
                     raise ValueError("Production date is required.")
                 if not alloy_id:
                     raise ValueError("Alloy is required.")
+                if not melting_team:
+                    raise ValueError("Select the melter name.")
+                if not production_supervisor:
+                    raise ValueError("Select the production supervisor.")
                 inputs_to_save = list(pending_charges)
                 total_save_weight = sum(
                     float(c.get("Weight") or 0) for c in inputs_to_save
@@ -2124,12 +2144,13 @@ else:
             )
         if not alloy_id:
             raise ValueError("Alloy is required.")
+        if not melting_team:
+            raise ValueError("Select the melter name.")
+        if not production_supervisor:
+            raise ValueError("Select the production supervisor.")
         db.update_production_batch_input(
             preview_id,
             extra_inputs=pending_charges,
-            allow_completed=bool(
-                is_completed and is_admin and st.session_state.get(unlock_key)
-            ),
             **_batch_kwargs(),
         )
         bid = preview_id
@@ -2155,8 +2176,8 @@ else:
         b1, b2, _ = st.columns([1.4, 1.4, 2])
         save_clicked = _button_clicked(
             b1.button(
-                "Save history correction" if is_completed else "Save changes",
-                type="primary" if is_completed else "secondary",
+                "Save changes",
+                type="secondary",
                 disabled=locked,
                 key=_pk("save_batch"),
             ),
@@ -2184,16 +2205,11 @@ else:
         if save_clicked:
             try:
                 bid = _save_chemistry_page(mark_completed=False)
-                if is_completed:
-                    st.session_state["_pb_flash"] = (
-                        f"Saved history correction for **{bid}**."
-                    )
-                else:
-                    st.session_state["_pb_flash"] = (
-                        f"Saved **{bid}**. Production status remains "
-                        f"**{existing_batch.get('Production_status') or db.BATCH_STATUS_IN_PROGRESS}**. "
-                        "Mark Completed when the checklist is done, then enter **Batch Output**."
-                    )
+                st.session_state["_pb_flash"] = (
+                    f"Saved **{bid}**. Production status remains "
+                    f"**{existing_batch.get('Production_status') or db.BATCH_STATUS_IN_PROGRESS}**. "
+                    "Mark Completed when the checklist is done, then enter **Batch Output**."
+                )
                 st.rerun()
             except Exception as exc:
                 st.error(str(exc))
