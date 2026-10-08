@@ -139,7 +139,8 @@ def _yield_cell(pct: object) -> str:
     return f'<td class="num"><span class="{css}">{float(pct):.2f}%</span></td>'
 
 
-N_COLS = 18
+# Set once the view is known: Production date is shown only for a date range.
+N_COLS = 15
 
 
 def _toggle(kind: str, bid: str, total: float) -> str:
@@ -158,7 +159,9 @@ def _detail_row(kind: str, title: str, table_html: str) -> str:
     )
 
 
-def _inputs_detail(bid: str, total: float, lines: list[dict]) -> tuple[str, str]:
+def _inputs_detail(
+    bid: str, heat: str, total: float, lines: list[dict]
+) -> tuple[str, str]:
     if not lines:
         return _num(total), _detail_row("in", "", "")
     rows = "".join(
@@ -180,11 +183,13 @@ def _inputs_detail(bid: str, total: float, lines: list[dict]) -> tuple[str, str]
         "<th class='num'>Est. output kg</th><th>Charged at</th></tr>"
         f"{rows}</table>"
     )
-    title = f"Input for {html.escape(bid)}: {len(lines)} charge line(s), {_num(total)} kg"
+    title = f"Input for heat {html.escape(heat)}: {len(lines)} charge line(s), {_num(total)} kg"
     return _toggle("in", bid, total), _detail_row("in", title, table)
 
 
-def _outputs_detail(bid: str, total: float, lines: list[dict]) -> tuple[str, str]:
+def _outputs_detail(
+    bid: str, heat: str, total: float, lines: list[dict]
+) -> tuple[str, str]:
     if not lines:
         return _num(total), _detail_row("out", "", "")
     rows = "".join(
@@ -202,7 +207,7 @@ def _outputs_detail(bid: str, total: float, lines: list[dict]) -> tuple[str, str
         "<th class='num'>kg</th><th class='num'>% of output</th></tr>"
         f"{rows}</table>"
     )
-    title = f"Output for {html.escape(bid)} by alloy: {_num(total)} kg"
+    title = f"Output for heat {html.escape(heat)} by alloy: {_num(total)} kg"
     return _toggle("out", bid, total), _detail_row("out", title, table)
 
 
@@ -213,9 +218,10 @@ st.caption(
     "output** figure to expand its charge lines or its output by alloy. "
     "**Estimated output** is each charge line's weight × its material's newest "
     "recovery % (Raw Material Master), as on Production Data Analysis. **Cost/kg** is "
-    "the overall ₹/kg saved on the batch's output (material + conversion). Actual "
-    "output is the total recorded output. Data refreshes with the Dashboard; use "
-    "**Refresh now** for the latest."
+    "the overall ₹/kg saved on the batch's output (material + conversion). Actual − "
+    "estimated and the yield use **Total output**. **Production date** is shown only "
+    "for a date range. Data refreshes with the Dashboard; use **Refresh now** for the "
+    "latest."
 )
 _render_dashboard_refresh_bar(key_prefix="psnap")
 
@@ -290,12 +296,17 @@ st.caption(
     "saved, so heats still in the furnace do not pull them down."
 )
 
+# One day is already named above the table, so its date column would repeat
+# the same value on every row.
+show_date = mode == BY_RANGE
+N_COLS = 15 + (1 if show_date else 0)
 header = (
-    "<tr><th>Production date</th><th>Batch ID</th><th>Heat no</th><th>Alloy</th><th>Customer</th>"
+    "<tr>" + ("<th>Production date</th>" if show_date else "")
+    + "<th>Heat no</th><th>Alloy</th><th>Customer</th>"
     "<th class='num'>Melt no</th>"
     "<th>Shift</th><th>Furnace</th><th class='num'>Total input (kg)</th><th>Input status</th>"
     "<th class='num'>Total output (kg)</th><th>Output status</th><th class='num'>Cost/kg (₹)</th>"
-    "<th class='num'>Estimated output (kg)</th><th class='num'>Actual output (kg)</th>"
+    "<th class='num'>Estimated output (kg)</th>"
     "<th class='num'>Actual − estimated (kg)</th><th class='num'>Actual vs estimated %</th>"
     "<th class='num'>Actual yield %</th></tr>"
 )
@@ -304,13 +315,15 @@ body = []
 for b in batches:
     bid = str(b["Batch_ID"])
     delta = b["Output_vs_Estimate"]
-    in_cell, in_row = _inputs_detail(bid, b["Total_Input"], snap["inputs"].get(bid, []))
-    out_cell, out_row = _outputs_detail(bid, b["Total_Output"], snap["outputs"].get(bid, []))
+    heat = str(b.get("Heat_no") or bid)
+    in_cell, in_row = _inputs_detail(bid, heat, b["Total_Input"], snap["inputs"].get(bid, []))
+    out_cell, out_row = _outputs_detail(
+        bid, heat, b["Total_Output"], snap["outputs"].get(bid, [])
+    )
     body.append(
         "<tr class='ps-row'>"
-        f"<td>{_esc(format_ui_date(b.get('Production_Date')))}</td>"
-        f"<td>{_esc(bid)}</td>"
-        f"<td>{_esc(b.get('Heat_no'))}</td>"
+        + (f"<td>{_esc(format_ui_date(b.get('Production_Date')))}</td>" if show_date else "")
+        + f"<td>{_esc(b.get('Heat_no'))}</td>"
         f"<td>{_esc(b.get('Alloy_name'))}</td>"
         f"{_customer_cell(bid, b.get('Customer_name'), customer_short)}"
         f"<td class='num'>{_esc(b.get('Melt_No'))}</td>"
@@ -322,7 +335,6 @@ for b in batches:
         f"<td>{_esc(b.get('Output_status') or db.BATCH_STATUS_IN_PROGRESS)}</td>"
         f"<td class='num'>{_num(b.get('Cost_per_kg'), '{:,.2f}')}</td>"
         f"<td class='num'>{_num(b['Estimated_Output'])}</td>"
-        f"<td class='num'>{_num(b['Total_Output'] if b['Total_Output'] > 0 else None)}</td>"
         f"<td class='num'>{_num(delta, '{:+,.1f}')}</td>"
         f"{_variance_cell(b['Output_vs_Estimate_pct'])}"
         f"{_yield_cell(b['Yield_pct'])}"
@@ -330,11 +342,10 @@ for b in batches:
     )
 body.append(
     "<tr class='ps-total'>"
-    f"<td colspan='8'>Total ({len(batches)} batches)</td>"
+    f"<td colspan='{7 if show_date else 6}'>Total ({len(batches)} batches)</td>"
     f"<td class='num'>{_num(total_in)}</td><td></td>"
     f"<td class='num'>{_num(total_out)}</td><td></td><td></td>"
     f"<td class='num'>{_num(sum(b['Estimated_Output'] for b in batches))}</td>"
-    f"<td class='num'>{_num(total_out)}</td>"
     f"<td class='num'>{_num(out_with_output - est_with_output if with_output else None, '{:+,.1f}')}</td>"
     f"{_variance_cell(overall_var)}{_yield_cell(overall_yield)}"
     "</tr>"
@@ -354,8 +365,8 @@ if abbreviated:
 export = pd.DataFrame(
     [
         {
+            # Kept in the download even for one day, so the file says which day it is.
             "Production date": format_ui_date(b.get("Production_Date")),
-            "Batch ID": b["Batch_ID"],
             "Heat no": b.get("Heat_no"),
             "Alloy": b.get("Alloy_name"),
             "Customer": b.get("Customer_name"),
@@ -368,7 +379,6 @@ export = pd.DataFrame(
             "Output status": b.get("Output_status"),
             "Cost/kg (Rs)": b.get("Cost_per_kg"),
             "Estimated output (kg)": round(b["Estimated_Output"], 2),
-            "Actual output (kg)": round(b["Total_Output"], 2),
             "Actual - estimated (kg)": None
             if b["Output_vs_Estimate"] is None
             else round(b["Output_vs_Estimate"], 2),
