@@ -15305,6 +15305,25 @@ PRODUCTION_BATCH_CORRECTION_FIELDS: tuple[tuple[str, str, str], ...] = (
     ("Middle_Sample_datetime", "Middle sample datetime", "datetime"),
     ("Bottom_Sample_datetime", "Bottom sample datetime", "datetime"),
 )
+# Fields not printed on a packing list or test certificate. They are the only
+# ones that can be corrected once the heat is on a packing list, and a change to
+# them alone does not re-check the Mark-as-Completed rules.
+PRODUCTION_BATCH_CREW_FIELDS = ("Melting_team", "Production_supervisor")
+_PRODUCTION_BATCH_CREW_LABELS = frozenset(
+    label
+    for column, label, _kind in PRODUCTION_BATCH_CORRECTION_FIELDS
+    if column in PRODUCTION_BATCH_CREW_FIELDS
+)
+
+
+def production_batch_correction_is_crew_only(changes: list[dict[str, Any]]) -> bool:
+    """True when every change is to Melter name or Production supervisor."""
+    return all(
+        c.get("Section") == "Batch" and c.get("Field_name") in _PRODUCTION_BATCH_CREW_LABELS
+        for c in changes
+    )
+
+
 PRODUCTION_BATCH_CORRECTION_FOUND_DURING = [
     "Lab / spectrometer recheck",
     "Shop-floor records",
@@ -15507,12 +15526,14 @@ def correct_production_batch(
     """Admin only: correct a Completed heat's header, QA results and chemistry.
 
     Batch ID, production date, shift, melt no and furnace are not changed here
-    (Admin -> Correct batch ID does that), nor are charge lines. The heat must
-    still meet every Mark-as-Completed rule after the correction. Changing the
-    alloy is refused once the heat is on a packing list; otherwise the heat's
-    product-alloy output lines move to the new alloy and its finished-goods
-    bundle is re-synced. Everything, including one production_batch_correction
-    row and a line per changed field, is written in one transaction.
+    (Admin -> Correct batch ID does that), nor are charge lines. Once the heat is
+    on a packing list (and so on its test certificate) only Melter name and
+    Production supervisor can change; everything those documents show stays
+    locked. A correction that changes anything beyond the crew must leave the
+    heat meeting every Mark-as-Completed rule. An alloy change moves the heat's
+    product-alloy output lines to the new alloy and re-syncs its finished-goods
+    bundle. Everything, including one production_batch_correction row and a
+    line per changed field, is written in one transaction.
     Returns the new Correction_id.
     """
     if not is_admin_user():
@@ -15595,7 +15616,21 @@ def correct_production_batch(
     if values["Sampled_pcs"] is not None and values["Sampled_pcs"] <= 0:
         values["Sampled_pcs"] = None
 
-    gaps = production_batch_completion_gaps(
+    planned = production_batch_correction_changes(
+        batch,
+        get_batch_chemistry(batch_id),
+        values,
+        {s: (composition[s], less_than[s]) for s in composition},
+    )
+    crew_change_only = production_batch_correction_is_crew_only(planned)
+    if list_batch_packing_lists(batch_id) and not crew_change_only:
+        raise ValueError(
+            f"{batch_id} is on a packing list, so only Melter name and Production "
+            "supervisor can be corrected. Take the heat off the packing list to "
+            "change anything else."
+        )
+
+    gaps = [] if crew_change_only else production_batch_completion_gaps(
         degassing_time=values["Degassing_time"],
         sampled_pcs=values["Sampled_pcs"],
         defect_pcs=values["Defect_pcs"],
@@ -15617,11 +15652,6 @@ def correct_production_batch(
 
     old_alloy = batch.get("Alloy_id")
     alloy_changed = old_alloy in (None, "") or int(old_alloy) != new_alloy
-    if alloy_changed and list_batch_packing_lists(batch_id):
-        raise ValueError(
-            f"{batch_id} is on a packing list, so its alloy cannot be changed. "
-            "Cancel or remove the heat from the packing list first."
-        )
 
     with get_connection() as conn:
         _ensure_production_batch_correction(conn)

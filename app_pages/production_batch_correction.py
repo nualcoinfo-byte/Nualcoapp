@@ -18,8 +18,11 @@ st.title("Production Batch Correction")
 st.caption(
     "**Admin only.** Correct a heat whose input is already **Completed** and locked "
     "on **Production Batch & Chemistry**: alloy, melter, production supervisor, notes, "
-    "degassing, sampled / defect pcs, sample results and chemistry. The heat must "
-    "still meet every **Mark as Completed** rule after the correction. Every saved "
+    "degassing, sampled / defect pcs, sample results and chemistry. Once the heat is "
+    "on a **Packing List** (and its test certificate), only **Melter name** and "
+    "**Production supervisor** can be corrected; everything else is locked. A "
+    "correction that changes more than those two must leave the heat meeting every "
+    "**Mark as Completed** rule. Every saved "
     "correction is logged with **who** made it, **when** (IST), the reason, and the "
     "old and new value of each field. Batch ID, production date, shift and melt no "
     "are changed on **Admin → Correct batch ID**; charge lines are not changed here. "
@@ -167,9 +170,9 @@ if packing_lists:
             f"#{p['Packing_list_id']} ({p.get('Packing_list_status')})"
             for p in packing_lists
         )
-        + ". Its **alloy cannot be changed** here. Test certificates read the heat's "
-        "chemistry when they are printed, so a chemistry correction also shows on "
-        "any certificate printed or reprinted after you save."
+        + ". Only **Melter name** and **Production supervisor** can be corrected: "
+        "they are not on the packing list or the test certificate. Every other field "
+        "is locked. To change one, take the heat off the packing list first."
     )
 
 charges = db.get_batch_inputs(bid)
@@ -273,7 +276,10 @@ expected_batch, expected_chem = st.session_state[expected_key]
 
 # ── Header ───────────────────────────────────────────────────────────────────
 st.markdown("#### Heat details")
-alloy_locked = bool(packing_lists)
+# A heat on a packing list (and so on its test certificate) keeps every field
+# those documents show. Only the crew, which they do not show, stays editable.
+crew_only = bool(packing_lists)
+alloy_locked = crew_only
 h1, h2, h3 = st.columns(3)
 with h1:
     alloy_ids = list(alloy_label_by_id)
@@ -305,21 +311,33 @@ with h3:
         key=_k("supervisor"),
         format_func=lambda v: v or "Select production supervisor",
     )
-notes = st.text_area("Notes", key=_k("notes"), height=68)
+notes = st.text_area("Notes", key=_k("notes"), height=68, disabled=crew_only)
 
 st.markdown("#### Degassing & piece counts")
 d1, d2, d3, d4 = st.columns(4)
 with d1:
     degassing = st.text_input(
-        "Degassing time *", key=_k("degassing"), placeholder="e.g. 14:30 or 12 min"
+        "Degassing time *",
+        key=_k("degassing"),
+        placeholder="e.g. 14:30 or 12 min",
+        disabled=crew_only,
     )
 with d2:
     sampled = empty_percent_input(
-        "Sampled pcs *", key=_k("Sampled_pcs"), max_value=None, step=1.0
+        "Sampled pcs *",
+        key=_k("Sampled_pcs"),
+        max_value=None,
+        step=1.0,
+        disabled=crew_only,
     )
 with d3:
     defect = empty_percent_input(
-        "Defect pcs *", key=_k("Defect_pcs"), max_value=None, step=1.0, allow_zero=True
+        "Defect pcs *",
+        key=_k("Defect_pcs"),
+        max_value=None,
+        step=1.0,
+        allow_zero=True,
+        disabled=crew_only,
     )
 with d4:
     if sampled and sampled > 0 and defect is not None:
@@ -338,20 +356,23 @@ s_cols = st.columns(4)
 sample_values: dict[str, str | None] = {}
 for (col, label), widget_col in zip(SAMPLE_FIELDS, s_cols):
     with widget_col:
-        choice = st.selectbox(f"{label} *", sample_opts, key=_k(col))
+        choice = st.selectbox(f"{label} *", sample_opts, key=_k(col), disabled=crew_only)
         sample_values[col] = None if choice == SAMPLE_BLANK else choice
 r_cols = st.columns(4)
 remarks: dict[str, str] = {}
 sample_dts: dict[str, datetime | None] = {}
 for pos, widget_col in zip(("Top", "Middle", "Bottom"), r_cols):
     with widget_col:
-        remarks[pos] = st.text_input(f"{pos} sample remarks", key=_k(f"{pos}_remarks"))
+        remarks[pos] = st.text_input(
+            f"{pos} sample remarks", key=_k(f"{pos}_remarks"), disabled=crew_only
+        )
         sample_dts[pos] = st.datetime_input(
             f"{pos} sample datetime *",
             value=None,
             key=_k(f"{pos}_dt"),
             step=60,
             format=UI_DATE_WIDGET_FORMAT,
+            disabled=crew_only,
         )
 
 # ── Chemistry ────────────────────────────────────────────────────────────────
@@ -368,7 +389,8 @@ edited = st.data_editor(
     hide_index=True,
     use_container_width=True,
     num_rows="fixed",
-    disabled=["Element", "Name"],
+    # Fully read-only on a packed heat; otherwise only the element columns are fixed.
+    disabled=True if crew_only else ["Element", "Name"],
     column_config={
         "%": st.column_config.NumberColumn(
             "%", min_value=0.0, max_value=600.0, step=0.0001, format="%.4f"
@@ -445,7 +467,11 @@ if not melter:
     problems.append("Select the melter name.")
 if not supervisor:
     problems.append("Select the production supervisor.")
-gaps = db.production_batch_completion_gaps(
+# The completion rules guard the heat's QA record; a crew-only correction does not
+# touch it, so an older heat with a gap (e.g. no sample time) can still get its
+# melter or supervisor fixed.
+crew_change_only = db.production_batch_correction_is_crew_only(changes)
+gaps = [] if crew_change_only else db.production_batch_completion_gaps(
     degassing_time=degassing,
     sampled_pcs=sampled,
     defect_pcs=defect,
@@ -459,6 +485,11 @@ gaps = db.production_batch_completion_gaps(
     chemistry_count=len(chemistry),
     charge_line_count=len(charges),
 )
+if crew_only and not crew_change_only:
+    problems.append(
+        "This heat is on a packing list: only Melter name and Production supervisor "
+        "can be corrected."
+    )
 if gaps:
     problems.append(
         "A Completed heat must still have everything Mark as Completed needs: "

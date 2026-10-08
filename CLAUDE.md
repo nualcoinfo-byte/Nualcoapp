@@ -116,9 +116,10 @@ Postgres folds them to lowercase, so every SELECT aliases columns with quoted na
    production supervisor start **blank** on a new heat and must be selected before saving (Quick Batch Input creates
    heats without them). Then degassing, K-mould test (defect/sampled ≤ `K_MOLD_MAX` 0.5), top/middle/bottom/vacuum
    samples, then **Mark input Completed**. A Completed heat is locked for everyone on that page; **Admin** corrects
-   it only on *Production Batch Correction* (audited, must still pass every completion rule; alloy change moves the
-   product output lines and is blocked once the heat is on a packing list; batch ID/date/shift/melt via Admin →
-   Correct batch ID).
+   it only on *Production Batch Correction* (audited). Once the heat is on a packing list (= on a test certificate)
+   only Melter name and Production supervisor can change (`PRODUCTION_BATCH_CREW_FIELDS`); otherwise any field,
+   and a change beyond the crew must still pass every completion rule; an alloy change moves the product output
+   lines. Batch ID/date/shift/melt via Admin → Correct batch ID.
 4. **Spectro analysis.** Chemistry is typed in from the **Bruker Q2 ION optical emission spectrometer** per heat and
    checked against `Alloy_Master_spec` min/max (out-of-spec in red). **SF** = Fe + 2×Mn + 3×Cr is entered from the spectro;
    the formula is shown as a guide only. Below-detection values print as `<`. There is no instrument integration.
