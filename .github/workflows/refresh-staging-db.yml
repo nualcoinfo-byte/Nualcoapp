@@ -89,7 +89,22 @@ jobs:
           printf 'DATABASE_URL=%s\nAPP_ENV=staging\n' "$STAGING_DATABASE_URL" > .env.local
 
       - name: Refresh staging from production
-        run: python scripts/refresh_staging_db.py --yes
+        shell: bash
+        run: |
+          # Also publish the script's last lines as a run annotation, so the result can be read
+          # (e.g. by Claude via the API) without opening the log. The script never prints credentials.
+          set +e
+          python scripts/refresh_staging_db.py --yes 2>&1 | tee refresh.log
+          status=${PIPESTATUS[0]}
+          set -e
+          summary="$(tail -n 30 refresh.log | sed -e 's/%/%25/g' | awk '{printf "%s%%0A", $0}')"
+          if [ "$status" -eq 0 ]; then
+            echo "::notice title=Staging refresh result::${summary}"
+          else
+            echo "::error title=Staging refresh failed (exit ${status})::${summary}"
+          fi
+          rm -f refresh.log
+          exit "$status"
 
       - name: Remove the env files
         if: always()
