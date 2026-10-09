@@ -55,10 +55,21 @@ jobs:
           PRODUCTION_DATABASE_URL: ${{ secrets.PRODUCTION_DATABASE_URL }}
           STAGING_DATABASE_URL: ${{ secrets.STAGING_DATABASE_URL }}
         run: |
-          if [ -z "$PRODUCTION_DATABASE_URL" ] || [ -z "$STAGING_DATABASE_URL" ]; then
-            echo "::error::Set the PRODUCTION_DATABASE_URL and STAGING_DATABASE_URL repository secrets."
+          # Name exactly which secret the run cannot see (never its value). Environment secrets,
+          # Codespaces / Dependabot secrets and repository *variables* are not visible here.
+          missing=""
+          [ -z "$PRODUCTION_DATABASE_URL" ] && missing="$missing PRODUCTION_DATABASE_URL"
+          [ -z "$STAGING_DATABASE_URL" ] && missing="$missing STAGING_DATABASE_URL"
+          if [ -n "$missing" ]; then
+            echo "::error::Missing or empty repository secret(s):$missing. Add them under Settings -> Secrets and variables -> Actions -> Secrets tab -> Repository secrets."
             exit 1
           fi
+          for name in PRODUCTION_DATABASE_URL STAGING_DATABASE_URL; do
+            case "${!name}" in
+              postgres://*|postgresql://*) ;;
+              *) echo "::error::$name does not start with postgresql:// (check for a NAME= prefix, quotes or spaces)."; exit 1 ;;
+            esac
+          done
           umask 077
           printf 'PRODUCTION_DATABASE_URL=%s\n' "$PRODUCTION_DATABASE_URL" > .env.production.local
           printf 'DATABASE_URL=%s\nAPP_ENV=staging\n' "$STAGING_DATABASE_URL" > .env.local
