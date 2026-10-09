@@ -64,12 +64,26 @@ jobs:
             echo "::error::Missing or empty repository secret(s):$missing. Add them under Settings -> Secrets and variables -> Actions -> Secrets tab -> Repository secrets."
             exit 1
           fi
-          for name in PRODUCTION_DATABASE_URL STAGING_DATABASE_URL; do
-            case "${!name}" in
+          # Forgive common paste mistakes: surrounding spaces / newlines, quotes, and a copied
+          # "NAME=" prefix from the .env file. Only what was fixed is printed, never the value.
+          clean() {
+            local name="$1" v="${!1}" fixed=""
+            local t; t="$(printf '%s' "$v" | tr -d '\r' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+            [ "$t" != "$v" ] && fixed="$fixed spaces/newlines"; v="$t"
+            if [[ "$v" =~ ^(export[[:space:]]+)?[A-Za-z_]+[[:space:]]*= ]]; then
+              v="${v#*=}"; v="${v#"${v%%[![:space:]]*}"}"; fixed="$fixed NAME=-prefix"
+            fi
+            t="${v%\"}"; t="${t#\"}"; t="${t%\'}"; t="${t#\'}"
+            [ "$t" != "$v" ] && fixed="$fixed quotes"; v="$t"
+            [ -n "$fixed" ] && echo "::warning::$name: removed$fixed from the pasted value."
+            case "$v" in
               postgres://*|postgresql://*) ;;
-              *) echo "::error::$name does not start with postgresql:// (check for a NAME= prefix, quotes or spaces)."; exit 1 ;;
+              *) echo "::error::$name is not a database address: it should be one line starting with postgresql://"; return 1 ;;
             esac
-          done
+            printf -v "$name" '%s' "$v"
+          }
+          clean PRODUCTION_DATABASE_URL || exit 1
+          clean STAGING_DATABASE_URL || exit 1
           umask 077
           printf 'PRODUCTION_DATABASE_URL=%s\n' "$PRODUCTION_DATABASE_URL" > .env.production.local
           printf 'DATABASE_URL=%s\nAPP_ENV=staging\n' "$STAGING_DATABASE_URL" > .env.local
