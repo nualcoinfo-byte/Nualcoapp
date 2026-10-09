@@ -45,6 +45,53 @@ _CSS = """
 </style>
 """
 
+# Frozen identity columns (Production date, Heat no, Alloy, Customer) stay on the
+# left while the figures scroll sideways. Sticky cells need a solid background
+# (the page's own), fixed widths so each knows where the previous one ends, and
+# a left offset that depends on whether Production date is shown.
+FROZEN_WIDTH_REM = {"date": 8.0, "heat": 6.0, "alloy": 7.5, "cust": 7.0}
+_THEME_BG = {"light": ("#ffffff", "#f3f3f4"), "dark": ("#0e1117", "#1f2229")}
+
+
+def _frozen_css(columns: list[str], theme: str) -> str:
+    page_bg, head_bg = _THEME_BG.get(theme, _THEME_BG["light"])
+    rules = [
+        ".ps-table td.fz, .ps-table th.fz { position: sticky; z-index: 2; "
+        f"background: {page_bg}; box-sizing: border-box; overflow: hidden; "
+        "text-overflow: ellipsis; }",
+        f".ps-table th.fz {{ background: {head_bg}; z-index: 3; }}",
+        ".ps-table .fz-last { box-shadow: 2px 0 0 rgba(128,128,128,0.45); }",
+    ]
+    left = 0.0
+    for col in columns:
+        w = FROZEN_WIDTH_REM[col]
+        rules.append(
+            f".ps-table .fz-{col} {{ left: {left:g}rem; width: {w:g}rem; "
+            f"min-width: {w:g}rem; max-width: {w:g}rem; }}"
+        )
+        left += w
+    # On a phone the four columns would fill the screen; freeze only Heat no there.
+    phone = [
+        "@media (max-width: 640px) {",
+        "  .ps-table td.fz, .ps-table th.fz { position: static; box-shadow: none; }",
+        "  .ps-table td.fz-heat, .ps-table th.fz-heat { position: sticky; left: 0; "
+        "box-shadow: 2px 0 0 rgba(128,128,128,0.45); }",
+        "  .ps-table td.fz-total { position: static; }",
+        "}",
+    ]
+    total_w = sum(FROZEN_WIDTH_REM[c] for c in columns)
+    rules.append(
+        f".ps-table .fz-total {{ left: 0; width: {total_w:g}rem; min-width: {total_w:g}rem; "
+        f"max-width: {total_w:g}rem; }}"
+    )
+    return "<style>" + "\n".join(rules + phone) + "</style>"
+
+
+def _fz(col: str, columns: list[str]) -> str:
+    """Class attribute for a frozen cell; the last frozen column gets the divider."""
+    last = " fz-last" if col == columns[-1] else ""
+    return f" class='fz fz-{col}{last}'"
+
 
 def _num(value: object, fmt: str = "{:,.1f}") -> str:
     if value is None:
@@ -104,17 +151,19 @@ def _customer_short_names(names: list[str]) -> dict[str, str]:
     return short
 
 
-def _customer_cell(bid: str, name: object, short_names: dict[str, str]) -> str:
+def _customer_cell(
+    bid: str, name: object, short_names: dict[str, str], attrs: str = ""
+) -> str:
     """Short customer name; hover shows the full name, a tap/click toggles it."""
     full = str(name or "").strip()
     if not full:
-        return "<td>—</td>"
+        return f"<td{attrs}>—</td>"
     short = short_names.get(full, full)
     if short == full:
-        return f"<td>{html.escape(full)}</td>"
+        return f"<td{attrs} title='{html.escape(full, quote=True)}'>{html.escape(full)}</td>"
     tid = f"ps-cust-{html.escape(bid)}"
     return (
-        f"<td><input type='checkbox' class='ps-toggle' id='{tid}'>"
+        f"<td{attrs}><input type='checkbox' class='ps-toggle' id='{tid}'>"
         f"<label class='ps-cust' for='{tid}' title='{html.escape(full, quote=True)}'>"
         f"<span class='ps-cust-short'>{html.escape(short)}</span>"
         f"<span class='ps-cust-full'>{html.escape(full)}</span></label></td>"
@@ -300,9 +349,15 @@ st.caption(
 # the same value on every row.
 show_date = mode == BY_RANGE
 N_COLS = 15 + (1 if show_date else 0)
+frozen = (["date"] if show_date else []) + ["heat", "alloy", "cust"]
+try:
+    theme_type = str(st.context.theme.type or "light")
+except Exception:
+    theme_type = "light"
 header = (
-    "<tr>" + ("<th>Production date</th>" if show_date else "")
-    + "<th>Heat no</th><th>Alloy</th><th>Customer</th>"
+    "<tr>" + (f"<th{_fz('date', frozen)}>Production date</th>" if show_date else "")
+    + f"<th{_fz('heat', frozen)}>Heat no</th><th{_fz('alloy', frozen)}>Alloy</th>"
+    f"<th{_fz('cust', frozen)}>Customer</th>"
     "<th class='num'>Melt no</th>"
     "<th>Shift</th><th>Furnace</th><th class='num'>Total input (kg)</th><th>Input status</th>"
     "<th class='num'>Total output (kg)</th><th>Output status</th><th class='num'>Cost/kg (₹)</th>"
@@ -322,10 +377,15 @@ for b in batches:
     )
     body.append(
         "<tr class='ps-row'>"
-        + (f"<td>{_esc(format_ui_date(b.get('Production_Date')))}</td>" if show_date else "")
-        + f"<td>{_esc(b.get('Heat_no'))}</td>"
-        f"<td>{_esc(b.get('Alloy_name'))}</td>"
-        f"{_customer_cell(bid, b.get('Customer_name'), customer_short)}"
+        + (
+            f"<td{_fz('date', frozen)}>{_esc(format_ui_date(b.get('Production_Date')))}</td>"
+            if show_date
+            else ""
+        )
+        + f"<td{_fz('heat', frozen)}>{_esc(b.get('Heat_no'))}</td>"
+        f"<td{_fz('alloy', frozen)} title='{html.escape(str(b.get('Alloy_name') or ''), quote=True)}'>"
+        f"{_esc(b.get('Alloy_name'))}</td>"
+        f"{_customer_cell(bid, b.get('Customer_name'), customer_short, _fz('cust', frozen))}"
         f"<td class='num'>{_esc(b.get('Melt_No'))}</td>"
         f"<td>{_esc(b.get('Shift'))}</td>"
         f"<td>{_esc(b.get('Furnace'))}</td>"
@@ -342,7 +402,10 @@ for b in batches:
     )
 body.append(
     "<tr class='ps-total'>"
-    f"<td colspan='{7 if show_date else 6}'>Total ({len(batches)} batches)</td>"
+    # The label spans exactly the frozen columns so it can stay frozen with them;
+    # Melt no, Shift and Furnace get empty cells of their own.
+    f"<td colspan='{len(frozen)}' class='fz fz-total fz-last'>Total ({len(batches)} batches)</td>"
+    "<td></td><td></td><td></td>"
     f"<td class='num'>{_num(total_in)}</td><td></td>"
     f"<td class='num'>{_num(total_out)}</td><td></td><td></td>"
     f"<td class='num'>{_num(sum(b['Estimated_Output'] for b in batches))}</td>"
@@ -351,7 +414,8 @@ body.append(
     "</tr>"
 )
 st.html(
-    _CSS + "<div class='ps-wrap'><table class='ps-table'>" + header + "".join(body) + "</table></div>"
+    _CSS + _frozen_css(frozen, theme_type)
+    + "<div class='ps-wrap'><table class='ps-table'>" + header + "".join(body) + "</table></div>"
 )
 
 abbreviated = {full: short for full, short in customer_short.items() if short != full}
