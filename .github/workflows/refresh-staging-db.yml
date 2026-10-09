@@ -2,8 +2,7 @@
 # Runs scripts/refresh_staging_db.py --yes: production is only read; staging's data is completely replaced.
 #
 # Schedule (GitHub cron is UTC; IST = UTC+05:30, and GitHub may start a scheduled run a few minutes late):
-#   Sunday    17:00 IST = Sunday  11:30 UTC
-#   Wednesday 05:00 IST = Tuesday 23:30 UTC
+#   Every day 06:00 IST = 00:30 UTC (before the shift starts, so staging has yesterday's production data)
 # Also runnable by hand: GitHub -> Actions -> "Refresh staging database" -> Run workflow.
 #
 # Repository secrets (Settings -> Secrets and variables -> Actions), copied from the local env files:
@@ -15,8 +14,7 @@ name: Refresh staging database
 
 on:
   schedule:
-    - cron: "30 11 * * 0"   # Sunday 17:00 IST
-    - cron: "30 23 * * 2"   # Wednesday 05:00 IST
+    - cron: "30 0 * * *"   # every day 06:00 IST
   workflow_dispatch:
 
 concurrency:

@@ -24,7 +24,7 @@ management and an Admin. Everything is in **IST** and **kg / ₹**.
 | Database | **PostgreSQL on Supabase**. Production = Singapore project (`nualco-sg`), dev/staging = Mumbai. Local **SQLite** (`nualco.db`) is an offline fallback only |
 | Data / reports | pandas 2.3, openpyxl (Excel export), **fpdf2** (test-certificate PDF), Pillow (photo compression) |
 | Hosting | **Railway**, Docker build (`Dockerfile`, `railway.toml`), 1 replica, healthcheck `/_stcore/health` |
-| CI | GitHub Actions only for `refresh-staging-db.yml` (copies prod → Mumbai, Sun 17:00 and Wed 05:00 IST). No test suite |
+| CI | GitHub Actions only for `refresh-staging-db.yml` (copies prod → Mumbai, daily 06:00 IST; needs repo secrets `PRODUCTION_DATABASE_URL`, `STAGING_DATABASE_URL`). No test suite |
 | Branches | `main` → staging (auto-deploy). `production` → production, moved only by `git push origin main:production` |
 
 Versions are pinned exactly in `requirements.txt` on purpose. Don't loosen them.
