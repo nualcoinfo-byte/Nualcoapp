@@ -1609,6 +1609,17 @@ else:
                     "Inventory returns are already deducted from the input "
                     "weight above. Scrap is not."
                 )
+    def _show_batch_identity_banner() -> None:
+        """Green Batch ID / Heat no / Production status line for a saved heat."""
+        created_status = (
+            existing_batch.get("Production_status") or db.BATCH_STATUS_IN_PROGRESS
+        )
+        st.success(
+            f"**Batch ID:** `{preview_id}`  ·  "
+            f"**Heat no:** `{heat_no_label}`  ·  "
+            f"**Production status:** `{created_status}`"
+        )
+
     top_save_clicked = False
     if not existing_batch:
         st.caption(
@@ -1705,14 +1716,7 @@ else:
         if persist_error:
             st.error(persist_error)
     else:
-        created_status = (
-            existing_batch.get("Production_status") or db.BATCH_STATUS_IN_PROGRESS
-        )
-        st.success(
-            f"**Batch ID:** `{preview_id}`  ·  "
-            f"**Heat no:** `{heat_no_label}`  ·  "
-            f"**Production status:** `{created_status}`"
-        )
+        _show_batch_identity_banner()
         if not is_completed:
             top_save_clicked = _button_clicked(
                 st.button(
@@ -1877,6 +1881,10 @@ else:
     middle_sample_dt = st.session_state.get(_pk("middle_sample_dt"))
     bottom_sample_dt = st.session_state.get(_pk("bottom_sample_dt"))
 
+    if existing_batch:
+        # Repeated here so the heat being entered is in view while typing the
+        # spectrometer readings, without scrolling back to the top.
+        _show_batch_identity_banner()
     st.markdown("#### Batch chemistry (ladle / spectrometer)")
     st.caption(
         f"First {db.ENTRY_CHEM_ELEMENT_LIMIT} elements by Serial_no from Element_Master, "
