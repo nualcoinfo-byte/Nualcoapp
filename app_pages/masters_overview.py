@@ -77,7 +77,7 @@ with tab4:
         | 32 | Packing_list_visual_inspection | OK / NOT OK + Verified checks, done by quality before a test certificate is Verified |
         | 33 | Company_profile | Our company (issuer) — legal, contact, GST/CIN/MSME, and bank details |
         | 34 | Furnace_Oil_Purchase_Tank | Tank dip readings for a furnace oil purchase (child of Furnace_Oil_Purchase; key is Purchase_id + Oil_tank_type); litres filled are checked against the purchase quantity |
-        | 35 | Furnace_Oil_Consumption_Tank | Tank dip readings for a day's furnace oil consumption (child of Furnace_Oil_Consumption; key is Consumption_date + Oil_tank_type); Furnace_Oil_Consumption.Quantity is calculated from them |
+        | 35 | Furnace_Oil_Consumption_Tank | Tank dip readings for a day's furnace oil consumption, one row per reading (key Reading_id; a tank can be read several times a day; child of Furnace_Oil_Consumption); Furnace_Oil_Consumption.Quantity is their total |
         | 36 | Heat_no_counter_start | Optional starting number for a furnace-month's heat numbers (key is Heat_prefix, e.g. 26-1K); the next Heat_no is never lower than Start_no |
 
         Extra production columns: sample fields, `Production_supervisor`.
