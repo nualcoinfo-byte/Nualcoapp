@@ -1175,6 +1175,7 @@ def tank_reading_rows(
     *,
     default_tank: str,
     consumption: bool = False,
+    first_reading: int = 1,
 ) -> tuple[list[dict], dict]:
     """Rows for entering tank dip readings, with the litres worked out from each tank's chart.
 
@@ -1185,6 +1186,9 @@ def tank_reading_rows(
     other tank. Consumption: a tank can be read several times in a day, so every row offers
     every tank, a new row starts on the tank of the row above, and up to
     MAX_CONSUMPTION_READINGS rows can be added; each reading's litres add to the day's total.
+
+    `first_reading` numbers consumption rows after readings already saved for the day
+    (2 saved -> new rows are Reading 3, 4, ...).
 
     Returns (the rows entered, the result of calculate_furnace_oil_tank_fill /
     calculate_furnace_oil_tank_consumption) so the page can save the rows and use the total.
@@ -1231,7 +1235,7 @@ def tank_reading_rows(
         c1, c2, c3 = st.columns([4, 2, 2])
         with c1:
             tank_type = st.selectbox(
-                f"Reading {i + 1}: oil tank type" if repeat_tanks else "Oil tank type",
+                f"Reading {first_reading + i}: oil tank type" if repeat_tanks else "Oil tank type",
                 options=options,
                 format_func=option_label,
                 key=type_key,
@@ -1270,7 +1274,7 @@ def tank_reading_rows(
     )
 
     result = (
-        db.calculate_furnace_oil_tank_consumption(entered)
+        db.calculate_furnace_oil_tank_consumption(entered, first_reading=first_reading)
         if consumption
         else db.calculate_furnace_oil_tank_fill(entered)
     )
@@ -1292,13 +1296,13 @@ def tank_reading_rows(
                         "Ending litres": r["Ending_litres"],
                         moved_label: r["Litres"],
                     }
-                    for n, r in enumerate(ok_rows, start=1)
+                    for n, r in enumerate(ok_rows, start=first_reading)
                 ]
             )
         )
         if repeat_tanks and len(ok_rows) > 1:
             st.markdown(
-                f"**Total {moved_label.lower()}: {result['total']:,.1f} L** "
+                f"**Total {moved_label.lower()} in these readings: {result['total']:,.1f} L** "
                 f"({len(ok_rows)} readings)"
             )
     return entered, result

@@ -18029,7 +18029,7 @@ def _furnace_oil_tank_chart(tank_type: str) -> tuple[list[dict[str, Any]], str]:
 
 
 def _calculate_furnace_oil_tank_movement(
-    rows: list[dict[str, Any]], *, consumption: bool
+    rows: list[dict[str, Any]], *, consumption: bool, first_reading: int = 1
 ) -> dict[str, Any]:
     """Litres moved in or out of each tank from its dip readings, and the total.
 
@@ -18052,7 +18052,7 @@ def _calculate_furnace_oil_tank_movement(
     seen: set[str] = set()
     out: list[dict[str, Any]] = []
     total = 0.0
-    for row_no, raw in enumerate(rows, start=1):
+    for row_no, raw in enumerate(rows, start=first_reading):
         tank = str(raw.get("Oil_tank_type") or "").strip()
         start, end = raw.get("Starting_reading"), raw.get("Ending_reading")
         if start is None and end is None:
@@ -18132,13 +18132,17 @@ def calculate_furnace_oil_tank_fill(rows: list[dict[str, Any]]) -> dict[str, Any
     return result
 
 
-def calculate_furnace_oil_tank_consumption(rows: list[dict[str, Any]]) -> dict[str, Any]:
+def calculate_furnace_oil_tank_consumption(
+    rows: list[dict[str, Any]], first_reading: int = 1
+) -> dict[str, Any]:
     """Litres drawn from each tank in a day (ending reading below the starting one).
 
     Rows also carry the amount as "Litres_consumed", the Furnace_Oil_Consumption_Tank
     column; "total" is the day's Furnace_Oil_Consumption.Quantity.
     """
-    result = _calculate_furnace_oil_tank_movement(rows, consumption=True)
+    result = _calculate_furnace_oil_tank_movement(
+        rows, consumption=True, first_reading=first_reading
+    )
     for row in result["rows"]:
         row["Litres_consumed"] = row["Litres"]
     return result
@@ -18295,13 +18299,17 @@ def add_furnace_oil_consumption(
     tank_readings: list[dict[str, Any]],
     notes: Optional[str] = None,
 ) -> float:
-    """Save one day's furnace oil consumption from the tank dip readings; returns the quantity.
+    """Add tank dip readings to a day's furnace oil consumption; returns the day's new total.
 
     tank_readings rows are {"Oil_tank_type", "Starting_reading", "Ending_reading"}; the same
-    tank may appear on several rows (one per reading). The day's Quantity is not passed in:
-    it is the total litres of all the readings (litres at the starting reading minus litres at
-    the ending reading, per reading; see calculate_furnace_oil_tank_consumption). Saving the
-    same date again replaces that day's row and all its readings together.
+    tank may appear on several rows (one per reading). Litres per reading = litres at the
+    starting reading minus litres at the ending reading (see
+    calculate_furnace_oil_tank_consumption).
+
+    Readings are ADDED: a date that already has readings keeps them, and the day's Quantity
+    grows by the new readings' litres. (Saving used to replace the whole day, so a late
+    reading entered alone wiped out the earlier ones.) A wrong reading is taken off with
+    delete_furnace_oil_consumption_reading. Notes are added to the day's notes.
     """
     day = _as_effective_date(consumption_date)
     if not day:
@@ -18317,33 +18325,52 @@ def add_furnace_oil_consumption(
     qty = fill["total"]
     if qty <= 0:
         raise ValueError("Consumption (litres) must be greater than zero.")
-    existing = get_furnace_oil_consumption_row(day)
-    available = get_furnace_oil_stock() + _oil_qty(existing.get("Quantity") if existing else 0)
+    available = get_furnace_oil_stock()
     if qty > available + 1e-9:
         raise ValueError(
             f"Consumption {qty:g} L exceeds available stock {available:g} L."
         )
+    note = (notes or "").strip() or None
     by_val, dt_val = audit_stamp()
     with get_connection() as conn:
-        _exec(
-            conn,
-            """
-            INSERT INTO Furnace_Oil_Consumption
-                (Consumption_date, Quantity, Notes, Last_updated_by, Last_updated_datetime)
-            VALUES (?, ?, ?, ?, ?)
-            ON CONFLICT(Consumption_date) DO UPDATE SET
-                Quantity=excluded.Quantity,
-                Notes=excluded.Notes,
-                Last_updated_by=excluded.Last_updated_by,
-                Last_updated_datetime=excluded.Last_updated_datetime
-            """,
-            (day, qty, (notes or "").strip() or None, by_val, dt_val),
+        current = (
+            _exec(
+                conn,
+                """
+                SELECT Quantity AS "Quantity", Notes AS "Notes"
+                FROM Furnace_Oil_Consumption WHERE Consumption_date = ?
+                """,
+                (day,),
+            )
+            .mappings()
+            .first()
         )
-        _exec(
-            conn,
-            "DELETE FROM Furnace_Oil_Consumption_Tank WHERE Consumption_date = ?",
-            (day,),
-        )
+        if current is None:
+            total = qty
+            _exec(
+                conn,
+                """
+                INSERT INTO Furnace_Oil_Consumption
+                    (Consumption_date, Quantity, Notes, Last_updated_by, Last_updated_datetime)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (day, total, note, by_val, dt_val),
+            )
+        else:
+            # Adding to what is saved (not re-summing the reading rows) keeps days whose
+            # quantity was entered before tank readings existed.
+            total = round(_oil_qty(current.get("Quantity")) + qty, 2)
+            old_note = (current.get("Notes") or "").strip()
+            merged = "; ".join(n for n in (old_note, note or "") if n) or None
+            _exec(
+                conn,
+                """
+                UPDATE Furnace_Oil_Consumption
+                SET Quantity = ?, Notes = ?, Last_updated_by = ?, Last_updated_datetime = ?
+                WHERE Consumption_date = ?
+                """,
+                (total, merged, by_val, dt_val, day),
+            )
         for tank in fill["rows"]:
             _exec(
                 conn,
@@ -18362,7 +18389,67 @@ def add_furnace_oil_consumption(
                 ),
             )
     rebuild_furnace_oil_inventory()
-    return qty
+    return total
+
+
+def delete_furnace_oil_consumption_reading(consumption_date: str, reading_id: int) -> float:
+    """Remove one saved reading (entered wrongly) and take its litres off the day's total.
+
+    Returns the day's new total. When the last reading goes and nothing is left, the day's
+    row is removed too. The date is checked so a stale page cannot remove another day's row.
+    """
+    day = _as_effective_date(consumption_date)
+    by_val, dt_val = audit_stamp()
+    with get_connection() as conn:
+        reading = (
+            _exec(
+                conn,
+                """
+                SELECT Litres_consumed AS "Litres_consumed"
+                FROM Furnace_Oil_Consumption_Tank
+                WHERE Reading_id = ? AND Consumption_date = ?
+                """,
+                (int(reading_id), day),
+            )
+            .mappings()
+            .first()
+        )
+        if reading is None:
+            raise ValueError("That reading is no longer saved for this date. Reload the page.")
+        _exec(
+            conn,
+            "DELETE FROM Furnace_Oil_Consumption_Tank WHERE Reading_id = ?",
+            (int(reading_id),),
+        )
+        current = _exec(
+            conn,
+            'SELECT Quantity AS "Quantity" FROM Furnace_Oil_Consumption WHERE Consumption_date = ?',
+            (day,),
+        ).mappings().first()
+        total = max(
+            round(_oil_qty((current or {}).get("Quantity")) - _oil_qty(reading["Litres_consumed"]), 2),
+            0.0,
+        )
+        left = _exec(
+            conn,
+            "SELECT COUNT(*) FROM Furnace_Oil_Consumption_Tank WHERE Consumption_date = ?",
+            (day,),
+        ).scalar()
+        if not left and total <= 0.005:
+            _exec(conn, "DELETE FROM Furnace_Oil_Consumption WHERE Consumption_date = ?", (day,))
+            total = 0.0
+        else:
+            _exec(
+                conn,
+                """
+                UPDATE Furnace_Oil_Consumption
+                SET Quantity = ?, Last_updated_by = ?, Last_updated_datetime = ?
+                WHERE Consumption_date = ?
+                """,
+                (total, by_val, dt_val, day),
+            )
+    rebuild_furnace_oil_inventory()
+    return total
 
 
 def furnace_oil_month_totals(year: int, month: int) -> dict[str, float]:

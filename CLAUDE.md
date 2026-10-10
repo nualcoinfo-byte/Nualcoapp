@@ -95,7 +95,9 @@ Postgres folds them to lowercase, so every SELECT aliases columns with quoted na
 - `Furnace_Oil_Purchase` / `_Consumption` / `_Inventory` (+ per-tank tables), `Service_Oil_Tank_Measurement`,
   `Ten_KL_Tank_Measurement` (dip charts). `Furnace_Oil_Consumption` = one row per day (total litres);
   `Furnace_Oil_Consumption_Tank` = one row per dip reading (`Reading_id` key since Oct 2026, so a tank can be read
-  several times a day). `Furnace_Oil_Purchase_Tank` stays one row per tank per purchase
+  several times a day). Saving readings for a date **adds** them (day Quantity grows; saved readings are kept);
+  a wrong reading is removed with `delete_furnace_oil_consumption_reading`. `Furnace_Oil_Purchase_Tank` stays one
+  row per tank per purchase
 - `Electricity_Consumption` (EB Line 1 / 2 meter readings)
 - `Cost_of_conversion`: monthly ₹/kg rates (oil, electricity, labour, salaries, consumables, overheads, total)
 
