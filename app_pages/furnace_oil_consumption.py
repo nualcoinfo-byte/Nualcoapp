@@ -25,9 +25,11 @@ if st.session_state.pop("fo_open_reset", False):
 
 st.title("Furnace Oil Consumption")
 st.caption(
-    "Production team: enter each tank's dip reading at the start and at the end of the day. "
-    "The quantity consumed is calculated from those readings; it cannot be typed in. "
-    "Saving the same date updates that day's row. "
+    "Production team: enter each tank's dip reading at the start and at the end of use. "
+    "A tank can be read more than once in a day (for example after it is topped up): "
+    "use **Add reading** for each one; every reading's litres are added to the day's total. "
+    "The quantity consumed is calculated from the readings; it cannot be typed in. "
+    "Saving the same date again replaces all of that day's readings. "
     "Inventory is rebuilt from purchases minus consumption."
 )
 for _flash_key in ("fo_open_saved_message", "fo_cons_saved_message"):
@@ -94,10 +96,38 @@ with c2:
 st.markdown("##### Tank readings")
 st.caption(
     "Enter the dip reading before and after use (10 KL tank in cm, service oil tank in inch). "
-    "The furnace draws mainly from the service oil tank, so it is selected first. "
+    "The furnace draws mainly from the service oil tank, so it is selected first; a new "
+    "reading starts on the same tank as the one above it. "
     "Litres consumed = litres at the starting reading minus litres at the ending reading, "
-    "from that tank's measurement chart."
+    "from that tank's measurement chart, for each reading; the day's quantity is their total."
 )
+if cons_date is not None:
+    _saved_day = db.get_furnace_oil_consumption_row(cons_date.isoformat())
+    if _saved_day:
+        _saved_readings = db.list_furnace_oil_consumption_tanks(cons_date.isoformat())
+        st.warning(
+            f"**{format_ui_date(cons_date)}** already has **{float(_saved_day['Quantity'] or 0):,.1f} L** "
+            f"saved from {len(_saved_readings)} reading(s). Saving replaces all of them with the "
+            "readings below, so enter every reading for the day, including those already saved."
+        )
+        if _saved_readings:
+            with st.expander("Readings already saved for this date"):
+                show_dataframe(
+                    df_from_rows(
+                        [
+                            {
+                                "Reading": n,
+                                "Oil tank": db.FURNACE_OIL_TANK_LABELS.get(
+                                    r["Oil_tank_type"], r["Oil_tank_type"]
+                                ),
+                                "Starting reading": r["Starting_reading"],
+                                "Ending reading": r["Ending_reading"],
+                                "Litres consumed": r["Litres_consumed"],
+                            }
+                            for n, r in enumerate(_saved_readings, start=1)
+                        ]
+                    )
+                )
 tank_inputs, tank_fill = tank_reading_rows(
     "foc_tank",
     default_tank=db.FURNACE_OIL_CONSUMPTION_DEFAULT_TANK,

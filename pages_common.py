@@ -1166,6 +1166,10 @@ def _render_dashboard_refresh_bar(*, key_prefix: str) -> None:
             st.rerun()
 
 
+# Readings of one day's furnace oil consumption (the same tank may be read more than once).
+MAX_CONSUMPTION_READINGS = 10
+
+
 def tank_reading_rows(
     key_prefix: str,
     *,
@@ -1174,14 +1178,22 @@ def tank_reading_rows(
 ) -> tuple[list[dict], dict]:
     """Rows for entering tank dip readings, with the litres worked out from each tank's chart.
 
-    The first row starts on `default_tank`; a second row (up to one per tank) starts on the
-    other tank. `consumption` picks the direction: oil used lowers the reading (starting above
-    ending), oil received raises it. Returns (the rows entered, the result of
-    calculate_furnace_oil_tank_fill / calculate_furnace_oil_tank_consumption) so the page can
-    save the rows and use the total. Session keys all start with `key_prefix`.
+    `consumption` picks the direction: oil used lowers the reading (starting above ending),
+    oil received raises it.
+
+    Purchase (fill): one row per tank; the first starts on `default_tank`, the next on the
+    other tank. Consumption: a tank can be read several times in a day, so every row offers
+    every tank, a new row starts on the tank of the row above, and up to
+    MAX_CONSUMPTION_READINGS rows can be added; each reading's litres add to the day's total.
+
+    Returns (the rows entered, the result of calculate_furnace_oil_tank_fill /
+    calculate_furnace_oil_tank_consumption) so the page can save the rows and use the total.
+    Session keys all start with `key_prefix`.
     """
     tank_types = db.FURNACE_OIL_TANK_TYPES
     rows_key = f"{key_prefix}_rows"
+    repeat_tanks = consumption
+    max_rows = MAX_CONSUMPTION_READINGS if repeat_tanks else len(tank_types)
 
     def option_label(tank_type: str) -> str:
         if not tank_type:
@@ -1189,7 +1201,7 @@ def tank_reading_rows(
         return f"{db.FURNACE_OIL_TANK_LABELS[tank_type]} ({tank_type})"
 
     def add_row() -> None:
-        st.session_state[rows_key] = min(st.session_state.get(rows_key, 1) + 1, len(tank_types))
+        st.session_state[rows_key] = min(st.session_state.get(rows_key, 1) + 1, max_rows)
 
     def remove_row() -> None:
         n = st.session_state.get(rows_key, 1)
@@ -1202,18 +1214,24 @@ def tank_reading_rows(
     entered: list[dict] = []
     for i in range(row_count):
         type_key = f"{key_prefix}_type_{i}"
-        chosen_above = {st.session_state.get(f"{key_prefix}_type_{j}") for j in range(i)}
-        if type_key not in st.session_state:
-            preferred = default_tank if i == 0 else ""
-            if preferred in chosen_above or not preferred:
-                preferred = next((t for t in tank_types if t not in chosen_above), "")
-            st.session_state[type_key] = preferred
-        own_choice = st.session_state.get(type_key)
-        options = [""] + [t for t in tank_types if t not in chosen_above or t == own_choice]
+        if repeat_tanks:
+            if type_key not in st.session_state:
+                above = st.session_state.get(f"{key_prefix}_type_{i - 1}") if i else ""
+                st.session_state[type_key] = above or default_tank
+            options = [""] + list(tank_types)
+        else:
+            chosen_above = {st.session_state.get(f"{key_prefix}_type_{j}") for j in range(i)}
+            if type_key not in st.session_state:
+                preferred = default_tank if i == 0 else ""
+                if preferred in chosen_above or not preferred:
+                    preferred = next((t for t in tank_types if t not in chosen_above), "")
+                st.session_state[type_key] = preferred
+            own_choice = st.session_state.get(type_key)
+            options = [""] + [t for t in tank_types if t not in chosen_above or t == own_choice]
         c1, c2, c3 = st.columns([4, 2, 2])
         with c1:
             tank_type = st.selectbox(
-                "Oil tank type",
+                f"Reading {i + 1}: oil tank type" if repeat_tanks else "Oil tank type",
                 options=options,
                 format_func=option_label,
                 key=type_key,
@@ -1239,10 +1257,10 @@ def tank_reading_rows(
         )
     add_col, remove_col, _spacer = st.columns([1, 1, 4])
     add_col.button(
-        "Add tank row",
+        "Add reading" if repeat_tanks else "Add tank row",
         key=f"{key_prefix}_add",
         on_click=add_row,
-        disabled=row_count >= len(tank_types),
+        disabled=row_count >= max_rows,
     )
     remove_col.button(
         "Remove last row",
@@ -1268,13 +1286,19 @@ def tank_reading_rows(
             df_from_rows(
                 [
                     {
+                        **({"Reading": n} if repeat_tanks else {}),
                         "Oil tank": option_label(r["Oil_tank_type"]),
                         "Starting litres": r["Starting_litres"],
                         "Ending litres": r["Ending_litres"],
                         moved_label: r["Litres"],
                     }
-                    for r in ok_rows
+                    for n, r in enumerate(ok_rows, start=1)
                 ]
             )
         )
+        if repeat_tanks and len(ok_rows) > 1:
+            st.markdown(
+                f"**Total {moved_label.lower()}: {result['total']:,.1f} L** "
+                f"({len(ok_rows)} readings)"
+            )
     return entered, result
