@@ -6,8 +6,8 @@ Production Dashboard or on demand with **Refresh now**. On SQLite the same
 SQL runs live.
 
 The From / To dates pick purchases received, raw material corrections made
-and production batches made in that period. Stock on hand (by material and by
-lot) is as of the last refresh, not the period.
+and production batches made in that period. Stock on hand (by material, by
+vendor and by lot) is as of the last refresh, not the period.
 """
 from __future__ import annotations
 
@@ -113,6 +113,7 @@ def _load(start: date, end: date, refreshed_key: str) -> dict:
         "consumption": db.pi_production_consumption(start, end),
         "production": db.pi_production_totals(start, end),
         "stock_summary": db.list_raw_material_stock_summary(),
+        "stock_by_vendor": db.list_raw_material_stock_by_vendor(),
         "lots": db.pi_inventory_lots(),
     }
 
@@ -121,7 +122,7 @@ def _load(start: date, end: date, refreshed_key: str) -> dict:
 st.title("Purchase and Inventory dashboard")
 st.caption(
     "Purchases received, raw material corrections made and production batches made "
-    "between the **From** and **To** dates. Stock on hand by material and by lot is "
+    "between the **From** and **To** dates. Stock on hand by material, by vendor and by lot is "
     "as of the last data refresh, not the period. Data refreshes every 4 hours with "
     "the Production Dashboard; use **Refresh now** to pull in the latest."
 )
@@ -216,6 +217,7 @@ tabs = st.tabs([
     "Vendors by raw material",
     "Cost trend",
     "Stock by material",
+    "Stock by vendor",
     "Inventory by lot",
     "Scrap",
     "Scrap value loss",
@@ -506,8 +508,137 @@ with tabs[3]:
                     "Melt, Awaiting Assay or Not Ready for Melt."
                 )
 
-# ── Inventory on hand by Lot_id (moved from the Dashboard) ───────────────────
+# ── Raw material stock by vendor ─────────────────────────────────────────────
 with tabs[4]:
+    st.subheader("Raw material stock by vendor")
+    st.caption(
+        "Stock on hand as of the last data refresh (not the period), split by the vendor "
+        "each lot was bought from; the same figures as **Stock by material**, which this "
+        "adds up to. Lots on cancelled invoices are excluded. Remelt lots made from "
+        "production output (Broken Ingot, Furnace Empty, Not Ok Ingot) are shown as "
+        "**Internal remelt**. Avg ₹/kg is stock value ÷ the remaining kg that has a cost."
+    )
+    by_vendor_rows = data["stock_by_vendor"]
+    if not by_vendor_rows:
+        st.info("No raw material inventory yet.")
+    else:
+        vf1, vf2, vf3 = st.columns([2, 2, 1], vertical_alignment="bottom")
+        with vf1:
+            vendor_pick = st.multiselect(
+                "Vendor",
+                sorted({str(r["Vendor_name"]) for r in by_vendor_rows}),
+                placeholder="All vendors",
+                key="pi_sv_vendors",
+            )
+        with vf2:
+            vmat_pick = st.multiselect(
+                "Raw material",
+                sorted({str(r["Raw_Material_Name"]) for r in by_vendor_rows}),
+                placeholder="All raw materials",
+                key="pi_sv_materials",
+            )
+        with vf3:
+            vendor_show_empty = st.checkbox(
+                "Include vendors with no stock", key="pi_sv_empty"
+            )
+        rows_v = [
+            r
+            for r in by_vendor_rows
+            if (not vendor_pick or r["Vendor_name"] in vendor_pick)
+            and (not vmat_pick or r["Raw_Material_Name"] in vmat_pick)
+            and (vendor_show_empty or _num(r.get("Remaining_kg")) > _EPS)
+        ]
+        if not rows_v:
+            st.info("No stock matches.")
+        else:
+            measures = {
+                "Remaining (kg)": "Remaining_kg",
+                "Charged (kg)": "Charged_kg",
+                "Received (kg)": "Received_kg",
+                "Processing loss (kg)": "Processing_loss_kg",
+                "Stock value (₹)": "Stock_value",
+                "Ready for melt (kg)": "Ready_for_melt_kg",
+                "Awaiting assay (kg)": "Awaiting_assay_kg",
+                "Not ready (kg)": "Not_ready_kg",
+                "Other status (kg)": "Other_status_kg",
+                "Open lots": "Open_lots",
+                "_uncosted": "Uncosted_kg",
+            }
+            detail = pd.DataFrame(
+                [
+                    {
+                        "Vendor": r["Vendor_name"],
+                        "Raw material": r["Raw_Material_Name"],
+                        **{label: _num(r.get(col)) for label, col in measures.items()},
+                    }
+                    for r in rows_v
+                ]
+            )
+            detail["Open lots"] = detail["Open lots"].astype(int)
+            show_loss_v = detail["Processing loss (kg)"].abs().sum() > _EPS
+            show_other_v = detail["Other status (kg)"].abs().sum() > _EPS
+
+            def _avg_rate(df: pd.DataFrame) -> pd.Series:
+                costed = df["Remaining (kg)"] - df["_uncosted"]
+                return (df["Stock value (₹)"] / costed.where(costed > _EPS)).astype(float)
+
+            # Same column order as Stock by material (Days of cover is per material only).
+            order = [
+                "Remaining (kg)", "Charged (kg)", "Received (kg)",
+                *(["Processing loss (kg)"] if show_loss_v else []),
+                "Stock value (₹)", "Avg ₹/kg",
+                "Ready for melt (kg)", "Awaiting assay (kg)", "Not ready (kg)",
+                *(["Other status (kg)"] if show_other_v else []),
+                "Open lots",
+            ]
+
+            per_vendor = detail.groupby("Vendor", as_index=False).sum(numeric_only=True)
+            per_vendor["Raw materials"] = (
+                detail[detail["Remaining (kg)"] > _EPS].groupby("Vendor")["Raw material"]
+                .nunique().reindex(per_vendor["Vendor"]).fillna(0).astype(int).values
+            )
+            per_vendor["Avg ₹/kg"] = _avg_rate(per_vendor)
+            total_value = per_vendor["Stock value (₹)"].sum()
+            per_vendor["Share of stock value %"] = (
+                per_vendor["Stock value (₹)"] / total_value * 100 if total_value > 0 else None
+            )
+            per_vendor = per_vendor.sort_values(
+                ["Remaining (kg)", "Vendor"], ascending=[False, True]
+            )
+
+            v1, v2, v3, v4 = st.columns(4)
+            v1.metric("Vendors with stock", f"{int((per_vendor['Remaining (kg)'] > _EPS).sum()):,}")
+            v2.metric("Remaining (kg)", f"{per_vendor['Remaining (kg)'].sum():,.1f}")
+            v3.metric("Stock value (₹)", f"{total_value:,.0f}")
+            top_v = per_vendor.sort_values("Stock value (₹)", ascending=False).iloc[0]
+            v4.metric(
+                "Largest vendor's share of value",
+                _fmt_pct(_pct(top_v["Stock value (₹)"], total_value)),
+                help=f"{top_v['Vendor']}",
+            )
+
+            _hbar(per_vendor.set_index("Vendor")["Remaining (kg)"].head(15), "Remaining (kg)")
+
+            st.markdown("**By vendor**")
+            vendor_df = per_vendor[["Vendor", *order[:order.index("Open lots") + 1],
+                                    "Raw materials", "Share of stock value %"]]
+            show_dataframe(vendor_df, hide_index=True, column_config=_kg_cols(vendor_df))
+
+            st.markdown("**By vendor and raw material**")
+            detail["Avg ₹/kg"] = _avg_rate(detail)
+            detail = detail.sort_values(
+                ["Vendor", "Remaining (kg)", "Raw material"], ascending=[True, False, True]
+            )
+            detail_df = detail[["Vendor", "Raw material", *order]]
+            show_dataframe(detail_df, hide_index=True, column_config=_kg_cols(detail_df))
+            if show_other_v:
+                st.caption(
+                    "**Other status** is stock on lots whose status is not Ready For "
+                    "Melt, Awaiting Assay or Not Ready for Melt."
+                )
+
+# ── Inventory on hand by Lot_id (moved from the Dashboard) ───────────────────
+with tabs[5]:
     st.subheader("Inventory on hand by Lot_id")
     st.caption(
         "Every lot with stock left, as of the last data refresh. Age is days since the "
@@ -587,7 +718,7 @@ with tabs[4]:
         show_dataframe(lot_df, hide_index=True, column_config=config)
 
 # ── Scrap generated ──────────────────────────────────────────────────────────
-with tabs[5]:
+with tabs[6]:
     st.subheader("Total scrap generated from purchase and production")
     st.caption(
         "**Purchase segregation** is contaminant (iron, plastic, rubber, dirt …) taken out "
@@ -687,7 +818,7 @@ with tabs[5]:
             show_dataframe(entries, hide_index=True, column_config=_kg_cols(entries))
 
 # ── Scrap value loss ─────────────────────────────────────────────────────────
-with tabs[6]:
+with tabs[7]:
     st.subheader("Scrap value loss")
     st.caption(
         "Scrap kg × the lot's cost per usable kg: what was paid for material that "
@@ -770,7 +901,7 @@ with tabs[6]:
     o4.metric("Melt loss (₹, est.)", f"{melt_value:,.0f}")
 
 # ── Corrections and consumption ──────────────────────────────────────────────
-with tabs[7]:
+with tabs[8]:
     st.subheader("Raw material corrections")
     st.caption(
         "Splits, scrap and returns made on Raw Material Purchase Correction in the period. "

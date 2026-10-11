@@ -102,7 +102,7 @@ Postgres folds them to lowercase, so every SELECT aliases columns with quoted na
 - `Cost_of_conversion`: monthly ₹/kg rates (oil, electricity, labour, salaries, consumables, overheads, total)
 
 **Reporting**: Postgres **materialized views** (`mv_po_supply_status`, `mv_production_analysis_*`,
-`mv_raw_material_stock_summary`, `mv_melter_output`, …) refreshed every 4 h by a background scheduler
+`mv_raw_material_stock_summary`, `mv_raw_material_stock_by_vendor`, `mv_melter_output`, …) refreshed every 4 h by a background scheduler
 (`start_dashboard_refresh_scheduler`), logged in `materialized_view_refresh_log`; pages show a "Refresh now" bar.
 
 ## 5. Manufacturing workflows in the code
@@ -211,6 +211,11 @@ inspection question. See TODO.md.
 - Page scripts can be smoke-run with a small stand-in `streamlit` module (widgets return `st.session_state` values,
   `st.stop` / `st.rerun` raise) via `runpy.run_path`. It checks control flow and HTML layout, not real rendering.
 - Known SQLite-only quirk: `production_snapshot()` fails on SQLite (double alias); patch it or stub it in tests.
+- **A real PostgreSQL 16 is installed in the workspace** (`/usr/lib/postgresql/16/bin`, `psql`). It refuses to run as
+  root: `su postgres -s /bin/sh -c "initdb -D /tmp/claude-0/pgtest/data -A trust && pg_ctl -D ... -o \"-p 54329 -k
+  /tmp/claude-0/pgtest -c listen_addresses=''\" start"`, then `psql -h /tmp/claude-0/pgtest -p 54329 -U postgres`.
+  No psycopg2, so test SQL directly (e.g. a new materialized view's SELECT, its unique index and
+  `REFRESH MATERIALIZED VIEW CONCURRENTLY`) on hand-made tables. Postgres is stricter than SQLite about GROUP BY.
 - Always say in the PR and to the user that the real UI was not run; ask them to click through on staging.
 
 ### Releasing
