@@ -462,16 +462,19 @@ with tabs[3]:
         stock_df = pd.DataFrame(
             [
                 {
+                    # Column order as asked by the user: stock on hand first, then movement,
+                    # value, the status split, lots and cover.
                     "Raw material": r["Raw_Material_Name"],
-                    "Open lots": int(r.get("Open_lots") or 0),
-                    "Received (kg)": _num(r.get("Received_kg")),
+                    "Remaining (kg)": _num(r.get("Remaining_kg")),
                     "Charged (kg)": _num(r.get("Charged_kg")),
+                    "Received (kg)": _num(r.get("Received_kg")),
                     **(
                         {"Processing loss (kg)": _num(r.get("Processing_loss_kg"))}
                         if show_loss
                         else {}
                     ),
-                    "Remaining (kg)": _num(r.get("Remaining_kg")),
+                    "Stock value (₹)": _num(r.get("Stock_value")),
+                    "Avg ₹/kg": _avg_cost(r),
                     "Ready for melt (kg)": _num(r.get("Ready_for_melt_kg")),
                     "Awaiting assay (kg)": _num(r.get("Awaiting_assay_kg")),
                     "Not ready (kg)": _num(r.get("Not_ready_kg")),
@@ -480,8 +483,7 @@ with tabs[3]:
                         if show_other
                         else {}
                     ),
-                    "Stock value (₹)": _num(r.get("Stock_value")),
-                    "Avg ₹/kg": _avg_cost(r),
+                    "Open lots": int(r.get("Open_lots") or 0),
                     "Days of cover": _cover(r),
                 }
                 for r in stock_rows
