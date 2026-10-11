@@ -11,6 +11,7 @@ vendor and by lot) is as of the last refresh, not the period.
 """
 from __future__ import annotations
 
+import io
 from datetime import date, timedelta
 
 import altair as alt
@@ -31,6 +32,8 @@ _EPS = 0.05  # kg
 SRC_PURCHASE = "Purchase segregation"
 SRC_PRODUCTION = "Production charge return"
 SOURCE_LABEL = {SRC_PURCHASE: "Purchase segregation", SRC_PRODUCTION: "Production"}
+CUSTOMER_CHARS = 12  # Alloy-wise consumption shows the customer cut to this length
+GROUP_NOT_SET = "Not set"
 AGE_BUCKETS = [(0, 30, "0–30 days"), (31, 60, "31–60 days"), (61, 90, "61–90 days"),
                (91, 180, "91–180 days"), (181, None, "Over 180 days")]
 
@@ -118,6 +121,21 @@ def _load(start: date, end: date, refreshed_key: str) -> dict:
     }
 
 
+@st.cache_data(ttl=600, show_spinner=False)
+def _load_alloy_consumption(start: date, end: date, completed_only: bool,
+                            refreshed_key: str) -> dict:
+    del refreshed_key
+    return db.pi_alloy_consumption(start, end, completed_only=completed_only)
+
+
+def _short_customer(name: object) -> str:
+    """First CUSTOMER_CHARS characters of the customer name, then "..."."""
+    text = str(name or "").strip()
+    if not text:
+        return "—"
+    return text if len(text) <= CUSTOMER_CHARS else text[:CUSTOMER_CHARS] + "..."
+
+
 # ── Header, refresh, period ──────────────────────────────────────────────────
 st.title("Purchase and Inventory dashboard")
 st.caption(
@@ -148,7 +166,8 @@ period_days = (end - start).days + 1
 
 try:
     last = db.get_dashboard_last_refreshed() if db.IS_POSTGRES else None
-    data = _load(start, end, last.isoformat() if last else "live")
+    refreshed_key = last.isoformat() if last else "live"
+    data = _load(start, end, refreshed_key)
 except Exception as exc:  # noqa: BLE001
     _show_db_connection_error(exc)
     st.stop()
@@ -222,6 +241,7 @@ tabs = st.tabs([
     "Scrap",
     "Scrap value loss",
     "Corrections & consumption",
+    "Alloy-wise consumption",
 ])
 
 # ── Top vendors / suppliers ──────────────────────────────────────────────────
@@ -997,4 +1017,209 @@ with tabs[8]:
         st.caption(
             "**Purchased − charged** above zero means stock of that material built up "
             "over the period; below zero means production drew down existing stock."
+        )
+
+# ── Alloy-wise raw material consumption ──────────────────────────────────────
+with tabs[9]:
+    st.subheader("Raw material consumption by alloy")
+    st.caption(
+        "Raw material charged to heats made in the period, one row per alloy (each alloy "
+        "belongs to one customer), net of charge returned to inventory. Alloys are in "
+        "**alloy group** order, then by alloy name; raw materials run left to right from "
+        "most to least used. The **Percentage** table shows each alloy's charge mix "
+        "(its row adds up to 100%); its Total row is the mix across all alloys. "
+        "Alloy group comes from the **Alloy Master**."
+    )
+    a1, a2 = st.columns([1, 2], vertical_alignment="bottom")
+    with a1:
+        completed_only = st.checkbox(
+            "Completed heats only",
+            key="pi_alloy_completed_only",
+            help="Leave out heats whose input is still In-Progress, since their charge "
+            "is not final yet.",
+        )
+    try:
+        ac = _load_alloy_consumption(start, end, bool(completed_only), refreshed_key)
+    except Exception as exc:  # noqa: BLE001
+        _show_db_connection_error(exc)
+        st.stop()
+    alloy_df = _frame(ac["alloys"], ("Heats", "Input_kg", "Output_kg"))
+    line_df = _frame(ac["lines"], ("Charged_kg", "Charged_value", "Uncosted_kg"))
+    if alloy_df.empty or line_df.empty:
+        st.info("No raw material was charged to heats in this period.")
+    else:
+        alloy_df["Alloy_group"] = (
+            alloy_df["Alloy_group"].fillna("").astype(str).str.strip()
+            .replace("", GROUP_NOT_SET)
+        )
+        alloy_df["Alloy_name"] = alloy_df["Alloy_name"].fillna("Not set").astype(str)
+        groups_all = sorted(
+            alloy_df["Alloy_group"].unique(),
+            key=lambda g: (g == GROUP_NOT_SET, g.casefold()),
+        )
+        with a2:
+            pick_groups = st.multiselect(
+                "Alloy group", groups_all, key="pi_alloy_groups",
+                placeholder="All alloy groups",
+            )
+        show_subtotals = st.checkbox(
+            "Show alloy group subtotals", value=True, key="pi_alloy_subtotals",
+        )
+        if pick_groups:
+            alloy_df = alloy_df[alloy_df["Alloy_group"].isin(pick_groups)]
+            line_df = line_df[line_df["Alloy_id"].isin(alloy_df["Alloy_id"])]
+
+        kg = line_df.pivot_table(index="Alloy_id", columns="Raw_Material_Name",
+                                 values="Charged_kg", aggfunc="sum", fill_value=0.0)
+        materials = list(kg.sum().sort_values(ascending=False).index)
+        kg = kg.reindex(columns=materials, fill_value=0.0)
+        money = line_df.groupby("Alloy_id").agg(
+            Value=("Charged_value", "sum"), Uncosted=("Uncosted_kg", "sum"),
+        )
+        alloy_df = alloy_df[alloy_df["Alloy_id"].isin(kg.index)].copy()
+        alloy_df["_group_unset"] = alloy_df["Alloy_group"] == GROUP_NOT_SET
+        alloy_df["_group_key"] = alloy_df["Alloy_group"].str.casefold()
+        alloy_df["_name_key"] = alloy_df["Alloy_name"].str.casefold()
+        alloy_df["_cust_key"] = alloy_df["Customer_name"].fillna("").astype(str).str.casefold()
+        alloy_df = alloy_df.sort_values(["_group_unset", "_group_key", "_name_key", "_cust_key"])
+
+        total_kg_all = float(kg.values.sum())
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Alloys", f"{len(alloy_df):,}")
+        m2.metric("Heats", f"{int(alloy_df['Heats'].sum()):,}")
+        m3.metric("Charged (kg)", f"{total_kg_all:,.0f}")
+        m4.metric("Raw materials used", f"{len(materials):,}")
+
+        def _row(kind: str, group: str, alloy: str, customer: str, full_customer: str,
+                 heats: float, mat_kg: pd.Series, output_kg: float, value: float,
+                 uncosted: float) -> dict:
+            total = float(mat_kg.sum())
+            return {
+                "_kind": kind,
+                "Alloy group": group,
+                "Alloy": alloy,
+                "Customer": customer,
+                "_customer_full": full_customer,
+                "Heats": int(heats),
+                **{m: float(mat_kg.get(m, 0.0)) for m in materials},
+                "Total (kg)": total,
+                "Output (kg)": output_kg,
+                "Yield %": _pct(output_kg, total),
+                "Charge ₹/kg": _rate(value, total - uncosted),
+            }
+
+        def _sum_row(kind, group, label, ids):
+            return _row(
+                kind, group, label, "", "",
+                alloy_df.loc[alloy_df["Alloy_id"].isin(ids), "Heats"].sum(),
+                kg.loc[ids].sum(),
+                float(alloy_df.loc[alloy_df["Alloy_id"].isin(ids), "Output_kg"].sum()),
+                float(money.reindex(ids)["Value"].sum()),
+                float(money.reindex(ids)["Uncosted"].sum()),
+            )
+
+        rows: list[dict] = []
+        for group, members in alloy_df.groupby("Alloy_group", sort=False):
+            for a in members.itertuples(index=False):
+                rows.append(_row(
+                    "alloy", group, a.Alloy_name, _short_customer(a.Customer_name),
+                    str(a.Customer_name or ""), a.Heats, kg.loc[a.Alloy_id],
+                    float(a.Output_kg), float(money.loc[a.Alloy_id, "Value"]),
+                    float(money.loc[a.Alloy_id, "Uncosted"]),
+                ))
+            if show_subtotals and len(members) > 1:
+                rows.append(_sum_row("subtotal", group, f"{group} subtotal",
+                                     list(members["Alloy_id"])))
+        rows.append(_sum_row("total", "", "Total", list(alloy_df["Alloy_id"])))
+        actual = pd.DataFrame(rows)
+
+        pct = actual.copy()
+        denom = pct["Total (kg)"].where(pct["Total (kg)"] > _EPS)
+        for m in materials:
+            pct[m] = pct[m] / denom * 100
+        pct["Total %"] = (pct["Total (kg)"] > _EPS).map({True: 100.0, False: None})
+
+        kinds = actual["_kind"]
+        shade = {"subtotal": "background-color: rgba(241, 90, 34, 0.10)",
+                 "total": "background-color: rgba(241, 90, 34, 0.20)"}
+
+        def _row_shade(row: pd.Series) -> list[str]:
+            css = shade.get(kinds.iloc[row.name], "")
+            return [css] * len(row)
+
+        def _blank_zero(fmt: str):
+            return lambda v: "" if v is None or pd.isna(v) or abs(v) < 0.005 else fmt.format(v)
+
+        id_cols = ["Alloy group", "Alloy", "Customer"]
+        act_cols = id_cols + ["Heats"] + materials + [
+            "Total (kg)", "Output (kg)", "Yield %", "Charge ₹/kg"]
+        act_view = actual[act_cols]
+        act_style = (
+            act_view.style
+            .format(_blank_zero("{:,.0f}"), subset=materials + ["Total (kg)", "Output (kg)"])
+            .format(_blank_zero("{:,.0f}"), subset=["Heats"])
+            .format(_blank_zero("{:.1f}"), subset=["Yield %"])
+            .format(_blank_zero("{:,.2f}"), subset=["Charge ₹/kg"])
+            .apply(_row_shade, axis=1)
+        )
+        st.markdown("**Actual (kg)**")
+        show_dataframe(act_style, hide_index=True)
+        st.caption(
+            "**Yield %** = all output kg (including Broken Ingot / Furnace Empty / Not Ok "
+            "Ingot) ÷ kg charged. **Charge ₹/kg** = charged value ÷ costed kg (lots whose "
+            "invoice is not yet costed are left out of it). Heats still In-Progress have "
+            "charge but little or no output yet, so tick **Completed heats only** for a fair yield."
+        )
+
+        pct_cols = id_cols + materials + ["Total %"]
+        pct_view = pct[pct_cols]
+
+        def _heat(col: pd.Series) -> list[str]:
+            out = []
+            for i, v in col.items():
+                if kinds.iloc[i] != "alloy":
+                    out.append(shade.get(kinds.iloc[i], ""))
+                elif pd.notna(v) and v >= 0.05:
+                    out.append(
+                        f"background-color: rgba(241, 90, 34, {0.08 + 0.5 * min(v, 100) / 100:.2f})"
+                    )
+                else:
+                    out.append("")
+            return out
+
+        pct_style = (
+            pct_view.style
+            .format(_blank_zero("{:.1f}%"), subset=materials + ["Total %"])
+            .apply(_heat, subset=materials)
+            .apply(lambda c: [shade.get(kinds.iloc[i], "") for i in c.index],
+                   subset=id_cols + ["Total %"])
+        )
+        st.markdown("**Percentage of each alloy's charge**")
+        show_dataframe(pct_style, hide_index=True)
+        st.caption("Darker cells are a bigger share of that alloy's charge.")
+
+        def _excel() -> bytes:
+            """Both tables with the full customer name, as in the sample sheet."""
+            full = actual["_customer_full"]
+            xa = act_view.copy()
+            xa["Customer"] = full.where(full != "", xa["Customer"])
+            xp = pct_view.copy()
+            xp["Customer"] = xa["Customer"]
+            buf = io.BytesIO()
+            with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+                xa.to_excel(writer, sheet_name="Actual (kg)", index=False, startrow=1)
+                xp.to_excel(writer, sheet_name="Percentage", index=False, startrow=1)
+                title = (f"Alloy wise raw material consumption, {format_ui_date(start)} "
+                         f"to {format_ui_date(end)}")
+                for name, sheet in writer.sheets.items():
+                    sheet["A1"] = f"{title} ({name})"
+                    sheet.freeze_panes = "D3"
+            return buf.getvalue()
+
+        st.download_button(
+            "Download Excel",
+            data=_excel(),
+            file_name=f"alloy_wise_consumption_{start.isoformat()}_{end.isoformat()}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key="pi_alloy_excel",
         )
