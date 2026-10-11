@@ -16356,6 +16356,61 @@ def pi_production_totals(start_date: object, end_date: object) -> dict[str, Any]
     }
 
 
+def pi_alloy_consumption(
+    start_date: object, end_date: object, *, completed_only: bool = False
+) -> dict[str, list[dict[str, Any]]]:
+    """Raw material charged per alloy for heats made in the period.
+
+    "lines": one row per alloy and raw material (kg, ₹, uncosted kg).
+    "alloys": one row per alloy (heats, total charge, total output) for the
+    heat count and yield columns. Charge and output come from the batch
+    production views (refreshed with the dashboards); alloy group and customer
+    are read live from the alloy and customer masters, which are small, so a
+    renamed group shows at once. With `completed_only`, heats whose input is
+    still In-Progress (charge not final) are left out.
+    """
+    summary = _mv_source("mv_batch_production_summary", _BATCH_PRODUCTION_SUMMARY_SELECT, "s")
+    inputs = _mv_source("mv_batch_production_inputs", _BATCH_PRODUCTION_INPUTS_SELECT, "i")
+    where = 'SUBSTR(s."Production_Date", 1, 10) BETWEEN ? AND ?'
+    params: list[Any] = _pi_range(start_date, end_date)
+    if completed_only:
+        where += ' AND s."Production_status" = ?'
+        params.append(BATCH_STATUS_COMPLETED)
+    lines = fetch_all(
+        f"""
+        SELECT s."Alloy_id" AS "Alloy_id",
+               i."Raw_Material_Name" AS "Raw_Material_Name",
+               SUM(i."Weight") AS "Charged_kg",
+               SUM(i."Weight" * COALESCE(i."Cost_per_kg", 0)) AS "Charged_value",
+               SUM(CASE WHEN i."Cost_per_kg" IS NULL THEN i."Weight" ELSE 0 END)
+                   AS "Uncosted_kg"
+        FROM {inputs}
+        JOIN {summary} ON s."Batch_ID" = i."Batch_ID"
+        WHERE {where}
+        GROUP BY s."Alloy_id", i."Raw_Material_Name"
+        """,
+        params,
+    )
+    alloys = fetch_all(
+        f"""
+        SELECT s."Alloy_id" AS "Alloy_id",
+               a.Alloy_name AS "Alloy_name",
+               a.Alloy_group AS "Alloy_group",
+               c.Customer_name AS "Customer_name",
+               COUNT(*) AS "Heats",
+               SUM(s."Total_Input") AS "Input_kg",
+               SUM(s."Total_Output") AS "Output_kg"
+        FROM {summary}
+        LEFT JOIN Alloy_Master a ON a.Alloy_id = s."Alloy_id"
+        LEFT JOIN Customer_Master c ON c.Cust_code = a.Cust_code
+        WHERE {where}
+        GROUP BY s."Alloy_id", a.Alloy_name, a.Alloy_group, c.Customer_name
+        """,
+        params,
+    )
+    return {"lines": lines, "alloys": alloys}
+
+
 # ---------- Production and Profitability dashboard ----------
 
 def pd_batches(start_date: object, end_date: object) -> list[dict[str, Any]]:

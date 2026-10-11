@@ -27,6 +27,9 @@ Rollback points if needed: `9d4a696` (before today), `8b074f0` (after #35–#37)
 - ✅ Brakes India: single BIL BORING material with plant per receipt, 85% usable stocking and costing, BIL Briquetting
 - ✅ Brakes India toll conversion (Conversion receipts, LM25 returns at 70%, tracker page)
 - ✅ Raw Material Master with effective-dated recovery % and chemistry spec; ISRI codes
+- ✅ Purchase and Inventory dashboard: stock by material, stock by vendor (`mv_raw_material_stock_by_vendor`), and
+  **Alloy-wise consumption** (kg and % of each alloy's charge, alloy group order, group subtotals, yield, charge ₹/kg,
+  Excel download; `db.pi_alloy_consumption` reads the batch production views + live alloy/customer masters)
 - 🟡 Assay status on lots (Awaiting Assay / Ready For Melt / Not Ready for Melt): chosen once at logging; no assay step (see Next Steps)
 
 ### Production
