@@ -44,7 +44,9 @@ Rollback points if needed: `9d4a696` (before today), `8b074f0` (after #35–#37)
 - ✅ Batch Output Correction with full audit trail and re-costing
 - ✅ Production Batch Correction (Admin only, #37/#38): audited correction of Completed heats (alloy, crew, notes, QA,
   chemistry). On a packed heat only the crew can change. Not covered: charge lines, batch ID/date/shift/melt
-- ✅ Daily Batch Summary, Production Batches, Production Snapshot (columns trimmed in #39), Production Data Analysis
+- ✅ Daily Batch Summary, Production Batches, Production Snapshot (columns trimmed in #39; frozen identity columns;
+  **Output by alloy** section: finished goods, Broken Ingot / Furnace Empty / Not Ok Ingot, melt loss and yield per
+  alloy in alloy group order, actual and % of input, built from the snapshot data + `db.list_alloys()`), Production Data Analysis
 - ✅ Melter Output report (CSV / Excel) for melter pay
 - ✅ Admin: Correct batch ID (all-or-nothing rename across tables)
 - ✅ Removed duplicate *Material Recovery & Yield* page (#35)
