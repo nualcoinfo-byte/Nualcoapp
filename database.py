@@ -9317,6 +9317,7 @@ DASHBOARD_MATERIALIZED_VIEWS = (
     "mv_batch_production_outputs",
     "mv_melter_output",
     # Purchase and Inventory dashboard
+    "mv_raw_material_stock_by_vendor",
     "mv_pi_purchase_lots",
     "mv_pi_corrections",
     "mv_pi_scrap",
@@ -9461,6 +9462,64 @@ _RAW_MATERIAL_STOCK_SUMMARY_SELECT = """
     ) c ON c.Lot_id = i.Lot_id
     WHERE p.Invoice_status IS NULL OR p.Invoice_status <> 'Cancelled'
     GROUP BY i.Raw_Material_Name
+"""
+
+
+# Raw material stock by vendor: the same measures as mv_raw_material_stock_summary,
+# split by the vendor each lot was bought from (one row per vendor and material).
+# Remelt lots made from production output have no purchase and are filed under
+# "Internal remelt"; a purchase with no vendor under "Unknown vendor". Vendor_code
+# is -1 / 0 for those, so (Vendor_code, Raw_Material_Name) is always unique.
+VENDOR_REMELT_LABEL = "Internal remelt (from production)"
+_RAW_MATERIAL_STOCK_BY_VENDOR_SELECT = """
+    SELECT x.vendor_code AS "Vendor_code",
+           MAX(x.vendor_name) AS "Vendor_name",
+           x.material AS "Raw_Material_Name",
+           SUM(CASE WHEN x.remaining > 0 THEN 1 ELSE 0 END) AS "Open_lots",
+           SUM(x.received) AS "Received_kg",
+           SUM(x.charged) AS "Charged_kg",
+           SUM(x.processing_loss) AS "Processing_loss_kg",
+           SUM(x.remaining) AS "Remaining_kg",
+           SUM(CASE WHEN x.status = 'Ready For Melt' THEN x.remaining ELSE 0 END)
+               AS "Ready_for_melt_kg",
+           SUM(CASE WHEN x.status = 'Awaiting Assay' THEN x.remaining ELSE 0 END)
+               AS "Awaiting_assay_kg",
+           SUM(CASE WHEN x.status = 'Not Ready for Melt' THEN x.remaining ELSE 0 END)
+               AS "Not_ready_kg",
+           SUM(CASE WHEN x.status IS NULL
+                      OR x.status NOT IN ('Ready For Melt', 'Awaiting Assay', 'Not Ready for Melt')
+                    THEN x.remaining ELSE 0 END) AS "Other_status_kg",
+           SUM(x.stock_value) AS "Stock_value",
+           SUM(x.uncosted) AS "Uncosted_kg"
+    FROM (
+        SELECT CASE WHEN i.Purchase_id IS NULL THEN -1
+                    ELSE COALESCE(p.Vendor_code, 0) END AS vendor_code,
+               CASE WHEN i.Purchase_id IS NULL THEN '""" + VENDOR_REMELT_LABEL + """'
+                    ELSE COALESCE(v.Vendor_name, 'Unknown vendor') END AS vendor_name,
+               i.Raw_Material_Name AS material,
+               i.Raw_Material_Status AS status,
+               COALESCE(i.Remaining_Weight, 0) AS remaining,
+               COALESCE(i.Received_weight, 0) AS received,
+               COALESCE(c.Charged_kg, 0) AS charged,
+               CASE WHEN i.Usable_pct IS NOT NULL
+                    THEN COALESCE(i.Received_weight, 0) * (100 - i.Usable_pct) / 100.0
+                    ELSE 0 END AS processing_loss,
+               CASE WHEN i.Cost_per_kg IS NOT NULL
+                    THEN COALESCE(i.Remaining_Weight, 0) * """ + lot_charge_cost_sql("i") + """
+                    ELSE 0 END AS stock_value,
+               CASE WHEN i.Cost_per_kg IS NULL
+                    THEN COALESCE(i.Remaining_Weight, 0) ELSE 0 END AS uncosted
+        FROM Raw_Material_Inventory i
+        LEFT JOIN Raw_Material_Purchase p ON p.Purchase_id = i.Purchase_id
+        LEFT JOIN Vendor_Master v ON v.Vendor_code = p.Vendor_code
+        LEFT JOIN (
+            SELECT Lot_id, SUM(Weight) AS Charged_kg
+            FROM batch_input
+            GROUP BY Lot_id
+        ) c ON c.Lot_id = i.Lot_id
+        WHERE p.Invoice_status IS NULL OR p.Invoice_status <> 'Cancelled'
+    ) x
+    GROUP BY x.vendor_code, x.material
 """
 
 
@@ -9986,6 +10045,16 @@ def _ensure_dashboard_materialized_views(conn: Connection) -> None:
         'CREATE UNIQUE INDEX IF NOT EXISTS idx_mv_raw_material_stock_summary_pk '
         'ON mv_raw_material_stock_summary ("Raw_Material_Name")',
     )
+    _exec(
+        conn,
+        "CREATE MATERIALIZED VIEW IF NOT EXISTS mv_raw_material_stock_by_vendor AS "
+        + _RAW_MATERIAL_STOCK_BY_VENDOR_SELECT,
+    )
+    _exec(
+        conn,
+        'CREATE UNIQUE INDEX IF NOT EXISTS idx_mv_raw_material_stock_by_vendor_pk '
+        'ON mv_raw_material_stock_by_vendor ("Vendor_code", "Raw_Material_Name")',
+    )
     # CREATE ... IF NOT EXISTS keeps an older definition; rebuild the summary
     # view once if it predates the Customer_name column.
     if _exec(
@@ -10053,6 +10122,7 @@ def _ensure_dashboard_materialized_views(conn: Connection) -> None:
     if _exec(conn, "SELECT 1 FROM pg_roles WHERE rolname = 'anon'").scalar():
         for view in (
             "mv_raw_material_stock_summary",
+            "mv_raw_material_stock_by_vendor",
             "mv_batch_production_summary",
             "mv_batch_production_inputs",
             "mv_batch_production_outputs",
@@ -16160,6 +16230,18 @@ def list_raw_material_stock_summary() -> list[dict[str, Any]]:
     return fetch_all(
         _RAW_MATERIAL_STOCK_SUMMARY_SELECT
         + ' ORDER BY "Remaining_kg" DESC, "Raw_Material_Name"'
+    )
+
+
+def list_raw_material_stock_by_vendor() -> list[dict[str, Any]]:
+    """Raw material stock by vendor and material (mv_raw_material_stock_by_vendor).
+
+    Reads the materialized view on Postgres (refreshed with the Dashboard, see
+    refresh_dashboard_materialized_views); runs the same SELECT live on SQLite.
+    """
+    src = _mv_source("mv_raw_material_stock_by_vendor", _RAW_MATERIAL_STOCK_BY_VENDOR_SELECT)
+    return fetch_all(
+        f'SELECT * FROM {src} ORDER BY "Vendor_name", "Remaining_kg" DESC, "Raw_Material_Name"'
     )
 
 
