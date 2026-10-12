@@ -663,7 +663,8 @@ with tabs[5]:
     st.caption(
         "Every lot with stock left, as of the last data refresh. Age is days since the "
         "lot was received (or, for remelt lots, since the batch that made it). "
-        "Stock value is remaining kg × the lot's cost per usable kg."
+        "Stock value is remaining kg × the lot's cost per usable kg. Supplier invoice no "
+        "and date are from the purchase the lot came in on (blank for remelt lots)."
     )
     lots = _frame(data["lots"], ("Remaining_Weight", "Received_weight", "Stock_value"))
     if lots.empty:
@@ -726,6 +727,8 @@ with tabs[5]:
             "Received date": view["Received_date"],
             "Age (days)": view["Age_days"],
             "Vendor": view["Vendor_name"],
+            "Supplier invoice no": view.get("Supplier_Invoice"),
+            "Supplier invoice date": view.get("Supplier_invoice_date"),
             "Receipt type": view["Receipt_type"],
             "Usable %": pd.to_numeric(view["Usable_pct"], errors="coerce"),
             "Storage bay": view["Storage_bay"],

@@ -9610,6 +9610,8 @@ _PI_INVENTORY_LOTS_SELECT = """
     SELECT i.Lot_id AS "Lot_id", i.Raw_Material_Name AS "Raw_Material_Name",
            i.Purchase_id AS "Purchase_id",
            p.Vendor_code AS "Vendor_code", v.Vendor_name AS "Vendor_name",
+           p.Supplier_Invoice AS "Supplier_Invoice",
+           SUBSTR(p.Supplier_invoice_date, 1, 10) AS "Supplier_invoice_date",
            CASE WHEN p.Purchase_id IS NULL THEN 'Remelt'
                 ELSE COALESCE(p.Receipt_type, 'Purchase') END AS "Receipt_type",
            p.BIL_plant AS "BIL_plant",
@@ -10104,6 +10106,20 @@ def _ensure_dashboard_materialized_views(conn: Connection) -> None:
         'CREATE INDEX IF NOT EXISTS idx_mv_melter_output_date '
         'ON mv_melter_output ("Production_Date", "Melting_team")',
     )
+
+    # mv_pi_inventory_lots gained the supplier invoice no / date (Oct 2026).
+    # CREATE ... IF NOT EXISTS keeps an old view as it is, so rebuild it once.
+    if _exec(
+        conn, "SELECT 1 FROM pg_matviews WHERE matviewname = 'mv_pi_inventory_lots'"
+    ).first() and not _exec(
+        conn,
+        """
+        SELECT 1 FROM pg_attribute
+        WHERE attrelid = 'mv_pi_inventory_lots'::regclass
+          AND attname = 'Supplier_Invoice' AND NOT attisdropped
+        """,
+    ).first():
+        _exec(conn, "DROP MATERIALIZED VIEW mv_pi_inventory_lots")
 
     # Purchase and Inventory, and Production and Profitability dashboards.
     for view, select_sql, key_cols, date_col in _PI_VIEWS + _PD_VIEWS:
