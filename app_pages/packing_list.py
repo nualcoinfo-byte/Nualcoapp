@@ -8,7 +8,7 @@ from pages_common import (
     _parse_master_date,
     df_from_rows,
     format_ui_date,
-    pdf_file_name,
+    summary_pdf_file_name,
     show_dataframe,
     summary_pdf_bytes,
     to_storage_date,
@@ -287,9 +287,10 @@ def _render_packing_list_summary(summary: dict) -> None:
             st.download_button(
                 "Download PDF",
                 data=pdf_data,
-                file_name=pdf_file_name(
-                    "packing_list_summary", list_ref or "draft",
-                    summary.get("invoice_number"),
+                file_name=summary_pdf_file_name(
+                    summary.get("customer_name"),
+                    summary.get("alloy_name"),
+                    summary.get("invoice_date"),
                 ),
                 mime="application/pdf",
                 key="pl_summary_pdf",
