@@ -62,6 +62,8 @@ Rollback points if needed: `9d4a696` (before today), `8b074f0` (after #35–#37)
 - ✅ Packing List: partial heats, several POs per list, search by heat no, Sale vs Conversion return
 - ✅ Test Certificate: draft (merge heats, ≤0.15% kg round-up), visual inspection, verify / reject / return, issue, PDF
 - ✅ Admin: cancel (void) an issued certificate
+- ✅ Download PDF beside Print summary on Packing List Summary, Test Certificate Summary and Test Certificate
+  Checking Summary (`pages_common.summary_pdf_bytes`, fpdf2, A4, table header repeats on each page)
 
 ### Platform
 - ✅ Employee login (pbkdf2), roles → nav sections, Admin password management

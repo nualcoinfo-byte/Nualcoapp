@@ -6,7 +6,7 @@ from pathlib import Path
 import pandas as pd
 import streamlit as st
 import database as db
-from pages_common import _as_photo_bytes, _is_blank_date, _pandas_styler, _parse_master_date, _show_db_connection_error, df_from_rows, format_ui_date, parse_any_date, show_dataframe, to_storage_date, ui_date_input
+from pages_common import _as_photo_bytes, _is_blank_date, _pandas_styler, _parse_master_date, _show_db_connection_error, df_from_rows, format_ui_date, parse_any_date, pdf_file_name, show_dataframe, summary_pdf_bytes, to_storage_date, ui_date_input
 
 LOGO_PATH = Path(__file__).resolve().parent.parent / "assets" / "nualco_logo.png"
 ISO_LOGO_PATH = Path(__file__).resolve().parent.parent / "assets" / "iso_9001_2015.png"
@@ -875,7 +875,89 @@ def _render_certificate_summary(
             unsafe_allow_html=True,
         )
 
-    c1, c2, _c3 = st.columns([1, 1, 2])
+    # The same content as the page, for Download PDF.
+    cert_no = str(cert.get("Certificate_no") or "")
+    count_label = f"Total ({len(lines)} printed line{'s' if len(lines) != 1 else ''})"
+    if checking:
+        pdf_title = f"Test Certificate Checking Summary - {cert_no}"
+        pdf_table = {
+            "heading": "Printed lines",
+            "columns": [("Line", 1, "L"), ("Printed heat no", 4, "L"),
+                        ("Printed kg", 2, "R"), ("Pieces", 1.5, "R")],
+            "rows": [
+                (
+                    [
+                        str(int(line.get("Line_no") or 0)),
+                        db.certificate_display_heat_no(line.get("Display_heat_no")) or "—",
+                        f"{float(line.get('Weight') or 0):,.2f}",
+                        f"{int(float(line.get('Pieces') or 0)):,}",
+                    ],
+                    "",
+                )
+                for line in lines
+            ] or [(["No printed lines"], "")],
+            "footer": [count_label, None, f"{printed_w:,.2f}", f"{printed_p:,}"],
+        }
+        pdf_notes: list[tuple[str, bool]] = []
+    else:
+        pdf_title = f"Test Certificate Summary - {cert_no}"
+        rows: list[tuple[list[str], str]] = []
+        for line in lines:
+            sources = line.get("sources") or []
+            source_kg = sum(float(x.get("Source_weight") or 0) for x in sources)
+            printed_kg = float(line.get("Weight") or 0)
+            heat_no = db.certificate_display_heat_no(line.get("Display_heat_no")) or "—"
+            rows.append((
+                [
+                    str(int(line.get("Line_no") or 0)),
+                    heat_no + (" (blended)" if line.get("Is_blended") else ""),
+                    f"{source_kg:,.2f}",
+                    f"{printed_kg:,.2f}",
+                    f"{printed_kg - source_kg:+,.2f}",
+                    f"{int(float(line.get('Pieces') or 0)):,}",
+                ],
+                "bold",
+            ))
+            for src in sources:
+                bid = str(src.get("Batch_ID") or "—")
+                heat = src.get("Heat_no") or heat_by_batch.get(bid) or "—"
+                rows.append((
+                    [
+                        "",
+                        f"   -> {bid} - heat {heat}",
+                        f"{float(src.get('Source_weight') or 0):,.2f}",
+                        "",
+                        "",
+                        f"{int(float(src.get('Source_pieces') or 0)):,}",
+                    ],
+                    "sub",
+                ))
+        pdf_table = {
+            "heading": "Printed lines (batches under each line are what it is made of)",
+            "columns": [("Line", 0.8, "L"), ("Printed heat no / source batches", 4.2, "L"),
+                        ("Source kg", 1.6, "R"), ("Printed kg", 1.6, "R"),
+                        ("Round-up kg", 1.6, "R"), ("Pieces", 1.2, "R")],
+            "rows": rows or [(["No printed lines"], "")],
+            "footer": [count_label, None, f"{packed_w:,.2f}", f"{printed_w:,.2f}",
+                       f"{printed_w - packed_w:+,.2f}", f"{printed_p:,}"],
+        }
+        weight_text = (
+            f"Round-up {weights['delta_kg']:+,.2f} kg ({weights['delta_pct']:+.3f}%), "
+            f"allowed up to {weights['allowed_kg']:,.2f} kg (+{weights['max_pct']:g}%)."
+        )
+        pdf_notes = [
+            (weight_text + ("" if weights["ok"] else " Outside the allowed round-up."),
+             not weights["ok"]),
+        ]
+        if printed_p != packed_p:
+            pdf_notes.append((f"Pieces differ from packed ({packed_p:,}).", True))
+        pdf_notes.append((
+            "Source kg is the packed weight from the packing list; printed kg is what the "
+            "certificate shows. Check the physical bundles against the source batches.",
+            False,
+        ))
+
+    c1, c2, c3, _c4 = st.columns([1, 1, 1, 1])
     with c1:
         if st.button("Back to certificate", key="tc_summary_back"):
             st.session_state.pop("tc_show_summary", None)
@@ -887,6 +969,23 @@ def _render_certificate_summary(
             'background:#fff;cursor:pointer;font-size:0.9rem;">Print summary</button>',
             unsafe_allow_html=True,
         )
+    with c3:
+        try:
+            pdf_data = summary_pdf_bytes(pdf_title, meta_rows, [pdf_table], pdf_notes)
+        except Exception as exc:  # noqa: BLE001
+            st.caption(f"PDF not available: {exc}")
+        else:
+            st.download_button(
+                "Download PDF",
+                data=pdf_data,
+                file_name=pdf_file_name(
+                    "test_certificate_checking_summary" if checking
+                    else "test_certificate_summary",
+                    cert_no or f"PL{header.get('Packing_list_id')}",
+                ),
+                mime="application/pdf",
+                key="tc_summary_pdf_checking" if checking else "tc_summary_pdf",
+            )
 
 
 def _style_spec_check_table(data: pd.DataFrame):

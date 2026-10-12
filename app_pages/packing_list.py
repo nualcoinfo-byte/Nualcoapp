@@ -4,7 +4,16 @@ import streamlit as st
 import database as db
 from datetime import date
 import pandas as pd
-from pages_common import _parse_master_date, df_from_rows, format_ui_date, show_dataframe, to_storage_date, ui_date_input
+from pages_common import (
+    _parse_master_date,
+    df_from_rows,
+    format_ui_date,
+    pdf_file_name,
+    show_dataframe,
+    summary_pdf_bytes,
+    to_storage_date,
+    ui_date_input,
+)
 
 _BRAND_ORANGE = "#F15A22"
 _BRAND_INK = "#1A1A1A"
@@ -231,7 +240,27 @@ def _render_packing_list_summary(summary: dict) -> None:
         unsafe_allow_html=True,
     )
 
-    c1, c2, _c3 = st.columns([1, 1, 2])
+    pdf_rows = [
+        (
+            [
+                str(row.get("Batch_ID") or "—"),
+                str(row.get("Heat_no") or "—"),
+                f"{float(row.get('Weight') or 0):,.2f}",
+                f"{int(float(row.get('Pieces') or 0)):,}",
+            ],
+            "",
+        )
+        for row in batches
+    ] or [(["No batches selected"], "")]
+    pdf_table = {
+        "heading": None,
+        "columns": [("Batch ID", 3, "L"), ("Heat No", 2, "L"),
+                    ("Weight (kg)", 2, "R"), ("Pieces", 1.5, "R")],
+        "rows": pdf_rows,
+        "footer": ["Total", None, f"{total_w:,.2f}", f"{total_p:,}"] if batches else None,
+    }
+
+    c1, c2, c3, _c4 = st.columns([1, 1, 1, 1])
     with c1:
         if st.button("Back to packing list", key="pl_summary_back", type="secondary"):
             st.session_state.pop("pl_show_summary", None)
@@ -244,6 +273,27 @@ def _render_packing_list_summary(summary: dict) -> None:
             'background:#fff;cursor:pointer;font-size:0.9rem;">Print summary</button>',
             unsafe_allow_html=True,
         )
+    with c3:
+        try:
+            pdf_data = summary_pdf_bytes(
+                title,
+                meta_rows,
+                [pdf_table],
+                [("Verify invoice details and batch quantities before dispatch.", False)],
+            )
+        except Exception as exc:  # noqa: BLE001
+            st.caption(f"PDF not available: {exc}")
+        else:
+            st.download_button(
+                "Download PDF",
+                data=pdf_data,
+                file_name=pdf_file_name(
+                    "packing_list_summary", list_ref or "draft",
+                    summary.get("invoice_number"),
+                ),
+                mime="application/pdf",
+                key="pl_summary_pdf",
+            )
 
 
 if st.session_state.get("pl_show_summary"):
