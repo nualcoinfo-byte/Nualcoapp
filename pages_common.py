@@ -7,6 +7,7 @@ migration -- function bodies are unchanged, only their home moved.
 from __future__ import annotations
 
 import io
+from pathlib import Path
 from datetime import date, datetime, timedelta, timezone
 
 import pandas as pd
@@ -1306,3 +1307,194 @@ def tank_reading_rows(
                 f"({len(ok_rows)} readings)"
             )
     return entered, result
+
+
+# ── Printable summaries as PDF ────────────────────────────────────────────────
+# Packing List Summary and the Test Certificate (checking) summaries have a
+# Print summary button that prints the browser page. Download PDF builds the
+# same content as an A4 file with fpdf2 so it can be saved or sent on WhatsApp
+# / e-mail from a phone, where printing the page is awkward.
+SUMMARY_PDF_LOGO = Path(__file__).resolve().parent / "assets" / "nualco_logo.png"
+_PDF_ORANGE = (241, 90, 34)
+_PDF_INK = (26, 26, 26)
+_PDF_GREY = (85, 85, 85)
+_PDF_RED = (198, 40, 40)
+
+
+def pdf_safe_text(value: object) -> str:
+    """Helvetica core fonts only cover Latin-1; map common Unicode first."""
+    text = str(value if value is not None else "")
+    for old, new in (
+        ("—", "-"), ("–", "-"), ("−", "-"), ("‘", "'"),
+        ("’", "'"), ("“", '"'), ("”", '"'), ("…", "..."),
+        (" ", " "), ("✓", "Y"), ("✔", "Y"), ("·", "-"),
+        ("↳", "->"), ("₹", "Rs "),
+    ):
+        text = text.replace(old, new)
+    return text.encode("latin-1", "replace").decode("latin-1")
+
+
+def summary_pdf_bytes(
+    title: str,
+    meta_rows: list[tuple[str, object]],
+    tables: list[dict],
+    notes: list[tuple[str, bool]] | tuple = (),
+) -> bytes:
+    """A4 PDF of a printable summary: title, label/value block, tables, notes.
+
+    Each table is {"heading": str | None, "columns": [(label, width, align)],
+    "rows": [(cells, kind)], "footer": cells | None}. Widths are relative;
+    align is "L" or "R". Row kind "" is normal, "bold" is bold and "sub" is a
+    small grey detail row (e.g. the source batches under a certificate line).
+    A None cell joins the cell before it.
+    Notes are (text, is_warning) and print below the tables, warnings in red.
+    """
+    from fpdf import FPDF
+
+    generated = db.now_ist().strftime("%d-%b-%Y %H:%M").upper()
+
+    class _SummaryPDF(FPDF):
+        def footer(self) -> None:
+            self.set_y(-10)
+            self.set_font("Helvetica", "", 7)
+            self.set_text_color(*_PDF_GREY)
+            self.cell(0, 4, pdf_safe_text(f"Generated {generated} IST"), align="L")
+            self.set_x(self.l_margin)
+            self.cell(0, 4, f"Page {self.page_no()} of {{nb}}", align="R")
+
+    pdf = _SummaryPDF(orientation="P", unit="mm", format="A4")
+    pdf.set_margins(12, 12, 12)
+    pdf.set_auto_page_break(auto=False)
+    pdf.add_page()
+    page_w = pdf.w - pdf.l_margin - pdf.r_margin
+    bottom = pdf.h - 16
+
+    def _fit(text: str, width: float) -> str:
+        text = pdf_safe_text(text)
+        if pdf.get_string_width(text) <= width - 2:
+            return text
+        while text and pdf.get_string_width(text + "...") > width - 2:
+            text = text[:-1]
+        return text + "..."
+
+    def _room(height: float) -> bool:
+        if pdf.get_y() + height > bottom:
+            pdf.add_page()
+            return False
+        return True
+
+    # Title block: logo, title, orange rule.
+    y = pdf.get_y()
+    text_x = pdf.l_margin
+    if SUMMARY_PDF_LOGO.exists():
+        pdf.image(str(SUMMARY_PDF_LOGO), x=pdf.l_margin, y=y, h=12)
+        text_x += 30
+    pdf.set_xy(text_x, y + 2)
+    pdf.set_text_color(*_PDF_INK)
+    pdf.set_font("Helvetica", "B", 14)
+    pdf.multi_cell(page_w - (text_x - pdf.l_margin), 7, pdf_safe_text(title),
+                   new_x="LMARGIN", new_y="NEXT")
+    pdf.set_y(max(pdf.get_y(), y + 13))
+    pdf.set_draw_color(*_PDF_ORANGE)
+    pdf.set_line_width(0.6)
+    pdf.line(pdf.l_margin, pdf.get_y(), pdf.l_margin + page_w, pdf.get_y())
+    pdf.ln(4)
+
+    # Label / value block; values wrap.
+    pdf.set_line_width(0.2)
+    pdf.set_draw_color(189, 189, 189)
+    label_w = page_w * 0.30
+    for label, value in meta_rows:
+        pdf.set_font("Helvetica", "", 9.5)
+        lines = pdf.multi_cell(page_w - label_w, 6, pdf_safe_text(value), dry_run=True,
+                               output="LINES")
+        h = 6 * max(1, len(lines))
+        _room(h)
+        y = pdf.get_y()
+        pdf.set_fill_color(247, 247, 247)
+        pdf.set_font("Helvetica", "B", 9.5)
+        pdf.set_xy(pdf.l_margin, y)
+        pdf.cell(label_w, h, _fit(label, label_w), border=1, fill=True)
+        pdf.set_font("Helvetica", "", 9.5)
+        pdf.set_xy(pdf.l_margin + label_w, y)
+        pdf.multi_cell(page_w - label_w, 6, pdf_safe_text(value), border=1,
+                       new_x="LMARGIN", new_y="NEXT")
+        pdf.set_y(y + h)
+
+    for table in tables:
+        cols = table["columns"]
+        total = sum(c[1] for c in cols) or 1
+        widths = [page_w * c[1] / total for c in cols]
+
+        def _head() -> None:
+            pdf.set_font("Helvetica", "B", 9)
+            pdf.set_fill_color(240, 240, 240)
+            pdf.set_text_color(*_PDF_INK)
+            for (label, _w, align), w in zip(cols, widths):
+                pdf.cell(w, 7, _fit(label, w), border=1, fill=True, align=align)
+            pdf.ln(7)
+
+        pdf.ln(4)
+        if table.get("heading"):
+            _room(20)
+            pdf.set_font("Helvetica", "B", 10.5)
+            pdf.set_text_color(*_PDF_INK)
+            pdf.cell(page_w, 6, pdf_safe_text(table["heading"]), new_x="LMARGIN", new_y="NEXT")
+        _room(14)
+        _head()
+        body = list(table.get("rows") or [])
+        if table.get("footer") is not None:
+            body.append((table["footer"], "footer"))
+        for cells, kind in body:
+            h = 5.5 if kind == "sub" else 6.5
+            if not _room(h):
+                _head()
+            if kind == "sub":
+                pdf.set_font("Helvetica", "", 8)
+                pdf.set_text_color(*_PDF_GREY)
+                pdf.set_fill_color(252, 252, 252)
+            elif kind in ("bold", "footer"):
+                pdf.set_font("Helvetica", "B", 9)
+                pdf.set_text_color(*_PDF_INK)
+                pdf.set_fill_color(250, 250, 250)
+            else:
+                pdf.set_font("Helvetica", "", 9)
+                pdf.set_text_color(*_PDF_INK)
+                pdf.set_fill_color(255, 255, 255)
+            if len(cells) == 1 and len(cols) > 1:
+                # One message across the whole table, e.g. "No batches selected".
+                pdf.set_text_color(*_PDF_GREY)
+                pdf.cell(page_w, h, _fit(cells[0], page_w), border=1, align="C")
+            else:
+                # A None cell joins the cell before it (like colspan), so a
+                # "Total (n lines)" label can run across two columns.
+                spans: list[list] = []
+                for (label, _w, align), w, value in zip(cols, widths, cells):
+                    if value is None and spans:
+                        spans[-1][0] += w
+                    else:
+                        spans.append([w, "" if value is None else value, align])
+                for w, value, align in spans:
+                    pdf.cell(w, h, _fit(value, w), border=1, align=align, fill=True)
+            pdf.ln(h)
+
+    if notes:
+        pdf.ln(3)
+        for text, warn in notes:
+            pdf.set_font("Helvetica", "B" if warn else "", 8.5)
+            pdf.set_text_color(*(_PDF_RED if warn else _PDF_GREY))
+            lines = pdf.multi_cell(page_w, 4.5, pdf_safe_text(text), dry_run=True,
+                                   output="LINES")
+            _room(4.5 * len(lines) + 1)
+            pdf.multi_cell(page_w, 4.5, pdf_safe_text(text), new_x="LMARGIN", new_y="NEXT")
+            pdf.ln(1)
+    return bytes(pdf.output())
+
+
+def pdf_file_name(*parts: object) -> str:
+    """Safe file name from parts, e.g. ("packing_list_summary", 42) -> packing_list_summary_42.pdf."""
+    import re
+
+    text = "_".join(str(p) for p in parts if p not in (None, ""))
+    text = re.sub(r"[^A-Za-z0-9._-]+", "_", text).strip("_") or "summary"
+    return f"{text}.pdf"
