@@ -1491,10 +1491,21 @@ def summary_pdf_bytes(
     return bytes(pdf.output())
 
 
-def pdf_file_name(*parts: object) -> str:
-    """Safe file name from parts, e.g. ("packing_list_summary", 42) -> packing_list_summary_42.pdf."""
+def summary_pdf_file_name(customer: object, alloy: object, invoice_date: object) -> str:
+    """Summary PDF name: Customer name_Alloy name_Invoice date.pdf.
+
+    e.g. "Abee Castings Private Limited_A356_12-OCT-2026.pdf". Spaces and case
+    are kept; characters Windows / phones refuse in a file name (/ \\ : * ? " < > |)
+    become "-". A missing part is left out.
+    """
     import re
 
-    text = "_".join(str(p) for p in parts if p not in (None, ""))
-    text = re.sub(r"[^A-Za-z0-9._-]+", "_", text).strip("_") or "summary"
+    parts = [
+        str(customer or "").strip(),
+        str(alloy or "").strip(),
+        format_ui_date(invoice_date, empty="") if invoice_date not in (None, "") else "",
+    ]
+    text = "_".join(p for p in parts if p)
+    text = re.sub(r'[\\/:*?"<>|\x00-\x1f]+', "-", text)
+    text = re.sub(r"\s+", " ", text).strip(" ._-") or "Summary"
     return f"{text}.pdf"

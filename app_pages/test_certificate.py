@@ -6,7 +6,7 @@ from pathlib import Path
 import pandas as pd
 import streamlit as st
 import database as db
-from pages_common import _as_photo_bytes, _is_blank_date, _pandas_styler, _parse_master_date, _show_db_connection_error, df_from_rows, format_ui_date, parse_any_date, pdf_file_name, show_dataframe, summary_pdf_bytes, to_storage_date, ui_date_input
+from pages_common import _as_photo_bytes, _is_blank_date, _pandas_styler, _parse_master_date, _show_db_connection_error, df_from_rows, format_ui_date, parse_any_date, show_dataframe, summary_pdf_bytes, summary_pdf_file_name, to_storage_date, ui_date_input
 
 LOGO_PATH = Path(__file__).resolve().parent.parent / "assets" / "nualco_logo.png"
 ISO_LOGO_PATH = Path(__file__).resolve().parent.parent / "assets" / "iso_9001_2015.png"
@@ -978,10 +978,10 @@ def _render_certificate_summary(
             st.download_button(
                 "Download PDF",
                 data=pdf_data,
-                file_name=pdf_file_name(
-                    "test_certificate_checking_summary" if checking
-                    else "test_certificate_summary",
-                    cert_no or f"PL{header.get('Packing_list_id')}",
+                file_name=summary_pdf_file_name(
+                    header.get("Customer_name"),
+                    header.get("Alloy_name"),
+                    header.get("Invoice_date"),
                 ),
                 mime="application/pdf",
                 key="tc_summary_pdf_checking" if checking else "tc_summary_pdf",
