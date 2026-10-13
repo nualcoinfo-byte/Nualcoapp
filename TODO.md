@@ -100,8 +100,9 @@ Rollback points if needed: `9d4a696` (before today), `8b074f0` (after #35–#37)
    `finished_goods_inventory`, `raw_material_inventory` and `employees` directly, with no
    correction log or re-costing. Make those read-only in the Data Browser (the audited pages exist now: Batch Output
    Correction, Production Batch Correction, Raw Material Purchase Correction, Employee passwords).
-4. ⬜ **Decide with the user:** should Production Batch Correction also correct charge lines on a Completed heat
-   (affects lot stock and costing; would need its own audit lines and re-costing)? Currently out of scope.
+4. ✅ **Charge lines on Production Batch Correction** (13 Oct 2026): edit lot / scale / tare / net, add or remove lines;
+   lot stock moved, output + remelt lots re-costed, audited with Costing lines. Packed heats allowed with a costing
+   warning and a confirmation tick. Check on staging with a real heat before relying on it.
 
 ## Backlog
 
