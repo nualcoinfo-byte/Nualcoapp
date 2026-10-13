@@ -1,6 +1,6 @@
 import streamlit as st
 import database as db
-from pages_common import df_from_rows, empty_int_input, empty_percent_input, format_ui_date, photo_picker, render_avg_piece_weight, show_dataframe
+from pages_common import confirm_possible_duplicates, df_from_rows, empty_int_input, empty_percent_input, format_ui_date, photo_picker, render_avg_piece_weight, show_dataframe
 
 
 def _batch_label(b: dict) -> str:
@@ -180,6 +180,19 @@ if out_alloy_id is not None and db.is_sidestream_alloy(out_alloy_id) and not pro
         "Yes, this weighing really is remelt material.", key=_k("remelt_ok")
     )
 
+# Same output alloy, net kg and pieces as a line already saved on this heat:
+# most likely the same weighing saved twice (e.g. a double tap on Save).
+dup_ok = confirm_possible_duplicates(
+    [
+        f"{format_ui_date(r.get('Output_time'), with_time=True)} · "
+        f"{r.get('Alloy_name') or alloy_pick} · {float(r.get('Weight') or 0):,.1f} kg · "
+        f"{int(r.get('Pieces') or 0)} pcs"
+        for r in db.duplicate_output_matches(saved_lines, out_alloy_id, net_w, pieces)
+    ],
+    key=_k("dup_ok"),
+    what="output line",
+)
+
 scale_photo = photo_picker("📷 Weighment scale photo", _k("wsp"))
 output_photo = photo_picker("📷 Output photo", _k("out"))
 
@@ -199,6 +212,11 @@ if st.button("Save output line", type="primary", use_container_width=True, key=_
         st.error("Fix the weight above before saving.")
     elif not remelt_confirmed:
         st.error("Not saved: tick the remelt confirmation, or change the output alloy.")
+    elif not dup_ok:
+        st.error(
+            "Not saved: the same output is already saved on this batch. Tick the "
+            "confirmation if this is a separate weighing."
+        )
     else:
         try:
             db.add_batch_output_line(

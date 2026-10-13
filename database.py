@@ -13301,6 +13301,97 @@ def get_batch(batch_id: str) -> Optional[dict[str, Any]]:
     )
 
 
+# ── Possible duplicate entries ───────────────────────────────────────────────
+# The same trolley or output weighing has been saved twice (a double tap on a
+# phone, or a line re-entered after a slow save). These only warn: two weighings
+# can genuinely match, so the page asks the user to confirm before saving.
+DUPLICATE_KG_TOLERANCE = 0.005
+
+
+def _dup_kg(value: Any) -> Optional[float]:
+    try:
+        num = float(value)
+    except (TypeError, ValueError):
+        return None
+    return None if num != num else num  # NaN
+
+
+def saved_charge_weighings(saved_lines: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Saved charge lines as weighings: {"Raw_Material_Name", "Net", "Charge_time"}.
+
+    A trolley split across lots (FIFO) is saved as one row per lot with the same
+    charge time, so the rows are added back together into the trolley's net.
+    Each single row is listed too, for lines entered against one lot.
+    """
+    groups: dict[tuple[str, str], dict[str, Any]] = {}
+    out: list[dict[str, Any]] = []
+    for row in saved_lines or []:
+        material = str(row.get("Raw_Material_Name") or "").strip()
+        when = str(row.get("Charge_time") or "")
+        weight = _dup_kg(row.get("Weight")) or 0.0
+        key = (material.lower(), when)
+        g = groups.setdefault(key, {"Raw_Material_Name": material, "Net": 0.0,
+                                    "Charge_time": when, "Rows": 0})
+        g["Net"] += weight
+        g["Rows"] += 1
+        scale = _dup_kg(row.get("Weighment_scale_weight"))
+        if scale is not None:
+            # The weighing as entered (before any later return to inventory).
+            g["Scale_net"] = scale - (_dup_kg(row.get("Trolley_weight")) or 0.0)
+        out.append({"Raw_Material_Name": material, "Net": weight, "Charge_time": when})
+    for g in groups.values():
+        if g["Rows"] > 1:
+            out.append({"Raw_Material_Name": g["Raw_Material_Name"], "Net": g["Net"],
+                        "Charge_time": g["Charge_time"]})
+        if g.get("Scale_net") is not None:
+            out.append({"Raw_Material_Name": g["Raw_Material_Name"], "Net": g["Scale_net"],
+                        "Charge_time": g["Charge_time"]})
+    return out
+
+
+def duplicate_charge_matches(
+    saved_lines: list[dict[str, Any]], material: object, net_kg: object
+) -> list[dict[str, Any]]:
+    """Saved weighings of the same raw material with the same net kg (one per charge time)."""
+    name = str(material or "").strip().lower()
+    net = _dup_kg(net_kg)
+    if not name or net is None or net <= 0:
+        return []
+    seen: set[str] = set()
+    matches: list[dict[str, Any]] = []
+    for w in saved_charge_weighings(saved_lines):
+        if (
+            str(w["Raw_Material_Name"]).lower() == name
+            and abs(float(w["Net"]) - net) < DUPLICATE_KG_TOLERANCE
+            and w["Charge_time"] not in seen
+        ):
+            seen.add(w["Charge_time"])
+            matches.append(w)
+    return matches
+
+
+def duplicate_output_matches(
+    saved_lines: list[dict[str, Any]], alloy_id: object, net_kg: object, pieces: object
+) -> list[dict[str, Any]]:
+    """Saved output lines with the same output alloy, net kg and pieces."""
+    net = _dup_kg(net_kg)
+    try:
+        aid = int(alloy_id)
+    except (TypeError, ValueError):
+        return []
+    if net is None or net <= 0:
+        return []
+    pcs = int(_dup_kg(pieces) or 0)
+    return [
+        row
+        for row in saved_lines or []
+        if row.get("Alloy_id") not in (None, "")
+        and int(row["Alloy_id"]) == aid
+        and abs((_dup_kg(row.get("Weight")) or 0.0) - net) < DUPLICATE_KG_TOLERANCE
+        and int(_dup_kg(row.get("Pieces")) or 0) == pcs
+    ]
+
+
 def get_batch_inputs(batch_id: str) -> list[dict[str, Any]]:
     return fetch_all(
         """

@@ -1,6 +1,6 @@
 import streamlit as st
 import database as db
-from pages_common import df_from_rows, empty_percent_input, format_ui_date, photo_picker, show_dataframe, ui_date_input
+from pages_common import confirm_possible_duplicates, df_from_rows, empty_percent_input, format_ui_date, photo_picker, show_dataframe, ui_date_input
 
 
 @st.cache_data(ttl=60, show_spinner=False)
@@ -234,6 +234,18 @@ else:
     for problem in problems:
         st.error(problem)
 
+    # Same raw material and net kg as a weighing already saved on this heat:
+    # most likely the same trolley saved twice (e.g. a double tap on Save).
+    dup_ok = confirm_possible_duplicates(
+        [
+            f"{format_ui_date(w['Charge_time'], with_time=True)} · "
+            f"{w['Raw_Material_Name']} · {float(w['Net']):,.1f} kg"
+            for w in db.duplicate_charge_matches(saved_lines, mat, net_w)
+        ],
+        key=_k("dup_ok"),
+        what="charge line",
+    )
+
     scale_photo = photo_picker("📷 Weighment photo", _k("wsp"))
     input_photo = photo_picker("📷 Raw material photo", _k("inp"))
 
@@ -253,6 +265,11 @@ else:
             st.error("Enter " + ", ".join(missing) + ".")
         elif problems or net_w <= 0 or not fifo_parts:
             st.error("Fix the weight above before saving.")
+        elif not dup_ok:
+            st.error(
+                "Not saved: the same raw material and net weight is already saved on "
+                "this batch. Tick the confirmation if this is a separate trolley."
+            )
         else:
             line = {
                 "Raw_Material_Name": mat,

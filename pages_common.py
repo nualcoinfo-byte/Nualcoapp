@@ -383,6 +383,28 @@ def _alloy_output_label(alloy: dict) -> str:
     return f"{aid} — {name} — {customer}" if customer else f"{aid} — {name}"
 
 
+def confirm_possible_duplicates(messages: list[str], *, key: str, what: str) -> bool:
+    """Warn about entries that match data already saved; True when the user may save.
+
+    `messages` lists each match in plain words. With none, nothing is shown.
+    `what` names the entry ("charge line" / "output line") for the tick box.
+    """
+    if not messages:
+        return True
+    st.warning(
+        f"**Possible duplicate {what}.** The same data is already saved on this batch:\n\n"
+        + "\n".join(f"- {m}" for m in messages)
+        + f"\n\nIf this is a separate weighing, tick the box below to save it. "
+        f"If it was already saved, remove it instead of saving it again."
+    )
+    return bool(
+        st.checkbox(
+            f"Yes, this is a separate {what}, not a repeat. Save it anyway.",
+            key=key,
+        )
+    )
+
+
 def render_batch_output_editor(batch: dict, *, key_prefix: str) -> None:
     """Enter output lines for one batch: product alloy plus 78/79/80."""
     bid = batch["Batch_ID"]
@@ -456,6 +478,11 @@ def render_batch_output_editor(batch: dict, *, key_prefix: str) -> None:
     if not st.session_state.get(loaded_key):
         existing = db.get_batch_outputs(bid, include_photos=True)
         st.session_state[state_key] = max(len(existing), 1)
+        # Which saved line each form line was loaded from, so the duplicate
+        # check below looks only at lines added or changed since.
+        st.session_state[f"{key_prefix}_loaded_ids_{bid}"] = [
+            row.get("Output_id") for row in existing
+        ]
         for idx, row in enumerate(existing):
             st.session_state[_k("alloy", idx)] = id_to_label.get(
                 int(row["Alloy_id"]), default_label
@@ -664,8 +691,55 @@ def render_batch_output_editor(batch: dict, *, key_prefix: str) -> None:
             for ln in weighed
         )
 
+    saved_outputs = db.get_batch_outputs(bid)
     screen_remelt_only = _remelt_only(collected)
-    saved_remelt_only = _remelt_only(db.get_batch_outputs(bid))
+    saved_remelt_only = _remelt_only(saved_outputs)
+
+    # A new or changed line with the same output alloy, net kg and pieces as a
+    # line already saved (or another new line) is probably the same weighing
+    # entered twice.
+    dup_messages: list[str] = []
+    if not locked:
+        loaded_ids = st.session_state.get(f"{key_prefix}_loaded_ids_{bid}")
+        if loaded_ids is None:  # form loaded before this check existed
+            loaded_ids = [row.get("Output_id") for row in saved_outputs]
+        saved_by_id = {row.get("Output_id"): row for row in saved_outputs}
+        id_label = {v: k for k, v in label_to_id.items()}
+
+        def _same(a: dict, b: dict) -> bool:
+            return bool(db.duplicate_output_matches(
+                [b], a.get("Alloy_id"), a.get("Weight"), a.get("Pieces")
+            ))
+
+        new_lines: list[int] = []
+        for idx, line in enumerate(collected):
+            own_id = loaded_ids[idx] if idx < len(loaded_ids) else None
+            own = saved_by_id.get(own_id)
+            if own is not None and _same(line, own):
+                continue  # unchanged saved line
+            if float(line.get("Weight") or 0) <= 0:
+                continue
+            for row in db.duplicate_output_matches(
+                [r for r in saved_outputs if r.get("Output_id") != own_id],
+                line.get("Alloy_id"), line.get("Weight"), line.get("Pieces"),
+            ):
+                dup_messages.append(
+                    f"Output line {idx + 1} matches the line saved "
+                    f"{format_ui_date(row.get('Output_time'), with_time=True)}: "
+                    f"{id_label.get(int(row['Alloy_id']), row.get('Alloy_name'))} · "
+                    f"{float(row.get('Weight') or 0):,.1f} kg · "
+                    f"{int(row.get('Pieces') or 0)} pcs"
+                )
+            for other in new_lines:
+                if _same(line, collected[other]):
+                    dup_messages.append(
+                        f"Output lines {other + 1} and {idx + 1} on screen are the same "
+                        f"({float(line['Weight']):,.1f} kg, {int(line.get('Pieces') or 0)} pcs)"
+                    )
+            new_lines.append(idx)
+    dup_ok = confirm_possible_duplicates(
+        dup_messages, key=f"{key_prefix}_{bid}_dup_ok", what="output line"
+    )
     remelt_confirmed = True
     if not locked and (screen_remelt_only or (saved_remelt_only and not output_completed)):
         product_name = next(
@@ -716,6 +790,11 @@ def render_batch_output_editor(batch: dict, *, key_prefix: str) -> None:
                 "Not saved: every output line is a remelt type. Change the output "
                 "alloy to the product, or tick the confirmation above."
             )
+        elif not dup_ok:
+            st.error(
+                "Not saved: an output line repeats one already saved. Remove it, or "
+                "tick the confirmation if it is a separate weighing."
+            )
         elif missing_stand:
             lines = ", ".join(str(n) for n in missing_stand)
             st.error(
@@ -728,6 +807,7 @@ def render_batch_output_editor(batch: dict, *, key_prefix: str) -> None:
                     bid, collected, allow_completed=output_completed
                 )
                 st.session_state.pop(loaded_key, None)
+                st.session_state.pop(f"{key_prefix}_{bid}_dup_ok", None)
                 st.success(
                     f"Saved history correction for **{bid}**."
                     if output_completed

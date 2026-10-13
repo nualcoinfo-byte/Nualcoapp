@@ -39,6 +39,9 @@ Rollback points if needed: `9d4a696` (before today), `8b074f0` (after #35–#37)
 - ✅ Degassing, K-mould value, top/middle/bottom/vacuum samples
 - ✅ Spectro chemistry entry vs alloy min/max, SF entered from spectrometer, below-detection-limit handling
 - ✅ Quick Batch Input / Quick Batch Output (mobile)
+- ✅ Possible-duplicate warning (Oct 2026): a new charge line with the same raw material + net kg as a saved weighing
+  (FIFO split rows added back; scale − tare), or a new output line with the same alloy + net kg + pieces, needs a
+  confirmation tick before Save (`duplicate_charge_matches`, `duplicate_output_matches`, `confirm_possible_duplicates`)
 - ✅ Batch Output: product + sidestream (78/79/80) lines, stand weight mandatory, piece-weight check, remelt-only guard,
   yield % vs 70% target with product / non-spec split, Mark Output Completed → FG + remelt lots
 - ✅ Batch Output Correction with full audit trail and re-costing

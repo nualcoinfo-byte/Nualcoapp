@@ -2,7 +2,7 @@ import html
 import streamlit as st
 import database as db
 from datetime import date, datetime
-from pages_common import CHEM_PERCENT_FORMAT, CHEM_PERCENT_STEP, UI_DATE_WIDGET_FORMAT, df_from_rows, dialog_all_element_percentages, element_input_grid, empty_percent_input, format_ui_date, merge_percent_composition, parse_any_date, photo_bytes, show_dataframe, ui_date_input
+from pages_common import CHEM_PERCENT_FORMAT, CHEM_PERCENT_STEP, UI_DATE_WIDGET_FORMAT, confirm_possible_duplicates, df_from_rows, dialog_all_element_percentages, element_input_grid, empty_percent_input, format_ui_date, merge_percent_composition, parse_any_date, photo_bytes, show_dataframe, ui_date_input
 
 
 def draft_banner(label: str, has_draft: bool, on_discard) -> None:
@@ -223,7 +223,7 @@ def _clear_production_entry_fields(furnace: str, sample_blank: str) -> None:
         if not isinstance(k, str) or not k.startswith(prefix):
             continue
         rest = k[len(prefix) :]
-        if rest in {"pending_charges", "full_chem", "create_error"} or rest.startswith(
+        if rest in {"pending_charges", "full_chem", "create_error", "dup_charge_ok"} or rest.startswith(
             "bchem_"
         ):
             st.session_state.pop(k, None)
@@ -1290,6 +1290,38 @@ else:
             st.session_state[pending_charges_key] = charge_inputs
         saved_pending_charges = st.session_state.get(pending_charges_key) or []
 
+        # A new charge line with the same raw material and net kg as a weighing
+        # already saved on this heat (or as another new line) is probably the
+        # same trolley entered twice. Save / Create waits for a confirmation;
+        # the flag is read by the save code further down the script.
+        dup_messages: list[str] = []
+        new_lines = charge_inputs or saved_pending_charges
+        for i, line in enumerate(new_lines):
+            for w in db.duplicate_charge_matches(
+                saved_charges, line.get("Raw_Material_Name"), line.get("Weight")
+            ):
+                dup_messages.append(
+                    f"Charge line {i + 1}: {w['Raw_Material_Name']} "
+                    f"{float(w['Net']):,.1f} kg was already saved "
+                    f"{format_ui_date(w['Charge_time'], with_time=True)}"
+                )
+            for j in range(i):
+                other = new_lines[j]
+                if (
+                    str(other.get("Raw_Material_Name") or "").lower()
+                    == str(line.get("Raw_Material_Name") or "").lower()
+                    and abs(float(other.get("Weight") or 0) - float(line.get("Weight") or 0))
+                    < db.DUPLICATE_KG_TOLERANCE
+                ):
+                    dup_messages.append(
+                        f"Charge lines {j + 1} and {i + 1} are the same: "
+                        f"{line.get('Raw_Material_Name')} {float(line.get('Weight') or 0):,.1f} kg"
+                    )
+        dup_ok = locked or confirm_possible_duplicates(
+            dup_messages, key=_pk("dup_charge_ok"), what="charge line"
+        )
+        st.session_state[_pk("dup_charge_blocked")] = not dup_ok
+
         if existing_batch:
             add_col, rem_col, save_col, _ = st.columns([1, 1, 1, 3])
         else:
@@ -1661,6 +1693,12 @@ else:
                 if not production_supervisor:
                     raise ValueError("Select the production supervisor.")
                 inputs_to_save = list(pending_charges)
+                if st.session_state.get(_pk("dup_charge_blocked")):
+                    raise ValueError(
+                        "Not saved: a charge line repeats another one. Remove it, or "
+                        "tick the confirmation under the charge lines if it is a "
+                        "separate trolley."
+                    )
                 total_save_weight = sum(
                     float(c.get("Weight") or 0) for c in inputs_to_save
                 )
@@ -1699,6 +1737,7 @@ else:
                     {"material": "", "lot_id": None, "weight": 0.0, "notes": ""}
                 ]
                 st.session_state.pop(pending_charges_key, None)
+                st.session_state.pop(_pk("dup_charge_ok"), None)
                 st.session_state.pop(_pk("_hydrated_batch_id"), None)
                 st.session_state.pop(create_error_key, None)
                 st.session_state["_pb_select_batch"] = bid
@@ -2156,6 +2195,12 @@ else:
             raise ValueError("Select the melter name.")
         if not production_supervisor:
             raise ValueError("Select the production supervisor.")
+        if pending_charges and st.session_state.get(_pk("dup_charge_blocked")):
+            raise ValueError(
+                "Not saved: a new charge line has the same raw material and net "
+                "weight as one already saved on this batch. Remove it, or tick the "
+                "confirmation under the charge lines if it is a separate trolley."
+            )
         db.update_production_batch_input(
             preview_id,
             extra_inputs=pending_charges,
@@ -2173,6 +2218,7 @@ else:
             for field in _charge_line_fields:
                 st.session_state.pop(_pk(f"{field}_{idx}"), None)
         st.session_state.pop(pending_charges_key, None)
+        st.session_state.pop(_pk("dup_charge_ok"), None)
         drafts[furnace] = [
             {"material": "", "lot_id": None, "weight": 0.0, "notes": ""}
         ]
