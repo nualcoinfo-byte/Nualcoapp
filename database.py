@@ -15658,6 +15658,426 @@ def _pbc_snapshot(batch: dict[str, Any], chemistry: list[dict[str, Any]]) -> tup
     return fields + chem + (str(batch.get("Production_status") or ""),)
 
 
+# ── Charge line correction (part of Production Batch Correction) ─────────────
+# A Completed heat's charge lines decide the lot stock it drew and its cost of
+# production. Correcting them puts the difference back on / takes it off each
+# lot, re-costs the heat's output lines (and its remelt lots), and logs every
+# changed line in production_batch_correction_line (Section "Charge lines").
+# A heat on a packing list / test certificate can still be corrected here: the
+# documents show heat no, kg, pieces and chemistry, none of which change, but
+# the heat's ₹/kg does, so the page warns and the caller must acknowledge it.
+CHARGE_CORRECTION_SECTION = "Charge lines"
+_CHARGE_EPS = 1e-6
+
+
+def _charge_num(value: Any) -> Optional[float]:
+    num = _pbc_number(value)
+    if num is None:
+        return None
+    try:
+        import math
+
+        return None if math.isnan(num) else float(num)
+    except (TypeError, ValueError):
+        return None
+
+
+def batch_charge_lines_for_correction(batch_id: str) -> list[dict[str, Any]]:
+    """The heat's saved charge lines, oldest first, as the correction works on them."""
+    return fetch_all(
+        """
+        SELECT bi.Raw_Material_Name AS "Raw_Material_Name", bi.Lot_id AS "Lot_id",
+               bi.Weight AS "Weight",
+               bi.Weighment_scale_weight AS "Weighment_scale_weight",
+               bi.Trolley_weight AS "Trolley_weight", bi.Trolley_name AS "Trolley_name",
+               bi.Charge_time AS "Charge_time", bi.Notes AS "Notes",
+               bi.Last_updated_by AS "Saved_by"
+        FROM batch_input bi
+        WHERE bi.Batch_ID = ?
+        ORDER BY bi.Charge_time, bi.Lot_id, bi.Raw_Material_Name
+        """,
+        (batch_id,),
+    )
+
+
+def _charge_correction_lots_on_conn(conn: Connection, batch_id: str) -> dict[int, dict[str, Any]]:
+    """Lots a corrected charge line may use: open Ready For Melt lots (as on
+    Production Batch & Chemistry) plus every lot this heat already drew from."""
+    rows = _exec(
+        conn,
+        f"""
+        SELECT i.Lot_id AS "Lot_id", i.Raw_Material_Name AS "Raw_Material_Name",
+               i.Remaining_Weight AS "Remaining_Weight",
+               i.Raw_Material_Status AS "Raw_Material_Status",
+               {lot_charge_cost_sql("i")} AS "Charge_cost_per_kg",
+               p.Invoice_status AS "Invoice_status",
+               CASE WHEN EXISTS (SELECT 1 FROM batch_input b
+                                 WHERE b.Batch_ID = ? AND b.Lot_id = i.Lot_id)
+                    THEN 1 ELSE 0 END AS "On_heat"
+        FROM Raw_Material_Inventory i
+        LEFT JOIN Raw_Material_Purchase p ON p.Purchase_id = i.Purchase_id
+        WHERE (i.Remaining_Weight > 0 AND i.Raw_Material_Status = 'Ready For Melt'
+               AND (p.Invoice_status IS NULL OR p.Invoice_status <> 'Cancelled'))
+           OR i.Lot_id IN (SELECT b.Lot_id FROM batch_input b WHERE b.Batch_ID = ?)
+        """,
+        (batch_id, batch_id),
+    ).mappings()
+    return {int(r["Lot_id"]): dict(r) for r in rows}
+
+
+def batch_charge_correction_lots(batch_id: str) -> dict[int, dict[str, Any]]:
+    with get_connection() as conn:
+        return _charge_correction_lots_on_conn(conn, batch_id)
+
+
+def _charge_scrapped_on_conn(conn: Connection, batch_id: str) -> dict[tuple[str, int], float]:
+    """Kg of each (material, lot) charge already written off to scrap on Record return."""
+    rows = _exec(
+        conn,
+        """
+        SELECT LOWER(Raw_Material_Name) AS "Material", Lot_id AS "Lot_id",
+               SUM(Weight) AS "Weight"
+        FROM batch_input_return
+        WHERE Batch_ID = ? AND Return_type = 'Scrap'
+        GROUP BY LOWER(Raw_Material_Name), Lot_id
+        """,
+        (batch_id,),
+    ).mappings()
+    return {(str(r["Material"]), int(r["Lot_id"])): float(r["Weight"] or 0) for r in rows}
+
+
+def _charge_desc(material: object, lot: object, net: float, scale: Optional[float],
+                 tare: Optional[float]) -> str:
+    text = f"lot {lot} {material}, {net:,.2f} kg"
+    if scale is not None:
+        text += f" (scale {scale:,.2f} − tare {float(tare or 0):,.2f})"
+    return text
+
+
+def _same_num(a: Optional[float], b: Optional[float]) -> bool:
+    if a is None or b is None:
+        return a is None and b is None
+    return abs(float(a) - float(b)) < 0.0005
+
+
+def plan_charge_line_correction(
+    old_lines: list[dict[str, Any]],
+    edits: list[dict[str, Any]],
+    lots: dict[int, dict[str, Any]],
+    scrapped: dict[tuple[str, int], float] | None = None,
+) -> dict[str, Any]:
+    """Work out what a charge-line correction does, without writing anything.
+
+    `old_lines` are the saved lines (batch_charge_lines_for_correction order).
+    `edits` are the edited rows: {"Line": 1-based index into old_lines, or None
+    for a new line, "Lot_id", "Weighment_scale_weight", "Trolley_weight",
+    "Weight" (net kg), "Remove"}. A saved line missing from `edits` is removed.
+
+    Net kg: changing a line's scale or tare moves its net by the same amount
+    (batch_input.Weight is already net of any return to inventory, so it is not
+    simply scale − tare); otherwise the Net (kg) typed is used. A new line with
+    a scale weight nets scale − tare.
+
+    Returns {"changes", "problems", "updates", "deletes", "inserts",
+    "lot_delta", "input_kg", "input_cost", "uncosted_kg", "line_count"}.
+    """
+    scrapped = scrapped or {}
+    problems: list[str] = []
+    changes: list[dict[str, Any]] = []
+    updates: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    deletes: list[dict[str, Any]] = []
+    inserts: list[dict[str, Any]] = []
+    lot_delta: dict[int, float] = {}
+    final: list[dict[str, Any]] = []
+    seen: set[int] = set()
+
+    def _label(n: int, line: dict[str, Any]) -> str:
+        return f"Line {n}: {line.get('Raw_Material_Name')} lot {line.get('Lot_id')}"
+
+    new_n = 0
+    for row in edits:
+        line_no = row.get("Line")
+        line_no = int(line_no) if _charge_num(line_no) is not None else None
+        lot = _charge_num(row.get("Lot_id"))
+        lot = int(lot) if lot is not None else None
+        scale = _charge_num(row.get("Weighment_scale_weight"))
+        tare = _charge_num(row.get("Trolley_weight"))
+        net_typed = _charge_num(row.get("Weight"))
+        remove = bool(row.get("Remove"))
+
+        if line_no is None:
+            if remove or (lot is None and scale is None and net_typed is None):
+                continue  # an empty or struck-out new row
+            new_n += 1
+            where = f"New line {new_n}"
+            if lot is None:
+                problems.append(f"{where}: choose the lot.")
+                continue
+            info = lots.get(lot)
+            if not info:
+                problems.append(f"{where}: lot {lot} is not an open Ready For Melt lot.")
+                continue
+            if scale is not None:
+                if tare is not None and tare < 0:
+                    problems.append(f"{where}: trolley tare cannot be negative.")
+                    continue
+                net = scale - float(tare or 0)
+            else:
+                net = net_typed if net_typed is not None else 0.0
+            if net <= _CHARGE_EPS:
+                problems.append(f"{where}: net kg must be more than zero.")
+                continue
+            new = {"Raw_Material_Name": info["Raw_Material_Name"], "Lot_id": lot,
+                   "Weight": round(net, 4), "Weighment_scale_weight": scale,
+                   "Trolley_weight": tare if scale is not None else None}
+            inserts.append(new)
+            final.append(new)
+            lot_delta[lot] = lot_delta.get(lot, 0.0) + new["Weight"]
+            changes.append({
+                "Section": CHARGE_CORRECTION_SECTION, "Field_name": f"{where} added",
+                "Old_value": "",
+                "New_value": _charge_desc(new["Raw_Material_Name"], lot, new["Weight"],
+                                          scale, new["Trolley_weight"]),
+            })
+            continue
+
+        if line_no < 1 or line_no > len(old_lines) or line_no in seen:
+            problems.append(f"Line {line_no} appears more than once; reload the page.")
+            continue
+        seen.add(line_no)
+        old = old_lines[line_no - 1]
+        old_lot = int(old["Lot_id"])
+        old_net = float(old.get("Weight") or 0)
+        old_scale = _charge_num(old.get("Weighment_scale_weight"))
+        old_tare = _charge_num(old.get("Trolley_weight"))
+        label = _label(line_no, old)
+        old_desc = _charge_desc(old["Raw_Material_Name"], old_lot, old_net, old_scale, old_tare)
+        if remove:
+            deletes.append(old)
+            lot_delta[old_lot] = lot_delta.get(old_lot, 0.0) - old_net
+            changes.append({"Section": CHARGE_CORRECTION_SECTION, "Field_name": f"{label} removed",
+                            "Old_value": old_desc, "New_value": "removed"})
+            continue
+        lot = lot if lot is not None else old_lot
+        info = lots.get(lot)
+        if not info:
+            problems.append(f"{label}: lot {lot} is not an open Ready For Melt lot.")
+            final.append(old)
+            continue
+        weighing_changed = not (_same_num(scale, old_scale) and _same_num(tare, old_tare))
+        net_changed = net_typed is not None and not _same_num(net_typed, old_net)
+        if weighing_changed and net_changed:
+            problems.append(
+                f"{label}: change either the scale / tare or the net kg, not both."
+            )
+            final.append(old)
+            continue
+        if weighing_changed:
+            if scale is None:
+                problems.append(f"{label}: enter the scale weight (or put the old one back).")
+                final.append(old)
+                continue
+            if tare is not None and tare < 0:
+                problems.append(f"{label}: trolley tare cannot be negative.")
+                final.append(old)
+                continue
+            net = old_net + (scale - float(tare or 0)) - (
+                (old_scale or 0.0) - float(old_tare or 0) if old_scale is not None else old_net
+            )
+        else:
+            net = net_typed if net_typed is not None else old_net
+        if net <= _CHARGE_EPS:
+            problems.append(f"{label}: net kg must be more than zero (tick Remove to drop the line).")
+            final.append(old)
+            continue
+        new = {"Raw_Material_Name": info["Raw_Material_Name"], "Lot_id": lot,
+               "Weight": round(net, 4), "Weighment_scale_weight": scale,
+               "Trolley_weight": tare}
+        final.append(new)
+        if lot == old_lot and _same_num(net, old_net) and not weighing_changed:
+            continue
+        updates.append((old, new))
+        lot_delta[old_lot] = lot_delta.get(old_lot, 0.0) - old_net
+        lot_delta[lot] = lot_delta.get(lot, 0.0) + new["Weight"]
+        changes.append({
+            "Section": CHARGE_CORRECTION_SECTION, "Field_name": label, "Old_value": old_desc,
+            "New_value": _charge_desc(new["Raw_Material_Name"], lot, new["Weight"], scale, tare),
+        })
+
+    for n, old in enumerate(old_lines, start=1):
+        if n not in seen:
+            old_net = float(old.get("Weight") or 0)
+            deletes.append(old)
+            lot_delta[int(old["Lot_id"])] = lot_delta.get(int(old["Lot_id"]), 0.0) - old_net
+            changes.append({
+                "Section": CHARGE_CORRECTION_SECTION, "Field_name": f"{_label(n, old)} removed",
+                "Old_value": _charge_desc(old["Raw_Material_Name"], old["Lot_id"], old_net,
+                                          _charge_num(old.get("Weighment_scale_weight")),
+                                          _charge_num(old.get("Trolley_weight"))),
+                "New_value": "removed",
+            })
+
+    for lot, delta in sorted(lot_delta.items()):
+        if delta <= _CHARGE_EPS:
+            continue
+        info = lots.get(lot) or {}
+        if info.get("Invoice_status") == "Cancelled":
+            problems.append(f"Lot {lot} belongs to a cancelled invoice and cannot be charged.")
+            continue
+        have = float(info.get("Remaining_Weight") or 0)
+        if delta > have + 1e-9:
+            problems.append(
+                f"Lot {lot} ({info.get('Raw_Material_Name')}) has {have:,.2f} kg left; this "
+                f"correction needs {delta:,.2f} kg more from it."
+            )
+
+    totals: dict[tuple[str, int], float] = {}
+    for line in final:
+        key = (str(line["Raw_Material_Name"]).lower(), int(line["Lot_id"]))
+        totals[key] = totals.get(key, 0.0) + float(line["Weight"] or 0)
+    for (material, lot), kg in scrapped.items():
+        if totals.get((material, lot), 0.0) + 1e-6 < kg:
+            problems.append(
+                f"{kg:,.2f} kg of {material.upper()} from lot {lot} was written off to scrap "
+                "on Record return, so the heat must keep at least that much charged from it."
+            )
+    if not final:
+        problems.append("A Completed heat needs at least one charge line.")
+
+    input_kg = sum(float(l["Weight"] or 0) for l in final)
+    input_cost = 0.0
+    uncosted = 0.0
+    for line in final:
+        rate = (lots.get(int(line["Lot_id"])) or {}).get("Charge_cost_per_kg")
+        if rate is None:
+            uncosted += float(line["Weight"] or 0)
+        else:
+            input_cost += float(line["Weight"] or 0) * float(rate)
+    return {
+        "changes": changes, "problems": problems, "updates": updates, "deletes": deletes,
+        "inserts": inserts, "lot_delta": lot_delta, "input_kg": input_kg,
+        "input_cost": input_cost, "uncosted_kg": uncosted, "line_count": len(final),
+    }
+
+
+def batch_charge_correction_preview(batch_id: str, edits: list[dict[str, Any]],
+                                    old_lines: list[dict[str, Any]]) -> dict[str, Any]:
+    """plan_charge_line_correction against the current lot stock (for the page preview)."""
+    with get_connection() as conn:
+        lots = _charge_correction_lots_on_conn(conn, batch_id)
+        scrapped = _charge_scrapped_on_conn(conn, batch_id)
+    return plan_charge_line_correction(old_lines, edits, lots, scrapped)
+
+
+def batch_output_cost_summary(batch_id: str) -> dict[str, Any]:
+    """Output kg and the ₹/kg stored on the heat's output lines."""
+    row = fetch_one(
+        """
+        SELECT COALESCE(SUM(Weight), 0) AS "Output_kg",
+               MAX(cost_of_production_per_kg) AS "Material_per_kg",
+               MAX(cost_of_production_overall_per_kg) AS "Overall_per_kg",
+               MAX(conversion_rate_applied) AS "Conversion_rate"
+        FROM batch_output WHERE Batch_ID = ?
+        """,
+        (batch_id,),
+    ) or {}
+    return dict(row)
+
+
+def _charge_snapshot(lines: list[dict[str, Any]]) -> list[tuple]:
+    return sorted(
+        (
+            str(l.get("Raw_Material_Name") or "").lower(),
+            int(l.get("Lot_id") or 0),
+            str(l.get("Charge_time") or ""),
+            round(float(l.get("Weight") or 0), 4),
+            None if _charge_num(l.get("Weighment_scale_weight")) is None
+            else round(float(l["Weighment_scale_weight"]), 3),
+            None if _charge_num(l.get("Trolley_weight")) is None
+            else round(float(l["Trolley_weight"]), 3),
+        )
+        for l in lines
+    )
+
+
+def _apply_charge_correction_on_conn(
+    conn: Connection, batch_id: str, plan: dict[str, Any], saved_by: str
+) -> None:
+    """Write a planned charge-line correction: lines, then lot stock."""
+    for old in plan["deletes"]:
+        _exec(
+            conn,
+            """
+            DELETE FROM batch_input
+            WHERE Batch_ID = ? AND Raw_Material_Name = ? AND Lot_id = ? AND Charge_time = ?
+            """,
+            (batch_id, old["Raw_Material_Name"], int(old["Lot_id"]), old["Charge_time"]),
+        )
+    for old, new in plan["updates"]:
+        try:
+            _exec(
+                conn,
+                """
+                UPDATE batch_input
+                SET Raw_Material_Name = ?, Lot_id = ?, Weight = ?,
+                    Weighment_scale_weight = ?, Trolley_weight = ?, Last_updated_by = ?
+                WHERE Batch_ID = ? AND Raw_Material_Name = ? AND Lot_id = ? AND Charge_time = ?
+                """,
+                (
+                    new["Raw_Material_Name"], int(new["Lot_id"]), new["Weight"],
+                    new.get("Weighment_scale_weight"), new.get("Trolley_weight"), saved_by,
+                    batch_id, old["Raw_Material_Name"], int(old["Lot_id"]), old["Charge_time"],
+                ),
+            )
+        except IntegrityError as exc:
+            raise ValueError(
+                f"Line {old['Raw_Material_Name']} lot {old['Lot_id']} cannot move to lot "
+                f"{new['Lot_id']}: the heat already has a line for that lot at the same "
+                "charge time. Change the other line instead."
+            ) from exc
+    used = {
+        (str(r["Raw_Material_Name"]).lower(), int(r["Lot_id"]), str(r["Charge_time"]))
+        for r in _exec(
+            conn,
+            'SELECT Raw_Material_Name AS "Raw_Material_Name", Lot_id AS "Lot_id", '
+            'Charge_time AS "Charge_time" FROM batch_input WHERE Batch_ID = ?',
+            (batch_id,),
+        ).mappings()
+    }
+    for new in plan["inserts"]:
+        ts = _unique_charge_time(dict(new), used)
+        _exec(
+            conn,
+            """
+            INSERT INTO batch_input
+                (Batch_ID, Raw_Material_Name, Lot_id, Weight, Weighment_scale_weight,
+                 Trolley_weight, Charge_time, Notes, Last_updated_by)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                batch_id, new["Raw_Material_Name"], int(new["Lot_id"]), new["Weight"],
+                new.get("Weighment_scale_weight"), new.get("Trolley_weight"), ts,
+                "Added on Production Batch Correction", saved_by,
+            ),
+        )
+    # Old kg back on, new kg off each lot; a lot emptied lands on exactly zero.
+    for lot, delta in plan["lot_delta"].items():
+        if abs(delta) <= _CHARGE_EPS:
+            continue
+        _exec(
+            conn,
+            """
+            UPDATE Raw_Material_Inventory
+            SET Remaining_Weight = CASE
+                WHEN Remaining_Weight - ? < 0.000001 THEN 0
+                ELSE Remaining_Weight - ?
+            END
+            WHERE Lot_id = ?
+            """,
+            (delta, delta, int(lot)),
+        )
+
+
 def correct_production_batch(
     batch_id: str,
     *,
@@ -15667,14 +16087,23 @@ def correct_production_batch(
     expected_chemistry: list[dict[str, Any]],
     reason: str,
     found_during: Optional[str] = None,
+    charges: Optional[list[dict[str, Any]]] = None,
+    expected_charges: Optional[list[dict[str, Any]]] = None,
+    acknowledge_packed_costing: bool = False,
 ) -> int:
-    """Admin only: correct a Completed heat's header, QA results and chemistry.
+    """Admin only: correct a Completed heat's header, QA results, chemistry and
+    charge lines.
 
     Batch ID, production date, shift, melt no and furnace are not changed here
-    (Admin -> Correct batch ID does that), nor are charge lines. Once the heat is
-    on a packing list (and so on its test certificate) only Melter name and
-    Production supervisor can change; everything those documents show stays
-    locked. A correction that changes anything beyond the crew must leave the
+    (Admin -> Correct batch ID does that). Once the heat is on a packing list
+    (and so on its test certificate) only Melter name and Production supervisor
+    can change among the header / QA / chemistry fields; everything those
+    documents show stays locked. Charge lines (`charges`, the edited rows for
+    plan_charge_line_correction, with `expected_charges` the lines the page
+    loaded) can be corrected on a packed heat too, because the documents do not
+    show them, but the heat's cost of production changes, so
+    `acknowledge_packed_costing` must be True there. A charge correction moves
+    the kg between lots and re-costs the heat's output lines and remelt lots. A correction that changes anything beyond the crew must leave the
     heat meeting every Mark-as-Completed rule. An alloy change moves the heat's
     product-alloy output lines to the new alloy and re-syncs its finished-goods
     bundle. Everything, including one production_batch_correction row and a
@@ -15768,11 +16197,12 @@ def correct_production_batch(
         {s: (composition[s], less_than[s]) for s in composition},
     )
     crew_change_only = production_batch_correction_is_crew_only(planned)
-    if list_batch_packing_lists(batch_id) and not crew_change_only:
+    packed = bool(list_batch_packing_lists(batch_id))
+    if packed and not crew_change_only:
         raise ValueError(
-            f"{batch_id} is on a packing list, so only Melter name and Production "
-            "supervisor can be corrected. Take the heat off the packing list to "
-            "change anything else."
+            f"{batch_id} is on a packing list, so only Melter name, Production "
+            "supervisor and the charge lines can be corrected. Take the heat off the "
+            "packing list to change anything else."
         )
 
     gaps = [] if crew_change_only else production_batch_completion_gaps(
@@ -15787,7 +16217,8 @@ def correct_production_batch(
         middle_sample_datetime=values["Middle_Sample_datetime"],
         bottom_sample_datetime=values["Bottom_Sample_datetime"],
         chemistry_count=len(composition),
-        charge_line_count=len(get_batch_inputs(batch_id)),
+        charge_line_count=len(get_batch_inputs(batch_id)) if charges is None
+        else max(1, sum(1 for c in charges if not c.get("Remove"))),
     )
     if gaps:
         raise ValueError(
@@ -15831,8 +16262,45 @@ def correct_production_batch(
         changes = production_batch_correction_changes(
             dict(current), current_chem, values, {s: (composition[s], less_than[s]) for s in composition}
         )
-        if not changes:
+        charge_plan: Optional[dict[str, Any]] = None
+        if charges is not None:
+            current_lines = [
+                dict(r)
+                for r in _exec(
+                    conn,
+                    """
+                    SELECT Raw_Material_Name AS "Raw_Material_Name", Lot_id AS "Lot_id",
+                           Weight AS "Weight",
+                           Weighment_scale_weight AS "Weighment_scale_weight",
+                           Trolley_weight AS "Trolley_weight", Charge_time AS "Charge_time"
+                    FROM batch_input WHERE Batch_ID = ?
+                    ORDER BY Charge_time, Lot_id, Raw_Material_Name
+                    """,
+                    (batch_id,),
+                ).mappings()
+            ]
+            if _charge_snapshot(current_lines) != _charge_snapshot(expected_charges or []):
+                raise ValueError(
+                    "This heat's charge lines changed while you were editing them. "
+                    "Reload the page and make the correction again."
+                )
+            charge_plan = plan_charge_line_correction(
+                current_lines,
+                charges,
+                _charge_correction_lots_on_conn(conn, batch_id),
+                _charge_scrapped_on_conn(conn, batch_id),
+            )
+            if charge_plan["problems"]:
+                raise ValueError(" ".join(charge_plan["problems"]))
+            if not charge_plan["changes"]:
+                charge_plan = None
+        if not changes and not charge_plan:
             raise ValueError("Nothing was changed, so there is no correction to save.")
+        if charge_plan and packed and not acknowledge_packed_costing:
+            raise ValueError(
+                "This heat is on a packing list / test certificate. Tick the box "
+                "confirming the change to its cost of production, then save again."
+            )
 
         saved_by, stamp = audit_stamp()
         _exec(
@@ -15891,6 +16359,30 @@ def correct_production_batch(
                 )
             if (batch.get("Output_status") or "") == BATCH_STATUS_COMPLETED:
                 _resync_finished_goods_after_correction(conn, batch_id)
+
+        if charge_plan:
+            cost_sql = """
+                SELECT MAX(cost_of_production_per_kg) AS "Material",
+                       MAX(cost_of_production_overall_per_kg) AS "Overall"
+                FROM batch_output WHERE Batch_ID = ?
+            """
+            before = dict(_exec(conn, cost_sql, (batch_id,)).mappings().first() or {})
+            _apply_charge_correction_on_conn(conn, batch_id, charge_plan, saved_by)
+            _recost_batch_outputs_on_conn(conn, batch_id)
+            after = dict(_exec(conn, cost_sql, (batch_id,)).mappings().first() or {})
+            changes.extend(charge_plan["changes"])
+            for key, label in (("Material", "Material ₹/kg"), ("Overall", "Overall ₹/kg")):
+                old_v, new_v = before.get(key), after.get(key)
+                if old_v is None and new_v is None:
+                    continue
+                if old_v is not None and new_v is not None and abs(float(old_v) - float(new_v)) < 0.00005:
+                    continue
+                changes.append({
+                    "Section": "Costing",
+                    "Field_name": label + " on output lines",
+                    "Old_value": "" if old_v is None else f"{float(old_v):,.4f}",
+                    "New_value": "" if new_v is None else f"{float(new_v):,.4f}",
+                })
 
         correction_id = int(
             _exec(

@@ -6,7 +6,6 @@ import streamlit as st
 import database as db
 from pages_common import (
     UI_DATE_WIDGET_FORMAT,
-    df_from_rows,
     empty_percent_input,
     format_ui_date,
     parse_any_date,
@@ -18,14 +17,17 @@ st.title("Production Batch Correction")
 st.caption(
     "**Admin only.** Correct a heat whose input is already **Completed** and locked "
     "on **Production Batch & Chemistry**: alloy, melter, production supervisor, notes, "
-    "degassing, sampled / defect pcs, sample results and chemistry. Once the heat is "
-    "on a **Packing List** (and its test certificate), only **Melter name** and "
-    "**Production supervisor** can be corrected; everything else is locked. A "
+    "degassing, sampled / defect pcs, sample results, chemistry and **charge lines**. "
+    "Correcting a charge line puts the kg back on the old lot, takes it off the new one "
+    "and re-costs the heat's output (and its remelt lots). Once the heat is on a "
+    "**Packing List** (and its test certificate), only **Melter name**, **Production "
+    "supervisor** and the charge lines can be corrected; everything else is locked. A "
     "correction that changes more than those two must leave the heat meeting every "
     "**Mark as Completed** rule. Every saved "
     "correction is logged with **who** made it, **when** (IST), the reason, and the "
     "old and new value of each field. Batch ID, production date, shift and melt no "
-    "are changed on **Admin → Correct batch ID**; charge lines are not changed here. "
+    "are changed on **Admin → Correct batch ID**; output lines on **Batch Output "
+    "Correction**. "
     "Heats still In-Progress are edited on Production Batch & Chemistry."
 )
 
@@ -170,20 +172,11 @@ if packing_lists:
             f"#{p['Packing_list_id']} ({p.get('Packing_list_status')})"
             for p in packing_lists
         )
-        + ". Only **Melter name** and **Production supervisor** can be corrected: "
-        "they are not on the packing list or the test certificate. Every other field "
-        "is locked. To change one, take the heat off the packing list first."
+        + ". Only **Melter name**, **Production supervisor** and the **charge lines** "
+        "can be corrected: they are not on the packing list or the test certificate. "
+        "Every other field is locked. To change one, take the heat off the packing "
+        "list first."
     )
-
-charges = db.get_batch_inputs(bid)
-with st.expander(
-    f"Charge lines (read only): {len(charges)} line(s), "
-    f"{sum(_kg(c.get('Weight')) for c in charges):,.2f} kg net"
-):
-    if charges:
-        show_dataframe(df_from_rows(charges))
-    else:
-        st.caption("No charge lines on this heat.")
 
 # ── Load the saved heat into the form once per heat (and again after a save) ─
 version = int(st.session_state.get(f"pbc_ver_{bid}", 0))
@@ -272,7 +265,39 @@ if expected_key not in st.session_state:
         )
     st.session_state[_k("chem_df")] = pd.DataFrame(rows)
 
+    # Charge lines: the saved lines (for the stale-save check) and the lots a
+    # line can use, labelled once so the editor's choices stay stable.
+    saved_lines = db.batch_charge_lines_for_correction(bid)
+    lot_info = db.batch_charge_correction_lots(bid)
+    lot_labels = {
+        lot_id: f"{lot_id} · {info.get('Raw_Material_Name')} · "
+        f"{_kg(info.get('Remaining_Weight')):,.1f} kg left"
+        + ("" if info.get("Raw_Material_Status") == "Ready For Melt"
+           else f" · {info.get('Raw_Material_Status') or 'no status'}")
+        for lot_id, info in sorted(lot_info.items())
+    }
+    st.session_state[_k("charges_expected")] = saved_lines
+    st.session_state[_k("lot_labels")] = lot_labels
+    st.session_state[_k("charge_df")] = pd.DataFrame(
+        [
+            {
+                "Line": n,
+                "Charged at": format_ui_date(line.get("Charge_time"), with_time=True),
+                "Lot": lot_labels.get(int(line["Lot_id"])),
+                "Scale (kg)": line.get("Weighment_scale_weight"),
+                "Tare (kg)": line.get("Trolley_weight"),
+                "Net (kg)": _kg(line.get("Weight")),
+                "Remove": False,
+            }
+            for n, line in enumerate(saved_lines, start=1)
+        ],
+        columns=["Line", "Charged at", "Lot", "Scale (kg)", "Tare (kg)", "Net (kg)", "Remove"],
+    )
+
 expected_batch, expected_chem = st.session_state[expected_key]
+expected_charges = st.session_state[_k("charges_expected")]
+lot_labels = st.session_state[_k("lot_labels")]
+lot_by_label = {label: lot_id for lot_id, label in lot_labels.items()}
 
 # ── Header ───────────────────────────────────────────────────────────────────
 st.markdown("#### Heat details")
@@ -440,6 +465,98 @@ if out_of_spec:
         + ". You can still save if this is what the spectrometer reported."
     )
 
+# ── Charge lines ─────────────────────────────────────────────────────────────
+st.markdown("#### Charge lines")
+st.caption(
+    "Change a line's **Lot**, its **Scale** / **Tare** reading (the net kg moves by the "
+    "same amount) or its **Net (kg)** directly; tick **Remove** to drop a line, or add "
+    "a row at the bottom for a missing one (pick the lot, then the scale and tare or "
+    "the net kg). Lots offered are open **Ready For Melt** lots plus the lots this heat "
+    "already used. On save the kg goes back on the old lot and comes off the new one, "
+    "and the heat's output is re-costed."
+)
+if packing_lists:
+    st.warning(
+        "**Costing impact:** this heat is on "
+        + ", ".join(
+            f"packing list #{p['Packing_list_id']} ({p.get('Packing_list_status')})"
+            for p in packing_lists
+        )
+        + " and so on its test certificate. Correcting the charge lines changes this "
+        "heat's **cost of production** (material ₹/kg and overall ₹/kg on its output "
+        "lines), and with it the cost and margin figures for that packing list / "
+        "test certificate. The documents themselves (heat no, kg, pieces, chemistry) "
+        "do not change."
+    )
+charge_edit = st.data_editor(
+    st.session_state[_k("charge_df")],
+    key=_k("charge_editor"),
+    hide_index=True,
+    use_container_width=True,
+    num_rows="dynamic",
+    disabled=["Line", "Charged at"],
+    column_config={
+        "Line": st.column_config.NumberColumn("Line", format="%d", width="small"),
+        "Charged at": st.column_config.TextColumn("Charged at"),
+        "Lot": st.column_config.SelectboxColumn(
+            "Lot", options=list(lot_labels.values()), width="large", required=False
+        ),
+        "Scale (kg)": st.column_config.NumberColumn("Scale (kg)", min_value=0.0, format="%.2f"),
+        "Tare (kg)": st.column_config.NumberColumn("Tare (kg)", min_value=0.0, format="%.2f"),
+        "Net (kg)": st.column_config.NumberColumn("Net (kg)", min_value=0.0, format="%.2f"),
+        "Remove": st.column_config.CheckboxColumn("Remove"),
+    },
+)
+charge_edits = [
+    {
+        "Line": row.get("Line"),
+        "Lot_id": lot_by_label.get(row.get("Lot")),
+        "Weighment_scale_weight": row.get("Scale (kg)"),
+        "Trolley_weight": row.get("Tare (kg)"),
+        "Weight": row.get("Net (kg)"),
+        "Remove": bool(row.get("Remove")) if not pd.isna(row.get("Remove")) else False,
+    }
+    for _i, row in charge_edit.iterrows()
+]
+charge_plan = db.batch_charge_correction_preview(bid, charge_edits, expected_charges)
+charge_changes = charge_plan["changes"]
+if charge_changes:
+    cost_now = db.batch_output_cost_summary(bid)
+    output_kg = _kg(cost_now.get("Output_kg"))
+    old_kg = sum(_kg(l.get("Weight")) for l in expected_charges)
+    new_kg = charge_plan["input_kg"]
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Charged (kg)", f"{new_kg:,.2f}", f"{new_kg - old_kg:+,.2f} kg",
+              delta_color="off")
+    if output_kg > 0:
+        c2.metric("Yield", f"{output_kg / new_kg * 100:,.2f}%" if new_kg > 0 else "—",
+                  f"was {output_kg / old_kg * 100:,.2f}%" if old_kg > 0 else None,
+                  delta_color="off")
+        new_material = charge_plan["input_cost"] / output_kg
+        old_material = cost_now.get("Material_per_kg")
+        c3.metric(
+            "Material ₹/kg (after)", f"{new_material:,.2f}",
+            f"was {float(old_material):,.2f}" if old_material is not None else None,
+            delta_color="off",
+            help="Charged value ÷ output kg, as Batch Output works it out. Saved on "
+            "every output line of the heat when you save.",
+        )
+        conv = cost_now.get("Conversion_rate")
+        if conv is not None:
+            old_overall = cost_now.get("Overall_per_kg")
+            c4.metric(
+                "Overall ₹/kg (after)", f"{new_material + float(conv):,.2f}",
+                f"was {float(old_overall):,.2f}" if old_overall is not None else None,
+                delta_color="off",
+            )
+    else:
+        c2.caption("No output saved on this heat yet, so there is no ₹/kg to re-cost.")
+    if charge_plan["uncosted_kg"] > 0.005:
+        st.caption(
+            f"{charge_plan['uncosted_kg']:,.2f} kg is on lots with no cost per kg yet; "
+            "it counts as ₹0 until the invoice is costed."
+        )
+
 # ── What will be saved ───────────────────────────────────────────────────────
 header = {
     "Alloy_id": alloy_id,
@@ -483,12 +600,13 @@ gaps = [] if crew_change_only else db.production_batch_completion_gaps(
     middle_sample_datetime=sample_dts["Middle"],
     bottom_sample_datetime=sample_dts["Bottom"],
     chemistry_count=len(chemistry),
-    charge_line_count=len(charges),
+    charge_line_count=max(1, charge_plan["line_count"]),
 )
+problems.extend(charge_plan["problems"])
 if crew_only and not crew_change_only:
     problems.append(
-        "This heat is on a packing list: only Melter name and Production supervisor "
-        "can be corrected."
+        "This heat is on a packing list: only Melter name, Production supervisor "
+        "and the charge lines can be corrected."
     )
 if gaps:
     problems.append(
@@ -496,8 +614,9 @@ if gaps:
         + "; ".join(gaps)
     )
 
-if not changes:
-    st.info("No changes yet. Edit a field or a chemistry value above.")
+all_changes = changes + charge_changes
+if not all_changes:
+    st.info("No changes yet. Edit a field, a chemistry value or a charge line above.")
 else:
     show_dataframe(
         pd.DataFrame(
@@ -508,7 +627,7 @@ else:
                     "Old value": c["Old_value"],
                     "New value": c["New_value"],
                 }
-                for c in changes
+                for c in all_changes
             ]
         )
     )
@@ -540,12 +659,20 @@ with r2:
         height=80,
     )
 
+acknowledged = True
+if packing_lists and charge_changes:
+    acknowledged = st.checkbox(
+        "I understand this changes the cost of production of a heat that is on a "
+        "packing list / test certificate.",
+        key=_k("ack_packed"),
+    )
+
 st.caption(f"Saved as **{db.get_acting_user()}** at the time you click Save (IST).")
 if st.button(
     "Save correction",
     type="primary",
     key=_k("save"),
-    disabled=bool(problems) or not changes or not reason.strip(),
+    disabled=bool(problems) or not all_changes or not reason.strip() or not acknowledged,
     help="Needs at least one change, a reason, and every Mark as Completed rule met.",
 ):
     try:
@@ -557,6 +684,9 @@ if st.button(
             expected_chemistry=expected_chem,
             reason=reason,
             found_during=None if found == "—" else found,
+            charges=charge_edits,
+            expected_charges=expected_charges,
+            acknowledge_packed_costing=bool(acknowledged),
         )
     except Exception as exc:
         st.error(str(exc))
@@ -565,7 +695,9 @@ if st.button(
         st.cache_data.clear()
         st.session_state[_FLASH_KEY] = (
             f"Correction #{correction_id} saved for **{bid}** "
-            f"({len(changes)} change{'s' if len(changes) != 1 else ''} logged)."
+            f"({len(all_changes)} change{'s' if len(all_changes) != 1 else ''} logged"
+            + ("; lot stock and output cost updated" if charge_changes else "")
+            + ")."
         )
         st.rerun()
 
