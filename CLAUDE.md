@@ -127,7 +127,8 @@ Postgres folds them to lowercase, so every SELECT aliases columns with quoted na
    and a change beyond the crew must still pass every completion rule; an alloy change moves the product output
    lines. Batch ID/date/shift/melt via Admin → Correct batch ID.
 4. **Spectro analysis.** Chemistry is typed in from the **Bruker Q2 ION optical emission spectrometer** per heat and
-   checked against `Alloy_Master_spec` min/max (out-of-spec in red). **SF** = Fe + 2×Mn + 3×Cr is entered from the spectro;
+   checked against `Alloy_Master_spec` min/max (out-of-spec in red). *Batch Analysis* checks one heat against every alloy spec
+   (alternative customers for stock) and side by side against one (deviation sheet). **SF** = Fe + 2×Mn + 3×Cr is entered from the spectro;
    the formula is shown as a guide only. Below-detection values print as `<`. There is no instrument integration.
 5. **Output & yield.** *Batch Output* / *Quick Batch Output* record output lines: product alloy plus **78 Broken Ingot,
    79 Furnace Empty, 80 Not Ok Ingot** (samples, furnace heel/empties, off-chem ingot). Net = scale − stand (stand is

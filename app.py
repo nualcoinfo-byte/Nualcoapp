@@ -247,6 +247,7 @@ NAV_SECTIONS: list[tuple[str, list[str]]] = [
             "Production and Profitability dashboard",
             "Production Data Analysis",
             "Production Snapshot",
+            "Batch Analysis",
             "Melter Output",
         ],
     ),
@@ -863,6 +864,11 @@ MIGRATED_PAGES: dict[str, st.Page] = {
         "app_pages/test_certificate.py",
         title="Test Certificate",
         url_path="test-certificate",
+    ),
+    "Batch Analysis": st.Page(
+        "app_pages/batch_analysis.py",
+        title="Batch Analysis",
+        url_path="batch-analysis",
     ),
     "Test Certificate Snapshot": st.Page(
         "app_pages/test_certificate_snapshot.py",

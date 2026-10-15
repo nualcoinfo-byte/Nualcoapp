@@ -49,6 +49,10 @@ Rollback points if needed: `9d4a696` (before today), `8b074f0` (after #35–#37)
   chemistry). On a packed heat only the crew can change. Not covered: charge lines, batch ID/date/shift/melt
 - ✅ Daily Batch Summary, Production Batches, Production Snapshot (columns trimmed in #39), Production Data Analysis
 - ✅ Melter Output report (CSV / Excel) for melter pay
+- ✅ Batch Analysis (Oct 2026, Overview): search a heat by Batch ID / heat no / customer / alloy; production, QA,
+  charge, returns, chemistry, output, FG and dispatch on one page; **alternative customers** (heat chemistry vs every
+  alloy spec + open P.O.s) and **spec comparison** with out-of-spec elements in red, CSV / PDF deviation sheet
+  (`compare_chemistry_to_spec`, `match_batch_to_alloys`; same in-spec rule as `element_percent_out_of_spec`)
 - ✅ Admin: Correct batch ID (all-or-nothing rename across tables)
 - ✅ Removed duplicate *Material Recovery & Yield* page (#35)
 
