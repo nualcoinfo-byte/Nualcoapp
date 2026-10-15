@@ -65,6 +65,9 @@ Rollback points if needed: `9d4a696` (before today), `8b074f0` (after #35–#37)
 - ✅ Packing List: partial heats, several POs per list, search by heat no, Sale vs Conversion return
 - ✅ Test Certificate: draft (merge heats, ≤0.15% kg round-up), visual inspection, verify / reject / return, issue, PDF
 - ✅ Admin: cancel (void) an issued certificate
+- ✅ Test Certificate Snapshot (Oct 2026): all certificates by invoice date (source / printed kg, pieces, status, all
+  P.O.s) with bulk **Verify selected** / **Issue selected** for ones stuck at Pending verification / Verified
+  (`db.list_certificate_snapshot`; calls the same verify / issue functions, so rules and roles are unchanged)
 - ✅ Download PDF beside Print summary on Packing List Summary, Test Certificate Summary and Test Certificate
   Checking Summary (`pages_common.summary_pdf_bytes`, fpdf2, A4, table header repeats on each page); file named
   `Customer name_Alloy name_Invoice date.pdf` (`summary_pdf_file_name`)

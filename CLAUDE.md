@@ -142,6 +142,7 @@ Postgres folds them to lowercase, so every SELECT aliases columns with quoted na
 8. **Dispatch & QA.** *Packing List* takes kg/pcs out of FG (part heats allowed, several POs per list) → Approved →
    *Test Certificate* Draft (Inventory/Management merge heats, round kg up ≤ 0.15%, pieces exact) → visual inspection +
    Verify (Production/Management) → Issued = dispatched. Admin can void an Issued certificate.
+   *Test Certificate Snapshot* lists every certificate and bulk-verifies / issues ones left at Pending verification / Verified.
 9. **Toll conversion.** Brakes India borings can come in as *Conversion* receipts; LM25 goes back at **70%** of collected
    weight as a "Conversion return" packing list, tracked on *Brakes India Conversion*.
 10. **Utilities & people.** Furnace oil purchase/consumption from dip readings (tank charts, interpolated), electricity

@@ -265,6 +265,7 @@ NAV_SECTIONS: list[tuple[str, list[str]]] = [
             "Finished Goods Inventory",
             "Packing List",
             "Test Certificate",
+            "Test Certificate Snapshot",
             "Bill of Materials",
         ],
     ),
@@ -862,6 +863,11 @@ MIGRATED_PAGES: dict[str, st.Page] = {
         "app_pages/test_certificate.py",
         title="Test Certificate",
         url_path="test-certificate",
+    ),
+    "Test Certificate Snapshot": st.Page(
+        "app_pages/test_certificate_snapshot.py",
+        title="Test Certificate Snapshot",
+        url_path="test-certificate-snapshot",
     ),
     "Production Batch & Chemistry": st.Page(
         "app_pages/production_batch.py",
