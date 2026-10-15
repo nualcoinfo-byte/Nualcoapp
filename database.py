@@ -13201,6 +13201,90 @@ def cancel_packing_list(packing_list_id: int) -> dict[str, Any]:
     return updated
 
 
+def list_certificate_snapshot(
+    start_date: object = None,
+    end_date: object = None,
+    statuses: Optional[Iterable[str]] = None,
+) -> list[dict[str, Any]]:
+    """One row per test certificate for the Test Certificate Snapshot page.
+
+    Packed (source) kg / pieces are what the packing list took from finished
+    goods; printed kg / pieces are the certificate lines. Lines are summed on
+    their own before the join so the totals are not multiplied, and a
+    certificate with no lines yet still shows (with 0 printed). Every P.O. on
+    the packing list is listed. Filtered on invoice date (inclusive) and status.
+    """
+    where: list[str] = []
+    params: list[Any] = []
+    if start_date:
+        where.append("SUBSTR(p.Invoice_date, 1, 10) >= ?")
+        params.append(_coerce_production_date(start_date).isoformat())
+    if end_date:
+        where.append("SUBSTR(p.Invoice_date, 1, 10) <= ?")
+        params.append(_coerce_production_date(end_date).isoformat())
+    picked = [s for s in (statuses or []) if s]
+    if picked:
+        where.append(f"c.Status IN ({', '.join('?' for _ in picked)})")
+        params.extend(picked)
+    where_sql = ("WHERE " + " AND ".join(where)) if where else ""
+    rows = fetch_all(
+        f"""
+        SELECT p.Packing_list_id AS "Packing_list_id",
+               p.Invoice_date AS "Invoice_date",
+               p.Invoice_number AS "Invoice_number",
+               c.Certificate_no AS "Certificate_no",
+               p.Customer_PO_No AS "Customer_PO_No",
+               p.Customer_name AS "Customer_name",
+               a.Alloy_name AS "Alloy_name",
+               p.Dispatch_type AS "Dispatch_type",
+               p.Packing_list_status AS "Packing_list_status",
+               c.Source_weight AS "Source_kg",
+               c.Source_pieces AS "Source_pieces",
+               COALESCE(lt.Line_kg, 0) AS "Printed_kg",
+               COALESCE(lt.Line_pieces, 0) AS "Printed_pieces",
+               COALESCE(lt.Line_count, 0) AS "Lines",
+               c.Status AS "Status",
+               c.Issued_date AS "Issued_date",
+               c.Last_updated_by AS "Last_updated_by",
+               c.Last_updated_datetime AS "Last_updated_datetime"
+        FROM Packing_list_certificate c
+        JOIN Packing_list p ON p.Packing_list_id = c.Packing_list_id
+        LEFT JOIN Alloy_Master a ON a.Alloy_id = p.Alloy_id
+        LEFT JOIN (
+            SELECT Packing_list_id,
+                   SUM(Weight) AS Line_kg,
+                   SUM(Pieces) AS Line_pieces,
+                   COUNT(*) AS Line_count
+            FROM Packing_list_certificate_line
+            GROUP BY Packing_list_id
+        ) lt ON lt.Packing_list_id = c.Packing_list_id
+        {where_sql}
+        ORDER BY p.Invoice_date DESC, p.Packing_list_id DESC
+        """,
+        params,
+    )
+    if not rows:
+        return rows
+    pos: dict[int, list[str]] = {}
+    for r in fetch_all(
+        """
+        SELECT Packing_list_id AS "Packing_list_id", Customer_PO_No AS "Customer_PO_No"
+        FROM Packing_list_po
+        ORDER BY Packing_list_id, Seq
+        """
+    ):
+        po = str(r.get("Customer_PO_No") or "").strip()
+        if po:
+            lst = pos.setdefault(int(r["Packing_list_id"]), [])
+            if po not in lst:
+                lst.append(po)
+    for row in rows:
+        listed = pos.get(int(row["Packing_list_id"]))
+        if listed:
+            row["Customer_PO_No"] = ", ".join(listed)
+    return rows
+
+
 def list_issued_certificates() -> list[dict[str, Any]]:
     """Issued test certificates for the Admin cancel page."""
     _ensure_packing_list_ready()
