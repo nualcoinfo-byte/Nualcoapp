@@ -12626,6 +12626,250 @@ def list_packing_list_spec_deviations(packing_list_id: int) -> list[dict[str, An
     ]
 
 
+# ── Batch Analysis: one heat's chemistry against any alloy spec ──────────────
+# Used to divert ready stock to another customer whose alloy the heat already
+# meets (when the ordering customer delays dispatch), and to list the elements
+# a deviation request would have to cover. "In spec" is decided by
+# element_percent_out_of_spec, the same rule as the packing-list deviation check
+# (on the limit counts as out; a below-detection value fails only over the max).
+SPEC_MATCH_FULL = "Meets spec"
+SPEC_MATCH_UNCHECKED = "Meets spec (some elements not measured)"
+SPEC_MATCH_DEVIATION = "Needs deviation"
+SPEC_STATUS_OK = "Within spec"
+SPEC_STATUS_LOW = "Below min"
+SPEC_STATUS_HIGH = "Above max"
+SPEC_STATUS_MISSING = "Not measured"
+
+
+def _spec_limit(value: Any) -> Optional[float]:
+    try:
+        num = float(value)
+    except (TypeError, ValueError):
+        return None
+    return None if num != num else num
+
+
+def compare_chemistry_to_spec(
+    chemistry: list[dict[str, Any]], spec_rows: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Element-by-element comparison of a heat's chemistry with one alloy spec.
+
+    `chemistry`: get_batch_chemistry rows. `spec_rows`: Element_symbol,
+    Min_percent, Max_percent (+ Element_Name). A spec line with no positive min
+    or max sets no limit and is skipped. Returns one row per spec element:
+    Element_symbol, Element_Name, Percentage, Less_than, Min_percent,
+    Max_percent, Spec, Status, Deviation (how far past the limit, in % points;
+    0 when within), Headroom (distance to the nearer limit when within).
+    """
+    chem = {
+        str(r.get("Element_symbol") or "").strip(): r
+        for r in chemistry or []
+        if str(r.get("Element_symbol") or "").strip()
+    }
+    out: list[dict[str, Any]] = []
+    for spec in spec_rows or []:
+        sym = str(spec.get("Element_symbol") or "").strip()
+        lo, hi = _spec_limit(spec.get("Min_percent")), _spec_limit(spec.get("Max_percent"))
+        if not sym or not ((lo or 0) > 0 or (hi or 0) > 0):
+            continue
+        lo = lo if (lo or 0) > 0 else None
+        hi = hi if (hi or 0) > 0 else None
+        rec = chem.get(sym) or {}
+        pct = _spec_limit(rec.get("Percentage"))
+        less = bool(rec.get("Less_than"))
+        row = {
+            "Element_symbol": sym,
+            "Element_Name": spec.get("Element_Name") or sym,
+            "Percentage": pct if pct and pct > 0 else None,
+            "Less_than": less,
+            "Min_percent": lo,
+            "Max_percent": hi,
+            "Spec": format_alloy_spec_percent(lo or 0, hi or 0) if hi else f"{lo:g} min",
+            "Deviation": 0.0,
+            "Headroom": None,
+        }
+        if not pct or pct <= 0:
+            row["Status"] = SPEC_STATUS_MISSING
+        elif element_percent_out_of_spec(pct, lo, hi, less_than=less):
+            if hi is not None and pct >= hi:
+                row["Status"] = SPEC_STATUS_HIGH
+                row["Deviation"] = round(pct - hi, 6)
+            else:
+                row["Status"] = SPEC_STATUS_LOW
+                row["Deviation"] = round((lo or 0) - pct, 6)
+        else:
+            row["Status"] = SPEC_STATUS_OK
+            gaps = [g for g in ((pct - lo) if lo is not None and not less else None,
+                                (hi - pct) if hi is not None else None) if g is not None]
+            row["Headroom"] = round(min(gaps), 6) if gaps else None
+        out.append(row)
+    return out
+
+
+def summarize_spec_comparison(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    """Verdict for one alloy: Meets spec / Meets spec (some not measured) / Needs deviation."""
+    off = [r for r in rows if r["Status"] in (SPEC_STATUS_LOW, SPEC_STATUS_HIGH)]
+    missing = [r for r in rows if r["Status"] == SPEC_STATUS_MISSING]
+    checked = [r for r in rows if r["Status"] == SPEC_STATUS_OK]
+    if off:
+        verdict = SPEC_MATCH_DEVIATION
+    elif missing:
+        verdict = SPEC_MATCH_UNCHECKED
+    else:
+        verdict = SPEC_MATCH_FULL
+    tight = min(
+        (r for r in checked if r.get("Headroom") is not None),
+        key=lambda r: r["Headroom"],
+        default=None,
+    )
+    return {
+        "Verdict": verdict,
+        "Elements": len(rows),
+        "Within": len(checked),
+        "Out": len(off),
+        "Missing": len(missing),
+        "Out_elements": off,
+        "Missing_elements": [r["Element_symbol"] for r in missing],
+        "Tightest": tight,
+    }
+
+
+def _all_alloy_spec_rows() -> dict[int, list[dict[str, Any]]]:
+    rows = fetch_all(
+        """
+        SELECT s.Alloy_id AS "Alloy_id", s.Element_symbol AS "Element_symbol",
+               s.Min_percent AS "Min_percent", s.Max_percent AS "Max_percent",
+               COALESCE(e.Element_Name, s.Element_symbol) AS "Element_Name"
+        FROM Alloy_Master_spec s
+        LEFT JOIN Element_Master e ON e.Element_Symbol = s.Element_symbol
+        ORDER BY s.Alloy_id, COALESCE(e.Serial_no, 9999), s.Element_symbol
+        """
+    )
+    out: dict[int, list[dict[str, Any]]] = {}
+    for r in rows:
+        out.setdefault(int(r["Alloy_id"]), []).append(r)
+    return out
+
+
+def alloy_spec_rows(alloy_id: object) -> list[dict[str, Any]]:
+    try:
+        return _all_alloy_spec_rows().get(int(alloy_id), [])
+    except (TypeError, ValueError):
+        return []
+
+
+def open_po_demand_by_alloy() -> dict[int, dict[str, Any]]:
+    """Open purchase orders per alloy: count, ordered kg, earliest delivery date."""
+    rows = fetch_all(
+        """
+        SELECT Alloy_Id AS "Alloy_id", COUNT(*) AS "Open_POs",
+               SUM(COALESCE(Order_Qty, 0)) AS "Order_kg",
+               MIN(Delivery_Date) AS "Next_delivery"
+        FROM Purchase_Order
+        WHERE COALESCE(Purchase_Order_Status, 'Open') = 'Open'
+        GROUP BY Alloy_Id
+        """
+    )
+    return {int(r["Alloy_id"]): dict(r) for r in rows if r.get("Alloy_id") is not None}
+
+
+def match_batch_to_alloys(
+    batch_id: str, *, include_inactive: bool = False
+) -> list[dict[str, Any]]:
+    """Every customer alloy with a spec, checked against this heat's chemistry.
+
+    Sidestream outputs (78/79/80) are left out, as are Inactive alloys unless
+    asked. Sorted: Meets spec, then Meets spec with unmeasured elements, then
+    Needs deviation by fewest elements out and smallest total excess.
+    """
+    batch = get_batch(batch_id) or {}
+    chemistry = get_batch_chemistry(batch_id)
+    specs = _all_alloy_spec_rows()
+    demand = open_po_demand_by_alloy()
+    rank = {SPEC_MATCH_FULL: 0, SPEC_MATCH_UNCHECKED: 1, SPEC_MATCH_DEVIATION: 2}
+    out: list[dict[str, Any]] = []
+    for alloy in list_alloys(include_sidestream=False):
+        aid = int(alloy["Alloy_id"])
+        if not include_inactive and (alloy.get("Status") or "Active") != "Active":
+            continue
+        rows = compare_chemistry_to_spec(chemistry, specs.get(aid, []))
+        if not rows:
+            continue
+        summary = summarize_spec_comparison(rows)
+        po = demand.get(aid, {})
+        out.append({
+            "Alloy_id": aid,
+            "Alloy_name": alloy.get("Alloy_name"),
+            "Customer_name": alloy.get("Customer_name"),
+            "Alloy_group": alloy.get("Alloy_group"),
+            "Bis_Designation": alloy.get("Bis_Designation"),
+            "Status": alloy.get("Status") or "Active",
+            "Is_batch_alloy": str(batch.get("Alloy_id") or "") == str(aid),
+            "Open_POs": int(po.get("Open_POs") or 0),
+            "Open_PO_kg": float(po.get("Order_kg") or 0),
+            "Next_delivery": po.get("Next_delivery"),
+            "Rows": rows,
+            **summary,
+            "_rank": (
+                rank[summary["Verdict"]],
+                summary["Out"],
+                round(sum(r["Deviation"] for r in summary["Out_elements"]), 6),
+                str(alloy.get("Alloy_name") or "").lower(),
+            ),
+        })
+    out.sort(key=lambda r: r["_rank"])
+    return out
+
+
+def search_batches_for_analysis(term: str, limit: int = 300) -> list[dict[str, Any]]:
+    """Heats whose Batch ID, heat no, customer name or alloy name contains `term`
+    (any case), newest first. A blank term returns the newest heats."""
+    text = (term or "").strip().lower()
+    rows = list_batches()
+    if text:
+        rows = [
+            r for r in rows
+            if any(text in str(r.get(k) or "").lower()
+                   for k in ("Batch_ID", "Heat_no", "Customer_name", "Alloy_name"))
+        ]
+    return rows[:limit]
+
+
+def batch_finished_goods(batch_id: str) -> list[dict[str, Any]]:
+    """Finished-goods bundles of a heat (kg / pieces by status)."""
+    return fetch_all(
+        """
+        SELECT Bundle_id AS "Bundle_id", Output_Weight AS "Output_Weight",
+               Output_pieces AS "Output_pieces",
+               Finished_Goods_Status AS "Finished_Goods_Status"
+        FROM Finished_Goods_Inventory
+        WHERE Batch_ID = ?
+        ORDER BY Bundle_id
+        """,
+        (batch_id,),
+    )
+
+
+def batch_dispatch_history(batch_id: str) -> list[dict[str, Any]]:
+    """Every packing list (any status) carrying this heat, with its certificate."""
+    return fetch_all(
+        """
+        SELECT p.Packing_list_id AS "Packing_list_id", p.Invoice_date AS "Invoice_date",
+               p.Invoice_number AS "Invoice_number", p.Customer_name AS "Customer_name",
+               a.Alloy_name AS "Alloy_name", p.Packing_list_status AS "Packing_list_status",
+               lb.Weight AS "Weight", lb.Pieces AS "Pieces",
+               c.Certificate_no AS "Certificate_no", c.Status AS "Certificate_status"
+        FROM Packing_list_batch lb
+        JOIN Packing_list p ON p.Packing_list_id = lb.Packing_list_id
+        LEFT JOIN Alloy_Master a ON a.Alloy_id = p.Alloy_id
+        LEFT JOIN Packing_list_certificate c ON c.Packing_list_id = p.Packing_list_id
+        WHERE lb.Batch_ID = ?
+        ORDER BY p.Packing_list_id DESC
+        """,
+        (batch_id,),
+    )
+
+
 def _validate_deviation_letter_name(filename: str) -> None:
     lower = (filename or "").strip().lower()
     if not any(lower.endswith(ext) for ext in DEVIATION_LETTER_EXTENSIONS):

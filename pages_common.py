@@ -1425,7 +1425,8 @@ def summary_pdf_bytes(
     Each table is {"heading": str | None, "columns": [(label, width, align)],
     "rows": [(cells, kind)], "footer": cells | None}. Widths are relative;
     align is "L" or "R". Row kind "" is normal, "bold" is bold and "sub" is a
-    small grey detail row (e.g. the source batches under a certificate line).
+    small grey detail row (e.g. the source batches under a certificate line);
+    "bad" is bold red on a pale red fill (an out-of-spec element).
     A None cell joins the cell before it.
     Notes are (text, is_warning) and print below the tables, warnings in red.
     """
@@ -1533,6 +1534,10 @@ def summary_pdf_bytes(
                 pdf.set_font("Helvetica", "", 8)
                 pdf.set_text_color(*_PDF_GREY)
                 pdf.set_fill_color(252, 252, 252)
+            elif kind == "bad":
+                pdf.set_font("Helvetica", "B", 9)
+                pdf.set_text_color(*_PDF_RED)
+                pdf.set_fill_color(253, 236, 234)
             elif kind in ("bold", "footer"):
                 pdf.set_font("Helvetica", "B", 9)
                 pdf.set_text_color(*_PDF_INK)
